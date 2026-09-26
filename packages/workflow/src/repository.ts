@@ -25,6 +25,14 @@ import {
   type AgentMemorySummary,
 } from "./agent-memory.js";
 import type {
+  EpisodeSource,
+  PendingReplacement,
+  RejectedResource,
+  UserMessage,
+  UserMessageScope,
+  UserRequestStore,
+} from "./user-requests.js";
+import type {
   Account,
   ConnectedStorage,
   Session,
@@ -125,7 +133,7 @@ export type WorkflowRunReservationResult =
       episodes: EpisodeState[];
     };
 
-export interface WorkflowRepository extends DeadLinkStore, AgentMemoryStore {
+export interface WorkflowRepository extends DeadLinkStore, AgentMemoryStore, UserRequestStore {
   saveWorkflowRunSnapshot(input: PersistWorkflowRunSnapshotInput): Promise<void>;
   reserveWorkflowRun(input: ReserveWorkflowRunInput): Promise<WorkflowRunReservationResult>;
   /** (account, storage)-scoped: returns null if the run belongs to a different
@@ -319,6 +327,10 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
   private readonly deadLinks = new Map<string, DeadLink>();
   private readonly agentSteps = new Map<string, AgentStep[]>();
   private readonly agentMemories = new Map<string, AgentMemory>();
+  private readonly userMessages = new Map<string, UserMessage>();
+  private readonly pendingReplacements = new Map<string, PendingReplacement>();
+  private readonly rejectedResources: RejectedResource[] = [];
+  private readonly episodeSources = new Map<string, EpisodeSource>();
 
   async getSetting(key: string): Promise<string | null> {
     return this.settings.get(key) ?? null;
@@ -669,6 +681,140 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
       const m = this.agentMemories.get(id);
       if (m && m.accountId === input.accountId) m.lastUsedAt = input.now;
     }
+  }
+
+  // ---- user requests (see user-requests.ts). No await between read and write → atomic.
+  async createUserMessage(input: Parameters<UserRequestStore["createUserMessage"]>[0]): Promise<UserMessage> {
+    const busy = [...this.userMessages.values()].some((m) => sameWork(m, input) && m.status === "processing");
+    const row: UserMessage = {
+      id: `msg_${globalThis.crypto.randomUUID()}`,
+      accountId: input.accountId, drive: input.drive, titleKey: input.titleKey,
+      body: input.body, episodeTags: [...input.episodeTags],
+      status: "pending", urgent: busy, runId: null, reply: null,
+      createdAt: input.now, updatedAt: input.now, processedAt: null,
+    };
+    this.userMessages.set(row.id, row);
+    return structuredClone(row);
+  }
+
+  async listUserMessages(scope: UserMessageScope): Promise<UserMessage[]> {
+    return [...this.userMessages.values()]
+      .filter((m) => sameWork(m, scope) && m.status !== "withdrawn")
+      .sort((a, b) => -compareCreated(a, b))
+      .map((m) => structuredClone(m));
+  }
+
+  async editUserMessage(input: Parameters<UserRequestStore["editUserMessage"]>[0]): Promise<UserMessage | null> {
+    const m = this.userMessages.get(input.id);
+    if (!m || m.accountId !== input.accountId || m.status !== "pending") return null;
+    Object.assign(m, { body: input.body, episodeTags: [...input.episodeTags], updatedAt: input.now });
+    return structuredClone(m);
+  }
+
+  async withdrawUserMessage(input: Parameters<UserRequestStore["withdrawUserMessage"]>[0]): Promise<boolean> {
+    const m = this.userMessages.get(input.id);
+    if (!m || m.accountId !== input.accountId || m.status !== "pending") return false;
+    Object.assign(m, { status: "withdrawn", updatedAt: input.now });
+    return true;
+  }
+
+  async markUserMessagesUrgent(input: Parameters<UserRequestStore["markUserMessagesUrgent"]>[0]): Promise<number> {
+    let n = 0;
+    for (const m of this.userMessages.values()) {
+      if (sameWork(m, input) && m.status === "pending") {
+        Object.assign(m, { urgent: true, updatedAt: input.now });
+        n += 1;
+      }
+    }
+    return n;
+  }
+
+  async claimUserMessages(input: Parameters<UserRequestStore["claimUserMessages"]>[0]): Promise<UserMessage[]> {
+    const claimed: UserMessage[] = [];
+    for (const m of this.userMessages.values()) {
+      if (sameWork(m, input) && m.status === "pending") {
+        Object.assign(m, { status: "processing", runId: input.runId, updatedAt: input.now });
+        claimed.push(structuredClone(m));
+      }
+    }
+    return claimed.sort(compareCreated);
+  }
+
+  async finishUserMessages(input: Parameters<UserRequestStore["finishUserMessages"]>[0]): Promise<void> {
+    for (const m of this.userMessages.values()) {
+      if (m.status === "processing" && m.runId === input.runId) {
+        Object.assign(m, { status: "done", reply: structuredClone(input.reply), processedAt: input.now, updatedAt: input.now });
+      }
+    }
+  }
+
+  async releaseUserMessages(input: Parameters<UserRequestStore["releaseUserMessages"]>[0]): Promise<void> {
+    for (const m of this.userMessages.values()) {
+      if (m.status === "processing" && m.runId === input.runId) {
+        Object.assign(m, { status: "pending", urgent: true, runId: null, updatedAt: input.now });
+      }
+    }
+  }
+
+  async listWorksWithPendingMessages(input: { urgentOnly: boolean }): Promise<UserMessageScope[]> {
+    return uniqueWorks(
+      [...this.userMessages.values()].filter((m) => m.status === "pending" && (!input.urgentOnly || m.urgent)),
+    );
+  }
+
+  async listPendingReplacements(scope: UserMessageScope): Promise<PendingReplacement[]> {
+    return [...this.pendingReplacements.values()]
+      .filter((p) => sameWork(p, scope))
+      .sort((a, b) => a.episode.localeCompare(b.episode))
+      .map((p) => ({ ...p }));
+  }
+
+  async listWorksWithPendingReplacements(): Promise<UserMessageScope[]> {
+    return uniqueWorks([...this.pendingReplacements.values()]);
+  }
+
+  async addPendingReplacements(input: Parameters<UserRequestStore["addPendingReplacements"]>[0]): Promise<void> {
+    for (const episode of input.episodes) {
+      const key = workKey(input, episode);
+      if (!this.pendingReplacements.has(key)) {
+        this.pendingReplacements.set(key, {
+          accountId: input.accountId, drive: input.drive, titleKey: input.titleKey,
+          episode, messageId: input.messageId, requestedAt: input.now,
+        });
+      }
+    }
+  }
+
+  async removePendingReplacements(input: Parameters<UserRequestStore["removePendingReplacements"]>[0]): Promise<number> {
+    let n = 0;
+    for (const episode of new Set(input.episodes)) if (this.pendingReplacements.delete(workKey(input, episode))) n += 1;
+    return n;
+  }
+
+  async addRejectedResources(input: Parameters<UserRequestStore["addRejectedResources"]>[0]): Promise<void> {
+    for (const item of input.items) {
+      this.rejectedResources.push({
+        ...item, id: `rej_${globalThis.crypto.randomUUID()}`,
+        accountId: input.accountId, titleKey: input.titleKey, createdAt: input.now,
+      });
+    }
+  }
+
+  async listRejectedResources(input: { accountId: string; titleKey: string }): Promise<RejectedResource[]> {
+    return this.rejectedResources
+      .filter((r) => r.accountId === input.accountId && r.titleKey === input.titleKey)
+      .map((r) => ({ ...r }));
+  }
+
+  async upsertEpisodeSource(input: EpisodeSource): Promise<void> {
+    this.episodeSources.set(workKey(input, input.episode), { ...input });
+  }
+
+  async listEpisodeSources(scope: UserMessageScope): Promise<EpisodeSource[]> {
+    return [...this.episodeSources.values()]
+      .filter((s) => sameWork(s, scope))
+      .sort((a, b) => a.episode.localeCompare(b.episode))
+      .map((s) => ({ ...s }));
   }
 
   async saveWorkflowRunSnapshot(input: PersistWorkflowRunSnapshotInput): Promise<void> {
@@ -1570,4 +1716,25 @@ export function compareTrackedSeasonStates(a: TrackedSeasonState, b: TrackedSeas
     a.season.seasonNumber - b.season.seasonNumber ||
     a.season.id.localeCompare(b.season.id)
   );
+}
+
+function sameWork(a: UserMessageScope, b: UserMessageScope): boolean {
+  return a.accountId === b.accountId && a.drive === b.drive && a.titleKey === b.titleKey;
+}
+
+function workKey(scope: UserMessageScope, episode: string): string {
+  return JSON.stringify([scope.accountId, scope.drive, scope.titleKey, episode]);
+}
+
+function uniqueWorks(rows: UserMessageScope[]): UserMessageScope[] {
+  const seen = new Map<string, UserMessageScope>();
+  for (const r of rows) seen.set(workKey(r, ""), { accountId: r.accountId, drive: r.drive, titleKey: r.titleKey });
+  return [...seen.values()].sort(
+    (a, b) => a.accountId.localeCompare(b.accountId) || a.drive.localeCompare(b.drive) || a.titleKey.localeCompare(b.titleKey),
+  );
+}
+
+/** Oldest first, id as the tie-break — the order both SQL engines use. */
+function compareCreated(a: UserMessage, b: UserMessage): number {
+  return a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 }
