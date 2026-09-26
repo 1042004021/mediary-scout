@@ -49,8 +49,8 @@ describe("userMessageFromRow", () => {
     status: "pending", urgent: 0, run_id: null, reply: null,
     created_at: "2026-09-26T00:00:00.000Z", updated_at: "2026-09-26T00:00:00.000Z", processed_at: null,
   };
-  it("fails loud on an unknown status instead of treating it as pending", () => {
-    expect(() => userMessageFromRow({ ...row, status: "archived" })).toThrow(/msg_1/);
+  it("maps an unknown status to done (never editable) instead of pending", () => {
+    expect(userMessageFromRow({ ...row, status: "archived" }).status).toBe("done");
   });
   it("reads a corrupt reply as null", () => {
     expect(userMessageFromRow({ ...row, status: "done", reply: "{not json" }).reply).toBeNull();

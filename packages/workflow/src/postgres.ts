@@ -1485,8 +1485,9 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
   // ---- user requests (see user-requests.ts)
   async createUserMessage(input: Parameters<UserRequestStore["createUserMessage"]>[0]): Promise<UserMessage> {
     return this.withTransaction(async (client) => {
-      // Serialized with claimUserMessages on the same work: under READ COMMITTED the
-      // EXISTS below could otherwise miss a claim committing concurrently.
+      // The EXISTS sees only the statement snapshot, so on its own a claim committing
+      // concurrently could leave this message non-urgent (harmless: it would wait for
+      // the patrol). The work lock, shared with claimUserMessages, makes urgent exact.
       await lockUserMessageWork(client, input);
       const result = await client.query<UserMessageRow>(
         "INSERT INTO user_messages (id, account_id, drive, title_key, body, episode_tags, status, urgent, run_id, reply, created_at, updated_at, processed_at) " +

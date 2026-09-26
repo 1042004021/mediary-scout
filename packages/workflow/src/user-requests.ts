@@ -190,10 +190,9 @@ export interface UserMessageRow {
 const USER_MESSAGE_STATUSES: readonly UserMessageStatus[] = ["pending", "processing", "done", "withdrawn"];
 
 export function userMessageFromRow(row: UserMessageRow): UserMessage {
-  // Fail loud on an unknown status: defaulting to "pending" would silently make a
-  // message editable/claimable again.
-  const status = USER_MESSAGE_STATUSES.find((s) => s === row.status);
-  if (!status) throw new Error(`user message ${String(row.id)} has unknown status ${JSON.stringify(row.status)}`);
+  // Unknown status → "done": fail safe (never editable, withdrawable or claimable
+  // again) without taking down the whole list the row appears in.
+  const status = USER_MESSAGE_STATUSES.find((s) => s === row.status) ?? "done";
   return {
     id: String(row.id),
     accountId: String(row.account_id),
@@ -211,9 +210,10 @@ export function userMessageFromRow(row: UserMessageRow): UserMessage {
   };
 }
 
-/** Oldest first, id as the tie-break — the claim order every engine returns
- *  (RETURNING has no ORDER BY, so the SQL engines sort in code too). */
-export function compareUserMessagesCreated(a: UserMessage, b: UserMessage): number {
+/** Oldest first, id as the tie-break — SQL `ORDER BY created_at, id`. Used for the
+ *  claim order every engine returns (RETURNING has no ORDER BY, so the SQL engines
+ *  sort in code too) and for the in-memory rejected list. */
+export function compareUserMessagesCreated(a: { createdAt: string; id: string }, b: { createdAt: string; id: string }): number {
   return a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 }
 

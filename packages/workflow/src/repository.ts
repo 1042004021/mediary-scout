@@ -804,7 +804,7 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
   async listRejectedResources(input: { accountId: string; titleKey: string }): Promise<RejectedResource[]> {
     return this.rejectedResources
       .filter((r) => r.accountId === input.accountId && r.titleKey === input.titleKey)
-      .sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+      .sort(compareUserMessagesCreated)
       .map((r) => ({ ...r }));
   }
 
