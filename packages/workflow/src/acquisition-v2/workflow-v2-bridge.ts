@@ -69,6 +69,8 @@ export interface BridgedV2Result {
   notification: NotificationEvent;
   notifications: NotificationEvent[];
   auditEvents: AuditEvent[];
+  /** Present only on a replace_request run (attached by runTvAcquisitionV2). */
+  replacement?: RunAcquisitionV2WorkflowResult["replacement"];
 }
 
 export function bridgeV2WorkflowToResult(input: {

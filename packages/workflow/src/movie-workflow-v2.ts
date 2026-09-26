@@ -21,7 +21,7 @@ import type { ResourceProvider, StorageExecutor } from "./ports.js";
 import type { DeadLinkStore } from "./acquisition-v2/dead-links.js";
 import { readLandedSize, type LandedSize } from "./acquisition-v2/landed-size.js";
 import type { AgentToolEvent } from "./acquisition-v2/activity.js";
-import { runAcquisitionV2 } from "./acquisition-v2/orchestrator.js";
+import { runAcquisitionV2, type RunAcquisitionV2Request, type RunAcquisitionV2Result } from "./acquisition-v2/orchestrator.js";
 import type { JevJudge } from "./jev-judge.js";
 import { getQualityGuidance, getSearchRecipe } from "./acquisition-v2/search-profile.js";
 import { ensureMediaLibraryDirectory } from "./media-library-folder.js";
@@ -58,13 +58,18 @@ export interface RunMovieAcquisitionV2Request {
   deadLinkStore?: DeadLinkStore;
   /** Agent memory (see orchestrator.memory). */
   memory?: { store: AgentMemoryStore; accountId: string; drive?: string };
+  /** A replace_request run (see orchestrator.userRequest; requestedEpisodes ["MOVIE"]). */
+  userRequest?: RunAcquisitionV2Request["userRequest"];
   onProgress?: (event: AgentToolEvent) => void;
   now?: () => string;
 }
 
+/** The movie result plus the replace outcome of a replace_request run. */
+export type MovieAcquisitionV2Result = MovieWorkflowResult & { replacement?: RunAcquisitionV2Result["replacement"] };
+
 export async function runMovieAcquisitionV2(
   request: RunMovieAcquisitionV2Request,
-): Promise<MovieWorkflowResult> {
+): Promise<MovieAcquisitionV2Result> {
   const now = request.now ?? defaultNowIso;
 
   // verify-or-create Movies/Title (Year) {tmdb-N} (legacy Title (Year) reused).
@@ -110,19 +115,22 @@ export async function runMovieAcquisitionV2(
     ...(request.jevJudge === undefined ? {} : { jevJudge: request.jevJudge }),
     ...(request.deadLinkStore ? { deadLinkStore: request.deadLinkStore } : {}),
     ...(request.memory ? { memory: request.memory } : {}),
+    ...(request.userRequest ? { userRequest: request.userRequest } : {}),
     ...(request.onProgress ? { onProgress: request.onProgress } : {}),
   });
 
   // Truth = the AGENT'S coverage (its markObtained), NOT a mechanical file scan
   // (§1.13/§7b). The agent looked at the real files and declared coverage; the
   // workflow records that, it does not re-derive obtained by counting files.
-  const obtained = v2.coverage.coverageMet;
+  // A replace run never un-obtains the film: the old file stays in the directory
+  // whether or not a replacement landed (spec §4.5).
+  const obtained = v2.coverage.coverageMet || request.userRequest !== undefined;
 
   // Real landed volume for the push (best-effort; never fails the run). The
   // movie dir IS the staging+final location, so its video file(s) are the film.
   const landed = obtained ? await readLandedSize(request.storage, [movieDirectoryId]) : undefined;
 
-  return buildResult({
+  const result = buildResult({
     request,
     movieDirectoryId,
     obtained,
@@ -137,6 +145,7 @@ export async function runMovieAcquisitionV2(
     ...(landed ? { landed } : {}),
     now,
   });
+  return v2.replacement ? { ...result, replacement: v2.replacement } : result;
 }
 
 function buildResult(input: {
