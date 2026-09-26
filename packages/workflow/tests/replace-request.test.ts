@@ -4,10 +4,12 @@ import {
   createEpisodeStates,
   enqueueUrgentReplaceRequests,
   FakeStorageExecutor,
+  formatDailyDigestPushText,
   InMemoryWorkflowRepository,
   movieAnchorSeason,
   queueReplaceRequest,
   runQueuedReplaceRequest,
+  scheduledDigestItems,
   type MediaTitle,
   type ResourceCandidate,
   type ResourceProvider,
@@ -720,6 +722,55 @@ describe("replace_request notifications — patrol vs user", () => {
 
     const run = await repository.getWorkflowRunSnapshot("run_rr_p2", SCOPE);
     expect(run?.notifications.map((n) => [n.kind, n.trigger])).toEqual([["already_current", "scheduled"]]);
+  });
+
+  it("a patrol-queued 待换-only run where a newly aired gap lands is not routine: it names the new episode in the digest and activity", async () => {
+    const { repository, title, season } = await trackedShow();
+    const storage = new FakeStorageExecutor({
+      transferOutcomes: {
+        cand_new: {
+          status: "succeeded",
+          providerMessage: "ok",
+          files: [{ id: "new03", storageDirectoryId: "staging", name: "[NewGroup] Show 03.mkv", sizeBytes: 2_000_000_000, episodeCode: "S01E03", providerFileId: "new03" }],
+        },
+      },
+    });
+    await seedV2Season(storage, title, season, ["S01E01", "S01E02"]);
+    await repository.addPendingReplacements({ ...WORK, episodes: ["S01E01"], messageId: "msg_old", now: NOW });
+    await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => "run_rr_grow", origin: "patrol" });
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        i += 1;
+        if (i === 1) return tool("searchResources", { keyword: "Show 03" }, i);
+        if (i === 2) {
+          const search = lastToolOutput(options.prompt, "searchResources");
+          return tool("transferCandidate", { snapshotId: search.snapshot.id, candidateId: search.snapshot.candidates[0].id }, i);
+        }
+        if (i === 3) return tool("moveToSeason", { moves: [{ season: 1, fileIds: ["new03"] }] }, i);
+        if (i === 4) return tool("markObtained", { codes: ["S01E03"] }, i);
+        if (i === 5) return tool("reportReplacement", { results: [{ episode: "S01E01", outcome: "not_found", note: "没找到" }] }, i);
+        if (i === 6) return tool("finish", {}, i);
+        return text("done");
+      },
+    });
+
+    await runQueuedReplaceRequest({
+      ...baseRun(repository, storage, model),
+      syncSeasonMetadata: async () => ({ latestAiredEpisode: 3, totalEpisodes: 3 }),
+    });
+
+    const state = await repository.getTrackedSeasonState(season.id, SCOPE);
+    expect(state?.episodes.find((e) => e.episodeCode === "S01E03")?.obtained).toBe(true);
+    const run = await repository.getWorkflowRunSnapshot("run_rr_grow", SCOPE);
+    const [notification] = run!.notifications;
+    expect(notification).toMatchObject({ kind: "replacement_done", trigger: "scheduled" });
+    expect(notification!.report).toMatchObject({ newlyObtained: ["S01E03"] });
+    expect(notification!.report!.status).not.toBe("no_coverage");
+    expect(notification!.report!.lines[0]).toContain("新增 E03");
+    // Not folded away: the digest lists it as a change (and, being no already_current,
+    // the activity page and the notification feed show it too).
+    expect(formatDailyDigestPushText(scheduledDigestItems(run!.notifications, { skipIfOnlyRoutine: true }))).toContain("新增 S01E03");
   });
 
   it("a movie queued by the patrol for its 待换 film, nothing replaced: routine too", async () => {

@@ -447,6 +447,28 @@ describe("buildReplacementReport — a user-requested replace run", () => {
     });
   });
 
+  it("nothing replaced but a plain gap landed: not no_coverage — it says what was added", () => {
+    const report = buildReplacementReport({
+      titleName: "Show",
+      movie: false,
+      results: [{ episode: "S01E13", outcome: "not_found" }],
+      newlyObtained: ["S01E25"],
+    });
+    expect(report.status).not.toBe("no_coverage");
+    expect(report.lines).toEqual(["新增 E25", "1 集还在找（E13）"]);
+    expect(report.newlyObtained).toEqual(["S01E25"]);
+  });
+
+  it("replaced and a plain gap landed: both are named", () => {
+    const report = buildReplacementReport({
+      titleName: "Show",
+      movie: false,
+      results: [{ episode: "S01E13", outcome: "replaced" }],
+      newlyObtained: ["S01E25"],
+    });
+    expect(report).toMatchObject({ status: "replaced", lines: ["换好 1 集（E13）", "新增 E25"] });
+  });
+
   it("nothing replaced because transfers were blocked says so", () => {
     const report = buildReplacementReport({
       titleName: "Show",
@@ -481,6 +503,13 @@ describe("stampReplaceNotification — who queued the replace run decides how it
     expect(stampReplaceNotification(base("replaced"), notice).kind).toBe("replacement_done");
     expect(stampReplaceNotification(base("failed", "transfer_failed"), notice).kind).toBe("transfer_failed");
     expect(stampReplaceNotification(base("no_coverage"), { ...notice, routineIfNothingReplaced: false }).kind).toBe("replacement_done");
+  });
+
+  it("a run that landed a newly aired episode is never routine, whatever its status", () => {
+    const notice = { trigger: "scheduled" as const, routineIfNothingReplaced: true };
+    const grew = base("no_coverage");
+    grew.report = { ...grew.report!, newlyObtained: ["S01E25"] };
+    expect(stampReplaceNotification(grew, notice).kind).toBe("replacement_done");
   });
 });
 

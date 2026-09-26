@@ -282,14 +282,15 @@ export function buildReplacementReport(input: {
 }): NotificationReport {
   const replaced = input.results.filter((r) => r.outcome === "replaced").map((r) => r.episode);
   const pending = input.results.filter((r) => r.outcome === "not_found").map((r) => r.episode);
+  const newlyObtained = input.newlyObtained ?? [];
   const base = {
     titleName: input.titleName,
     seasonLabel: null,
-    newlyObtained: input.newlyObtained ?? [],
+    newlyObtained,
     realMissing: [],
     ...(input.meta ?? {}),
   };
-  if (replaced.length === 0) {
+  if (replaced.length === 0 && newlyObtained.length === 0) {
     // Nothing new landed: an honest block/source-fault reason beats "not found".
     const outcome = emptyRunOutcome(input.transferBlockReason, input.searchSourceFaultReason);
     if (outcome.status === "failed") return { ...base, ...outcome };
@@ -303,11 +304,18 @@ export function buildReplacementReport(input: {
     return { ...base, status: "replaced", lines: ["已换成新版本"] };
   }
   // "E13" when every episode is in one season (the card names the show); full codes otherwise.
-  const seasons = new Set([...replaced, ...pending].map((code) => code.replace(/E\d+$/, "")));
+  const seasons = new Set([...replaced, ...pending, ...newlyObtained].map((code) => code.replace(/E\d+$/, "")));
   const label = (codes: string[]) => codes.map((code) => (seasons.size === 1 ? shortCode(code) : code)).join("、");
-  let line = `换好 ${replaced.length} 集（${label(replaced)}）`;
-  if (pending.length > 0) line += `，${pending.length} 集还在找（${label(pending)}）`;
-  return { ...base, status: "replaced", lines: [line] };
+  const stillLooking = pending.length > 0 ? `${pending.length} 集还在找（${label(pending)}）` : null;
+  const added = newlyObtained.length > 0 ? `新增 ${label(newlyObtained)}` : null;
+  if (replaced.length === 0) {
+    // A work with 待换 episodes is patrolled only through this run, so a newly aired
+    // gap lands here: that is news, never "还没找到". Nothing was replaced, though,
+    // so the status is the ordinary "new episodes landed" one, not "replaced".
+    return { ...base, status: "airing", lines: [added!, ...(stillLooking ? [stillLooking] : [])] };
+  }
+  const line = `换好 ${replaced.length} 集（${label(replaced)}）` + (stillLooking ? `，${stillLooking}` : "");
+  return { ...base, status: "replaced", lines: [line, ...(added ? [added] : [])] };
 }
 
 /**
@@ -316,14 +324,16 @@ export function buildReplacementReport(input: {
  * its own every sweep; one the user asked for (现在处理, the urgent scan) stays
  * `user`. A patrol re-check of 待换 episodes with no new message that replaced
  * nothing is routine (`already_current`): the notification page folds it into the
- * 例行巡检 card and the digest lists it under 其余已是最新. Failures and actual
- * replacements are never downgraded.
+ * 例行巡检 card and the digest lists it under 其余已是最新. Failures, actual
+ * replacements and newly landed episodes are never downgraded.
  */
 export function stampReplaceNotification(
   notification: NotificationEvent,
   notice: { trigger: NotificationTrigger; routineIfNothingReplaced: boolean },
 ): NotificationEvent {
-  const routine = notice.routineIfNothingReplaced && notification.report?.status === "no_coverage";
+  const report = notification.report;
+  const routine =
+    notice.routineIfNothingReplaced && report?.status === "no_coverage" && report.newlyObtained.length === 0;
   return { ...notification, trigger: notice.trigger, ...(routine ? { kind: "already_current" } : {}) };
 }
 
