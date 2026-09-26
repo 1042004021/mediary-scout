@@ -27,6 +27,16 @@ import {
   type AgentMemorySummary,
   type AgentMemoryScope,
 } from "./agent-memory.js";
+import {
+  userMessageFromRow,
+  type EpisodeSource,
+  type PendingReplacement,
+  type RejectedResource,
+  type UserMessage,
+  type UserMessageRow,
+  type UserMessageScope,
+  type UserRequestStore,
+} from "./user-requests.js";
 import { MAGNET_DEAD_LINK_TTL_MS } from "./acquisition-v2/dead-links.js";
 import type {
   Account,
@@ -164,6 +174,56 @@ export const SQLITE_SCHEMA = `
     last_used_at text,
     source_run_id text,
     UNIQUE (account_id, scope, title_key, name)
+  );
+  CREATE TABLE IF NOT EXISTS user_messages (
+    id text PRIMARY KEY,
+    account_id text NOT NULL,
+    drive text NOT NULL DEFAULT '',
+    title_key text NOT NULL,
+    body text NOT NULL,
+    episode_tags text NOT NULL DEFAULT '[]',
+    status text NOT NULL,
+    urgent integer NOT NULL DEFAULT 0,
+    run_id text,
+    reply text,
+    created_at text NOT NULL,
+    updated_at text NOT NULL,
+    processed_at text
+  );
+  CREATE INDEX IF NOT EXISTS user_messages_work ON user_messages (account_id, drive, title_key, status);
+  CREATE TABLE IF NOT EXISTS pending_replacements (
+    account_id text NOT NULL,
+    drive text NOT NULL DEFAULT '',
+    title_key text NOT NULL,
+    episode text NOT NULL,
+    message_id text NOT NULL,
+    requested_at text NOT NULL,
+    PRIMARY KEY (account_id, drive, title_key, episode)
+  );
+  CREATE TABLE IF NOT EXISTS rejected_resources (
+    id text PRIMARY KEY,
+    account_id text NOT NULL,
+    title_key text NOT NULL,
+    episode text NOT NULL,
+    link_key text,
+    label text NOT NULL,
+    size_bytes integer,
+    reason text NOT NULL,
+    message_id text,
+    created_at text NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS rejected_resources_work ON rejected_resources (account_id, title_key);
+  CREATE TABLE IF NOT EXISTS episode_sources (
+    account_id text NOT NULL,
+    drive text NOT NULL DEFAULT '',
+    title_key text NOT NULL,
+    episode text NOT NULL,
+    link_key text,
+    label text NOT NULL,
+    size_bytes integer,
+    run_id text NOT NULL,
+    recorded_at text NOT NULL,
+    PRIMARY KEY (account_id, drive, title_key, episode)
   );
   CREATE TABLE IF NOT EXISTS accounts (
     id text PRIMARY KEY,
@@ -1607,6 +1667,158 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
     for (const id of input.ids) stmt.run(input.now, input.accountId, id);
   }
 
+  // ---- user requests (see user-requests.ts)
+  async createUserMessage(input: Parameters<UserRequestStore["createUserMessage"]>[0]): Promise<UserMessage> {
+    const id = `msg_${globalThis.crypto.randomUUID()}`;
+    // One INSERT … SELECT: the "is another message of this work processing?" read and
+    // the write can't be split by a concurrent claim.
+    this.db
+      .prepare(
+        "INSERT INTO user_messages (id, account_id, drive, title_key, body, episode_tags, status, urgent, run_id, reply, created_at, updated_at, processed_at) " +
+          "VALUES (?, ?, ?, ?, ?, ?, 'pending', EXISTS (SELECT 1 FROM user_messages WHERE account_id = ? AND drive = ? AND title_key = ? AND status = 'processing'), NULL, NULL, ?, ?, NULL)",
+      )
+      .run(
+        id, input.accountId, input.drive, input.titleKey, input.body, JSON.stringify(input.episodeTags),
+        input.accountId, input.drive, input.titleKey, input.now, input.now,
+      );
+    return userMessageFromRow(this.db.prepare("SELECT * FROM user_messages WHERE id = ?").get(id) as UserMessageRow);
+  }
+
+  async listUserMessages(scope: UserMessageScope): Promise<UserMessage[]> {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM user_messages WHERE account_id = ? AND drive = ? AND title_key = ? AND status <> 'withdrawn' ORDER BY created_at DESC, id DESC",
+      )
+      .all(scope.accountId, scope.drive, scope.titleKey) as UserMessageRow[];
+    return rows.map(userMessageFromRow);
+  }
+
+  async editUserMessage(input: Parameters<UserRequestStore["editUserMessage"]>[0]): Promise<UserMessage | null> {
+    const row = this.db
+      .prepare(
+        "UPDATE user_messages SET body = ?, episode_tags = ?, updated_at = ? WHERE id = ? AND account_id = ? AND status = 'pending' RETURNING *",
+      )
+      .get(input.body, JSON.stringify(input.episodeTags), input.now, input.id, input.accountId) as UserMessageRow | undefined;
+    return row ? userMessageFromRow(row) : null;
+  }
+
+  async withdrawUserMessage(input: Parameters<UserRequestStore["withdrawUserMessage"]>[0]): Promise<boolean> {
+    const result = this.db
+      .prepare("UPDATE user_messages SET status = 'withdrawn', updated_at = ? WHERE id = ? AND account_id = ? AND status = 'pending'")
+      .run(input.now, input.id, input.accountId);
+    return result.changes > 0;
+  }
+
+  async markUserMessagesUrgent(input: Parameters<UserRequestStore["markUserMessagesUrgent"]>[0]): Promise<number> {
+    return this.db
+      .prepare("UPDATE user_messages SET urgent = 1, updated_at = ? WHERE account_id = ? AND drive = ? AND title_key = ? AND status = 'pending'")
+      .run(input.now, input.accountId, input.drive, input.titleKey).changes;
+  }
+
+  async claimUserMessages(input: Parameters<UserRequestStore["claimUserMessages"]>[0]): Promise<UserMessage[]> {
+    // One UPDATE … RETURNING: returns exactly the rows this call moved, never rows a
+    // previous claim under the same runId already held.
+    const rows = this.db
+      .prepare(
+        "UPDATE user_messages SET status = 'processing', run_id = ?, updated_at = ? WHERE account_id = ? AND drive = ? AND title_key = ? AND status = 'pending' RETURNING *",
+      )
+      .all(input.runId, input.now, input.accountId, input.drive, input.titleKey) as UserMessageRow[];
+    return rows.map(userMessageFromRow).sort(compareUserMessagesCreated);
+  }
+
+  async finishUserMessages(input: Parameters<UserRequestStore["finishUserMessages"]>[0]): Promise<void> {
+    this.db
+      .prepare("UPDATE user_messages SET status = 'done', reply = ?, processed_at = ?, updated_at = ? WHERE run_id = ? AND status = 'processing'")
+      .run(JSON.stringify(input.reply), input.now, input.now, input.runId);
+  }
+
+  async releaseUserMessages(input: Parameters<UserRequestStore["releaseUserMessages"]>[0]): Promise<void> {
+    this.db
+      .prepare("UPDATE user_messages SET status = 'pending', urgent = 1, run_id = NULL, updated_at = ? WHERE run_id = ? AND status = 'processing'")
+      .run(input.now, input.runId);
+  }
+
+  async listWorksWithPendingMessages(input: { urgentOnly: boolean }): Promise<UserMessageScope[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT account_id, drive, title_key FROM user_messages WHERE status = 'pending'${input.urgentOnly ? " AND urgent = 1" : ""} ORDER BY account_id, drive, title_key`,
+      )
+      .all() as Array<{ account_id: string; drive: string; title_key: string }>;
+    return rows.map((r) => ({ accountId: r.account_id, drive: r.drive, titleKey: r.title_key }));
+  }
+
+  async listPendingReplacements(scope: UserMessageScope): Promise<PendingReplacement[]> {
+    const rows = this.db
+      .prepare("SELECT * FROM pending_replacements WHERE account_id = ? AND drive = ? AND title_key = ? ORDER BY episode")
+      .all(scope.accountId, scope.drive, scope.titleKey) as Array<Record<string, string>>;
+    return rows.map((r) => ({ accountId: r["account_id"]!, drive: r["drive"]!, titleKey: r["title_key"]!, episode: r["episode"]!, messageId: r["message_id"]!, requestedAt: r["requested_at"]! }));
+  }
+
+  async listWorksWithPendingReplacements(): Promise<UserMessageScope[]> {
+    const rows = this.db
+      .prepare("SELECT DISTINCT account_id, drive, title_key FROM pending_replacements ORDER BY account_id, drive, title_key")
+      .all() as Array<{ account_id: string; drive: string; title_key: string }>;
+    return rows.map((r) => ({ accountId: r.account_id, drive: r.drive, titleKey: r.title_key }));
+  }
+
+  async addPendingReplacements(input: Parameters<UserRequestStore["addPendingReplacements"]>[0]): Promise<void> {
+    const insert = this.db.prepare(
+      "INSERT INTO pending_replacements (account_id, drive, title_key, episode, message_id, requested_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+    );
+    this.db.transaction(() => {
+      for (const episode of input.episodes) insert.run(input.accountId, input.drive, input.titleKey, episode, input.messageId, input.now);
+    })();
+  }
+
+  async removePendingReplacements(input: Parameters<UserRequestStore["removePendingReplacements"]>[0]): Promise<number> {
+    const del = this.db.prepare("DELETE FROM pending_replacements WHERE account_id = ? AND drive = ? AND title_key = ? AND episode = ?");
+    return this.db.transaction(() => input.episodes.reduce((n, e) => n + del.run(input.accountId, input.drive, input.titleKey, e).changes, 0))();
+  }
+
+  async addRejectedResources(input: Parameters<UserRequestStore["addRejectedResources"]>[0]): Promise<void> {
+    const insert = this.db.prepare(
+      "INSERT INTO rejected_resources (id, account_id, title_key, episode, link_key, label, size_bytes, reason, message_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    );
+    this.db.transaction(() => {
+      for (const i of input.items) {
+        insert.run(`rej_${globalThis.crypto.randomUUID()}`, input.accountId, input.titleKey, i.episode, i.linkKey, i.label, i.sizeBytes, i.reason, i.messageId, input.now);
+      }
+    })();
+  }
+
+  async listRejectedResources(input: { accountId: string; titleKey: string }): Promise<RejectedResource[]> {
+    const rows = this.db
+      .prepare("SELECT * FROM rejected_resources WHERE account_id = ? AND title_key = ? ORDER BY created_at, id")
+      .all(input.accountId, input.titleKey) as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      id: String(r["id"]), accountId: String(r["account_id"]), titleKey: String(r["title_key"]), episode: String(r["episode"]),
+      linkKey: (r["link_key"] as string | null) ?? null, label: String(r["label"]),
+      sizeBytes: r["size_bytes"] === null || r["size_bytes"] === undefined ? null : Number(r["size_bytes"]),
+      reason: String(r["reason"]), messageId: (r["message_id"] as string | null) ?? null, createdAt: String(r["created_at"]),
+    }));
+  }
+
+  async upsertEpisodeSource(input: EpisodeSource): Promise<void> {
+    this.db
+      .prepare(
+        "INSERT INTO episode_sources (account_id, drive, title_key, episode, link_key, label, size_bytes, run_id, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) " +
+          "ON CONFLICT (account_id, drive, title_key, episode) DO UPDATE SET link_key = excluded.link_key, label = excluded.label, size_bytes = excluded.size_bytes, run_id = excluded.run_id, recorded_at = excluded.recorded_at",
+      )
+      .run(input.accountId, input.drive, input.titleKey, input.episode, input.linkKey, input.label, input.sizeBytes, input.runId, input.recordedAt);
+  }
+
+  async listEpisodeSources(scope: UserMessageScope): Promise<EpisodeSource[]> {
+    const rows = this.db
+      .prepare("SELECT * FROM episode_sources WHERE account_id = ? AND drive = ? AND title_key = ? ORDER BY episode")
+      .all(scope.accountId, scope.drive, scope.titleKey) as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      accountId: String(r["account_id"]), drive: String(r["drive"]), titleKey: String(r["title_key"]), episode: String(r["episode"]),
+      linkKey: (r["link_key"] as string | null) ?? null, label: String(r["label"]),
+      sizeBytes: r["size_bytes"] === null || r["size_bytes"] === undefined ? null : Number(r["size_bytes"]),
+      runId: String(r["run_id"]), recordedAt: String(r["recorded_at"]),
+    }));
+  }
+
   async listDeadLinkKeys(options?: { now?: string }): Promise<string[]> {
     // Permanent deaths (expires_at NULL) always filter; soft ones only until their
     // own expiry (so an unresolvable magnet's longer TTL is honored per-record).
@@ -1616,4 +1828,9 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
       .all(now) as { key: string }[];
     return rows.map((row) => String(row.key));
   }
+}
+
+/** Oldest first, id as the tie-break (RETURNING has no ORDER BY). */
+function compareUserMessagesCreated(a: UserMessage, b: UserMessage): number {
+  return a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 }
