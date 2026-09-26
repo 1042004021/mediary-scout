@@ -526,6 +526,70 @@ describe("runQueuedReplaceRequest", () => {
   });
 });
 
+describe("replace_request crash recovery", () => {
+  const SCOPE = { accountId: "acct_1", connectedStorageId: DRIVE };
+
+  /** A replace run that claimed its message and then lost its worker (still running). */
+  async function crashedRun(runId: string) {
+    const { repository, title, season } = await trackedShow();
+    const message = await repository.createUserMessage({ ...WORK, body: "换第 1 集", episodeTags: ["S01E01"], now: NOW });
+    await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => runId });
+    await repository.claimNextQueuedWorkflowRun({ kind: "replace_request", now: NOW });
+    await repository.claimUserMessages({ ...WORK, runId, now: NOW });
+    return { repository, title, season, message };
+  }
+
+  it("a run requeued after a crash re-claims its own processing messages and finishes them", async () => {
+    const { repository, title, season, message } = await crashedRun("run_rr_crash");
+    expect(await repository.requeueRunningWorkflowRuns(NOW)).toBe(1);
+    const storage = new FakeStorageExecutor();
+    await seedV2Season(storage, title, season, ["S01E01", "S01E02"]);
+    let system = "";
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        i += 1;
+        if (i === 1) {
+          system = JSON.stringify(options.prompt.find((m) => m.role === "system") ?? "");
+          return tool("reportReplacement", { results: [{ episode: "S01E01", outcome: "not_found", note: "没找到" }] }, i);
+        }
+        return text("done");
+      },
+    });
+
+    const result = await runQueuedReplaceRequest(baseRun(repository, storage, model));
+
+    expect(result).toMatchObject({ status: "ran", workflowRunId: "run_rr_crash" });
+    expect(system).toContain("换第 1 集");
+    expect((await repository.listUserMessages(WORK))[0]).toMatchObject({ id: message.id, status: "done", runId: "run_rr_crash" });
+  });
+
+  it("an orphaned replace run past the recovery cap is failed and its messages go back to pending (not urgent: the patrol retries)", async () => {
+    const { repository } = await crashedRun("run_rr_poison");
+    const stored = await repository.getWorkflowRunSnapshot("run_rr_poison", SCOPE);
+    await repository.saveWorkflowRunSnapshot({ ...stored!, workflowRun: { ...stored!.workflowRun, orphanRequeueCount: 5 } });
+
+    expect(await repository.requeueRunningWorkflowRuns(NOW)).toBe(0);
+
+    expect((await repository.getWorkflowRunSnapshot("run_rr_poison", SCOPE))?.workflowRun.status).toBe("failed");
+    expect((await repository.listUserMessages(WORK))[0]).toMatchObject({ status: "pending", urgent: false, runId: null });
+    expect(await enqueueUrgentReplaceRequests({ repository, now: fixedNow })).toBe(0);
+  });
+
+  it("the idle scan releases messages stranded in processing by a run that is gone, and queues them", async () => {
+    const { repository } = await trackedShow();
+    await repository.createUserMessage({ ...WORK, body: "换第 1 集", episodeTags: ["S01E01"], now: NOW });
+    // Claimed by a run that never got saved (or was pruned/cancelled out from under it).
+    await repository.claimUserMessages({ ...WORK, runId: "run_vanished", now: NOW });
+
+    expect(await enqueueUrgentReplaceRequests({ repository, now: () => "2026-09-26T08:30:00.000Z" })).toBe(1);
+
+    expect((await repository.listUserMessages(WORK))[0]).toMatchObject({ status: "pending", urgent: true, runId: null });
+    const active = await repository.listActiveWorkflowRuns(SCOPE);
+    expect(active.map((r) => r.workflowRun.kind)).toEqual(["replace_request"]);
+  });
+});
+
 describe("enqueueUrgentReplaceRequests", () => {
   it("queues works with an urgent pending message and no active run; skips busy works and non-urgent messages", async () => {
     const repository = new InMemoryWorkflowRepository();

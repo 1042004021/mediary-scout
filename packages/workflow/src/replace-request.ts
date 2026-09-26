@@ -82,11 +82,22 @@ export async function queueReplaceRequest(input: {
   return { status: "queued", workflowRunId };
 }
 
+/** How long a finished run may still hold its messages: the post-run bookkeeping
+ *  (finishUserMessages) takes seconds, so anything older died before finishing. */
+const ORPHANED_MESSAGE_GRACE_MS = 10 * 60 * 1000;
+
 /** Idle-queue scan: every work with an urgent pending message and no active run. */
 export async function enqueueUrgentReplaceRequests(input: {
   repository: WorkflowRepository;
   now?: () => string;
 }): Promise<number> {
+  const nowIso = (input.now ?? (() => new Date().toISOString()))();
+  // A worker that died between claiming messages and finishing them leaves them in
+  // processing with no live run: hand them back first so the scan below sees them.
+  await input.repository.releaseOrphanedUserMessages({
+    now: nowIso,
+    finishedBefore: new Date(Date.parse(nowIso) - ORPHANED_MESSAGE_GRACE_MS).toISOString(),
+  });
   let n = 0;
   for (const work of await input.repository.listWorksWithPendingMessages({ urgentOnly: true })) {
     // A run that failed for good released its messages as urgent. Re-queueing it on

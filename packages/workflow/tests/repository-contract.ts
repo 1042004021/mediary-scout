@@ -150,12 +150,64 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         await repo.releaseUserMessages({ runId: "run_1", now: t1 });
         let [m] = await repo.listUserMessages(scope);
         expect(m).toMatchObject({ status: "pending", urgent: true, runId: null });
+        await repo.claimUserMessages({ ...scope, runId: "run_1b", now: t1 });
+        await repo.releaseUserMessages({ runId: "run_1b", now: t1, urgent: false });
+        [m] = await repo.listUserMessages(scope);
+        expect(m).toMatchObject({ status: "pending", urgent: false, runId: null });
 
         await repo.claimUserMessages({ ...scope, runId: "run_2", now: t1 });
         const reply = { results: [{ episode: "S01E13", outcome: "replaced" as const, label: "x", sizeBytes: 1, note: "ok" }], oldFiles: ["Season 01/a.mkv"], runId: "run_2" };
         await repo.finishUserMessages({ runId: "run_2", reply, now: t1 });
         [m] = await repo.listUserMessages(scope);
         expect(m).toMatchObject({ status: "done", processedAt: t1, reply });
+      });
+
+      it("claim is idempotent per run: the same run gets its processing messages back, another run does not", async () => {
+        const repo = await fresh();
+        const a = await repo.createUserMessage({ ...scope, body: "a", episodeTags: [], now: t0 });
+        expect((await repo.claimUserMessages({ ...scope, runId: "run_1", now: t0 })).map((m) => m.id)).toEqual([a.id]);
+        const b = await repo.createUserMessage({ ...scope, body: "b", episodeTags: [], now: t1 });
+        // The crashed-and-requeued run_1 re-claims a (still its own) and the new pending b.
+        const again = await repo.claimUserMessages({ ...scope, runId: "run_1", now: t1 });
+        expect(again.map((m) => [m.id, m.status, m.runId])).toEqual([[a.id, "processing", "run_1"], [b.id, "processing", "run_1"]]);
+        expect(await repo.claimUserMessages({ ...scope, runId: "run_2", now: t1 })).toEqual([]);
+        expect(await repo.listWorksWithProcessingMessages()).toEqual([scope]);
+      });
+
+      it("releaseOrphanedUserMessages releases processing messages whose run is gone or finished, keeps live ones", async () => {
+        const repo = await fresh();
+        const base = workflowPersistenceFixture();
+        const run = (id: string, status: "queued" | "running" | "failed", seasonId: string) => ({
+          ...base,
+          accountId: "acct_a",
+          connectedStorageId: "cs_1",
+          season: { ...base.season, id: seasonId },
+          workflowRun: { ...base.workflowRun, id, kind: "replace_request" as const, status, trackedSeasonId: seasonId, finishedAt: status === "failed" ? t0 : null },
+          episodes: [],
+          resourceSnapshots: [],
+          decisions: [],
+          transferAttempts: [],
+          notifications: [],
+        });
+        await repo.saveWorkflowRunSnapshot(run("run_live", "running", "season_live"));
+        await repo.saveWorkflowRunSnapshot(run("run_dead", "failed", "season_dead"));
+        // Just saved its final status; its bookkeeping (finishUserMessages) is still to come.
+        const fresh_ = run("run_just_done", "failed", "season_just");
+        await repo.saveWorkflowRunSnapshot({ ...fresh_, workflowRun: { ...fresh_.workflowRun, finishedAt: t1 } });
+        const works = ["tmdb_tv_live", "tmdb_tv_just", "tmdb_tv_dead", "tmdb_tv_gone"].map((titleKey) => ({ ...scope, titleKey }));
+        for (const work of works) await repo.createUserMessage({ ...work, body: "x", episodeTags: [], now: t0 });
+        await repo.claimUserMessages({ ...works[0]!, runId: "run_live", now: t0 });
+        await repo.claimUserMessages({ ...works[1]!, runId: "run_just_done", now: t0 });
+        await repo.claimUserMessages({ ...works[2]!, runId: "run_dead", now: t0 });
+        await repo.claimUserMessages({ ...works[3]!, runId: "run_never_saved", now: t0 });
+
+        expect(await repo.releaseOrphanedUserMessages({ now: t1, finishedBefore: t1 })).toBe(2);
+        expect((await repo.listUserMessages(works[0]!))[0]).toMatchObject({ status: "processing", runId: "run_live" });
+        expect((await repo.listUserMessages(works[1]!))[0]).toMatchObject({ status: "processing", runId: "run_just_done" });
+        for (const work of works.slice(2)) {
+          expect((await repo.listUserMessages(work))[0]).toMatchObject({ status: "pending", urgent: true, runId: null, updatedAt: t1 });
+        }
+        expect(await repo.releaseOrphanedUserMessages({ now: t1, finishedBefore: t1 })).toBe(0);
       });
 
       it("markUserMessagesUrgent and listWorksWithPendingMessages", async () => {
@@ -737,6 +789,27 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         ).toBe(true);
       });
 
+      it("requeueRunningWorkflowRuns: a replace run at the cap is failed and hands its messages back; a requeued one keeps them", async () => {
+        const repo = await fresh();
+        const work = { accountId: "acct_default", drive: "cs_rr", titleKey: "tmdb_tv_rr" };
+        for (const [id, count] of [["rr_capped", 5], ["rr_requeued", 0]] as const) {
+          const snap = queued(id, { startedAt: "2026-06-11T00:00:00.000Z", connectedStorageId: "cs_rr" });
+          await repo.saveWorkflowRunSnapshot({
+            ...snap,
+            workflowRun: { ...snap.workflowRun, id, kind: "replace_request", status: "running", finishedAt: null, orphanRequeueCount: count },
+          });
+          const titleKey = `${work.titleKey}_${id}`;
+          await repo.createUserMessage({ ...work, titleKey, body: id, episodeTags: [], now: "2026-06-11T00:00:00.000Z" });
+          await repo.claimUserMessages({ ...work, titleKey, runId: id, now: "2026-06-11T00:00:00.000Z" });
+        }
+
+        expect(await repo.requeueRunningWorkflowRuns("2026-06-11T03:00:00.000Z")).toBe(1);
+        expect((await repo.getWorkflowRunSnapshot("rr_capped", { accountId: "acct_default", connectedStorageId: "cs_rr" }))?.workflowRun.status).toBe("failed");
+        // Not urgent: a run that crashed the worker five times waits for the patrol or 现在处理.
+        expect((await repo.listUserMessages({ ...work, titleKey: `${work.titleKey}_rr_capped` }))[0]).toMatchObject({ status: "pending", urgent: false, runId: null });
+        expect((await repo.listUserMessages({ ...work, titleKey: `${work.titleKey}_rr_requeued` }))[0]).toMatchObject({ status: "processing", runId: "rr_requeued" });
+      });
+
       it("requeueRunningWorkflowRuns terminates an orphaned type3_monitor instead of queueing it", async () => {
         const repo = await fresh();
         const snap = queued("orphan3", { startedAt: "2026-06-11T00:00:00.000Z" });
@@ -1267,6 +1340,41 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         expect((await repo.cancelQueuedWorkflowRun("cancelme", scope)).status).toBe("cancelled");
         expect(await repo.getWorkflowRunSnapshot("cancelme", scope)).toBeNull();
         expect(await repo.listActiveWorkflowRuns(scope)).toHaveLength(0);
+      });
+
+      it("cancelQueuedWorkflowRun of a replace_request only removes the run: the season stays tracked, its messages go back to pending", async () => {
+        const repo = await fresh();
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_rc" };
+        // A tracked, acquired season…
+        await repo.saveWorkflowRunSnapshot(queuedRun({ id: "rc", status: "succeeded", connectedStorageId: "cs_rc" }));
+        const tracked = await repo.getTrackedSeasonState("season_rc", scope);
+        expect(tracked?.episodes.length).toBeGreaterThan(0);
+        // …with a queued replace_request on it (sole active run) holding a message.
+        const base = queuedRun({ id: "rc", connectedStorageId: "cs_rc" });
+        await repo.saveWorkflowRunSnapshot({
+          ...base,
+          workflowRun: { ...base.workflowRun, id: "rc_replace", kind: "replace_request", startedAt: "2026-06-12T00:00:00.000Z" },
+          episodes: tracked!.episodes,
+        });
+        const work = { accountId: "acct_default", drive: "cs_rc", titleKey: "title_rc" };
+        await repo.createUserMessage({ ...work, body: "换", episodeTags: [], now: "2026-06-12T00:00:00.000Z" });
+        await repo.claimUserMessages({ ...work, runId: "rc_replace", now: "2026-06-12T00:00:00.000Z" });
+
+        expect((await repo.cancelQueuedWorkflowRun("rc_replace", scope)).status).toBe("cancelled");
+        expect(await repo.getWorkflowRunSnapshot("rc_replace", scope)).toBeNull();
+        const after = await repo.getTrackedSeasonState("season_rc", scope);
+        expect(after?.episodes).toEqual(tracked!.episodes);
+        expect(await repo.listTrackedSeasonStates(scope)).toHaveLength(1);
+        expect((await repo.listUserMessages(work))[0]).toMatchObject({ status: "pending", urgent: true, runId: null });
+      });
+
+      it("cancelQueuedWorkflowRun of the ONLY run of a replace_request season still leaves the tracking", async () => {
+        const repo = await fresh();
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_rc2" };
+        const base = queuedRun({ id: "rc2", connectedStorageId: "cs_rc2" });
+        await repo.saveWorkflowRunSnapshot({ ...base, workflowRun: { ...base.workflowRun, kind: "replace_request" } });
+        expect((await repo.cancelQueuedWorkflowRun("rc2", scope)).status).toBe("cancelled");
+        expect((await repo.listEpisodeStates("season_rc2", scope)).length).toBeGreaterThan(0);
       });
 
       it("cancelQueuedWorkflowRun refuses a non-queued (succeeded) run", async () => {

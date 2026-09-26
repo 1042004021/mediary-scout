@@ -64,6 +64,7 @@ import {
   isQueueClaimableKind,
   isStaleActiveWorkflowRun,
   recoverOrphanRunningRun,
+  tearsDownTrackingOnCancel,
   retriedWorkflowRun,
   seasonScopeKey,
   UNSCOPED_STORAGE,
@@ -686,6 +687,8 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
         const recovered = recoverOrphanRunningRun(workflowRun, now);
         this.upsertWorkflowRun(recovered.run);
         if (recovered.action === "requeue") requeued += 1;
+        // A replace run that will never run again hands its messages back (retry).
+        else if (recovered.run.kind === "replace_request") this.releaseUserMessagesSync(recovered.run.id, now, false);
       }
       return requeued;
     })();
@@ -875,6 +878,12 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
       this.db.prepare("DELETE FROM resource_snapshots WHERE workflow_run_id = ?").run(workflowRunId);
       this.db.prepare("DELETE FROM workflow_runs WHERE id = ?").run(workflowRunId);
 
+      // Only an init run owns its season's tracking; a cancelled replace_request is
+      // just removed, and any messages it held go back to pending.
+      if (!tearsDownTrackingOnCancel(run.kind)) {
+        if (run.kind === "replace_request") this.releaseUserMessagesSync(workflowRunId, new Date().toISOString(), true);
+        return { status: "cancelled" as const };
+      }
       // Only tear down the tracking when no OTHER run on the SAME (season, drive)
       // still references it. Scoped to this drive so another drive's tracking survives.
       const others = this.db
@@ -1726,13 +1735,13 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
   }
 
   async claimUserMessages(input: Parameters<UserRequestStore["claimUserMessages"]>[0]): Promise<UserMessage[]> {
-    // One UPDATE … RETURNING: returns exactly the rows this call moved, never rows a
-    // previous claim under the same runId already held.
+    // One UPDATE … RETURNING. Idempotent per run: the rows this run already holds
+    // come back too, so a run requeued after a crash re-claims its own messages.
     const rows = this.db
       .prepare(
-        "UPDATE user_messages SET status = 'processing', run_id = ?, updated_at = ? WHERE account_id = ? AND drive = ? AND title_key = ? AND status = 'pending' RETURNING *",
+        "UPDATE user_messages SET status = 'processing', run_id = ?, updated_at = ? WHERE account_id = ? AND drive = ? AND title_key = ? AND (status = 'pending' OR (status = 'processing' AND run_id = ?)) RETURNING *",
       )
-      .all(input.runId, input.now, input.accountId, input.drive, input.titleKey) as UserMessageRow[];
+      .all(input.runId, input.now, input.accountId, input.drive, input.titleKey, input.runId) as UserMessageRow[];
     return rows.map(userMessageFromRow).sort(compareUserMessagesCreated);
   }
 
@@ -1743,9 +1752,32 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
   }
 
   async releaseUserMessages(input: Parameters<UserRequestStore["releaseUserMessages"]>[0]): Promise<void> {
+    this.releaseUserMessagesSync(input.runId, input.now, input.urgent ?? true);
+  }
+
+  /** Sync form, for use inside a db.transaction. */
+  private releaseUserMessagesSync(runId: string, now: string, urgent: boolean): void {
     this.db
-      .prepare("UPDATE user_messages SET status = 'pending', urgent = 1, run_id = NULL, updated_at = ? WHERE run_id = ? AND status = 'processing'")
-      .run(input.now, input.runId);
+      .prepare("UPDATE user_messages SET status = 'pending', urgent = ?, run_id = NULL, updated_at = ? WHERE run_id = ? AND status = 'processing'")
+      .run(urgent ? 1 : 0, now, runId);
+  }
+
+  async releaseOrphanedUserMessages(input: { now: string; finishedBefore: string }): Promise<number> {
+    // A processing message whose run is gone, or finished before the cutoff.
+    return this.db
+      .prepare(
+        "UPDATE user_messages SET status = 'pending', urgent = 1, run_id = NULL, updated_at = ? WHERE status = 'processing' AND NOT EXISTS (" +
+          "SELECT 1 FROM workflow_runs r WHERE r.id = user_messages.run_id AND (json_extract(r.payload, '$.status') IN ('queued', 'running') " +
+          "OR json_extract(r.payload, '$.finishedAt') >= ?))",
+      )
+      .run(input.now, input.finishedBefore).changes;
+  }
+
+  async listWorksWithProcessingMessages(): Promise<UserMessageScope[]> {
+    const rows = this.db
+      .prepare("SELECT DISTINCT account_id, drive, title_key FROM user_messages WHERE status = 'processing' ORDER BY account_id, drive, title_key")
+      .all() as Array<{ account_id: string; drive: string; title_key: string }>;
+    return rows.map((r) => ({ accountId: r.account_id, drive: r.drive, titleKey: r.title_key }));
   }
 
   async listWorksWithPendingMessages(input: { urgentOnly: boolean }): Promise<UserMessageScope[]> {

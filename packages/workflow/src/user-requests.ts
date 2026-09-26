@@ -90,14 +90,25 @@ export interface UserRequestStore {
   withdrawUserMessage(input: { accountId: string; id: string; now: string }): Promise<boolean>;
   /** Mark this work's pending messages urgent ("现在处理"). Returns how many. */
   markUserMessagesUrgent(input: UserMessageScope & { now: string }): Promise<number>;
-  /** Atomically move every pending message of the work to processing under runId. */
+  /** Atomically move every pending message of the work to processing under runId.
+   *  Idempotent per run: messages this run already holds come back too, so a run
+   *  requeued after a crash re-claims its own messages. */
   claimUserMessages(input: UserMessageScope & { runId: string; now: string }): Promise<UserMessage[]>;
   /** processing(runId) → done with the reply. */
   finishUserMessages(input: { runId: string; reply: UserMessageReply; now: string }): Promise<void>;
-  /** processing(runId) → pending + urgent (the run died; retry when the queue is free). */
-  releaseUserMessages(input: { runId: string; now: string }): Promise<void>;
+  /** processing(runId) → pending + urgent (the run died; retry when the queue is free).
+   *  `urgent: false` hands them back to the patrol instead (a run that crashed the
+   *  worker over and over must not be retried on every idle tick). */
+  releaseUserMessages(input: { runId: string; now: string; urgent?: boolean }): Promise<void>;
+  /** processing → pending + urgent for every message whose run is gone, or finished
+   *  before `finishedBefore` without finishing the messages (the worker died between
+   *  the run's last save and finishUserMessages). The cutoff leaves a run that just
+   *  saved its final status the few seconds its bookkeeping takes. Returns how many. */
+  releaseOrphanedUserMessages(input: { now: string; finishedBefore: string }): Promise<number>;
   /** Works (any account) with a pending message; `urgentOnly` for the idle-queue scan. */
   listWorksWithPendingMessages(input: { urgentOnly: boolean }): Promise<UserMessageScope[]>;
+  /** Works (any account) with a message being processed right now. */
+  listWorksWithProcessingMessages(): Promise<UserMessageScope[]>;
 
   listPendingReplacements(scope: UserMessageScope): Promise<PendingReplacement[]>;
   /** Every (work) that has at least one pending replacement. */

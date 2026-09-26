@@ -21,6 +21,7 @@ import {
   compareTrackedSeasonStates,
   expireWorkflowRun,
   recoverOrphanRunningRun,
+  tearsDownTrackingOnCancel,
   retriedWorkflowRun,
   isActiveWorkflowStatus,
   isQueueClaimableKind,
@@ -552,6 +553,8 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
         const recovered = recoverOrphanRunningRun(workflowRun, now);
         await this.upsertWorkflowRun(client, recovered.run);
         if (recovered.action === "requeue") requeued += 1;
+        // A replace run that will never run again hands its messages back (retry).
+        else if (recovered.run.kind === "replace_request") await releaseUserMessagesWith(client, recovered.run.id, now, false);
       }
       return requeued;
     });
@@ -738,6 +741,12 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       await client.query("DELETE FROM resource_snapshots WHERE workflow_run_id = $1", [workflowRunId]);
       await client.query("DELETE FROM workflow_runs WHERE id = $1", [workflowRunId]);
 
+      // Only an init run owns its season's tracking; a cancelled replace_request is
+      // just removed, and any messages it held go back to pending.
+      if (!tearsDownTrackingOnCancel(run.kind)) {
+        if (run.kind === "replace_request") await releaseUserMessagesWith(client, workflowRunId, new Date().toISOString(), true);
+        return { status: "cancelled" as const };
+      }
       // Only tear down the tracking when no OTHER run on the SAME (season, drive)
       // still references it (a queued init is the sole run for its fresh season →
       // torn down, vanishing from the library; a re-queued run beside acquired
@@ -1541,7 +1550,8 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       // One UPDATE … RETURNING: a concurrent edit/withdraw either lands before (and is
       // claimed as edited) or finds status <> 'pending' and does nothing.
       const result = await client.query<UserMessageRow>(
-        "UPDATE user_messages SET status = 'processing', run_id = $1, updated_at = $2 WHERE account_id = $3 AND drive = $4 AND title_key = $5 AND status = 'pending' RETURNING *",
+        // Idempotent per run: a run requeued after a crash re-claims its own messages.
+        "UPDATE user_messages SET status = 'processing', run_id = $1, updated_at = $2 WHERE account_id = $3 AND drive = $4 AND title_key = $5 AND (status = 'pending' OR (status = 'processing' AND run_id = $1)) RETURNING *",
         [input.runId, input.now, input.accountId, input.drive, input.titleKey],
       );
       return result.rows.map(userMessageFromRow).sort(compareUserMessagesCreated);
@@ -1558,10 +1568,27 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
 
   async releaseUserMessages(input: Parameters<UserRequestStore["releaseUserMessages"]>[0]): Promise<void> {
     await this.ensureSchema();
-    await this.pool.query(
-      "UPDATE user_messages SET status = 'pending', urgent = true, run_id = NULL, updated_at = $1 WHERE run_id = $2 AND status = 'processing'",
-      [input.now, input.runId],
+    await releaseUserMessagesWith(this.pool, input.runId, input.now, input.urgent ?? true);
+  }
+
+  async releaseOrphanedUserMessages(input: { now: string; finishedBefore: string }): Promise<number> {
+    await this.ensureSchema();
+    // A processing message whose run is gone, or finished before the cutoff.
+    const result = await this.pool.query(
+      "UPDATE user_messages SET status = 'pending', urgent = true, run_id = NULL, updated_at = $1 WHERE status = 'processing' AND NOT EXISTS (" +
+        "SELECT 1 FROM workflow_runs r WHERE r.id = user_messages.run_id AND (r.payload->>'status' IN ('queued', 'running') " +
+        "OR r.payload->>'finishedAt' >= $2))",
+      [input.now, input.finishedBefore],
     );
+    return result.rowCount ?? 0;
+  }
+
+  async listWorksWithProcessingMessages(): Promise<UserMessageScope[]> {
+    await this.ensureSchema();
+    const result = await this.pool.query<{ account_id: string; drive: string; title_key: string }>(
+      "SELECT DISTINCT account_id, drive, title_key FROM user_messages WHERE status = 'processing' ORDER BY account_id, drive, title_key",
+    );
+    return result.rows.map((r) => ({ accountId: r.account_id, drive: r.drive, titleKey: r.title_key }));
   }
 
   async listWorksWithPendingMessages(input: { urgentOnly: boolean }): Promise<UserMessageScope[]> {
@@ -1997,6 +2024,14 @@ function connectedStorageFromRow(row: Record<string, unknown>): ConnectedStorage
 }
 
 /** Transaction-scoped lock on one work's user messages (create vs claim). */
+/** processing(runId) → pending + urgent, on the pool or inside a transaction. */
+async function releaseUserMessagesWith(db: Pick<PoolClient, "query">, runId: string, now: string, urgent: boolean): Promise<void> {
+  await db.query(
+    "UPDATE user_messages SET status = 'pending', urgent = $3, run_id = NULL, updated_at = $1 WHERE run_id = $2 AND status = 'processing'",
+    [now, runId, urgent],
+  );
+}
+
 async function lockUserMessageWork(client: PoolClient, scope: UserMessageScope): Promise<void> {
   await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
     `user_messages:${scope.accountId}:${scope.drive}:${scope.titleKey}`,

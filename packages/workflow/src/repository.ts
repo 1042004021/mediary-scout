@@ -733,7 +733,8 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
   async claimUserMessages(input: Parameters<UserRequestStore["claimUserMessages"]>[0]): Promise<UserMessage[]> {
     const claimed: UserMessage[] = [];
     for (const m of this.userMessages.values()) {
-      if (sameWork(m, input) && m.status === "pending") {
+      // Idempotent per run: a run requeued after a crash gets its own messages back.
+      if (sameWork(m, input) && (m.status === "pending" || (m.status === "processing" && m.runId === input.runId))) {
         Object.assign(m, { status: "processing", runId: input.runId, updatedAt: input.now });
         claimed.push(structuredClone(m));
       }
@@ -752,15 +753,33 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
   async releaseUserMessages(input: Parameters<UserRequestStore["releaseUserMessages"]>[0]): Promise<void> {
     for (const m of this.userMessages.values()) {
       if (m.status === "processing" && m.runId === input.runId) {
-        Object.assign(m, { status: "pending", urgent: true, runId: null, updatedAt: input.now });
+        Object.assign(m, { status: "pending", urgent: input.urgent ?? true, runId: null, updatedAt: input.now });
       }
     }
+  }
+
+  async releaseOrphanedUserMessages(input: { now: string; finishedBefore: string }): Promise<number> {
+    let n = 0;
+    for (const m of this.userMessages.values()) {
+      if (m.status !== "processing") continue;
+      const run = m.runId === null ? undefined : this.workflowRuns.get(m.runId);
+      if (run && isActiveWorkflowStatus(run.workflowRun.status)) continue;
+      const finishedAt = run?.workflowRun.finishedAt;
+      if (run && finishedAt && finishedAt >= input.finishedBefore) continue;
+      Object.assign(m, { status: "pending", urgent: true, runId: null, updatedAt: input.now });
+      n += 1;
+    }
+    return n;
   }
 
   async listWorksWithPendingMessages(input: { urgentOnly: boolean }): Promise<UserMessageScope[]> {
     return uniqueWorks(
       [...this.userMessages.values()].filter((m) => m.status === "pending" && (!input.urgentOnly || m.urgent)),
     );
+  }
+
+  async listWorksWithProcessingMessages(): Promise<UserMessageScope[]> {
+    return uniqueWorks([...this.userMessages.values()].filter((m) => m.status === "processing"));
   }
 
   async listPendingReplacements(scope: UserMessageScope): Promise<PendingReplacement[]> {
@@ -953,6 +972,8 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
         workflowRun: recovered.run,
       });
       if (recovered.action === "requeue") requeued += 1;
+      // A replace run that will never run again hands its messages back (retry).
+      else if (recovered.run.kind === "replace_request") await this.releaseUserMessages({ runId: id, now, urgent: false });
     }
     return requeued;
   }
@@ -1058,6 +1079,15 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     const storageValue = stored.connectedStorageId ?? UNSCOPED_STORAGE;
     this.workflowRuns.delete(workflowRunId);
     this.agentSteps.delete(workflowRunId);
+    // Only an init run owns its season's tracking. Anything else (a replace_request
+    // on a library that already has files) is just removed — plus, for a replace
+    // run, any messages it held go back to pending.
+    if (!tearsDownTrackingOnCancel(stored.workflowRun.kind)) {
+      if (stored.workflowRun.kind === "replace_request") {
+        await this.releaseUserMessages({ runId: workflowRunId, now: new Date().toISOString() });
+      }
+      return { status: "cancelled" };
+    }
     // Only drop THIS drive's episode bucket, and only if no run on the same
     // (season, drive) still references it — never touch another drive's episodes.
     const seasonStillReferenced = Array.from(this.workflowRuns.values()).some(
@@ -1512,6 +1542,22 @@ const KIND_HAS_QUEUE_CLAIMER: Record<WorkflowKind, boolean> = {
   type3_monitor: false,
   replace_request: true,
 };
+
+/** Whether cancelling a queued run of this kind tears down its season's tracking.
+ *  Only an init run owns the season (cancelling it = "never mind, don't track");
+ *  a replace_request runs on a library that already has files and must never take
+ *  the tracking down with it. `=== true` for the same reason as isQueueClaimableKind. */
+const KIND_OWNS_TRACKING: Record<WorkflowKind, boolean> = {
+  type1_package_init: true,
+  type2_init: true,
+  movie_init: true,
+  type3_monitor: false,
+  replace_request: false,
+};
+
+export function tearsDownTrackingOnCancel(kind: WorkflowKind): boolean {
+  return KIND_OWNS_TRACKING[kind] === true;
+}
 
 /** True when a `queued` run of this kind will actually be picked up by a worker.
  *
