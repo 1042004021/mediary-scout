@@ -4,7 +4,9 @@ import {
   normalizeResourceLabel,
   parseSizeFromTitle,
   resourceFingerprintMatches,
+  userMessageFromRow,
   validateUserMessageInput,
+  type UserMessageRow,
 } from "../src/user-requests.js";
 
 describe("validateUserMessageInput", () => {
@@ -38,5 +40,19 @@ describe("resource fingerprint", () => {
     expect(resourceFingerprintMatches("The Odyssey 2026 [4.6G]", rejected)).toBe(false);
     expect(resourceFingerprintMatches("The Odyssey 2026", rejected)).toBe(false); // no size in title → leave to agent
     expect(resourceFingerprintMatches("The Odyssey 2026 [2.3G]", { ...rejected, sizeBytes: null })).toBe(false);
+  });
+});
+
+describe("userMessageFromRow", () => {
+  const row: UserMessageRow = {
+    id: "msg_1", account_id: "acct_a", drive: "cs_1", title_key: "tmdb_tv_1", body: "hi", episode_tags: "[]",
+    status: "pending", urgent: 0, run_id: null, reply: null,
+    created_at: "2026-09-26T00:00:00.000Z", updated_at: "2026-09-26T00:00:00.000Z", processed_at: null,
+  };
+  it("fails loud on an unknown status instead of treating it as pending", () => {
+    expect(() => userMessageFromRow({ ...row, status: "archived" })).toThrow(/msg_1/);
+  });
+  it("reads a corrupt reply as null", () => {
+    expect(userMessageFromRow({ ...row, status: "done", reply: "{not json" }).reply).toBeNull();
   });
 });

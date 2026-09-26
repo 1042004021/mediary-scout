@@ -28,10 +28,17 @@ import {
   type AgentMemoryScope,
 } from "./agent-memory.js";
 import {
+  compareUserMessagesCreated,
+  episodeSourceFromRow,
+  pendingReplacementFromRow,
+  rejectedResourceFromRow,
   userMessageFromRow,
   type EpisodeSource,
+  type EpisodeSourceRow,
   type PendingReplacement,
+  type PendingReplacementRow,
   type RejectedResource,
+  type RejectedResourceRow,
   type UserMessage,
   type UserMessageRow,
   type UserMessageScope,
@@ -191,6 +198,8 @@ export const SQLITE_SCHEMA = `
     processed_at text
   );
   CREATE INDEX IF NOT EXISTS user_messages_work ON user_messages (account_id, drive, title_key, status);
+  CREATE INDEX IF NOT EXISTS user_messages_pending ON user_messages (status, urgent);
+  CREATE INDEX IF NOT EXISTS user_messages_run ON user_messages (run_id);
   CREATE TABLE IF NOT EXISTS pending_replacements (
     account_id text NOT NULL,
     drive text NOT NULL DEFAULT '',
@@ -1670,8 +1679,9 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
   // ---- user requests (see user-requests.ts)
   async createUserMessage(input: Parameters<UserRequestStore["createUserMessage"]>[0]): Promise<UserMessage> {
     const id = `msg_${globalThis.crypto.randomUUID()}`;
-    // One INSERT … SELECT: the "is another message of this work processing?" read and
-    // the write can't be split by a concurrent claim.
+    // INSERT … VALUES (…, EXISTS (…), …): the "is another message of this work
+    // processing?" read happens inside the INSERT; SQLite has a single writer, so no
+    // claim can land between that read and the write.
     this.db
       .prepare(
         "INSERT INTO user_messages (id, account_id, drive, title_key, body, episode_tags, status, urgent, run_id, reply, created_at, updated_at, processed_at) " +
@@ -1750,8 +1760,8 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
   async listPendingReplacements(scope: UserMessageScope): Promise<PendingReplacement[]> {
     const rows = this.db
       .prepare("SELECT * FROM pending_replacements WHERE account_id = ? AND drive = ? AND title_key = ? ORDER BY episode")
-      .all(scope.accountId, scope.drive, scope.titleKey) as Array<Record<string, string>>;
-    return rows.map((r) => ({ accountId: r["account_id"]!, drive: r["drive"]!, titleKey: r["title_key"]!, episode: r["episode"]!, messageId: r["message_id"]!, requestedAt: r["requested_at"]! }));
+      .all(scope.accountId, scope.drive, scope.titleKey) as PendingReplacementRow[];
+    return rows.map(pendingReplacementFromRow);
   }
 
   async listWorksWithPendingReplacements(): Promise<UserMessageScope[]> {
@@ -1789,13 +1799,8 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
   async listRejectedResources(input: { accountId: string; titleKey: string }): Promise<RejectedResource[]> {
     const rows = this.db
       .prepare("SELECT * FROM rejected_resources WHERE account_id = ? AND title_key = ? ORDER BY created_at, id")
-      .all(input.accountId, input.titleKey) as Array<Record<string, unknown>>;
-    return rows.map((r) => ({
-      id: String(r["id"]), accountId: String(r["account_id"]), titleKey: String(r["title_key"]), episode: String(r["episode"]),
-      linkKey: (r["link_key"] as string | null) ?? null, label: String(r["label"]),
-      sizeBytes: r["size_bytes"] === null || r["size_bytes"] === undefined ? null : Number(r["size_bytes"]),
-      reason: String(r["reason"]), messageId: (r["message_id"] as string | null) ?? null, createdAt: String(r["created_at"]),
-    }));
+      .all(input.accountId, input.titleKey) as RejectedResourceRow[];
+    return rows.map(rejectedResourceFromRow);
   }
 
   async upsertEpisodeSource(input: EpisodeSource): Promise<void> {
@@ -1810,13 +1815,8 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
   async listEpisodeSources(scope: UserMessageScope): Promise<EpisodeSource[]> {
     const rows = this.db
       .prepare("SELECT * FROM episode_sources WHERE account_id = ? AND drive = ? AND title_key = ? ORDER BY episode")
-      .all(scope.accountId, scope.drive, scope.titleKey) as Array<Record<string, unknown>>;
-    return rows.map((r) => ({
-      accountId: String(r["account_id"]), drive: String(r["drive"]), titleKey: String(r["title_key"]), episode: String(r["episode"]),
-      linkKey: (r["link_key"] as string | null) ?? null, label: String(r["label"]),
-      sizeBytes: r["size_bytes"] === null || r["size_bytes"] === undefined ? null : Number(r["size_bytes"]),
-      runId: String(r["run_id"]), recordedAt: String(r["recorded_at"]),
-    }));
+      .all(scope.accountId, scope.drive, scope.titleKey) as EpisodeSourceRow[];
+    return rows.map(episodeSourceFromRow);
   }
 
   async listDeadLinkKeys(options?: { now?: string }): Promise<string[]> {
@@ -1828,9 +1828,4 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
       .all(now) as { key: string }[];
     return rows.map((row) => String(row.key));
   }
-}
-
-/** Oldest first, id as the tie-break (RETURNING has no ORDER BY). */
-function compareUserMessagesCreated(a: UserMessage, b: UserMessage): number {
-  return a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 }

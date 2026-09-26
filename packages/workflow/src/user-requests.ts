@@ -187,8 +187,13 @@ export interface UserMessageRow {
   processed_at: string | null;
 }
 
+const USER_MESSAGE_STATUSES: readonly UserMessageStatus[] = ["pending", "processing", "done", "withdrawn"];
+
 export function userMessageFromRow(row: UserMessageRow): UserMessage {
-  const status = (["pending", "processing", "done", "withdrawn"] as const).find((s) => s === row.status) ?? "pending";
+  // Fail loud on an unknown status: defaulting to "pending" would silently make a
+  // message editable/claimable again.
+  const status = USER_MESSAGE_STATUSES.find((s) => s === row.status);
+  if (!status) throw new Error(`user message ${String(row.id)} has unknown status ${JSON.stringify(row.status)}`);
   return {
     id: String(row.id),
     accountId: String(row.account_id),
@@ -199,11 +204,108 @@ export function userMessageFromRow(row: UserMessageRow): UserMessage {
     status,
     urgent: row.urgent === true || row.urgent === 1,
     runId: row.run_id ?? null,
-    reply: row.reply ? (JSON.parse(row.reply) as UserMessageReply) : null,
+    reply: parseReply(row.reply),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
     processedAt: row.processed_at ?? null,
   };
+}
+
+/** Oldest first, id as the tie-break — the claim order every engine returns
+ *  (RETURNING has no ORDER BY, so the SQL engines sort in code too). */
+export function compareUserMessagesCreated(a: UserMessage, b: UserMessage): number {
+  return a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+/** Row shape of pending_replacements in both SQL engines. */
+export interface PendingReplacementRow {
+  account_id: string;
+  drive: string;
+  title_key: string;
+  episode: string;
+  message_id: string;
+  requested_at: string;
+}
+
+export function pendingReplacementFromRow(row: PendingReplacementRow): PendingReplacement {
+  return {
+    accountId: String(row.account_id),
+    drive: String(row.drive ?? ""),
+    titleKey: String(row.title_key),
+    episode: String(row.episode),
+    messageId: String(row.message_id),
+    requestedAt: String(row.requested_at),
+  };
+}
+
+/** Row shape of rejected_resources. size_bytes is bigint in Postgres (pg returns
+ *  it as a string) and integer in SQLite. */
+export interface RejectedResourceRow {
+  id: string;
+  account_id: string;
+  title_key: string;
+  episode: string;
+  link_key: string | null;
+  label: string;
+  size_bytes: string | number | null;
+  reason: string;
+  message_id: string | null;
+  created_at: string;
+}
+
+export function rejectedResourceFromRow(row: RejectedResourceRow): RejectedResource {
+  return {
+    id: String(row.id),
+    accountId: String(row.account_id),
+    titleKey: String(row.title_key),
+    episode: String(row.episode),
+    linkKey: row.link_key ?? null,
+    label: String(row.label),
+    sizeBytes: sizeFromColumn(row.size_bytes),
+    reason: String(row.reason),
+    messageId: row.message_id ?? null,
+    createdAt: String(row.created_at),
+  };
+}
+
+/** Row shape of episode_sources (size_bytes as for rejected_resources). */
+export interface EpisodeSourceRow {
+  account_id: string;
+  drive: string;
+  title_key: string;
+  episode: string;
+  link_key: string | null;
+  label: string;
+  size_bytes: string | number | null;
+  run_id: string;
+  recorded_at: string;
+}
+
+export function episodeSourceFromRow(row: EpisodeSourceRow): EpisodeSource {
+  return {
+    accountId: String(row.account_id),
+    drive: String(row.drive ?? ""),
+    titleKey: String(row.title_key),
+    episode: String(row.episode),
+    linkKey: row.link_key ?? null,
+    label: String(row.label),
+    sizeBytes: sizeFromColumn(row.size_bytes),
+    runId: String(row.run_id),
+    recordedAt: String(row.recorded_at),
+  };
+}
+
+function sizeFromColumn(value: string | number | null | undefined): number | null {
+  return value === null || value === undefined ? null : Number(value);
+}
+
+function parseReply(text: string | null | undefined): UserMessageReply | null {
+  if (!text) return null;
+  try {
+    return JSON.parse(text) as UserMessageReply;
+  } catch {
+    return null;
+  }
 }
 
 function parseJsonArray(text: string | null | undefined): string[] {

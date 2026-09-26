@@ -58,10 +58,17 @@ import {
   type AgentMemoryScope,
 } from "./agent-memory.js";
 import {
+  compareUserMessagesCreated,
+  episodeSourceFromRow,
+  pendingReplacementFromRow,
+  rejectedResourceFromRow,
   userMessageFromRow,
   type EpisodeSource,
+  type EpisodeSourceRow,
   type PendingReplacement,
+  type PendingReplacementRow,
   type RejectedResource,
+  type RejectedResourceRow,
   type UserMessage,
   type UserMessageRow,
   type UserMessageScope,
@@ -200,6 +207,8 @@ const SCHEMA = `
     processed_at text
   );
   CREATE INDEX IF NOT EXISTS user_messages_work ON user_messages (account_id, drive, title_key, status);
+  CREATE INDEX IF NOT EXISTS user_messages_pending ON user_messages (status, urgent);
+  CREATE INDEX IF NOT EXISTS user_messages_run ON user_messages (run_id);
   CREATE TABLE IF NOT EXISTS pending_replacements (
     account_id text NOT NULL,
     drive text NOT NULL DEFAULT '',
@@ -1475,13 +1484,17 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
 
   // ---- user requests (see user-requests.ts)
   async createUserMessage(input: Parameters<UserRequestStore["createUserMessage"]>[0]): Promise<UserMessage> {
-    await this.ensureSchema();
-    const result = await this.pool.query<UserMessageRow>(
-      "INSERT INTO user_messages (id, account_id, drive, title_key, body, episode_tags, status, urgent, run_id, reply, created_at, updated_at, processed_at) " +
-        "VALUES ($1, $2, $3, $4, $5, $6, 'pending', EXISTS (SELECT 1 FROM user_messages WHERE account_id = $2 AND drive = $3 AND title_key = $4 AND status = 'processing'), NULL, NULL, $7, $7, NULL) RETURNING *",
-      [`msg_${globalThis.crypto.randomUUID()}`, input.accountId, input.drive, input.titleKey, input.body, JSON.stringify(input.episodeTags), input.now],
-    );
-    return userMessageFromRow(result.rows[0]!);
+    return this.withTransaction(async (client) => {
+      // Serialized with claimUserMessages on the same work: under READ COMMITTED the
+      // EXISTS below could otherwise miss a claim committing concurrently.
+      await lockUserMessageWork(client, input);
+      const result = await client.query<UserMessageRow>(
+        "INSERT INTO user_messages (id, account_id, drive, title_key, body, episode_tags, status, urgent, run_id, reply, created_at, updated_at, processed_at) " +
+          "VALUES ($1, $2, $3, $4, $5, $6, 'pending', EXISTS (SELECT 1 FROM user_messages WHERE account_id = $2 AND drive = $3 AND title_key = $4 AND status = 'processing'), NULL, NULL, $7, $7, NULL) RETURNING *",
+        [`msg_${globalThis.crypto.randomUUID()}`, input.accountId, input.drive, input.titleKey, input.body, JSON.stringify(input.episodeTags), input.now],
+      );
+      return userMessageFromRow(result.rows[0]!);
+    });
   }
 
   async listUserMessages(scope: UserMessageScope): Promise<UserMessage[]> {
@@ -1521,14 +1534,17 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
   }
 
   async claimUserMessages(input: Parameters<UserRequestStore["claimUserMessages"]>[0]): Promise<UserMessage[]> {
-    await this.ensureSchema();
-    // One UPDATE … RETURNING: a concurrent edit/withdraw either lands before (and is
-    // claimed as edited) or finds status <> 'pending' and does nothing.
-    const result = await this.pool.query<UserMessageRow>(
-      "UPDATE user_messages SET status = 'processing', run_id = $1, updated_at = $2 WHERE account_id = $3 AND drive = $4 AND title_key = $5 AND status = 'pending' RETURNING *",
-      [input.runId, input.now, input.accountId, input.drive, input.titleKey],
-    );
-    return result.rows.map(userMessageFromRow).sort(compareUserMessagesCreated);
+    return this.withTransaction(async (client) => {
+      // Same lock as createUserMessage, so a create overlapping this claim sees it.
+      await lockUserMessageWork(client, input);
+      // One UPDATE … RETURNING: a concurrent edit/withdraw either lands before (and is
+      // claimed as edited) or finds status <> 'pending' and does nothing.
+      const result = await client.query<UserMessageRow>(
+        "UPDATE user_messages SET status = 'processing', run_id = $1, updated_at = $2 WHERE account_id = $3 AND drive = $4 AND title_key = $5 AND status = 'pending' RETURNING *",
+        [input.runId, input.now, input.accountId, input.drive, input.titleKey],
+      );
+      return result.rows.map(userMessageFromRow).sort(compareUserMessagesCreated);
+    });
   }
 
   async finishUserMessages(input: Parameters<UserRequestStore["finishUserMessages"]>[0]): Promise<void> {
@@ -1557,11 +1573,11 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
 
   async listPendingReplacements(scope: UserMessageScope): Promise<PendingReplacement[]> {
     await this.ensureSchema();
-    const result = await this.pool.query<Record<string, string>>(
+    const result = await this.pool.query<PendingReplacementRow>(
       "SELECT * FROM pending_replacements WHERE account_id = $1 AND drive = $2 AND title_key = $3 ORDER BY episode",
       [scope.accountId, scope.drive, scope.titleKey],
     );
-    return result.rows.map((r) => ({ accountId: r["account_id"]!, drive: r["drive"]!, titleKey: r["title_key"]!, episode: r["episode"]!, messageId: r["message_id"]!, requestedAt: r["requested_at"]! }));
+    return result.rows.map(pendingReplacementFromRow);
   }
 
   async listWorksWithPendingReplacements(): Promise<UserMessageScope[]> {
@@ -1605,16 +1621,11 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
 
   async listRejectedResources(input: { accountId: string; titleKey: string }): Promise<RejectedResource[]> {
     await this.ensureSchema();
-    const result = await this.pool.query<Record<string, unknown>>(
+    const result = await this.pool.query<RejectedResourceRow>(
       "SELECT * FROM rejected_resources WHERE account_id = $1 AND title_key = $2 ORDER BY created_at, id",
       [input.accountId, input.titleKey],
     );
-    return result.rows.map((r) => ({
-      id: String(r["id"]), accountId: String(r["account_id"]), titleKey: String(r["title_key"]), episode: String(r["episode"]),
-      linkKey: (r["link_key"] as string | null) ?? null, label: String(r["label"]),
-      sizeBytes: r["size_bytes"] === null ? null : Number(r["size_bytes"]),
-      reason: String(r["reason"]), messageId: (r["message_id"] as string | null) ?? null, createdAt: String(r["created_at"]),
-    }));
+    return result.rows.map(rejectedResourceFromRow);
   }
 
   async upsertEpisodeSource(input: EpisodeSource): Promise<void> {
@@ -1628,16 +1639,11 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
 
   async listEpisodeSources(scope: UserMessageScope): Promise<EpisodeSource[]> {
     await this.ensureSchema();
-    const result = await this.pool.query<Record<string, unknown>>(
+    const result = await this.pool.query<EpisodeSourceRow>(
       "SELECT * FROM episode_sources WHERE account_id = $1 AND drive = $2 AND title_key = $3 ORDER BY episode",
       [scope.accountId, scope.drive, scope.titleKey],
     );
-    return result.rows.map((r) => ({
-      accountId: String(r["account_id"]), drive: String(r["drive"]), titleKey: String(r["title_key"]), episode: String(r["episode"]),
-      linkKey: (r["link_key"] as string | null) ?? null, label: String(r["label"]),
-      sizeBytes: r["size_bytes"] === null ? null : Number(r["size_bytes"]),
-      runId: String(r["run_id"]), recordedAt: String(r["recorded_at"]),
-    }));
+    return result.rows.map(episodeSourceFromRow);
   }
 
   // ---- private ----
@@ -1989,7 +1995,9 @@ function connectedStorageFromRow(row: Record<string, unknown>): ConnectedStorage
   };
 }
 
-/** Oldest first, id as the tie-break (RETURNING has no ORDER BY). */
-function compareUserMessagesCreated(a: UserMessage, b: UserMessage): number {
-  return a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+/** Transaction-scoped lock on one work's user messages (create vs claim). */
+async function lockUserMessageWork(client: PoolClient, scope: UserMessageScope): Promise<void> {
+  await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
+    `user_messages:${scope.accountId}:${scope.drive}:${scope.titleKey}`,
+  ]);
 }

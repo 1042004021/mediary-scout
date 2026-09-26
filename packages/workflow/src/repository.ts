@@ -24,13 +24,14 @@ import {
   type AgentMemoryStore,
   type AgentMemorySummary,
 } from "./agent-memory.js";
-import type {
-  EpisodeSource,
-  PendingReplacement,
-  RejectedResource,
-  UserMessage,
-  UserMessageScope,
-  UserRequestStore,
+import {
+  compareUserMessagesCreated,
+  type EpisodeSource,
+  type PendingReplacement,
+  type RejectedResource,
+  type UserMessage,
+  type UserMessageScope,
+  type UserRequestStore,
 } from "./user-requests.js";
 import type {
   Account,
@@ -700,7 +701,7 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
   async listUserMessages(scope: UserMessageScope): Promise<UserMessage[]> {
     return [...this.userMessages.values()]
       .filter((m) => sameWork(m, scope) && m.status !== "withdrawn")
-      .sort((a, b) => -compareCreated(a, b))
+      .sort((a, b) => -compareUserMessagesCreated(a, b))
       .map((m) => structuredClone(m));
   }
 
@@ -737,7 +738,7 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
         claimed.push(structuredClone(m));
       }
     }
-    return claimed.sort(compareCreated);
+    return claimed.sort(compareUserMessagesCreated);
   }
 
   async finishUserMessages(input: Parameters<UserRequestStore["finishUserMessages"]>[0]): Promise<void> {
@@ -803,6 +804,7 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
   async listRejectedResources(input: { accountId: string; titleKey: string }): Promise<RejectedResource[]> {
     return this.rejectedResources
       .filter((r) => r.accountId === input.accountId && r.titleKey === input.titleKey)
+      .sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
       .map((r) => ({ ...r }));
   }
 
@@ -1732,9 +1734,4 @@ function uniqueWorks(rows: UserMessageScope[]): UserMessageScope[] {
   return [...seen.values()].sort(
     (a, b) => a.accountId.localeCompare(b.accountId) || a.drive.localeCompare(b.drive) || a.titleKey.localeCompare(b.titleKey),
   );
-}
-
-/** Oldest first, id as the tie-break — the order both SQL engines use. */
-function compareCreated(a: UserMessage, b: UserMessage): number {
-  return a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 }

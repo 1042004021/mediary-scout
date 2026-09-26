@@ -83,6 +83,52 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         expect(await repo.editUserMessage({ accountId: "acct_b", id: a.id, body: "x", episodeTags: [], now: t1 })).toBeNull();
         expect(await repo.withdrawUserMessage({ accountId: "acct_b", id: a.id, now: t1 })).toBe(false);
         expect(await repo.listUserMessages({ ...scope, accountId: "acct_b" })).toEqual([]);
+        const [still] = await repo.listUserMessages(scope);
+        expect(still).toMatchObject({ id: a.id, body: "hi", status: "pending", updatedAt: t0 });
+      });
+
+      it("isolates drives: urgency, claims and pending replacements never cross drives", async () => {
+        const repo = await fresh();
+        const other = { ...scope, drive: "cs_2" };
+        await repo.createUserMessage({ ...scope, body: "on cs_1", episodeTags: [], now: t0 });
+        await repo.claimUserMessages({ ...scope, runId: "run_1", now: t0 });
+        const onOther = await repo.createUserMessage({ ...other, body: "on cs_2", episodeTags: [], now: t1 });
+        expect(onOther.urgent).toBe(false);
+        expect(await repo.claimUserMessages({ ...scope, runId: "run_2", now: t1 })).toEqual([]);
+        expect((await repo.listUserMessages(other)).map((m) => [m.id, m.status])).toEqual([[onOther.id, "pending"]]);
+
+        await repo.addPendingReplacements({ ...scope, episodes: ["S01E13"], messageId: "m1", now: t0 });
+        expect(await repo.listPendingReplacements(other)).toEqual([]);
+        expect(await repo.removePendingReplacements({ ...other, episodes: ["S01E13"] })).toBe(0);
+        expect((await repo.listPendingReplacements(scope)).map((p) => p.episode)).toEqual(["S01E13"]);
+      });
+
+      it("does not claim a withdrawn message", async () => {
+        const repo = await fresh();
+        const a = await repo.createUserMessage({ ...scope, body: "gone", episodeTags: [], now: t0 });
+        const b = await repo.createUserMessage({ ...scope, body: "kept", episodeTags: [], now: t1 });
+        expect(await repo.withdrawUserMessage({ accountId: "acct_a", id: a.id, now: t1 })).toBe(true);
+        expect((await repo.claimUserMessages({ ...scope, runId: "run_1", now: t1 })).map((m) => m.id)).toEqual([b.id]);
+      });
+
+      it("finish/release only touch their own run; release after finish keeps done", async () => {
+        const repo = await fresh();
+        const a = await repo.createUserMessage({ ...scope, body: "a", episodeTags: [], now: t0 });
+        const b = await repo.createUserMessage({ ...scope, titleKey: "tmdb_tv_2", body: "b", episodeTags: [], now: t0 });
+        await repo.claimUserMessages({ ...scope, runId: "run_1", now: t0 });
+        await repo.claimUserMessages({ ...scope, titleKey: "tmdb_tv_2", runId: "run_2", now: t0 });
+        const reply = { results: [], oldFiles: [], runId: "run_x" };
+
+        await repo.finishUserMessages({ runId: "run_other", reply, now: t1 });
+        await repo.releaseUserMessages({ runId: "run_other", now: t1 });
+        expect((await repo.listUserMessages(scope))[0]).toMatchObject({ id: a.id, status: "processing", runId: "run_1", reply: null });
+
+        await repo.finishUserMessages({ runId: "run_1", reply: { ...reply, runId: "run_1" }, now: t1 });
+        await repo.releaseUserMessages({ runId: "run_1", now: t1 });
+        expect((await repo.listUserMessages(scope))[0]).toMatchObject({ id: a.id, status: "done", runId: "run_1", urgent: false, processedAt: t1 });
+        expect((await repo.listUserMessages({ ...scope, titleKey: "tmdb_tv_2" }))[0]).toMatchObject({
+          id: b.id, status: "processing", runId: "run_2", reply: null, processedAt: null,
+        });
       });
 
       it("a message written while another is processing is urgent; claim takes only what is pending", async () => {
@@ -131,6 +177,8 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         expect(await repo.listWorksWithPendingReplacements()).toEqual([scope]);
         expect(await repo.removePendingReplacements({ ...scope, episodes: ["S01E13", "S01E99"] })).toBe(1);
         expect((await repo.listPendingReplacements(scope)).map((p) => p.episode)).toEqual(["S01E24"]);
+        expect(await repo.removePendingReplacements({ ...scope, episodes: ["S01E24", "S01E24"] })).toBe(1);
+        expect(await repo.listPendingReplacements(scope)).toEqual([]);
       });
 
       it("rejected resources are scoped by account + work, across drives", async () => {
@@ -145,12 +193,41 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         expect(await repo.listRejectedResources({ accountId: "acct_b", titleKey: "tmdb_movie_9" })).toEqual([]);
       });
 
+      it("rejected resources round-trip null link/size and sizes beyond 32 bits", async () => {
+        const repo = await fresh();
+        const big = 60 * 1024 ** 3;
+        await repo.addRejectedResources({
+          accountId: "acct_a", titleKey: "tmdb_movie_9", now: t0,
+          items: [{ episode: "MOVIE", linkKey: null, label: "unknown.mkv", sizeBytes: null, reason: "假片", messageId: null }],
+        });
+        await repo.addRejectedResources({
+          accountId: "acct_a", titleKey: "tmdb_movie_9", now: t1,
+          items: [{ episode: "MOVIE", linkKey: "magnet:bb", label: "remux.mkv", sizeBytes: big, reason: "发蓝", messageId: "m2" }],
+        });
+        const list = await repo.listRejectedResources({ accountId: "acct_a", titleKey: "tmdb_movie_9" });
+        expect(list.map((r) => ({ linkKey: r.linkKey, sizeBytes: r.sizeBytes, messageId: r.messageId, createdAt: r.createdAt }))).toEqual([
+          { linkKey: null, sizeBytes: null, messageId: null, createdAt: t0 },
+          { linkKey: "magnet:bb", sizeBytes: big, messageId: "m2", createdAt: t1 },
+        ]);
+      });
+
       it("episode sources upsert per episode", async () => {
         const repo = await fresh();
         const base = { ...scope, episode: "S01E13", linkKey: "magnet:aa", label: "old", sizeBytes: 1, runId: "r1", recordedAt: t0 };
         await repo.upsertEpisodeSource(base);
         await repo.upsertEpisodeSource({ ...base, label: "new", runId: "r2", recordedAt: t1 });
         expect(await repo.listEpisodeSources(scope)).toEqual([{ ...base, label: "new", runId: "r2", recordedAt: t1 }]);
+      });
+
+      it("episode sources round-trip null link/size and sizes beyond 32 bits", async () => {
+        const repo = await fresh();
+        const big = 60 * 1024 ** 3;
+        const unknown = { ...scope, episode: "S01E01", linkKey: null, label: "a.mkv", sizeBytes: null, runId: "r1", recordedAt: t0 };
+        const large = { ...scope, episode: "S01E02", linkKey: "115:cc", label: "b.mkv", sizeBytes: big, runId: "r1", recordedAt: t0 };
+        await repo.upsertEpisodeSource(unknown);
+        await repo.upsertEpisodeSource(large);
+        expect(await repo.listEpisodeSources(scope)).toEqual([unknown, large]);
+        expect(await repo.listEpisodeSources({ ...scope, drive: "cs_2" })).toEqual([]);
       });
     });
 
