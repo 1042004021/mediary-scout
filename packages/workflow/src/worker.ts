@@ -32,7 +32,7 @@ import {
 } from "./runner-v2.js";
 import { syncSeasonAgainstMetadata } from "./season-sync.js";
 import { isBrandStorageAuthError } from "./storage-auth-error.js";
-import { userMessageDrive } from "./user-requests.js";
+import { userMessageDrive, type UserMessageScope } from "./user-requests.js";
 // Circular with replace-request.ts (it uses this module's claim helpers); both sides
 // only call the other's functions at run time, never at module evaluation.
 import { queueReplaceRequest } from "./replace-request.js";
@@ -474,18 +474,35 @@ export async function runScheduledType3Monitoring(input: {
   // Works with a user message or an unfinished replacement run as ONE replace_request
   // (it covers every season and includes the gaps), so this sweep skips their seasons.
   // Queued, not run here: the queue worker claims it right after the sweep.
+  const workKey = (w: UserMessageScope) => JSON.stringify([w.accountId, w.drive, w.titleKey]);
   const requestWorks = [
     ...(await input.repository.listWorksWithPendingMessages({ urgentOnly: false })),
     ...(await input.repository.listWorksWithPendingReplacements()),
   ];
-  const requestKeys = new Set(requestWorks.map((w) => JSON.stringify([w.accountId, w.drive, w.titleKey])));
+  const requestKeys = new Set(requestWorks.map(workKey));
   for (const key of requestKeys) {
     const [accountId, drive, titleKey] = JSON.parse(key) as [string, string, string];
-    await queueReplaceRequest({ repository: input.repository, work: { accountId, drive, titleKey }, now });
+    try {
+      await queueReplaceRequest({ repository: input.repository, work: { accountId, drive, titleKey }, now, origin: "patrol" });
+    } catch (error) {
+      // One work's queueing failure must not abort the whole sweep; the next sweep retries it.
+      console.error(`[user-message] patrol could not queue a replace request for ${titleKey}: ${String(error)}`);
+    }
   }
-  const patrolStates = trackedStates.filter(
-    (s) => !requestKeys.has(JSON.stringify([s.accountId, userMessageDrive(s.connectedStorageId), s.title.id])),
-  );
+  // Also skip works whose replace run is already in flight: a type3 run beside it
+  // would work the same directories at the same time (the per-season reservation
+  // only blocks the same kind, not a title-level replace_request).
+  const busyKeys = new Set((await input.repository.listWorksWithProcessingMessages()).map(workKey));
+  for (const accountId of new Set(trackedStates.map((s) => s.accountId))) {
+    for (const run of await input.repository.listActiveWorkflowRuns({ accountId, connectedStorageId: null })) {
+      if (run.workflowRun.kind !== "replace_request") continue;
+      busyKeys.add(workKey({ accountId, drive: userMessageDrive(run.connectedStorageId), titleKey: run.title.id }));
+    }
+  }
+  const patrolStates = trackedStates.filter((s) => {
+    const key = workKey({ accountId: s.accountId, drive: userMessageDrive(s.connectedStorageId), titleKey: s.title.id });
+    return !requestKeys.has(key) && !busyKeys.has(key);
+  });
 
   // One drive at a time, several drives side by side (see runKeyedPool). The key
   // is the drive the run will actually land on: a state with no bound drive runs

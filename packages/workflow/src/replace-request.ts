@@ -40,11 +40,17 @@ async function workStates(repository: WorkflowRepository, work: UserMessageScope
     .sort((a, b) => a.season.seasonNumber - b.season.seasonNumber);
 }
 
+/** Who queued a replace run: the patrol (its report joins the daily digest) or the
+ *  user (现在处理 / the idle scan for urgent messages — pushed on its own). */
+export type ReplaceRequestOrigin = "patrol" | "user";
+
 export async function queueReplaceRequest(input: {
   repository: WorkflowRepository;
   work: UserMessageScope;
   now?: () => string;
   createWorkflowRunId?: () => string;
+  /** Default "user". Recorded on the queued audit event. */
+  origin?: ReplaceRequestOrigin;
 }): Promise<{ status: "queued" | "already_running" | "not_tracked"; workflowRunId: string | null }> {
   const now = input.now ?? (() => new Date().toISOString());
   const states = await workStates(input.repository, input.work);
@@ -65,7 +71,13 @@ export async function queueReplaceRequest(input: {
       trackedSeasonId: lock.season.id,
       startedAt: queuedAt,
       finishedAt: null,
-      auditEvents: [{ type: "replace_request_queued", message: `Queued replace request ${workflowRunId}` }],
+      auditEvents: [
+        {
+          type: "replace_request_queued",
+          message: `Queued replace request ${workflowRunId}`,
+          data: { origin: input.origin ?? "user" },
+        },
+      ],
     },
     // A reservation replaces the season's episode bucket wholesale: hand it back unchanged.
     episodes: lock.episodes,

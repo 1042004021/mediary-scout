@@ -822,6 +822,55 @@ describe("runScheduledType3Monitoring — user requests", () => {
     expect(await repository.listActiveWorkflowRuns()).toEqual([]);
   });
 
+  it("a work whose replace run is in flight (messages processing) is not patrolled alongside it", async () => {
+    const { repository, storage, season } = await completeShow();
+    await repository.createUserMessage({ ...WORK, body: "第 1 集发蓝", episodeTags: ["S01E01"], now: fixedNow() });
+    // A replace run already claimed the message and is running right now.
+    await repository.claimUserMessages({ ...WORK, runId: "run_replace_live", now: fixedNow() });
+
+    const outcomes = await patrol(repository, storage);
+
+    expect(outcomes.filter((o) => o.trackedSeasonId === season.id)).toEqual([]);
+    expect(await repository.getWorkflowRunSnapshot("run_patrol_1")).toBeNull();
+  });
+
+  it("a work with a queued replace_request (messages withdrawn meanwhile) is not patrolled alongside it", async () => {
+    const { repository, storage, season } = await completeShow();
+    const { title } = trackedFixture();
+    await repository.reserveWorkflowRun({
+      title,
+      season,
+      workflowRun: { id: "run_replace_queued", kind: "replace_request", status: "queued", trackedSeasonId: season.id, startedAt: fixedNow(), finishedAt: null, auditEvents: [] },
+      episodes: (await repository.getTrackedSeasonState(season.id))!.episodes,
+      resourceSnapshots: [],
+      decisions: [],
+      transferAttempts: [],
+      notifications: [],
+    });
+
+    const outcomes = await patrol(repository, storage);
+
+    expect(outcomes.filter((o) => o.trackedSeasonId === season.id)).toEqual([]);
+    expect((await repository.listActiveWorkflowRuns()).map((r) => r.workflowRun.id)).toEqual(["run_replace_queued"]);
+  });
+
+  it("one work whose replace request cannot be queued does not abort the sweep", async () => {
+    const { repository, storage } = await completeShow();
+    const other = trackedFixture("other");
+    await seedTrackedSeason({ repository, title: other.title, season: other.season, obtainedCodes: ["S01E01", "S01E02"] });
+    await seedV2Season(storage, other.title, other.season, ["S01E01", "S01E02"]);
+    await repository.createUserMessage({ ...WORK, body: "换", episodeTags: [], now: fixedNow() });
+    const reserve = repository.reserveWorkflowRun.bind(repository);
+    repository.reserveWorkflowRun = async (input) => {
+      if (input.workflowRun.kind === "replace_request") throw new Error("db hiccup");
+      return reserve(input);
+    };
+
+    const outcomes = await patrol(repository, storage);
+
+    expect(outcomes.map((o) => o.trackedSeasonId)).toEqual([other.season.id]);
+  });
+
   it("only the work with a request is taken out of the sweep; another show is patrolled as before", async () => {
     const { repository, storage, season } = await completeShow();
     const other = trackedFixture("other");
