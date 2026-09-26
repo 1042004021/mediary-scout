@@ -344,13 +344,33 @@ export async function runQueuedReplaceRequest(
   }
 
   // The run itself succeeded and is saved. What follows is bookkeeping: a failure
-  // here is logged, never turned into a failed run, and the messages still get
-  // their reply (a message left in processing is released by the idle scan).
+  // here is logged, never turned into a failed run.
   const results = (replacement?.results ?? []).map((r) => ({ ...r, sizeBytes: r.label ? parseSizeFromTitle(r.label) : null }));
+  const outcome = { repository, work, runId, results, messages, pendingRows, now };
   try {
-    await recordReplacementOutcome({ repository, work, runId, results, messages, pendingRows, now });
-  } catch (error) {
-    console.error(`[user-message] run ${runId} bookkeeping failed (the run itself succeeded): ${String(error)}`);
+    await recordReplacementOutcome(outcome);
+  } catch (firstError) {
+    try {
+      await recordReplacementOutcome(outcome);
+    } catch (error) {
+      // The 待换 rows / episode sources are what bring a not-replaced episode back,
+      // so a reply without them would drop the request for good. Hand the messages
+      // back to the patrol instead (not urgent: a store that keeps failing must not be
+      // hit on every idle tick). The retry run may find the file this run landed and
+      // reject it as "current" — worse than nothing only in that one run, far better
+      // than silently forgetting the episode.
+      console.error(
+        `[user-message] run ${runId} bookkeeping failed twice (the run itself succeeded); messages go back to the patrol: ${String(firstError)} / ${String(error)}`,
+      );
+      if (messages.length > 0) {
+        try {
+          await repository.releaseUserMessages({ runId, now: now(), urgent: false });
+        } catch (releaseError) {
+          console.error(`[user-message] run ${runId} could not release its messages: ${String(releaseError)}`);
+        }
+      }
+      return { status: "ran", workflowRunId: runId, workflowStatus };
+    }
   }
   if (messages.length > 0) {
     const reply: UserMessageReply = {

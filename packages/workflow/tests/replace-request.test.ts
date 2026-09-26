@@ -636,23 +636,49 @@ describe("runQueuedReplaceRequest — scope, metadata and bookkeeping", () => {
     expect(await repository.listWorksWithPendingReplacements()).toEqual([]);
   });
 
-  it("a bookkeeping failure after a successful run still finishes the messages and never turns the run into a failure", async () => {
+  it("a bookkeeping write that fails twice sends the messages back to the patrol, never finishing them without their 待换 rows", async () => {
     const { repository, title, season } = await trackedShow();
     const storage = storageWithNewRelease();
     await seedV2Season(storage, title, season, ["S01E01", "S01E02"]);
     await repository.createUserMessage({ ...WORK, body: "1 集发蓝", episodeTags: ["S01E01"], now: NOW });
     await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => "run_rr_book" });
+    let calls = 0;
     repository.addPendingReplacements = async () => {
+      calls += 1;
       throw new Error("db hiccup");
     };
 
     const result = await runQueuedReplaceRequest(baseRun(repository, storage, reportingModel(["S01E01"])));
 
     expect(result).toMatchObject({ status: "ran", workflowRunId: "run_rr_book" });
+    expect(calls).toBe(2);
     const run = await repository.getWorkflowRunSnapshot("run_rr_book", SCOPE);
     expect(run?.workflowRun.status).not.toBe("failed");
-    expect(run?.notifications.map((n) => n.kind)).toEqual(["replacement_done"]);
-    expect((await repository.listUserMessages(WORK))[0]).toMatchObject({ status: "done", runId: "run_rr_book" });
+    const [message] = await repository.listUserMessages(WORK);
+    expect(message).toMatchObject({ status: "pending", urgent: false });
+    expect(message?.reply).toBeFalsy();
+  });
+
+  it("a bookkeeping write that fails once is retried and the messages finish", async () => {
+    const { repository, title, season } = await trackedShow();
+    const storage = storageWithNewRelease();
+    await seedV2Season(storage, title, season, ["S01E01", "S01E02"]);
+    await repository.createUserMessage({ ...WORK, body: "1 集发蓝", episodeTags: ["S01E01"], now: NOW });
+    await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => "run_rr_book1" });
+    const add = repository.addPendingReplacements.bind(repository);
+    let calls = 0;
+    repository.addPendingReplacements = async (input) => {
+      calls += 1;
+      if (calls === 1) throw new Error("db hiccup");
+      return add(input);
+    };
+
+    const result = await runQueuedReplaceRequest(baseRun(repository, storage, reportingModel(["S01E01"])));
+
+    expect(result).toMatchObject({ status: "ran", workflowRunId: "run_rr_book1" });
+    expect(calls).toBe(2);
+    expect((await repository.listUserMessages(WORK))[0]).toMatchObject({ status: "done", runId: "run_rr_book1" });
+    expect(await repository.listPendingReplacements(WORK)).toEqual([expect.objectContaining({ episode: "S01E01" })]);
   });
 
   it("a reply write that fails once is retried, so the message still gets its reply", async () => {
