@@ -102,7 +102,8 @@ export interface RunAcquisitionV2Request {
     requestedEpisodes: string[];
     prompt: UserRequestPromptInput;
     rejectedStore: {
-      list: () => Promise<Array<{ linkKey: string | null; label: string; sizeBytes: number | null }>>;
+      /** `episode` lets a repeated rejection be skipped (see onReject). */
+      list: () => Promise<Array<{ episode?: string; linkKey: string | null; label: string; sizeBytes: number | null }>>;
       add: (rows: Array<{ episode: string; linkKey: string | null; label: string; sizeBytes: number | null; reason: string }>) => Promise<void>;
     };
   };
@@ -223,13 +224,33 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
           replace: {
             requestedEpisodes: userRequest.requestedEpisodes,
             onReject: async (items) => {
-              for (const i of items) {
+              // Skip what is already rejected (same episode + label + size), in the
+              // store or earlier this run — the agent may reject the same file twice.
+              const seen = new Set<string>();
+              const key = (r: { episode: string; label: string; sizeBytes: number | null }) =>
+                JSON.stringify([r.episode, r.label, r.sizeBytes]);
+              for (const r of replaceRejected) seen.add(key(r));
+              try {
+                for (const r of await userRequest.rejectedStore.list()) {
+                  if (r.episode !== undefined) seen.add(key({ episode: r.episode, label: r.label, sizeBytes: r.sizeBytes }));
+                }
+              } catch (error) {
+                console.log(`[user-message] run ${request.workflowRunId} rejected list read failed (not deduping): ${errorText(error)}`);
+              }
+              const fresh = items.filter((i) => {
+                const k = key(i);
+                if (seen.has(k)) return false;
+                seen.add(k);
+                return true;
+              });
+              for (const i of items) oldFiles.add(i.path);
+              if (fresh.length === 0) return;
+              for (const i of fresh) {
                 replaceRejected.push({ episode: i.episode, label: i.label, sizeBytes: i.sizeBytes, reason: i.reason });
-                oldFiles.add(i.path);
               }
               try {
                 await userRequest.rejectedStore.add(
-                  items.map((i) => ({ episode: i.episode, linkKey: null, label: i.label, sizeBytes: i.sizeBytes, reason: i.reason })),
+                  fresh.map((i) => ({ episode: i.episode, linkKey: null, label: i.label, sizeBytes: i.sizeBytes, reason: i.reason })),
                 );
               } catch (error) {
                 // Best-effort (spec §7): the run goes on and the reply says the list was not saved.
@@ -242,7 +263,8 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
                 // The agent speaks in short aliases (s2-14); persistence needs the real
                 // candidate, its title and its link identity (for episode_sources and a
                 // future rejection of this same resource).
-                const candidate = r.candidateId ? registry.get(r.candidateId) : undefined;
+                // Only a replaced result names what landed; a not_found never carries one.
+                const candidate = r.outcome === "replaced" && r.candidateId ? registry.get(r.candidateId) : undefined;
                 // A not_found may be upgraded to replaced later in the run: the last report wins.
                 replaceResults.set(r.episode, {
                   episode: r.episode,
@@ -409,13 +431,16 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
       digest = `COVERAGE: ${result.coverage.coverageMet ? "met" : "NOT met"} (details unavailable: ${error instanceof Error ? error.message.slice(0, 120) : "unknown"})`;
     }
     if (userRequest) {
-      digest += `\nUSER REQUEST: ${[...replaceResults.values()].map((r) => `${r.episode} ${r.outcome}`).join(", ")} (the system already remembers rejected resources — do not write a note about them)`;
+      // Facts only: the matching instruction goes outside the fence (userRequest below).
+      const outcomes = [...replaceResults.values()].map((r) => `${r.episode} ${r.outcome}`).join(", ");
+      digest += `\nUSER REQUEST: ${outcomes || "(no episodes reported)"}`;
     }
     const reflection = await runMemoryReflection({
       sandbox,
       model: request.model,
       digest,
       memory: loadedMemory ?? { title: [], globalIndex: [] },
+      ...(userRequest ? { userRequest: true } : {}),
     });
     console.log(
       `[memory] run ${request.workflowRunId} title=${memoryBinding.titleKey} ${reflection.ran ? `changes=${reflection.changes}` : `skipped=${reflection.skipped ?? "-"}`}`,

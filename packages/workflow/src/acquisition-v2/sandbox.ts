@@ -382,11 +382,26 @@ export class TaskSandbox {
   /** Whether every needed token has been confirmed obtained — the gate that
    *  stops the agent from acquiring past the point of coverage (莉可丽丝 scar). */
   isCoverageMet(): boolean {
-    return this.need.length > 0 && this.need.every((token) => this.obtainedCodes.has(token));
+    return this.need.length > 0 && this.need.every((token) => this.countsAsObtained(token));
   }
 
   private missingNeed(): string[] {
-    return this.need.filter((token) => !this.obtainedCodes.has(token));
+    return this.need.filter((token) => !this.countsAsObtained(token));
+  }
+
+  /** Replace runs: the episodes the user wants swapped (requested or rejected this
+   *  run). Their OLD file is already in the library, so a mark proves nothing until
+   *  a new file has landed — see markObtained. Empty outside a replace run. */
+  private replaceGuardedEpisodes(): Set<string> {
+    return this.replace ? new Set([...this.replace.requestedEpisodes, ...this.rejectedEpisodes]) : new Set();
+  }
+
+  /** Whether a need token counts toward coverage. A replace-guarded episode counts
+   *  only once some transfer succeeded this run (it may have been marked before the
+   *  agent rejected it), so the old file can never close the transfer gate. */
+  private countsAsObtained(token: string): boolean {
+    if (!this.obtainedCodes.has(token)) return false;
+    return this.succeededCandidates.size > 0 || !this.replaceGuardedEpisodes().has(token);
   }
 
   /** Search one keyword. Repeats are deduped (no extra provider hit); distinct
@@ -845,8 +860,23 @@ export class TaskSandbox {
    *  re-judge from the real files every patrol, so a stale mark self-heals next
    *  round. Correctness is the prompt ordering (clean/flatten, THEN mark last),
    *  not a system gate that costs extra 115 reads. No fileId↔episode map (§1.13):
-   *  the code IS the unit; the agent names what it judged present. */
+   *  the code IS the unit; the agent names what it judged present.
+   *
+   *  Replace runs are the one exception: a requested/rejected episode's OLD file is
+   *  already there, and marking it would meet coverage and block every transfer. So
+   *  such a mark is refused (whole call, nothing recorded) until at least one
+   *  transfer succeeded this run. Deliberately coarse — any landed transfer unlocks
+   *  it; which episodes that transfer carried stays the agent's judgment. */
   async markObtained(input: { codes: string[]; subtitleFallback?: boolean }): Promise<{ confirmed: string[] }> {
+    if (this.replace && this.succeededCandidates.size === 0) {
+      const guarded = this.replaceGuardedEpisodes();
+      const early = input.codes.filter((code) => guarded.has(code));
+      if (early.length > 0) {
+        throw new Error(
+          `SANDBOX_REPLACEMENT_NOT_LANDED: ${early.join(",")} — the user wants these replaced and nothing has landed this run; the OLD file does not count. Mark them only after the NEW file is in place`,
+        );
+      }
+    }
     for (const code of input.codes) {
       this.obtainedCodes.add(code);
     }

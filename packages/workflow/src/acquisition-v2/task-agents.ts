@@ -350,8 +350,14 @@ export async function runTvAnimeTaskAgent(request: RunTvAnimeRequest): Promise<A
   const { sandbox, model, target, maxSteps, onProgress, apiCallCount, budgetSoftAt, ...promptOptions } = request;
   const seasonsLabel =
     target.seasons.length === 1 ? `season ${target.seasons[0]}` : `seasons ${target.seasons.join(", ")}`;
+  // A user request on a complete library has nothing missing: say so, instead of an
+  // empty list that reads as "nothing to do" (the requested episodes' OLD files are there).
+  const missingLine =
+    target.missingEpisodes.length === 0 && promptOptions.userRequests
+      ? "(none — this run is for the USER REQUESTS in your instructions)"
+      : target.missingEpisodes.join(", ");
   const prompt = `Acquire the missing episodes for "${target.title}"${target.aliases.length ? ` (aliases: ${target.aliases.join(", ")})` : ""}, ${seasonsLabel}.
-Missing episodes (the coverage need — may span multiple seasons): ${target.missingEpisodes.join(", ")}.
+Missing episodes (the coverage need — may span multiple seasons): ${missingLine}.
 If one pack covers multiple seasons, distribute its files in ONE plan with a move per season (moveToSeason({moves:[{season,fileIds}]})) and take only still-missing episodes — never recopy a season already present. Cover every missing episode with the fewest reliable transfers, keep each season directory clean, mark what truly landed, then finish.`;
   return runAcquisitionAgent({
     sandbox,
@@ -371,7 +377,11 @@ export async function runMovieTaskAgent(request: RunMovieRequest): Promise<Acqui
   const { sandbox, model, target, maxSteps, onProgress, apiCallCount, budgetSoftAt, ...promptOptions } = request;
   const prompt = `Acquire the movie "${target.title}" (${target.year})${target.aliases.length ? ` (aliases: ${target.aliases.join(", ")})` : ""}.
 This is the coverage need: the single MOVIE token. Cross-check title AND year so you do not grab a remake or same-IP different film.
-Find the one correct film, transfer it, keep the directory clean, mark it present, then finish.`;
+Find the one correct film, transfer it, keep the directory clean, mark it present, then finish.${
+    promptOptions.userRequests
+      ? "\nThe film is already in the library: this run is for the USER REQUESTS in your instructions — land a DIFFERENT copy, and do not mark MOVIE until the new file is in place."
+      : ""
+  }`;
   return runAcquisitionAgent({
     sandbox,
     model,

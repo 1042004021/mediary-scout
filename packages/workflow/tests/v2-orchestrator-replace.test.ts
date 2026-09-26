@@ -66,7 +66,7 @@ function executor() {
   });
 }
 
-type RejectedRow = { linkKey: string | null; label: string; sizeBytes: number | null };
+type RejectedRow = { episode?: string; linkKey: string | null; label: string; sizeBytes: number | null };
 
 function userRequest(rejectedRows: RejectedRow[]): NonNullable<RunAcquisitionV2Request["userRequest"]> {
   return {
@@ -332,7 +332,107 @@ describe("runAcquisitionV2 — user replace request", () => {
     req.memory = { store: new InMemoryWorkflowRepository(), accountId: "acct_1", now: () => NOW };
     await runAcquisitionV2(req);
     expect(reflectionPrompt).toContain("USER REQUEST: S01E13 not_found, S01E24 not_found");
-    expect(reflectionPrompt).toContain("do not write a note about them");
+    // The instruction is system text after the untrusted fence, not inside it.
+    const close = reflectionPrompt.indexOf("</run_facts>");
+    expect(reflectionPrompt.indexOf("USER REQUEST: S01E13")).toBeLessThan(close);
+    expect(reflectionPrompt.indexOf("do not write a note about them")).toBeGreaterThan(close);
+  });
+
+  it("the reflection digest never carries an empty USER REQUEST line", async () => {
+    let reflectionPrompt = "";
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        const sys = JSON.stringify(options.prompt.find((m) => m.role === "system") ?? "");
+        if (sys.includes("reviewing an acquisition run")) {
+          reflectionPrompt = JSON.stringify(options.prompt.filter((m) => m.role === "user"));
+          return text("nothing");
+        }
+        return text("done");
+      },
+    });
+    const req = baseRequest(model, executor(), []);
+    // Nothing requested by tag (the agent was to read episodes from the words) and nothing rejected.
+    req.userRequest = { ...req.userRequest!, requestedEpisodes: [] };
+    req.memory = { store: new InMemoryWorkflowRepository(), accountId: "acct_1", now: () => NOW };
+    await runAcquisitionV2(req);
+    expect(reflectionPrompt).toContain("USER REQUEST: (no episodes reported)");
+  });
+
+  it("rejecting the same file twice (or one already in the store) is recorded once", async () => {
+    const rejectedRows: RejectedRow[] = [
+      // Stored by an earlier run for S01E24.
+      { episode: "S01E24", linkKey: null, label: "Show - 24 [CR 1080p].mkv", sizeBytes: OLD_SIZE },
+    ];
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => {
+        i += 1;
+        if (i === 1) return tool("rejectCurrentSource", { episodes: ["S01E13"], fileIds: ["old13"], reason: "发蓝" }, i);
+        if (i === 2) return tool("rejectCurrentSource", { episodes: ["S01E13", "S01E24"], fileIds: ["old13", "old24"], reason: "发蓝" }, i);
+        return text("done");
+      },
+    });
+    const result = await runAcquisitionV2(baseRequest(model, executor(), rejectedRows));
+    // old13 once for E13; old24 for E24 is already stored; old13×E24 and old24×E13 are new pairs.
+    expect(result.replacement?.rejected.map((r) => [r.episode, r.label])).toEqual([
+      ["S01E13", "Show - 13 [CR 1080p].mkv"],
+      ["S01E24", "Show - 13 [CR 1080p].mkv"],
+      ["S01E13", "Show - 24 [CR 1080p].mkv"],
+    ]);
+    expect(rejectedRows.map((r) => [r.episode, r.label])).toEqual([
+      ["S01E24", "Show - 24 [CR 1080p].mkv"],
+      ["S01E13", "Show - 13 [CR 1080p].mkv"],
+      ["S01E24", "Show - 13 [CR 1080p].mkv"],
+      ["S01E13", "Show - 24 [CR 1080p].mkv"],
+    ]);
+    // Every rejected file is still listed as an old file.
+    expect(result.replacement?.oldFiles.sort()).toEqual(["Season 01/Show - 13 [CR 1080p].mkv", "Season 01/Show - 24 [CR 1080p].mkv"]);
+  });
+
+  it("a not_found result never carries a candidate, even when the agent passes one", async () => {
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        i += 1;
+        if (i === 1) return tool("searchResources", { keyword: "Show 13" }, i);
+        if (i === 2) {
+          const search = lastToolOutput(options.prompt, "searchResources");
+          const alias = (search.snapshot.candidates as Array<{ id: string; title: string }>).find((c) => c.title === NEKOMOE_TITLE)!.id;
+          return tool("reportReplacement", { results: [{ episode: "S01E13", outcome: "not_found", candidateId: alias, note: "试过没落地" }] }, i);
+        }
+        return text("done");
+      },
+    });
+    const result = await runAcquisitionV2(baseRequest(model, executor(), []));
+    expect(result.replacement?.results).toEqual([
+      { episode: "S01E13", outcome: "not_found", note: "试过没落地" },
+      { episode: "S01E24", outcome: "not_found", note: "" },
+    ]);
+  });
+
+  it("a stored rejection matches by link key even when the title is different", async () => {
+    const rejectedRows: RejectedRow[] = [];
+    const exec = executor();
+    let transferOutput: any;
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        i += 1;
+        if (i === 1) return tool("viewResourceSnapshot", {}, i);
+        if (i === 2) {
+          // Rejected (e.g. by an earlier run) under another name, same magnet.
+          rejectedRows.push({ episode: "S01E13", linkKey: `magnet:${"a".repeat(40)}`, label: "Something Else Entirely.mkv", sizeBytes: 1 });
+          const doc = String(lastToolOutput(options.prompt, "viewResourceSnapshot").document);
+          const row = /\[(s(\d+)-\d+)\] Show - 13 \[CR 1080p\]/.exec(doc)!;
+          return tool("transferCandidate", { snapshotId: `s${row[2]}`, candidateId: row[1] }, i);
+        }
+        if (i === 3) transferOutput = lastToolOutput(options.prompt, "transferCandidate");
+        return text("done");
+      },
+    });
+    const result = await runAcquisitionV2(baseRequest(model, exec, rejectedRows));
+    expect(String(transferOutput?.error)).toMatch(/SANDBOX_CANDIDATE_REJECTED/);
+    expect(result.outcome.transferAttempts).toEqual([]);
   });
 
   it("no user request → no replace tools, no user-request block, no replacement result", async () => {

@@ -146,6 +146,41 @@ describe("TaskSandbox — replace", () => {
     expect(results).toHaveLength(3);
   });
 
+  it("markObtained of a requested or rejected episode is refused until a transfer lands this run (the old file does not count)", async () => {
+    const { sandbox, old24 } = await setup();
+    await expect(sandbox.markObtained({ codes: ["S01E13"] })).rejects.toThrow(/SANDBOX_REPLACEMENT_NOT_LANDED: S01E13/);
+    // Rejected (not requested) episodes are guarded too; the whole call is refused.
+    await sandbox.rejectCurrentSource({ episodes: ["S01E25"], fileIds: [old24], reason: "x" });
+    await expect(sandbox.markObtained({ codes: ["S01E01", "S01E25"] })).rejects.toThrow(/SANDBOX_REPLACEMENT_NOT_LANDED: S01E25/);
+    expect((await sandbox.finish()).obtained).toEqual([]);
+    // An episode nobody asked about can still be marked.
+    await sandbox.markObtained({ codes: ["S01E01"] });
+    // After a successful transfer the requested episode can be marked.
+    const snap = (await sandbox.searchResources("Show")).snapshot!;
+    await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_new13" });
+    await expect(sandbox.markObtained({ codes: ["S01E13"] })).resolves.toEqual({ confirmed: ["S01E13"] });
+  });
+
+  it("an episode marked before it was rejected does not meet coverage (nor block a transfer) until something lands", async () => {
+    const { sandbox, old24 } = await setup();
+    // Not requested yet → the mark is accepted...
+    await sandbox.markObtained({ codes: ["S01E25"] });
+    // ...then the agent rejects its current file: it joins the need as a guarded episode.
+    await sandbox.rejectCurrentSource({ episodes: ["S01E25"], fileIds: [old24], reason: "x" });
+    expect(sandbox.isCoverageMet()).toBe(false);
+    expect((await sandbox.finish()).missing).toEqual(["S01E25"]);
+    const snap = (await sandbox.searchResources("Show")).snapshot!;
+    const out = await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_new13" });
+    expect(out.attempt.status).toBe("succeeded");
+    expect(sandbox.isCoverageMet()).toBe(true);
+  });
+
+  it("a normal (non-replace) run marks and meets coverage without any transfer", async () => {
+    const sandbox = new TaskSandbox({ provider: new FakeResourceProviderV2(), need: ["S01E13"] });
+    await expect(sandbox.markObtained({ codes: ["S01E13"] })).resolves.toEqual({ confirmed: ["S01E13"] });
+    expect(sandbox.isCoverageMet()).toBe(true);
+  });
+
   it("files that existed before the run can never be deleted", async () => {
     const { sandbox, old13 } = await setup();
     await expect(sandbox.deleteFiles({ directory: "season", season: 1, fileIds: [old13] })).rejects.toThrow(/PROTECTED/);
@@ -176,6 +211,9 @@ describe("TaskSandbox — replace", () => {
 
   it("reportReplacement refuses a replaced episode whose candidate never landed this run", async () => {
     const { sandbox } = await setup();
+    // Another candidate landed (so the mark is allowed), but not the one reported.
+    const snap = (await sandbox.searchResources("Show")).snapshot!;
+    await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_cr13" });
     await sandbox.markObtained({ codes: ["S01E13"] });
     await expect(
       sandbox.reportReplacement({ results: [{ episode: "S01E13", outcome: "replaced", candidateId: "cand_new13", note: "x" }] }),

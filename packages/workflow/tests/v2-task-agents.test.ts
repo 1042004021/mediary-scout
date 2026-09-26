@@ -272,6 +272,52 @@ describe("run wiring", () => {
     expect(result.coverage.missing).toEqual(["S01E01"]);
   });
 
+  it("the TV user turn says the run is for the user requests when nothing is missing", async () => {
+    const userTurn = async (userRequests: Parameters<typeof runTvAnimeTaskAgent>[0]["userRequests"], missingEpisodes: string[]) => {
+      let prompt = "";
+      const model = new MockLanguageModelV3({
+        doGenerate: async (options) => {
+          prompt = JSON.stringify(options.prompt.filter((m) => m.role === "user"));
+          return { content: [{ type: "text" as const, text: "done" }], finishReason: { unified: "stop" as const, raw: "stop" as const }, usage: USAGE, warnings: [] };
+        },
+      });
+      await runTvAnimeTaskAgent({
+        sandbox: await sandboxFor(needForTvTarget({ missingEpisodes })),
+        model,
+        target: { title: "Show", aliases: [], seasons: [1], missingEpisodes, qualityPreference: "1080p" },
+        ...(userRequests ? { userRequests } : {}),
+      });
+      return prompt;
+    };
+    const req = { messages: [{ body: "13 发蓝", episodeTags: ["S01E13"], createdAt: "2026-09-26T06:00:00.000Z" }], rejected: [], pending: [] };
+    expect(await userTurn(req, [])).toContain("(none — this run is for the USER REQUESTS in your instructions)");
+    expect(await userTurn(req, ["S01E14"])).toContain("Missing episodes (the coverage need — may span multiple seasons): S01E14.");
+    expect(await userTurn(undefined, ["S01E14"])).not.toContain("USER REQUESTS");
+  });
+
+  it("the movie user turn points at the user requests only when there is one", async () => {
+    const userTurn = async (withRequest: boolean) => {
+      let prompt = "";
+      const model = new MockLanguageModelV3({
+        doGenerate: async (options) => {
+          prompt = JSON.stringify(options.prompt.filter((m) => m.role === "user"));
+          return { content: [{ type: "text" as const, text: "done" }], finishReason: { unified: "stop" as const, raw: "stop" as const }, usage: USAGE, warnings: [] };
+        },
+      });
+      await runMovieTaskAgent({
+        sandbox: await sandboxFor(needForMovie()),
+        model,
+        target: { title: "Some Film", aliases: [], year: 2025, qualityPreference: "1080p" },
+        ...(withRequest
+          ? { userRequests: { messages: [{ body: "假片", episodeTags: ["MOVIE"], createdAt: "2026-09-26T06:00:00.000Z" }], rejected: [], pending: [] } }
+          : {}),
+      });
+      return prompt;
+    };
+    expect(await userTurn(true)).toMatch(/this run is for the USER REQUESTS in your instructions.*do not mark MOVIE until the new file is in place/);
+    expect(await userTurn(false)).not.toContain("USER REQUESTS");
+  });
+
   it("runMovieTaskAgent drives the loop with the MOVIE need", async () => {
     const sandbox = await sandboxFor(needForMovie());
     const result = await runMovieTaskAgent({
@@ -343,6 +389,9 @@ describe("user request block", () => {
     expect(text).toMatch(/rejectCurrentSource/);
     expect(text).toMatch(/reportReplacement/);
     expect(text).toContain("Show - 13 [CR].mkv");
+    expect(text).toContain("Never markObtained a requested episode because its OLD file is there — mark it only after the NEW file is in place");
+    // The rule is system text, above the fence.
+    expect(text.indexOf("Never markObtained")).toBeLessThan(text.indexOf("\n<user_requests>\n"));
   });
   it("strips an injected opening tag and a closer smuggled in via a rejected label or reason", () => {
     const text = userRequestBlock({
