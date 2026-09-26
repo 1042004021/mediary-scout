@@ -263,6 +263,52 @@ export function buildSeriesReport(input: {
   };
 }
 
+/**
+ * The report of a replace_request run (a user asked for a different resource). Never
+ * "入库/获取完成": the old files are still there, so the only news is which episodes
+ * got a new version and which are still being looked for. No landed size either —
+ * the directories now hold old + new files, so a size would double-count.
+ */
+export function buildReplacementReport(input: {
+  titleName: string;
+  movie: boolean;
+  results: Array<{ episode: string; outcome: "replaced" | "not_found" }>;
+  /** Episodes that were plain gaps and landed in the same run (TV only). */
+  newlyObtained?: string[];
+  transferBlockReason?: string | null;
+  searchSourceFaultReason?: string | null;
+  meta?: NotificationTitleMeta;
+}): NotificationReport {
+  const replaced = input.results.filter((r) => r.outcome === "replaced").map((r) => r.episode);
+  const pending = input.results.filter((r) => r.outcome === "not_found").map((r) => r.episode);
+  const base = {
+    titleName: input.titleName,
+    seasonLabel: null,
+    newlyObtained: input.newlyObtained ?? [],
+    realMissing: [],
+    ...(input.meta ?? {}),
+  };
+  if (replaced.length === 0) {
+    // Nothing new landed: an honest block/source-fault reason beats "not found".
+    const outcome = emptyRunOutcome(input.transferBlockReason, input.searchSourceFaultReason);
+    if (outcome.status === "failed") return { ...base, ...outcome };
+    return {
+      ...base,
+      status: "no_coverage",
+      lines: [input.results.length === 0 ? "这次没有换任何文件" : "还没找到可以换的版本 · 巡检时接着找"],
+    };
+  }
+  if (input.movie) {
+    return { ...base, status: "replaced", lines: ["已换成新版本"] };
+  }
+  // "E13" when every episode is in one season (the card names the show); full codes otherwise.
+  const seasons = new Set([...replaced, ...pending].map((code) => code.replace(/E\d+$/, "")));
+  const label = (codes: string[]) => codes.map((code) => (seasons.size === 1 ? shortCode(code) : code)).join("、");
+  let line = `换好 ${replaced.length} 集（${label(replaced)}）`;
+  if (pending.length > 0) line += `，${pending.length} 集还在找（${label(pending)}）`;
+  return { ...base, status: "replaced", lines: [line] };
+}
+
 /** Title metadata for richer pushes (poster image + tap-through link). */
 export interface NotificationTitleMeta {
   posterPath?: string | null;
@@ -300,6 +346,7 @@ const STATUS_EMOJI: Record<NotificationReportStatus, string> = {
   no_coverage: "🔍",
   failed: "❌",
   retrying: "⚠️",
+  replaced: "🔁",
 };
 
 /**

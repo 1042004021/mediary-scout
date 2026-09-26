@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildMovieReport,
+  buildReplacementReport,
   buildSeasonReport,
   buildSeriesReport,
   createEpisodeStates,
@@ -403,5 +404,54 @@ describe("formatDailyDigestPushText source tags", () => {
       realMissing: [],
     });
     expect(formatDailyDigestPushText([notif])).not.toContain("来自");
+  });
+});
+
+describe("buildReplacementReport — a user-requested replace run", () => {
+  it("names what was replaced and what is still being looked for, never 入库 or a size", () => {
+    const report = buildReplacementReport({
+      titleName: "黄泉使者",
+      movie: false,
+      results: [
+        { episode: "S01E13", outcome: "replaced" },
+        { episode: "S01E24", outcome: "not_found" },
+      ],
+    });
+    expect(report).toMatchObject({ status: "replaced", lines: ["换好 1 集（E13），1 集还在找（E24）"] });
+    expect(report.fileCount).toBeUndefined();
+    expect(formatReportPushText(report)).not.toMatch(/入库|获取完成/);
+  });
+
+  it("keeps the season in the code when the episodes span seasons", () => {
+    const report = buildReplacementReport({
+      titleName: "Show",
+      movie: false,
+      results: [
+        { episode: "S01E02", outcome: "replaced" },
+        { episode: "S02E05", outcome: "replaced" },
+      ],
+    });
+    expect(report.lines).toEqual(["换好 2 集（S01E02、S02E05）"]);
+  });
+
+  it("a movie: replaced vs still looking", () => {
+    expect(buildReplacementReport({ titleName: "奥德赛", movie: true, results: [{ episode: "MOVIE", outcome: "replaced" }] })).toMatchObject({
+      status: "replaced",
+      lines: ["已换成新版本"],
+    });
+    expect(buildReplacementReport({ titleName: "奥德赛", movie: true, results: [{ episode: "MOVIE", outcome: "not_found" }] })).toMatchObject({
+      status: "no_coverage",
+      lines: ["还没找到可以换的版本 · 巡检时接着找"],
+    });
+  });
+
+  it("nothing replaced because transfers were blocked says so", () => {
+    const report = buildReplacementReport({
+      titleName: "Show",
+      movie: false,
+      results: [{ episode: "S01E01", outcome: "not_found" }],
+      transferBlockReason: "云下载配额不足",
+    });
+    expect(report).toMatchObject({ status: "failed", lines: ["转存失败:云下载配额不足"] });
   });
 });

@@ -32,6 +32,9 @@ export interface UserMessageReply {
   /** Paths (relative to the library dir) of the files the user may now delete. */
   oldFiles: string[];
   runId: string;
+  /** The rejected list could not be saved this run: it was honoured in the run, but
+   *  the next run will not know it (the UI says so). */
+  rejectedNotSaved?: boolean;
 }
 
 export interface UserMessage extends UserMessageScope {

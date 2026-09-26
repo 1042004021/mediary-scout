@@ -1510,6 +1510,7 @@ const KIND_HAS_QUEUE_CLAIMER: Record<WorkflowKind, boolean> = {
   type2_init: true,
   movie_init: true,
   type3_monitor: false,
+  replace_request: true,
 };
 
 /** True when a `queued` run of this kind will actually be picked up by a worker.

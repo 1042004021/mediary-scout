@@ -13,7 +13,9 @@ export type SeasonStatus = "active" | "completed";
 export type LatestAiredSource = "metadata" | "manual" | "unknown";
 export type AirStatus = "aired" | "unaired" | "unknown";
 export type MetadataStatus = "confirmed" | "provider_ahead" | "storage_only";
-export type WorkflowKind = "type1_package_init" | "type2_init" | "type3_monitor" | "movie_init";
+/** `replace_request` = a user message asking the agent to swap a bad resource
+ *  (packages/workflow/src/replace-request.ts); it covers every tracked season. */
+export type WorkflowKind = "type1_package_init" | "type2_init" | "type3_monitor" | "movie_init" | "replace_request";
 export type WorkflowStatus =
   | "queued"
   | "running"
@@ -274,7 +276,8 @@ export type NotificationReportStatus =
   | "partial" // a genuine aired gap remains
   | "no_coverage" // nothing found yet
   | "failed" // acquisition failed terminally (transient retries exhausted, or a hard error)
-  | "retrying"; // transient failure; an automatic retry is scheduled
+  | "retrying" // transient failure; an automatic retry is scheduled
+  | "replaced"; // a user-requested replacement landed (the old file stays beside it)
 
 /**
  * Structured acquisition report. The single source of wording: the web feed

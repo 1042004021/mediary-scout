@@ -3,18 +3,18 @@ import type { AgentMemoryStore } from "./agent-memory.js";
 import type { LanguageModel } from "ai";
 import type {
   AcquisitionSeasonScope,
+  AuditEvent,
   EpisodeState,
   MediaTitle,
-  MovieWorkflowResult,
   TrackedSeason,
   WorkflowKind,
   WorkflowRunMetadata,
 } from "./domain.js";
-import { runTvAcquisitionV2 } from "./acquisition-v2/run-tv-v2.js";
+import { runTvAcquisitionV2, type RunTvAcquisitionV2Request } from "./acquisition-v2/run-tv-v2.js";
 import type { BridgedV2Result } from "./acquisition-v2/workflow-v2-bridge.js";
 import { makeProgressSink } from "./acquisition-v2/progress-sink.js";
 import { makeAgentTraceSink, combineToolEventSinks } from "./acquisition-v2/agent-trace-sink.js";
-import { runMovieAcquisitionV2 } from "./movie-workflow-v2.js";
+import { runMovieAcquisitionV2, type MovieAcquisitionV2Result, type RunMovieAcquisitionV2Request } from "./movie-workflow-v2.js";
 import type { JevJudge } from "./jev-judge.js";
 import type { ResourceProvider, StorageExecutor } from "./ports.js";
 import type { WorkflowRepository } from "./repository.js";
@@ -338,6 +338,91 @@ export async function runSeriesInitializationV2AndPersist(
   return bridged;
 }
 
+/**
+ * A replace_request run on a show (user message): the same resource-sync workflow
+ * over EVERY tracked season of the work on this drive, with the user's request
+ * threaded to the agent. The episodes to replace stay obtained (the old files are
+ * still there), gaps found on the way are filled too.
+ *
+ * Persistence: the claimed lock run itself becomes the lock season's record and
+ * carries the run's evidence + the replacement notification (so the activity page,
+ * which follows the lock run id, sees it finish); every other season gets a bare
+ * `${runId}_s${n}` record with its episode states only.
+ */
+export async function runReplaceRequestV2AndPersist(
+  input: TvV2Common & {
+    seasons: Array<{ season: TrackedSeason; episodes: EpisodeState[] }>;
+    /** The claimed lock run's season and audit trail (queued/claimed events are kept). */
+    lockSeasonNumber: number;
+    lockAuditEvents: AuditEvent[];
+    // Declared, not spread: see the ⚠ above passthrough.
+    userRequest: NonNullable<RunTvAcquisitionV2Request["userRequest"]>;
+  },
+): Promise<BridgedV2Result> {
+  const now = resolveNow(input);
+  const priorObtained = input.seasons.flatMap((entry) =>
+    entry.episodes.filter((episode) => episode.obtained).map((episode) => episode.episodeCode),
+  );
+  const missing = input.seasons.reduce(
+    (sum, entry) => sum + entry.episodes.filter((episode) => episode.airStatus === "aired" && !episode.obtained).length,
+    0,
+  );
+  const bridged = await runTvAcquisitionV2({
+    title: input.title,
+    mode: "replace",
+    seasons: input.seasons.map(({ season }) => ({
+      seasonNumber: season.seasonNumber,
+      totalEpisodes: season.totalEpisodes,
+      latestAiredEpisode: season.latestAiredEpisode,
+      qualityPreference: season.qualityPreference,
+      status: season.status,
+    })),
+    categoryParentId: input.categoryParentId,
+    resourceProvider: input.resourceProvider,
+    storage: input.storage,
+    deadLinkStore: input.repository,
+    model: input.model,
+    workflowRunId: input.workflowRun.id,
+    priorObtained,
+    userRequest: input.userRequest,
+    now,
+    onProgress: progressAndTraceSink({
+      repository: input.repository,
+      workflowRunId: input.workflowRun.id,
+      neededHint: Math.max(1, missing + input.userRequest.requestedEpisodes.length),
+      storage: input.storage,
+    }),
+    ...passthrough(input),
+  });
+
+  const finishedAt = now();
+  for (const seasonResult of bridged.seasons) {
+    const isLock = seasonResult.season.seasonNumber === input.lockSeasonNumber;
+    const runId = isLock ? input.workflowRun.id : `${input.workflowRun.id}_s${seasonResult.season.seasonNumber}`;
+    await input.repository.saveWorkflowRunSnapshot({
+      ...(input.accountId ? { accountId: input.accountId } : {}),
+      ...(input.connectedStorageId != null ? { connectedStorageId: input.connectedStorageId } : {}),
+      title: input.title,
+      season: seasonResult.season,
+      workflowRun: {
+        id: runId,
+        kind: "replace_request",
+        status: bridged.status,
+        trackedSeasonId: seasonResult.season.id,
+        startedAt: input.workflowRun.startedAt,
+        finishedAt,
+        auditEvents: isLock ? [...input.lockAuditEvents, ...bridged.auditEvents] : [],
+      },
+      episodes: seasonResult.episodes,
+      resourceSnapshots: isLock ? bridged.resourceSnapshots : [],
+      decisions: isLock ? bridged.decisions : [],
+      transferAttempts: isLock ? bridged.transferAttempts : [],
+      notifications: isLock ? bridged.notifications : [],
+    });
+  }
+  return bridged;
+}
+
 export async function runMovieAcquisitionV2AndPersist(input: {
   title: MediaTitle;
   categoryParentId: string;
@@ -363,9 +448,11 @@ export async function runMovieAcquisitionV2AndPersist(input: {
   jevJudge?: JevJudge;
   /** See TvV2Common.agentMemory. */
   agentMemory?: boolean;
+  /** A replace_request run (user message): persisted under kind replace_request. */
+  userRequest?: RunMovieAcquisitionV2Request["userRequest"];
   /** See TvV2Common.now — finishedAt is stamped post-run from this clock. */
   now?: () => string;
-}): Promise<MovieWorkflowResult> {
+}): Promise<MovieAcquisitionV2Result> {
   const now = resolveNow(input);
   const result = await runMovieAcquisitionV2({
     title: input.title,
@@ -389,6 +476,7 @@ export async function runMovieAcquisitionV2AndPersist(input: {
     ...(input.storageProvider === undefined ? {} : { storageProvider: input.storageProvider }),
     ...(input.assrtToken === undefined ? {} : { assrtToken: input.assrtToken }),
     ...(input.jevJudge === undefined ? {} : { jevJudge: input.jevJudge }),
+    ...(input.userRequest === undefined ? {} : { userRequest: input.userRequest }),
     ...memoryOption(input),
   });
 
@@ -399,7 +487,7 @@ export async function runMovieAcquisitionV2AndPersist(input: {
     season: result.season,
     workflowRun: {
       id: input.workflowRun.id,
-      kind: "movie_init",
+      kind: input.userRequest ? "replace_request" : "movie_init",
       status: result.status,
       trackedSeasonId: result.season.id,
       startedAt: input.workflowRun.startedAt,

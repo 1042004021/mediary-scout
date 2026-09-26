@@ -230,13 +230,16 @@ function completedPillLabel(status: ActivityCompletedItem["status"]): string {
       return "获取失败";
     case "retrying":
       return "重试中…";
+    case "replaced":
+      return "已换源";
     default:
       return "已入库";
   }
 }
 
 function CompletedRow({ item }: { item: ActivityCompletedItem }) {
-  const ok = item.status === "complete" || item.status === "acquired" || item.status === "airing";
+  const ok =
+    item.status === "complete" || item.status === "acquired" || item.status === "airing" || item.status === "replaced";
   const failed = item.status === "failed";
   return (
     <div className="act-row act-row-done">

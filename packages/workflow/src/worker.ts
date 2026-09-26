@@ -57,7 +57,7 @@ async function maybeFreezeOnBrandAuthError(input: {
  * (when configured) so the 动漫 library shelf is a physically separate tree,
  * never intermixed with TV shows; everything else uses the default parent.
  */
-function storageParentForTitle(
+export function storageParentForTitle(
   title: { type: MediaType },
   storageParentDirectoryId: string | undefined,
   animeStorageParentDirectoryId: string | undefined,
@@ -73,7 +73,7 @@ function storageParentForTitle(
  * globally-passed deps. Per-account fields (115 storage + landing CIDs) win;
  * everything else falls through to the base. No resolver → base unchanged.
  */
-async function resolveWorkerDeps(
+export async function resolveWorkerDeps(
   resolve: ResolveAccountWorkerContext | undefined,
   accountId: string,
   connectedStorageId: string | null,
@@ -282,13 +282,16 @@ export async function handleWorkflowRunFailure(input: {
   //  - terminal failure: a failed Type 2 init intentionally clears its initial
   //    episode state so a fresh, never-acquired season doesn't linger as tracked
   //    (see worker.test "clears initial episode state when the agent model dies").
+  //    A replace_request is the exception: it runs on a library that already has
+  //    files, and a failed replace must leave that library exactly as it was.
+  const keepEpisodes = willRetry || claimed.workflowRun.kind === "replace_request";
   await repository.saveWorkflowRunSnapshot({
     accountId: claimed.accountId,
     connectedStorageId: claimed.connectedStorageId,
     title: claimed.title,
     season: claimed.season,
     workflowRun,
-    episodes: willRetry ? claimed.episodes : [],
+    episodes: keepEpisodes ? claimed.episodes : [],
     resourceSnapshots: willRetry ? claimed.resourceSnapshots : [],
     decisions: willRetry ? claimed.decisions : [],
     transferAttempts: willRetry ? claimed.transferAttempts : [],
@@ -877,7 +880,7 @@ function staleStartedBefore(
  * (Movies/TV/Anime); a missing parent is a misconfiguration, not a silent
  * account-root fallback (fail loud — see acquisition-hard-details).
  */
-function requireCategoryParent(parent: string | undefined): string {
+export function requireCategoryParent(parent: string | undefined): string {
   if (parent === undefined || parent === "") {
     throw new Error(
       "MEDIA_TRACK_CATEGORY_PARENT_REQUIRED: a library category parent (Movies/TV/Anime) is required for directory verify-or-create",
