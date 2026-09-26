@@ -116,19 +116,25 @@ function memoryOption(input: {
 
 /** Episodes of this work (on this drive) that hold an old + replacement copy on
  *  purpose — every run of it protects its existing files and says so to the agent,
- *  so a later keep-larger dedup cannot undo a replacement. */
+ *  so a later keep-larger dedup cannot undo a replacement. Best-effort: a failed read
+ *  is logged and the run goes ahead without the hint (it must never fail a patrol). */
 async function keptDuplicatesOption(input: {
   repository: WorkflowRepository;
   accountId?: string;
   connectedStorageId?: string | null;
   title: MediaTitle;
 }): Promise<{ keptDuplicates?: string[] }> {
-  const sources = await input.repository.listEpisodeSources({
-    accountId: input.accountId ?? DEFAULT_ACCOUNT_ID,
-    drive: userMessageDrive(input.connectedStorageId),
-    titleKey: input.title.id,
-  });
-  return sources.length > 0 ? { keptDuplicates: sources.map((s) => s.episode) } : {};
+  try {
+    const sources = await input.repository.listEpisodeSources({
+      accountId: input.accountId ?? DEFAULT_ACCOUNT_ID,
+      drive: userMessageDrive(input.connectedStorageId),
+      titleKey: input.title.id,
+    });
+    return sources.length > 0 ? { keptDuplicates: sources.map((s) => s.episode) } : {};
+  } catch (error) {
+    console.error(`[user-message] could not read episode sources of ${input.title.id}: ${String(error).slice(0, 300)}`);
+    return {};
+  }
 }
 
 /** The run's onProgress: live activity progress (for the activity page) AND the

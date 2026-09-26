@@ -919,6 +919,31 @@ describe("runScheduledType3Monitoring — user requests", () => {
     expect(plain.left).toEqual([]);
   });
 
+  it("a failing episode-source read does not fail the patrol run (the kept-duplicates hint is best-effort)", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    const { title, season } = trackedFixture();
+    // E02 is a real gap, so the patrol runs the agent (and would read episode sources).
+    await seedTrackedSeason({ repository, title, season, obtainedCodes: ["S01E01"] });
+    const storage = new FakeStorageExecutor();
+    await seedV2Season(storage, title, season, ["S01E01"]);
+    repository.listEpisodeSources = async () => {
+      throw new Error("episode_sources table missing");
+    };
+
+    const outcomes = await runScheduledType3Monitoring({
+      repository,
+      resourceProvider: emptyProvider(),
+      storage,
+      model: noCoverageModel(),
+      storageParentDirectoryId: "library_root",
+      now: fixedNow,
+      createWorkflowRunId: () => "run_sources_down",
+    });
+
+    expect(outcomes).toEqual([expect.objectContaining({ trackedSeasonId: season.id, status: "ran" })]);
+    expect((await repository.getWorkflowRunSnapshot("run_sources_down"))?.workflowRun.status).not.toBe("failed");
+  });
+
   it("only the work with a request is taken out of the sweep; another show is patrolled as before", async () => {
     const { repository, storage, season } = await completeShow();
     const other = trackedFixture("other");
