@@ -48,14 +48,14 @@ describe("TaskSandbox — replace", () => {
     await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
     const path13 = oldPaths.find((p) => p.includes("13"))!; // the pack may nest files in a wrapper dir
     expect(rejected).toEqual([{ episode: "S01E13", label: "Show - 13 [CR 1080p].mkv", sizeBytes: 1_400_000_000, reason: "发蓝", path: `Season 01/${path13}` }]);
-    expect(sandbox.needed()).toContain("S01E13");
+    expect((await sandbox.finish()).missing).toContain("S01E13");
     await expect(sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: ["nope"], reason: "x" })).rejects.toThrow(/NOT_IN_TARGET/);
   });
 
   it("rejectCurrentSource needs at least one current file, and refuses outside a replace run", async () => {
     const { sandbox } = await setup();
     await expect(sandbox.rejectCurrentSource({ episodes: ["S01E99"], fileIds: [], reason: "x" })).rejects.toThrow(/NO_FILES/);
-    expect(sandbox.needed()).not.toContain("S01E99");
+    expect((await sandbox.finish()).missing).not.toContain("S01E99");
     const plain = new TaskSandbox({ provider: new FakeResourceProviderV2() });
     expect(plain.hasReplace()).toBe(false);
     await expect(plain.rejectCurrentSource({ episodes: [], fileIds: ["x"], reason: "x" })).rejects.toThrow(/NO_REPLACE/);
@@ -72,7 +72,7 @@ describe("TaskSandbox — replace", () => {
         `SANDBOX_EPISODE_OUT_OF_SCOPE: ${bad}`,
       );
     }
-    expect(sandbox.needed()).toEqual([]);
+    expect((await sandbox.finish()).missing).toEqual([]);
   });
 
   it("rejectCurrentSource refuses a file that landed during this run (only pre-run files), without re-listing the season", async () => {
@@ -218,6 +218,28 @@ describe("TaskSandbox — replace", () => {
     await expect(
       sandbox.reportReplacement({ results: [{ episode: "S01E13", outcome: "replaced", candidateId: "cand_new13", note: "x" }] }),
     ).rejects.toThrow(/NO_TRANSFER/);
+  });
+
+  it("finish (the agent's tool) is refused while a requested or rejected episode is unreported; the summary stays readable", async () => {
+    const { sandbox, old24 } = await setup();
+    await sandbox.rejectCurrentSource({ episodes: ["S01E25"], fileIds: [old24], reason: "x" });
+    await expect(sandbox.declareFinish()).rejects.toThrow("SANDBOX_REPORT_REQUIRED: S01E13,S01E24,S01E25");
+    await sandbox.reportReplacement({ results: [{ episode: "S01E13", outcome: "not_found", note: "没有" }] });
+    await expect(sandbox.declareFinish()).rejects.toThrow("SANDBOX_REPORT_REQUIRED: S01E24,S01E25");
+    // The workflow's own end-of-run summary is never gated.
+    await expect(sandbox.finish()).resolves.toMatchObject({ coverageMet: false });
+    await sandbox.reportReplacement({
+      results: [
+        { episode: "S01E24", outcome: "not_found", note: "没有" },
+        { episode: "S01E25", outcome: "not_found", note: "没有" },
+      ],
+    });
+    await expect(sandbox.declareFinish()).resolves.toMatchObject({ coverageMet: false, missing: ["S01E25"] });
+  });
+
+  it("finish outside a replace run is the plain summary", async () => {
+    const sandbox = new TaskSandbox({ provider: new FakeResourceProviderV2(), need: ["S01E13"] });
+    await expect(sandbox.declareFinish()).resolves.toEqual(await sandbox.finish());
   });
 
   it("finalizeReplacement reports every requested episode the agent never reported as not_found", async () => {

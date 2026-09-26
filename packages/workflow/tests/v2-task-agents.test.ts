@@ -291,6 +291,8 @@ describe("run wiring", () => {
     };
     const req = { messages: [{ body: "13 发蓝", episodeTags: ["S01E13"], createdAt: "2026-09-26T06:00:00.000Z" }], rejected: [], pending: [] };
     expect(await userTurn(req, [])).toContain("(none — this run is for the USER REQUESTS in your instructions)");
+    expect(await userTurn(req, [])).toMatch(/call reportReplacement for every requested episode, then finish/);
+    expect(await userTurn(undefined, ["S01E14"])).not.toContain("reportReplacement");
     expect(await userTurn(req, ["S01E14"])).toContain("Missing episodes (the coverage need — may span multiple seasons): S01E14.");
     expect(await userTurn(undefined, ["S01E14"])).not.toContain("USER REQUESTS");
   });
@@ -315,7 +317,9 @@ describe("run wiring", () => {
       return prompt;
     };
     expect(await userTurn(true)).toMatch(/this run is for the USER REQUESTS in your instructions.*do not mark MOVIE until the new file is in place/);
+    expect(await userTurn(true)).toMatch(/call reportReplacement for MOVIE, then finish/);
     expect(await userTurn(false)).not.toContain("USER REQUESTS");
+    expect(await userTurn(false)).not.toContain("reportReplacement");
   });
 
   it("runMovieTaskAgent drives the loop with the MOVIE need", async () => {
@@ -458,6 +462,19 @@ describe("replace tools registration", () => {
     await expect(
       tools.reportReplacement!.execute({ results: [{ episode: "S01E13", outcome: "replaced", candidateId: "c", note: "" }] }, {}),
     ).resolves.toEqual({ error: "SANDBOX_REPLACEMENT_NOT_MARKED: S01E13" });
+  });
+
+  it("the finish tool of a replace run returns the report requirement as evidence, not a crash", async () => {
+    const sandbox = new TaskSandbox({
+      provider: new FakeResourceProviderV2(),
+      need: [],
+      targetSeasonDirectoryIds: { 1: "season" },
+      replace: { requestedEpisodes: ["S01E13"], onReject: async () => undefined, onReport: async () => undefined, isRejected: async () => false },
+    });
+    const tools = buildSandboxToolSet(sandbox) as Record<string, ExecutableTool>;
+    await expect(tools.finish!.execute({}, {})).resolves.toEqual({ error: expect.stringContaining("SANDBOX_REPORT_REQUIRED: S01E13") });
+    await tools.reportReplacement!.execute({ results: [{ episode: "S01E13", outcome: "not_found", note: "没有" }] }, {});
+    await expect(tools.finish!.execute({}, {})).resolves.toMatchObject({ coverageMet: false });
   });
 
   it("the activity page has 中文 lines for both tools", () => {

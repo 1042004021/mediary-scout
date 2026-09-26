@@ -358,7 +358,11 @@ export async function runTvAnimeTaskAgent(request: RunTvAnimeRequest): Promise<A
       : target.missingEpisodes.join(", ");
   const prompt = `Acquire the missing episodes for "${target.title}"${target.aliases.length ? ` (aliases: ${target.aliases.join(", ")})` : ""}, ${seasonsLabel}.
 Missing episodes (the coverage need — may span multiple seasons): ${missingLine}.
-If one pack covers multiple seasons, distribute its files in ONE plan with a move per season (moveToSeason({moves:[{season,fileIds}]})) and take only still-missing episodes — never recopy a season already present. Cover every missing episode with the fewest reliable transfers, keep each season directory clean, mark what truly landed, then finish.`;
+If one pack covers multiple seasons, distribute its files in ONE plan with a move per season (moveToSeason({moves:[{season,fileIds}]})) and take only still-missing episodes — never recopy a season already present. Cover every missing episode with the fewest reliable transfers, keep each season directory clean, mark what truly landed, then finish.${
+    promptOptions.userRequests
+      ? "\nUser requests: before you finish, call reportReplacement for every requested episode, then finish (finish is refused until they are all reported)."
+      : ""
+  }`;
   return runAcquisitionAgent({
     sandbox,
     model,
@@ -379,7 +383,7 @@ export async function runMovieTaskAgent(request: RunMovieRequest): Promise<Acqui
 This is the coverage need: the single MOVIE token. Cross-check title AND year so you do not grab a remake or same-IP different film.
 Find the one correct film, transfer it, keep the directory clean, mark it present, then finish.${
     promptOptions.userRequests
-      ? "\nThe film is already in the library: this run is for the USER REQUESTS in your instructions — land a DIFFERENT copy, and do not mark MOVIE until the new file is in place."
+      ? "\nThe film is already in the library: this run is for the USER REQUESTS in your instructions — land a DIFFERENT copy, and do not mark MOVIE until the new file is in place. Then call reportReplacement for MOVIE, then finish (finish is refused until it is reported)."
       : ""
   }`;
   return runAcquisitionAgent({

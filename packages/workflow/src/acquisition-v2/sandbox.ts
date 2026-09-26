@@ -934,8 +934,32 @@ export class TaskSandbox {
     return { movie: await this.storage.listTree({ directoryId: root }) };
   }
 
-  /** The agent declares it is done. Returns the honest coverage picture from the
-   *  obtained marks — the workflow decides what to persist. */
+  /** The agent's `finish` tool. On a replace run it is refused while an episode the
+   *  user asked about (or the agent rejected) has no reportReplacement yet: the error
+   *  goes back to the agent and the loop continues (the step cap and the recovery
+   *  turn still end it; finalizeReplacement then records the rest as not_found). */
+  async declareFinish(): Promise<Awaited<ReturnType<TaskSandbox["finish"]>>> {
+    if (this.replace) {
+      const unreported = this.unreportedReplaceEpisodes();
+      if (unreported.length > 0) {
+        throw new Error(
+          `SANDBOX_REPORT_REQUIRED: ${unreported.join(",")} — call reportReplacement for these (replaced with the candidateId that landed, or not_found with a note), then finish`,
+        );
+      }
+    }
+    return this.finish();
+  }
+
+  /** Requested or rejected episodes with no reportReplacement yet, in request order. */
+  private unreportedReplaceEpisodes(): string[] {
+    if (!this.replace) return [];
+    return [...new Set([...this.replace.requestedEpisodes, ...this.rejectedEpisodes])].filter(
+      (e) => !this.reportedEpisodes.has(e),
+    );
+  }
+
+  /** The honest coverage picture from the obtained marks — the workflow decides what
+   *  to persist. Also the loop's own end-of-run summary, so never gated. */
   async finish(): Promise<{ coverageMet: boolean; obtained: string[]; missing: string[]; subtitleFallback: boolean }> {
     // Report the agent's marks beyond just need∩marked — a coherent full pack
     // often delivers episodes BEYOND the aired cursor (the need), and those
@@ -1045,11 +1069,6 @@ export class TaskSandbox {
    *  registered only when it does). */
   hasReplace(): boolean {
     return this.replace !== undefined;
-  }
-
-  /** The current coverage need (read-only copy). */
-  needed(): string[] {
-    return [...this.need];
   }
 
   /** Called once before the agent starts: every file already in a target dir is the
@@ -1186,9 +1205,7 @@ export class TaskSandbox {
    *  patrols keep looking. */
   async finalizeReplacement(): Promise<void> {
     if (!this.replace) return;
-    const left = [...new Set([...this.replace.requestedEpisodes, ...this.rejectedEpisodes])].filter(
-      (e) => !this.reportedEpisodes.has(e),
-    );
+    const left = this.unreportedReplaceEpisodes();
     for (const e of left) this.reportedEpisodes.set(e, "not_found");
     if (left.length > 0) await this.replace.onReport(left.map((episode) => ({ episode, outcome: "not_found", note: "" })));
   }

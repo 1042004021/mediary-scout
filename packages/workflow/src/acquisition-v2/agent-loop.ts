@@ -206,9 +206,9 @@ export function buildSandboxToolSet(
     },
     finish: {
       description:
-        "Declare the task done. Returns the honest coverage summary (what is obtained, what remains). TERMINAL: a successful finish ENDS the task immediately — do all clean-up BEFORE calling it, and never call it twice.",
+        "Declare the task done. Returns the honest coverage summary (what is obtained, what remains). TERMINAL: a successful finish ENDS the task immediately — do all clean-up BEFORE calling it, and never call it twice. User request run: refused until every requested episode has a reportReplacement.",
       inputSchema: z.object({}),
-      execute: () => asEvidence(() => sandbox.finish()),
+      execute: () => asEvidence(() => sandbox.declareFinish()),
     },
     reportNoCoverage: {
       description:
@@ -226,6 +226,7 @@ export function buildSandboxToolSet(
     };
   }
   // User replace request: registered only when the run carries one (like memory below).
+  // `?.` like hasMemory below: partial test doubles typed as TaskSandbox build a tool set too.
   if (sandbox.hasReplace?.()) {
     tools["rejectCurrentSource"] = {
       description:
@@ -418,7 +419,7 @@ export async function runAcquisitionAgent(
       ]);
       if (!request.movie) recoveryToolNames.add("discardStaging");
       // A user request run must still be able to report its per-episode outcome.
-      if (request.sandbox.hasReplace?.()) recoveryToolNames.add("reportReplacement");
+      if (request.sandbox.hasReplace()) recoveryToolNames.add("reportReplacement");
       const recoveryTools = Object.fromEntries(
         Object.entries(tools).filter(([name]) => recoveryToolNames.has(name)),
       ) as ToolSet;
