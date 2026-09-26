@@ -6,6 +6,7 @@ import type {
   AuditEvent,
   EpisodeState,
   MediaTitle,
+  NotificationEvent,
   TrackedSeason,
   WorkflowKind,
   WorkflowRunMetadata,
@@ -19,6 +20,7 @@ import type { JevJudge } from "./jev-judge.js";
 import type { ResourceProvider, StorageExecutor } from "./ports.js";
 import type { WorkflowRepository } from "./repository.js";
 import { userMessageDrive } from "./user-requests.js";
+import { stampReplaceNotification } from "./notification-report.js";
 
 /**
  * Phase 7d — production persist wrappers on the V2 engine. These mirror the old
@@ -378,6 +380,8 @@ export async function runReplaceRequestV2AndPersist(
     lockAuditEvents: AuditEvent[];
     // Declared, not spread: see the ⚠ above passthrough.
     userRequest: NonNullable<RunTvAcquisitionV2Request["userRequest"]>;
+    /** How the replacement notification is pushed (see stampReplaceNotification). */
+    notice?: ReplaceNotice;
   },
 ): Promise<BridgedV2Result> {
   const now = resolveNow(input);
@@ -439,10 +443,17 @@ export async function runReplaceRequestV2AndPersist(
       resourceSnapshots: isLock ? bridged.resourceSnapshots : [],
       decisions: isLock ? bridged.decisions : [],
       transferAttempts: isLock ? bridged.transferAttempts : [],
-      notifications: isLock ? bridged.notifications : [],
+      notifications: isLock ? stampNotifications(bridged.notifications, input.notice) : [],
     });
   }
   return bridged;
+}
+
+/** See stampReplaceNotification. */
+export type ReplaceNotice = Parameters<typeof stampReplaceNotification>[1];
+
+function stampNotifications<T extends NotificationEvent>(notifications: T[], notice: ReplaceNotice | undefined): NotificationEvent[] {
+  return notice ? notifications.map((n) => stampReplaceNotification(n, notice)) : notifications;
 }
 
 export async function runMovieAcquisitionV2AndPersist(input: {
@@ -474,6 +485,8 @@ export async function runMovieAcquisitionV2AndPersist(input: {
   userRequest?: RunMovieAcquisitionV2Request["userRequest"];
   /** Replace runs: whether the film was obtained before (see RunMovieAcquisitionV2Request). */
   priorObtained?: boolean;
+  /** Replace runs: how the notification is pushed (see stampReplaceNotification). */
+  notice?: ReplaceNotice;
   /** See TvV2Common.now — finishedAt is stamped post-run from this clock. */
   now?: () => string;
 }): Promise<MovieAcquisitionV2Result> {
@@ -524,7 +537,7 @@ export async function runMovieAcquisitionV2AndPersist(input: {
     resourceSnapshots: result.resourceSnapshots,
     decisions: result.decisions,
     transferAttempts: result.transferAttempts,
-    notifications: result.notifications,
+    notifications: stampNotifications(result.notifications, input.notice),
   });
   return result;
 }

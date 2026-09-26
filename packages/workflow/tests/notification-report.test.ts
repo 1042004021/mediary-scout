@@ -10,6 +10,8 @@ import {
   formatDailyDigestPushText,
   formatReportPushText,
   landedSize,
+  scheduledDigestItems,
+  stampReplaceNotification,
   type EpisodeState,
   type NotificationEvent,
   type NotificationReportStatus,
@@ -453,5 +455,54 @@ describe("buildReplacementReport — a user-requested replace run", () => {
       transferBlockReason: "云下载配额不足",
     });
     expect(report).toMatchObject({ status: "failed", lines: ["转存失败:云下载配额不足"] });
+  });
+});
+
+describe("stampReplaceNotification — who queued the replace run decides how it is pushed", () => {
+  const base = (status: NotificationReportStatus, kind = "replacement_done"): NotificationEvent => ({
+    id: "n1",
+    workflowRunId: "run_1",
+    kind,
+    title: "Show",
+    body: "x",
+    createdAt: "2026-09-26T08:00:00.000Z",
+    trigger: "user",
+    report: { titleName: "Show", seasonLabel: null, status, lines: ["x"], newlyObtained: [], realMissing: [] },
+  });
+
+  it("a patrol-queued run joins the scheduled digest; a user-queued one stays individual", () => {
+    expect(stampReplaceNotification(base("replaced"), { trigger: "scheduled", routineIfNothingReplaced: false })).toMatchObject({ trigger: "scheduled", kind: "replacement_done" });
+    expect(stampReplaceNotification(base("replaced"), { trigger: "user", routineIfNothingReplaced: false })).toMatchObject({ trigger: "user", kind: "replacement_done" });
+  });
+
+  it("a pending-only run that replaced nothing is routine (already_current); a failure or a replacement never is", () => {
+    const notice = { trigger: "scheduled" as const, routineIfNothingReplaced: true };
+    expect(stampReplaceNotification(base("no_coverage"), notice).kind).toBe("already_current");
+    expect(stampReplaceNotification(base("replaced"), notice).kind).toBe("replacement_done");
+    expect(stampReplaceNotification(base("failed", "transfer_failed"), notice).kind).toBe("transfer_failed");
+    expect(stampReplaceNotification(base("no_coverage"), { ...notice, routineIfNothingReplaced: false }).kind).toBe("replacement_done");
+  });
+});
+
+describe("scheduledDigestItems", () => {
+  const n = (kind: string, trigger: "user" | "scheduled"): NotificationEvent => ({
+    id: `${kind}_${trigger}`,
+    workflowRunId: "r",
+    kind,
+    title: "t",
+    body: "b",
+    createdAt: "2026-09-26T08:00:00.000Z",
+    trigger,
+  });
+
+  it("the sweep digest goes out even when nothing changed", () => {
+    expect(scheduledDigestItems([n("already_current", "scheduled")], { skipIfOnlyRoutine: false })).toHaveLength(1);
+  });
+
+  it("a queue drain skips a digest that would only say nothing changed", () => {
+    expect(scheduledDigestItems([n("already_current", "scheduled"), n("replacement_done", "user")], { skipIfOnlyRoutine: true })).toEqual([]);
+    expect(
+      scheduledDigestItems([n("already_current", "scheduled"), n("replacement_done", "scheduled")], { skipIfOnlyRoutine: true }).map((x) => x.kind),
+    ).toEqual(["already_current", "replacement_done"]);
   });
 });

@@ -5,6 +5,7 @@ import type {
   NotificationEvent,
   NotificationReport,
   NotificationReportStatus,
+  NotificationTrigger,
   TrackedSeason,
 } from "./domain.js";
 
@@ -307,6 +308,38 @@ export function buildReplacementReport(input: {
   let line = `换好 ${replaced.length} 集（${label(replaced)}）`;
   if (pending.length > 0) line += `，${pending.length} 集还在找（${label(pending)}）`;
   return { ...base, status: "replaced", lines: [line] };
+}
+
+/**
+ * How a replace run's notification is pushed, set by who queued it. A run the
+ * patrol queued reports into the daily digest (`scheduled`) instead of pushing on
+ * its own every sweep; one the user asked for (现在处理, the urgent scan) stays
+ * `user`. A patrol re-check of 待换 episodes with no new message that replaced
+ * nothing is routine (`already_current`): the notification page folds it into the
+ * 例行巡检 card and the digest lists it under 其余已是最新. Failures and actual
+ * replacements are never downgraded.
+ */
+export function stampReplaceNotification(
+  notification: NotificationEvent,
+  notice: { trigger: NotificationTrigger; routineIfNothingReplaced: boolean },
+): NotificationEvent {
+  const routine = notice.routineIfNothingReplaced && notification.report?.status === "no_coverage";
+  return { ...notification, trigger: notice.trigger, ...(routine ? { kind: "already_current" } : {}) };
+}
+
+/**
+ * The scheduled notifications that make up one digest push. The sweep always
+ * sends its digest (even "本次巡检无更新"). A queue drain runs patrol-queued replace
+ * runs one by one after the sweep: a digest there that would only say "nothing
+ * changed" is skipped, else every such run would push a lone 每日巡检.
+ */
+export function scheduledDigestItems(
+  notifications: NotificationEvent[],
+  opts: { skipIfOnlyRoutine: boolean },
+): NotificationEvent[] {
+  const scheduled = notifications.filter((notification) => notification.trigger === "scheduled");
+  if (opts.skipIfOnlyRoutine && scheduled.every((notification) => notification.kind === "already_current")) return [];
+  return scheduled;
 }
 
 /** Title metadata for richer pushes (poster image + tap-through link). */

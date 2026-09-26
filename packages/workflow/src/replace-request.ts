@@ -1,6 +1,6 @@
 import type { LanguageModel } from "ai";
 import type { TrackedSeasonState, WorkflowRepository } from "./repository.js";
-import type { EpisodeState, TrackedSeason } from "./domain.js";
+import type { AuditEvent, EpisodeState, TrackedSeason } from "./domain.js";
 import { syncSeasonAgainstMetadata } from "./season-sync.js";
 import type { ResourceProvider, StorageExecutor } from "./ports.js";
 import type { JevJudge } from "./jev-judge.js";
@@ -258,6 +258,12 @@ export async function runQueuedReplaceRequest(
       },
     };
 
+    // A patrol-queued run reports into the daily digest; a 待换 re-check with no new
+    // message that replaced nothing is routine (see stampReplaceNotification).
+    const notice = {
+      trigger: queuedBy(claimed.workflowRun.auditEvents) === "patrol" ? ("scheduled" as const) : ("user" as const),
+      routineIfNothingReplaced: messages.length === 0,
+    };
     const deps = await resolveWorkerDeps(input.resolveAccountContext, claimed.accountId, claimed.connectedStorageId, input);
     const common = {
       resourceProvider: deps.resourceProvider,
@@ -269,6 +275,7 @@ export async function runQueuedReplaceRequest(
       ...optionalDeps(deps),
       workflowRun: { id: runId, startedAt: claimed.workflowRun.startedAt, finishedAt: null },
       userRequest,
+      notice,
       now,
     };
 
@@ -434,6 +441,12 @@ async function syncedSeasons(
     out.push(entry);
   }
   return out;
+}
+
+/** Who queued the run (the queued audit event's origin); "user" when unknown. */
+function queuedBy(events: AuditEvent[]): ReplaceRequestOrigin {
+  const origin = events.find((e) => e.type === "replace_request_queued")?.data?.["origin"];
+  return origin === "patrol" ? "patrol" : "user";
 }
 
 /** The message that named this episode, else the oldest one claimed. */

@@ -693,6 +693,62 @@ describe("runQueuedReplaceRequest — scope, metadata and bookkeeping", () => {
   });
 });
 
+describe("replace_request notifications — patrol vs user", () => {
+  const SCOPE = { accountId: "acct_1", connectedStorageId: DRIVE };
+
+  it("a patrol-queued run with a message reports into the scheduled digest", async () => {
+    const { repository, title, season } = await trackedShow();
+    const storage = new FakeStorageExecutor();
+    await seedV2Season(storage, title, season, ["S01E01", "S01E02"]);
+    await repository.createUserMessage({ ...WORK, body: "换第 1 集", episodeTags: ["S01E01"], now: NOW });
+    await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => "run_rr_p1", origin: "patrol" });
+
+    await runQueuedReplaceRequest(baseRun(repository, storage, reportingModel(["S01E01"])));
+
+    const run = await repository.getWorkflowRunSnapshot("run_rr_p1", SCOPE);
+    expect(run?.notifications.map((n) => [n.kind, n.trigger])).toEqual([["replacement_done", "scheduled"]]);
+  });
+
+  it("a patrol-queued run for 待换 episodes only that replaced nothing is routine (no push of its own)", async () => {
+    const { repository, title, season } = await trackedShow();
+    const storage = new FakeStorageExecutor();
+    await seedV2Season(storage, title, season, ["S01E01", "S01E02"]);
+    await repository.addPendingReplacements({ ...WORK, episodes: ["S01E02"], messageId: "msg_old", now: NOW });
+    await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => "run_rr_p2", origin: "patrol" });
+
+    await runQueuedReplaceRequest(baseRun(repository, storage, reportingModel(["S01E02"])));
+
+    const run = await repository.getWorkflowRunSnapshot("run_rr_p2", SCOPE);
+    expect(run?.notifications.map((n) => [n.kind, n.trigger])).toEqual([["already_current", "scheduled"]]);
+  });
+
+  it("a movie queued by the patrol for its 待换 film, nothing replaced: routine too", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    const title: MediaTitle = { id: "tmdb_movie_6", tmdbId: 6, type: "movie", title: "Film", originalTitle: "Film", year: 2010, aliases: [] };
+    const season = movieAnchorSeason({ titleId: title.id, qualityPreference: "4K", storageDirectoryId: "dir_movie" });
+    await repository.saveWorkflowRunSnapshot({
+      accountId: "acct_1",
+      connectedStorageId: DRIVE,
+      title,
+      season,
+      workflowRun: { id: "seed_movie6", kind: "movie_init", status: "succeeded", trackedSeasonId: season.id, startedAt: "2026-09-01T00:00:00.000Z", finishedAt: "2026-09-01T00:00:00.000Z", auditEvents: [] },
+      episodes: createEpisodeStates({ trackedSeasonId: season.id, seasonNumber: 1, totalEpisodes: 1, latestAiredEpisode: 1 }).map((e) => ({ ...e, obtained: true })),
+      resourceSnapshots: [],
+      decisions: [],
+      transferAttempts: [],
+      notifications: [],
+    });
+    const work = { accountId: "acct_1", drive: DRIVE, titleKey: title.id };
+    await repository.addPendingReplacements({ ...work, episodes: ["MOVIE"], messageId: "msg_old", now: NOW });
+    await queueReplaceRequest({ repository, work, now: fixedNow, createWorkflowRunId: () => "run_rr_m6", origin: "patrol" });
+
+    await runQueuedReplaceRequest(baseRun(repository, new FakeStorageExecutor(), reportingModel(["MOVIE"])));
+
+    const run = await repository.getWorkflowRunSnapshot("run_rr_m6", SCOPE);
+    expect(run?.notifications.map((n) => [n.kind, n.trigger])).toEqual([["already_current", "scheduled"]]);
+  });
+});
+
 describe("replace_request crash recovery", () => {
   const SCOPE = { accountId: "acct_1", connectedStorageId: DRIVE };
 

@@ -28,6 +28,7 @@ import {
   createStubAcquisitionModel,
   llmConfigError,
   formatDailyDigestPushText,
+  scheduledDigestItems,
   getTrackedSeasonStatusView,
   importForeignWorkAsMovie,
   assertWorkflowAgentAdapterPolicy,
@@ -1493,6 +1494,9 @@ export async function reserveCandidate(
 async function pushNotificationsSince(
   targetRepository: WorkflowRepository,
   sinceIso: string,
+  /** The sweep always sends its digest; a queue drain (a patrol-queued replace run)
+   *  skips one that would only say nothing changed (see scheduledDigestItems). */
+  opts: { sweep?: boolean } = {},
 ): Promise<void> {
   try {
     // Cross-account: the drain/sweep may have completed runs for several accounts.
@@ -1528,7 +1532,7 @@ async function pushNotificationsSince(
       const notifications = entries.map((entry) => entry.notification);
       // A scheduled sweep touches many shows; collapse this account's into ONE
       // digest. User-triggered events stay per-resource — each its own message.
-      const scheduled = notifications.filter((notification) => notification.trigger === "scheduled");
+      const scheduled = scheduledDigestItems(notifications, { skipIfOnlyRoutine: opts.sweep !== true });
       const individual = notifications.filter((notification) => notification.trigger !== "scheduled");
 
       for (const notification of individual) {
@@ -1779,7 +1783,7 @@ export async function runScheduledType3(options?: {
       ...(sync ? { syncSeasonMetadata: sync } : {}),
     });
     await repository.setSetting(LAST_SWEEP_COMPLETED_AT_SETTING_KEY, new Date().toISOString());
-    await pushNotificationsSince(repository, startedAt);
+    await pushNotificationsSince(repository, startedAt, { sweep: true });
     return { outcomes: result };
   } catch (error) {
     // The sweep failed before completing — release THIS call's claims (keep the
