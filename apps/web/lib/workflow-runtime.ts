@@ -1061,6 +1061,8 @@ export async function runNextQueuedWorkflow() {
     moviesParentDirectoryId: parents.movies,
     resolveAccountContext,
     onAuthErrorFreeze,
+    // A work with 待换 episodes skips the patrol, where TMDB sync normally happens.
+    ...syncOption(),
   });
   if (replace.status !== "idle") {
     await pushNotificationsSince(repository, startedAt);
@@ -1804,6 +1806,11 @@ export async function runScheduledType3(options?: {
  * after tracking began. Returns undefined when TMDB isn't configured, leaving
  * the sweep on stored counts.
  */
+function syncOption(): { syncSeasonMetadata?: SeasonMetadataSync } {
+  const sync = tmdbSeasonMetadataSync();
+  return sync ? { syncSeasonMetadata: sync } : {};
+}
+
 function tmdbSeasonMetadataSync(): SeasonMetadataSync | undefined {
   if (process.env.MEDIA_TRACK_SEARCH_PROVIDER !== "tmdb") {
     return undefined;

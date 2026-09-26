@@ -450,6 +450,8 @@ export async function runMovieAcquisitionV2AndPersist(input: {
   agentMemory?: boolean;
   /** A replace_request run (user message): persisted under kind replace_request. */
   userRequest?: RunMovieAcquisitionV2Request["userRequest"];
+  /** Replace runs: whether the film was obtained before (see RunMovieAcquisitionV2Request). */
+  priorObtained?: boolean;
   /** See TvV2Common.now — finishedAt is stamped post-run from this clock. */
   now?: () => string;
 }): Promise<MovieAcquisitionV2Result> {
@@ -477,6 +479,7 @@ export async function runMovieAcquisitionV2AndPersist(input: {
     ...(input.assrtToken === undefined ? {} : { assrtToken: input.assrtToken }),
     ...(input.jevJudge === undefined ? {} : { jevJudge: input.jevJudge }),
     ...(input.userRequest === undefined ? {} : { userRequest: input.userRequest }),
+    ...(input.priorObtained === undefined ? {} : { priorObtained: input.priorObtained }),
     ...memoryOption(input),
   });
 

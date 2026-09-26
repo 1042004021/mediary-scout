@@ -1,10 +1,14 @@
 import type { LanguageModel } from "ai";
 import type { TrackedSeasonState, WorkflowRepository } from "./repository.js";
+import type { EpisodeState, TrackedSeason } from "./domain.js";
+import { syncSeasonAgainstMetadata } from "./season-sync.js";
 import type { ResourceProvider, StorageExecutor } from "./ports.js";
 import type { JevJudge } from "./jev-judge.js";
 import type { RunAcquisitionV2Request, RunAcquisitionV2Result } from "./acquisition-v2/orchestrator.js";
 import {
+  parseSizeFromTitle,
   userMessageDrive,
+  type EpisodeSource,
   type ReplacementResult,
   type UserMessage,
   type UserMessageReply,
@@ -20,6 +24,7 @@ import {
   type AccountWorkerContext,
   type QueuedType2WorkerResult,
   type ResolveAccountWorkerContext,
+  type SeasonMetadataSync,
 } from "./worker.js";
 
 /**
@@ -32,11 +37,13 @@ import {
 
 /** The tracked states of ONE work on ONE drive (all seasons, or the movie anchor). */
 async function workStates(repository: WorkflowRepository, work: UserMessageScope): Promise<TrackedSeasonState[]> {
-  const all = await repository.listAllTrackedSeasonStates();
-  return all
-    .filter(
-      (s) => s.accountId === work.accountId && userMessageDrive(s.connectedStorageId) === work.drive && s.title.id === work.titleKey,
-    )
+  // A null storage scope is account-wide, so the exact-drive filter stays.
+  const states = await repository.listTrackedSeasonStates({
+    accountId: work.accountId,
+    connectedStorageId: work.drive === "" ? null : work.drive,
+  });
+  return states
+    .filter((s) => userMessageDrive(s.connectedStorageId) === work.drive && s.title.id === work.titleKey)
     .sort((a, b) => a.season.seasonNumber - b.season.seasonNumber);
 }
 
@@ -114,9 +121,9 @@ export async function enqueueUrgentReplaceRequests(input: {
   for (const work of await input.repository.listWorksWithPendingMessages({ urgentOnly: true })) {
     // A run that failed for good released its messages as urgent. Re-queueing it on
     // every idle tick would retry a broken setup (dead LLM key, missing library dir)
-    // every few seconds, each with a failure push. After such a failure only a user
-    // action (现在处理, a new or edited message) brings it back here; the patrol
-    // still retries it on its own schedule.
+    // every few seconds, each with a failure push. After such a failure only 现在处理
+    // or editing one of its messages (both touch an urgent message) brings it back
+    // here — a new message is not urgent. The patrol still retries it on its own schedule.
     if (await failedSinceLastTouch(input.repository, work)) continue;
     const result = await queueReplaceRequest({ repository: input.repository, work, ...(input.now ? { now: input.now } : {}) });
     if (result.status === "queued") n += 1;
@@ -128,13 +135,16 @@ async function failedSinceLastTouch(repository: WorkflowRepository, work: UserMe
   const urgent = (await repository.listUserMessages(work)).filter((m) => m.status === "pending" && m.urgent);
   const lastTouch = urgent.map((m) => m.updatedAt).sort().at(-1);
   if (lastTouch === undefined) return false;
+  // A null storage scope is account-wide: the run's own drive must match exactly, or a
+  // failure of the same title on another drive would hold back the unbound work.
   const scope = { accountId: work.accountId, connectedStorageId: work.drive === "" ? null : work.drive };
   const notifications = await repository.listNotifications({ ...scope, since: lastTouch, limit: 500 });
   for (const notification of notifications) {
     // handleWorkflowRunFailure stamps the failure notification with the run's kind.
     if (notification.kind !== "replace_request") continue;
     const run = await repository.getWorkflowRunSnapshot(notification.workflowRunId, scope);
-    if (run?.title.id === work.titleKey && run.workflowRun.status === "failed") return true;
+    if (!run || userMessageDrive(run.connectedStorageId) !== work.drive) continue;
+    if (run.title.id === work.titleKey && run.workflowRun.status === "failed") return true;
   }
   return false;
 }
@@ -149,6 +159,9 @@ export async function runQueuedReplaceRequest(
     model: LanguageModel;
     storageParentDirectoryId: string;
     moviesParentDirectoryId: string;
+    /** TMDB refresh of aired/total counts. A work with 待换 episodes is skipped by
+     *  the patrol, where the sync normally happens — so this run does it instead. */
+    syncSeasonMetadata?: SeasonMetadataSync;
     now?: () => string;
     resolveAccountContext?: ResolveAccountWorkerContext;
     onAuthErrorFreeze?: (storageId: string, reason: string) => Promise<void>;
@@ -166,15 +179,28 @@ export async function runQueuedReplaceRequest(
   };
 
   let messages: UserMessage[] = [];
+  let pendingRows: Awaited<ReturnType<WorkflowRepository["listPendingReplacements"]>> = [];
+  let sources: EpisodeSource[] = [];
+  let replacement: RunAcquisitionV2Result["replacement"];
+  let workflowStatus: WorkflowStatus;
   try {
     messages = await repository.claimUserMessages({ ...work, runId, now: now() });
-    const pendingRows = await repository.listPendingReplacements(work);
-    const pending = pendingRows.map((p) => p.episode);
     const states = await workStates(repository, work);
     if (!states.some((s) => s.season.id === claimed.season.id)) {
       throw new Error(`REPLACE_REQUEST_NOT_TRACKED: ${work.titleKey} is no longer tracked on this drive`);
     }
     const lockState = states.find((s) => s.season.id === claimed.season.id)!;
+    const movie = claimed.title.type === "movie";
+
+    // Only episodes of the seasons tracked here can be replaced (movie: the film). An
+    // old tag or a 待换 row of a season untracked since would only be refused by the
+    // sandbox; the stale 待换 rows are dropped for good.
+    const inScope = episodeScope(movie, states);
+    const allPending = await repository.listPendingReplacements(work);
+    pendingRows = allPending.filter((p) => inScope(p.episode));
+    const stale = allPending.filter((p) => !inScope(p.episode)).map((p) => p.episode);
+    if (stale.length > 0) await repository.removePendingReplacements({ ...work, episodes: stale });
+    const pending = pendingRows.map((p) => p.episode);
 
     if (messages.length === 0 && pending.length === 0) {
       // Everything was withdrawn (or already replaced) before the run started.
@@ -198,15 +224,14 @@ export async function runQueuedReplaceRequest(
       return { status: "ran", workflowRunId: runId, workflowStatus: "succeeded" };
     }
 
-    const movie = claimed.title.type === "movie";
-    const requested = [...new Set([...messages.flatMap((m) => m.episodeTags), ...pending])];
+    const requested = [...new Set([...messages.flatMap((m) => m.episodeTags), ...pending])].filter(inScope);
     const requestedEpisodes = movie && requested.length === 0 ? ["MOVIE"] : requested;
     const rejected = await repository.listRejectedResources({ accountId: work.accountId, titleKey: work.titleKey });
-    const sources = await repository.listEpisodeSources(work);
+    sources = await repository.listEpisodeSources(work);
     const userRequest: UserRequest = {
       requestedEpisodes,
       prompt: {
-        messages: messages.map((m) => ({ body: m.body, episodeTags: m.episodeTags, createdAt: m.createdAt })),
+        messages: messages.map((m) => ({ body: m.body, episodeTags: m.episodeTags.filter(inScope), createdAt: m.createdAt })),
         rejected: rejected.map((r) => ({ episode: r.episode, label: r.label, sizeBytes: r.sizeBytes, reason: r.reason })),
         pending,
       },
@@ -247,76 +272,31 @@ export async function runQueuedReplaceRequest(
       now,
     };
 
-    let replacement: RunAcquisitionV2Result["replacement"];
-    let workflowStatus: WorkflowStatus;
     if (movie) {
       const result = await runMovieAcquisitionV2AndPersist({
         ...common,
         title: claimed.title,
         categoryParentId: requireCategoryParent(deps.moviesParentDirectoryId ?? input.moviesParentDirectoryId),
+        // The film stays obtained only if it was: the old file is still there.
+        priorObtained: lockState.episodes.some((e) => e.obtained),
       });
       replacement = result.replacement;
       workflowStatus = result.status;
     } else {
+      const seasons = await syncedSeasons(states, claimed.title.tmdbId, input.syncSeasonMetadata);
       const result = await runReplaceRequestV2AndPersist({
         ...common,
         title: claimed.title,
         categoryParentId: requireCategoryParent(
           storageParentForTitle(claimed.title, deps.storageParentDirectoryId, deps.animeStorageParentDirectoryId),
         ),
-        seasons: states.map((s) => ({ season: s.season, episodes: s.episodes })),
+        seasons,
         lockSeasonNumber: lockState.season.seasonNumber,
         lockAuditEvents: claimed.workflowRun.auditEvents,
       });
       replacement = result.replacement;
       workflowStatus = result.status;
     }
-
-    // Bookkeeping: 待换 records, episode sources, and the reply on the messages.
-    const results = replacement?.results ?? [];
-    const replaced = results.filter((r) => r.outcome === "replaced");
-    const notFound = results.filter((r) => r.outcome === "not_found").map((r) => r.episode);
-    if (replaced.length > 0) {
-      await repository.removePendingReplacements({ ...work, episodes: replaced.map((r) => r.episode) });
-    }
-    for (const r of replaced) {
-      await repository.upsertEpisodeSource({
-        ...work,
-        episode: r.episode,
-        linkKey: r.linkKey ?? null,
-        label: r.label ?? "",
-        sizeBytes: null,
-        runId,
-        recordedAt: now(),
-      });
-    }
-    // Keep a still-pending episode on the message that first asked for it.
-    const byMessage = new Map<string, string[]>();
-    for (const episode of notFound) {
-      const messageId =
-        pendingRows.find((p) => p.episode === episode)?.messageId ?? messageFor(messages, episode)?.id ?? pendingRows[0]?.messageId;
-      if (messageId === undefined) continue;
-      byMessage.set(messageId, [...(byMessage.get(messageId) ?? []), episode]);
-    }
-    for (const [messageId, episodes] of byMessage) {
-      await repository.addPendingReplacements({ ...work, episodes, messageId, now: now() });
-    }
-    if (messages.length > 0) {
-      const reply: UserMessageReply = {
-        results: results.map((r): ReplacementResult => ({
-          episode: r.episode,
-          outcome: r.outcome,
-          // Only a replaced episode names a resource.
-          ...(r.outcome === "replaced" && r.label !== undefined ? { label: r.label } : {}),
-          note: r.note,
-        })),
-        oldFiles: replacement?.oldFiles ?? [],
-        runId,
-        ...(replacement?.rejectedPersistFailed ? { rejectedNotSaved: true } : {}),
-      };
-      await repository.finishUserMessages({ runId, reply, now: now() });
-    }
-    return { status: "ran", workflowRunId: runId, workflowStatus };
   } catch (error) {
     // Messages go back to pending (urgent) for a retry; the library stays as it was.
     try {
@@ -324,10 +304,20 @@ export async function runQueuedReplaceRequest(
     } catch (releaseError) {
       console.error(`[user-message] run ${runId} could not release its messages: ${String(releaseError)}`);
     }
-    const lockState = (await workStates(repository, work).catch(() => [])).find((s) => s.season.id === claimed.season.id);
+    // The failure record keeps the lock season's CURRENT episodes, not the queue-time
+    // copy; none at all when the work is no longer tracked here. Only when the read
+    // itself fails does the queue-time copy stand in (never wipe a real library).
+    const current = await workStates(repository, work).then(
+      (states) => states.find((s) => s.season.id === claimed.season.id) ?? null,
+      () => undefined,
+    );
     const handled = await handleWorkflowRunFailure({
-      // The failure record keeps the lock season's CURRENT episodes, not the queue-time copy.
-      claimed: lockState ? { ...claimed, season: lockState.season, episodes: lockState.episodes } : claimed,
+      claimed:
+        current === undefined
+          ? claimed
+          : current === null
+            ? { ...claimed, episodes: [] }
+            : { ...claimed, season: current.season, episodes: current.episodes },
       error,
       repository,
       now,
@@ -337,6 +327,113 @@ export async function runQueuedReplaceRequest(
       ? { status: "ran", workflowRunId: handled.workflowRunId, workflowStatus: "queued" }
       : { status: "failed", workflowRunId: handled.workflowRunId, errorMessage: handled.errorMessage };
   }
+
+  // The run itself succeeded and is saved. What follows is bookkeeping: a failure
+  // here is logged, never turned into a failed run, and the messages still get
+  // their reply (a message left in processing is released by the idle scan).
+  const results = (replacement?.results ?? []).map((r) => ({ ...r, sizeBytes: r.label ? parseSizeFromTitle(r.label) : null }));
+  try {
+    await recordReplacementOutcome({ repository, work, runId, results, messages, pendingRows, now });
+  } catch (error) {
+    console.error(`[user-message] run ${runId} bookkeeping failed (the run itself succeeded): ${String(error)}`);
+  }
+  if (messages.length > 0) {
+    const reply: UserMessageReply = {
+      results: results.map((r): ReplacementResult => ({
+        episode: r.episode,
+        outcome: r.outcome,
+        // Only a replaced episode names a resource.
+        ...(r.outcome === "replaced" && r.label !== undefined ? { label: r.label } : {}),
+        ...(r.outcome === "replaced" && r.sizeBytes !== null ? { sizeBytes: r.sizeBytes } : {}),
+        note: r.note,
+      })),
+      oldFiles: replacement?.oldFiles ?? [],
+      runId,
+      ...(replacement?.rejectedPersistFailed ? { rejectedNotSaved: true } : {}),
+    };
+    try {
+      await repository.finishUserMessages({ runId, reply, now: now() });
+    } catch (error) {
+      console.error(`[user-message] run ${runId} could not write the reply: ${String(error)}`);
+    }
+  }
+  return { status: "ran", workflowRunId: runId, workflowStatus };
+}
+
+/** 待换 records and episode sources after a replace run. */
+async function recordReplacementOutcome(input: {
+  repository: WorkflowRepository;
+  work: UserMessageScope;
+  runId: string;
+  results: Array<{ episode: string; outcome: "replaced" | "not_found"; label?: string; linkKey?: string | null; sizeBytes: number | null }>;
+  messages: UserMessage[];
+  pendingRows: Array<{ episode: string; messageId: string }>;
+  now: () => string;
+}): Promise<void> {
+  const { repository, work, messages, pendingRows, now } = input;
+  const replaced = input.results.filter((r) => r.outcome === "replaced");
+  const notFound = input.results.filter((r) => r.outcome === "not_found").map((r) => r.episode);
+  if (replaced.length > 0) {
+    await repository.removePendingReplacements({ ...work, episodes: replaced.map((r) => r.episode) });
+  }
+  for (const r of replaced) {
+    await repository.upsertEpisodeSource({
+      ...work,
+      episode: r.episode,
+      linkKey: r.linkKey ?? null,
+      label: r.label ?? "",
+      sizeBytes: r.sizeBytes,
+      runId: input.runId,
+      recordedAt: now(),
+    });
+  }
+  // Keep a still-pending episode on the message that first asked for it.
+  const byMessage = new Map<string, string[]>();
+  for (const episode of notFound) {
+    const messageId =
+      pendingRows.find((p) => p.episode === episode)?.messageId ?? messageFor(messages, episode)?.id ?? pendingRows[0]?.messageId;
+    if (messageId === undefined) continue;
+    byMessage.set(messageId, [...(byMessage.get(messageId) ?? []), episode]);
+  }
+  for (const [messageId, episodes] of byMessage) {
+    await repository.addPendingReplacements({ ...work, episodes, messageId, now: now() });
+  }
+}
+
+/** Whether an episode code belongs to this work on this drive: "MOVIE" for a film,
+ *  SxxEyy of a tracked season for a show. */
+function episodeScope(movie: boolean, states: TrackedSeasonState[]): (episode: string) => boolean {
+  if (movie) return (episode) => episode === "MOVIE";
+  const seasons = new Set(states.map((s) => s.season.seasonNumber));
+  return (episode) => {
+    const m = /^S(\d{2,})E\d{2,}$/.exec(episode);
+    return m !== null && seasons.has(Number(m[1]));
+  };
+}
+
+/** Every season refreshed against TMDB (best-effort per season, as in the patrol). */
+async function syncedSeasons(
+  states: TrackedSeasonState[],
+  tmdbId: number,
+  sync: SeasonMetadataSync | undefined,
+): Promise<Array<{ season: TrackedSeason; episodes: EpisodeState[] }>> {
+  const out: Array<{ season: TrackedSeason; episodes: EpisodeState[] }> = [];
+  for (const state of states) {
+    let entry = { season: state.season, episodes: state.episodes };
+    if (sync) {
+      try {
+        const meta = await sync({ tmdbId, seasonNumber: state.season.seasonNumber });
+        if (meta) {
+          const synced = syncSeasonAgainstMetadata({ ...entry, latestAiredEpisode: meta.latestAiredEpisode, totalEpisodes: meta.totalEpisodes });
+          entry = { season: synced.season, episodes: synced.episodes };
+        }
+      } catch {
+        // Metadata sync is best-effort; fall back to stored counts.
+      }
+    }
+    out.push(entry);
+  }
+  return out;
 }
 
 /** The message that named this episode, else the oldest one claimed. */

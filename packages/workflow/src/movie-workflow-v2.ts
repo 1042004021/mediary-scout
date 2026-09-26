@@ -60,6 +60,9 @@ export interface RunMovieAcquisitionV2Request {
   memory?: { store: AgentMemoryStore; accountId: string; drive?: string };
   /** A replace_request run (see orchestrator.userRequest; requestedEpisodes ["MOVIE"]). */
   userRequest?: RunAcquisitionV2Request["userRequest"];
+  /** Replace runs: the film was obtained before the run (its old file is there), so
+   *  it stays obtained whether or not a replacement landed. Default false. */
+  priorObtained?: boolean;
   onProgress?: (event: AgentToolEvent) => void;
   now?: () => string;
 }
@@ -123,8 +126,9 @@ export async function runMovieAcquisitionV2(
   // (§1.13/§7b). The agent looked at the real files and declared coverage; the
   // workflow records that, it does not re-derive obtained by counting files.
   // A replace run never un-obtains the film: the old file stays in the directory
-  // whether or not a replacement landed (spec §4.5).
-  const obtained = v2.coverage.coverageMet || request.userRequest !== undefined;
+  // whether or not a replacement landed (spec §4.5). One that was never obtained
+  // is obtained only by what landed now.
+  const obtained = v2.coverage.coverageMet || (request.userRequest !== undefined && request.priorObtained === true);
 
   // Real landed volume for the push (best-effort; never fails the run). The
   // movie dir IS the staging+final location, so its video file(s) are the film.

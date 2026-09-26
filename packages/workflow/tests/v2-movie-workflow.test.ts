@@ -313,6 +313,8 @@ describe("runMovieAcquisitionV2 — user request (replace_request run)", () => {
         prompt: { messages: [{ body: "这是假片", episodeTags: ["MOVIE"], createdAt: "2026-09-26T08:00:00.000Z" }], rejected: [], pending: [] },
         rejectedStore: { list: async () => [], add: async () => undefined },
       },
+      // The film was obtained before this run (the knock-off is in the library).
+      priorObtained: true,
       now: () => "2026-09-26T08:00:00.000Z",
     });
 
