@@ -1,6 +1,6 @@
 # 给 agent 留言换资源 · 设计（2026-09-26）
 
-> 状态：UI 设计经用户在 visual companion 里逐版确认（v1 → v2 → +④ 排队 → 配色修订），最终稿 `.superpowers/brainstorm/64860-1790419990/content/message-v5.html`。
+> 状态：2026-09-26 按代码现状修订（待换改为独立表、新 run 类型 `replace_request`）。UI 设计经用户在 visual companion 里逐版确认（v1 → v2 → +④ 排队 → 配色修订），最终稿 `.superpowers/brainstorm/64860-1790419990/content/message-v5.html`。
 > 背景：用户拿到的资源有问题时没有办法告诉 agent。123 盘的《耳语人》色调发蓝，115 盘的《奥德赛》是山寨公司拍的同名假片。删掉重新获取，agent 多半又会转回同一份。需要求往往很具体（换第 13、24 集；换分散在几季里的几集），做成表单穷举不完，所以用一句自然语言留言。
 
 ## 1. 目标与非目标
@@ -21,112 +21,116 @@
 
 ## 2. 数据模型
 
-### 2.1 新表 `user_messages`（三套仓库各一份，共用契约测试）
+新增一个存储端口 `UserRequestStore`（`packages/workflow/src/user-requests.ts`），`WorkflowRepository` 继承它，三套仓库各实现一份，共用契约测试。四张表：
+
+### 2.1 `user_messages`
 
 | 列 | 说明 |
 |---|---|
 | `id` | text PK，`msg_<uuid>` |
 | `account_id` | text |
-| `connected_storage_id` | text，可空（同 tracked_seasons 的语义） |
-| `title_key` | text，`tmdb_<mediaType>_<tmdbId>`，复用 `requireMemoryTitleKey` |
-| `body` | 用户原话，≤ 500 字 |
-| `episode_tags` | text[]/JSON，UI「选集数」生成的 `S01E13` 这类标签，可空。只是提示，agent 以原话为准 |
+| `drive` | text NOT NULL，connected_storage_id，没有时存 `''` |
+| `title_key` | text，等于 media title id（`tmdb_tv_283428` / `tmdb_movie_238`） |
+| `body` | 用户原话，1–500 字 |
+| `episode_tags` | JSON 文本，`["S01E13","S01E24"]`，可为空数组。只是提示 |
 | `status` | `pending` / `processing` / `done` / `withdrawn` |
-| `run_id` | 处理它的 workflow run，processing 起写入 |
-| `reply` | JSON，agent 的逐集回复（§4.3），done 时写入 |
+| `urgent` | bool。true = 不等巡检，队列空闲就处理（§3） |
+| `run_id` | 处理它的 run，processing 起写入 |
+| `reply` | JSON（§4.3），done 时写入；同一个 run 认领的几条留言写同一份 |
 | `created_at` / `updated_at` / `processed_at` | ISO 文本 |
 
-规则：
-- 只有 `pending` 能改、能撤回。改或撤回用条件更新（`WHERE status='pending'`），与认领竞争时认领赢，UI 收到「已开始处理」。
-- 认领：run 开工时把同一 `(account, drive, title_key)` 下所有 `pending` 原子改为 `processing` 并写 `run_id`。开工之后才写的留言保持 `pending`，留给下一轮（§5）。
-- run 失败或被取消时，`processing` 退回 `pending`，不丢留言。
+规则（存储层原子执行）：
+- 只有 `pending` 能改、能撤回（条件更新 `WHERE status='pending'`，返回是否成功）。
+- `claimUserMessages(scope, runId)`：把该作品该盘所有 `pending` 一次改成 `processing` 并写 `run_id`，返回认领到的。之后才写的留言留给下一轮。
+- 发留言时，同一作品同一盘已有 `processing` 的留言 → 新留言 `urgent=true`（处理中追加，§5）。
+- `releaseUserMessages(runId)`：run 失败时 `processing` 退回 `pending`，urgent 置 true（下次队列空闲就重试）。
+- `finishUserMessages(runId, reply)`：`processing` → `done`，写 reply。
 
-### 2.2 集状态新增「待换」
+### 2.2 `pending_replacements`（「待换」）
 
-`EpisodeState` 新增可选字段 `replaceRequested?: { messageId: string; requestedAt: string }`。
-
-- `obtained` 仍为 `true`：文件确实在，进度条照算已获取（24/24）。
-- 有 `replaceRequested` 的集进入巡检的「需要」集合（§3.3），UI 渲染为红色「待换」。
-- 电影同样用它的单集锚点（`MOVIE`）承载，标题显示「待换资源」。
-- 「不换了」清除该字段；「换好了」由 agent 在处理后清除（§4.2）。
-
-### 2.3 资源来源记录 `episode_sources`（不会被 30 天清理）
-
-运行记录和转存记录会被 30 天回收（`pruneFinishedWorkflowRuns`），不能靠它们知道「上次拿的是哪个」。新增一张小表，按集记录当前落在库里的资源：
+**不放在 `EpisodeState` 上**：每次持久化都会用 `createEpisodeStates` 重建集状态，字段会被冲掉。
 
 | 列 | 说明 |
 |---|---|
-| `account_id`, `connected_storage_id`, `title_key`, `episode_code` | 复合键 |
-| `resource_title` | 候选标题（例如 `[喵萌奶茶屋] 黄泉的使者 13 [1080p]`） |
-| `size_bytes` | 落盘文件大小 |
-| `link_key` | `deadLinkKey(url)` 的结果（115 分享码 / 磁力 infohash / …），可空 |
-| `file_path` | 在库里的相对路径（给回复里「旧文件还在」用） |
-| `recorded_at`, `run_id` | |
+| `account_id`, `drive`, `title_key`, `episode_code` | 复合主键；电影用 `MOVIE` |
+| `message_id`, `requested_at` | |
 
-写入时机：`markObtained` 成功后，orchestrator 用本次转存记录 + 该集落盘文件回填。同一集换了新资源就覆盖（旧那条进 §2.4 的拒绝名单，不丢）。存量没有来源记录的集，第一次处理留言时由 agent 读 `inspectTargetDir` 看文件名，照样能工作，只是指纹只有文件名和大小。
+- agent 汇报 `not_found` → 写入；`replaced` → 删除；用户「不换了」→ 删除。
+- 集的 `obtained` 不变（文件在），进度条照算已获取。UI 看到这张表里有它就画成红色「待换」。
 
-### 2.4 拒绝名单 `rejected_resources`
-
-用户说「这份不行」之后，这份资源进这部作品的拒绝名单，**由系统在搜索结果交给 agent 之前剔掉**（与现在的死链过滤同一处，`RealResourceProviderV2.search`）。
+### 2.3 `rejected_resources`（拒绝名单）
 
 | 列 | 说明 |
 |---|---|
-| `account_id`, `title_key`, `episode_code`（可空=整部） | 作用域 |
-| `link_key` | 精确键：同一个链接 |
-| `fingerprint` | 模糊键：规范化标题 + 大小，识别「换个链接分享的同一份」 |
+| `id` | PK |
+| `account_id`, `title_key` | 作用域：**账号 + 作品**，不按盘分（假片在哪块盘都是假的） |
+| `episode_code` | 被拒的是哪一集的来源；电影 `MOVIE` |
+| `link_key` | `deadLinkKey(url)`，知道时才有 |
+| `label` | 资源名 / 文件名（给 agent 看、给指纹用） |
+| `size_bytes` | 知道时才有 |
 | `reason` | 用户原话摘要 |
 | `message_id`, `created_at` | |
 
-- **精确键**命中直接剔除，不进 agent 视野。
-- **指纹**：`normalizeTitle(resource_title)`（去掉括号里的发布组 / 画质 / 分辨率 / 空白）+ 大小 ±1%。大小只有在候选标题里带大小时可用（PanSou 标题常带 `[2.3G]`）；带大小的候选指纹命中才剔除，只能靠标题判断的不剔，交给 agent（§4.1 会把拒绝名单原文给它看）。机械规则只做确定的事，模糊的留给 agent（`agent-node-design-principles`）。
-- 拒绝名单按**账号 + 作品**共享，不按盘隔离：同一份假片在 115 和 123 上都是假的。（来源记录 §2.3 则按盘，因为文件落在具体某块盘上。）
+过滤（`RealResourceProviderV2.search`，与死链过滤同一处，每次搜索重新读，本轮刚拒的立刻生效）：
+- `link_key` 相同 → 剔除。
+- 指纹：候选标题里带大小（PanSou 常见的 `[2.3G]`），且与某条拒绝记录大小相差 ≤2%，且两边标题规范化后相同（去掉方括号内容、扩展名、分辨率/编码词、标点空白、小写）→ 剔除。
+- 其余哪怕看着像也不剔，交给 agent：拒绝名单原文会注入提示词。机械规则只做确定的事。
+
+### 2.4 `episode_sources`（换上去的是哪份）
+
+| 列 | 说明 |
+|---|---|
+| `account_id`, `drive`, `title_key`, `episode_code` | 复合主键 |
+| `link_key`, `label`, `size_bytes`, `run_id`, `recorded_at` | |
+
+只在 agent 汇报 `replaced` 时写（它指明是哪个候选，系统核对该候选本轮确实转存成功）。用处：同一集第二次被投诉时，拒绝名单能带上精确的 `link_key`。普通获取不写（设计上不做 文件↔集 的机械映射，§1.13）。第一次投诉的集没有来源记录，agent 用 `inspectTargetDir` 看到的真实文件（名字 + 大小）来拒，系统按 fileId 核对文件确实在目标目录里。
 
 ## 3. 触发与调度
 
-### 3.1 留言入口
-- 服务端 action：`postUserMessage` / `editUserMessage` / `withdrawUserMessage` / `processMessageNow` / `keepEpisodeAsIs`，全部走 `requireAuthenticatedAccountId` + `assertNotDemo`，参数里的作品与盘必须属于当前账号。
+所有留言处理走同一条路：**新的 run 类型 `replace_request`**（可被队列认领）。它覆盖这部作品在这块盘上**所有已追踪的季**，并加作品级互斥锁（`blockIfTitleHasActiveRun`），因为留言针对整部作品、可能跨季，而巡检是逐季跑、不锁整部作品。
 
-### 3.2 「现在处理」
-- 为这部作品在这块盘上入队一个 run（电视剧 `type3_monitor`，电影 `movie_init`），和手动获取同一条队列、同一个认领逻辑。已有进行中的 run 时不重复入队，UI 显示「排队中」（§5）。
+入队的三个来源：
+1. **巡检**：`patrolTrackedState` / `patrolMovie` 发现这部作品有 `pending` 留言或有待换集 → 入队 `replace_request`（已有活动 run 则跳过），并跳过这部作品各季本轮的普通巡检（`replace_request` 的需要集合本来就包含缺集）。
+2. **「现在处理」**：该作品的 pending 留言置 `urgent=true`，尝试入队。
+3. **队列空闲扫描**：`runNextQueuedWorkflow` 每次开头调用 `enqueueUrgentReplaceRequests`，给有 `urgent` pending 留言、当前没有活动 run 的作品入队。这一处同时覆盖「点现在处理时正好有别的 run 在跑」「处理中追加的留言」「失败重试」。
 
-### 3.3 巡检
-- 现在巡检会跳过「已全部入库」的季和已获取的电影（`patrolTrackedState` / `patrolMovie`）。改为：**有 `pending` 留言或有 `replaceRequested` 集的作品也要跑**。
-- 需要集合 = 缺集 ∪ 待换集 ∪ 留言涉及的集（后者由 agent 判定，系统只负责把作品唤起）。
-- `syncSeasonNeed` 保持纯计算，新增 `replaceRequested` 输入：待换集进入 `missing` 之外单独的 `toReplace` 列表，传给 agent 的目标里分开写，提示词里说清楚两者的区别（缺的是没有文件，待换的是有文件但用户不满意）。
-- 巡检并行（#276）按盘分键的规则不变。
+默认（非 urgent）的留言只由巡检入队，所以「默认等下次巡检」成立。
 
 ## 4. agent 侧
 
 ### 4.1 输入
-提示词新增一段 `USER REQUESTS`（放在 `<user_requests>` 围栏里，按不可信数据处理，同记忆的 `fenceRunFacts` 做法）：
-- 每条待处理留言：原话、选集标签、时间。
-- 每个涉及集的当前来源（§2.3）：资源标题、大小、文件路径。没有记录就写「未记录，请用 inspectTargetDir 看文件名」。
-- 这部作品的拒绝名单原文。
-- 规则：
-  - 目标是**找一个与当前来源不同的资源**替换留言点名的集。换成同一个发布组的同一版本不算换。
-  - 新文件落到同一季目录，**不删旧文件、不改旧文件名**。
-  - 用户说的是「这部是假片」一类整部否定时，把当前来源整份报告为拒绝。
+- 需要集合 = 缺集 ∪ 待换集 ∪ 留言选集标签。`workflow-v2` 的「没有缺集就不跑 agent」短路在有留言或待换集时不生效。
+- 提示词新增 `<user_requests>` 围栏段（不可信数据，同记忆的做法）：每条留言原话 + 选集标签 + 时间；拒绝名单原文；规则：
+  - 目标是换成**与现在不同**的资源；同一发布组同一版本不算换。
+  - 新文件放进同一季目录；**不删、不改名已有文件**，也不要按「保留较大的」去重掉旧文件。
+  - 先 `inspectTargetDir` 看这些集现在的文件，再 `rejectCurrentSource`，然后再搜。
+  - 结束前必须 `reportReplacement`。
 
-### 4.2 新工具
-- `rejectCurrentSource({ episodes, reason })`：把这些集的当前来源写进拒绝名单。agent 读懂留言后第一步调用，之后本轮搜索立即生效。
-- `reportReplacement({ results: [{ episode, outcome: "replaced" | "not_found", note }] })`：结束前逐集汇报。
-  - `replaced`：必须是本轮 `markObtained` 过、且确有新转存落盘的集，系统核对，不符合就拒。系统清掉该集 `replaceRequested`，覆盖 `episode_sources`。
-  - `not_found`：系统给该集打上 `replaceRequested`（若还没有）。
-- 留言涉及但 agent 没汇报的集，系统按 `not_found` 处理，不能静默丢。
-
-「换好了」必须由 agent 判定，但系统要核对它确实转存了新东西（`no-mechanical-mark-coverage`：判定归 agent，事实核对归系统）。
+### 4.2 新工具（只在有留言或待换集的 run 里注册）
+- `rejectCurrentSource({ episodes, fileIds, reason })`：
+  - 系统核对 fileIds 都在目标目录里，用文件名 + 大小（以及 `episode_sources` 里已知的 link_key）写拒绝名单。
+  - 把这些集加进本轮需要集合（留言没带标签、agent 从原话里读出来的集也能走完转存闸门）。
+- `reportReplacement({ results: [{ episode, outcome: "replaced" | "not_found", candidateId?, note }] })`：
+  - `replaced` 必须满足：该集本轮 `markObtained` 过；`candidateId` 本轮转存成功过。不满足就拒，工具报错给 agent。系统删掉待换记录，写 `episode_sources`。
+  - `not_found`：写待换记录。
+  - 留言涉及、agent 却没汇报的集（选集标签或待换集），run 结束时系统按 `not_found` 处理。
+- **旧文件保护**：replace run 开始时系统记下各目标目录现有的 fileId；本轮 `deleteFiles` 拒绝删除这些文件。
 
 ### 4.3 回复
-`reply` = `{ results: [{ episode, outcome, resourceTitle?, sizeBytes?, note }], oldFiles: [path], summary }`。由系统从 `reportReplacement` + 本轮转存记录 + `episode_sources` 旧值组装，agent 只提供 `note`（一句中文，说为什么没换成之类）。UI 把它渲染成逐集列表。
+`reply = { results: [{ episode, outcome, label?, sizeBytes?, note }], oldFiles: [path], runId }`。系统用 `reportReplacement` + 转存记录 + `rejectCurrentSource` 时记下的旧文件路径组装；agent 只给 `note`。run 正常结束（含没换成）→ `finishUserMessages`；run 抛错 → `releaseUserMessages`。
 
 ### 4.4 复盘（记忆）
-复盘轮照旧跑。事实摘要里加「本轮处理了用户留言：…」，提示词加一句：用户拒掉的资源已由系统记住，不用再写成笔记。
+复盘照旧。事实摘要加一行「本轮处理了用户留言，结果：…」；复盘提示词加一句：用户拒掉的资源系统已经记住，不用写成笔记。
+
+### 4.5 电影
+- `need=["MOVIE"]`，电影目录就是暂存区，新文件和旧文件在同一目录，不删旧的。
+- 电影 replace run 无论换没换成，作品都保持已获取（旧文件还在）。
 
 ## 5. 处理中又留言（排队）
 
-- 认领时只认领当时的 `pending`。之后的新留言保持 `pending`，UI 标「排队中 · 这次处理完接着处理」，照样能改、能撤回。
-- run 结束（任何结局）后，worker 检查这部作品在这块盘上还有没有 `pending` 留言，有就立刻为它入队一个新 run，不等下次巡检。
-- 同一部作品同一时间只跑一个 run：现有 `reserveWorkflowRun` 的「已有活动 run 则 skipped_active」保证。
+- 认领只认领当时的 pending。之后的新留言保持 pending 且 `urgent=true`，UI 标「排队中 · 这次处理完接着处理」，照样能改、能撤回。
+- 这次结束后，下一次队列空闲扫描（§3.3）发现它，立刻入队，不等巡检。
+- 同一部作品同一时间只跑一个 run：`blockIfTitleHasActiveRun`。
 - 后一条推翻前一条（「E13 其实不用换了」）：不打断当前 run。第二轮 agent 读到时 E13 可能已换好，回复里如实说明「已经换过，新旧两个文件都在」。
 
 ## 6. UI（详情页）
@@ -139,7 +143,7 @@
 - 处理中：锁定；agent 行显示跳动音柱 + 实时活动文字（复用 `workflow_runs.progress`，同活动页）。
 - 处理完：逐集列表（集 / 这次用的资源 / 大小 / 结果）；没换成的行 hover（触屏常显）出现「不换了」；旧文件路径 + 复制（按钮文字变「已复制」，不弹 toast）。
 - 待换：集格子红底红框 + 右上角红点，文字「待换」；标题徽章「N 集待换」/电影「待换资源」+ 红底提示条带「不换了」。
-- 「不换了」：乐观更新，底部白色 toast 6 秒撤销（沿用笔记删除的延迟提交做法）。
+- 「不换了」：乐观更新，底部白色 toast 6 秒撤销（沿用笔记删除的延迟提交做法），提交时删掉该集的待换记录。
 - 更早的留言折叠为「之前的留言 · N 条」。
 - 移动端：列表收成两行，旧文件路径换行显示。
 
@@ -147,7 +151,7 @@
 
 ## 7. 错误处理
 
-- run 失败 / 模型中断（content-filter）/ 预算耗尽：留言退回 `pending`，UI 显示「上次没处理完，下次巡检会再试」；不会把集误标为「换好了」。
+- run 抛错：留言退回 `pending`（urgent），UI 显示「上次没处理完，稍后会再试」。模型中断（content-filter）或预算耗尽但 run 正常收尾时，留言照常 done，没汇报的集按 `not_found` 进待换。都不会把集误标为「换好了」。
 - 拒绝名单写失败：本轮继续，但回复里说明（尽力而为，不能让留言功能拖垮获取）。
 - 盘被冻结（鉴权失效）：留言保持 `pending`，沿用现有冻结提示。
 - 作品取消追踪：该作品的 `pending` 留言一并撤回；`episode_sources` / 拒绝名单保留（重新追踪时还用得上）。
@@ -157,15 +161,16 @@
 - 三套仓库契约测试：留言状态机（改/撤回只在 pending、认领原子、失败回退）、`episode_sources` 覆盖、拒绝名单查询。
 - 过滤：精确键剔除、指纹（标题+大小）剔除、只有标题相似不剔。
 - 巡检：已全部入库但有 pending 留言 / 待换集的作品会被唤起；没有的照旧跳过。
-- 排队：run 结束后自动入队下一条；同作品不并发。
+- 排队：处理中追加的留言为 urgent，队列空闲扫描自动入队；同作品不并发。
+- 旧文件保护：replace run 里删除开工前已在目标目录的文件被拒。
 - `reportReplacement` 核对：未转存新东西的 `replaced` 被拒；未汇报的集按 `not_found`。
 - UI：`build:web`；组件测试覆盖 pending/processing/done/待换/不换了+撤销。
 - **端到端（生产）**：用黄泉的使者（123）留言换 E13、E24，走「现在处理」，确认新文件落盘、旧文件未动、回复与格子状态正确；奥德赛（115）留「假片」，确认拒绝名单生效、之后巡检不会再转同一份。
 
 ## 9. 分期
 
-一个功能、一个 spec，按依赖分成若干 PR：
-1. 数据层：三张表 + `EpisodeState.replaceRequested` + 契约测试。
-2. 引擎：拒绝名单过滤、来源记录回填、两个新工具、提示词、巡检唤起、排队续跑。
-3. UI：详情页留言卡片、待换状态、不换了。
-4. 生产端到端验证。
+两个 PR：
+1. **引擎 + 数据层**：四张表与契约测试、`replace_request` run、拒绝名单过滤、两个新工具、旧文件保护、提示词、巡检唤起与队列扫描。没有 UI 入口时它是惰性的（没人能发留言）。
+2. **UI**：详情页留言卡片、选集、待换状态、不换了、现在处理。
+
+之后生产端到端验证。
