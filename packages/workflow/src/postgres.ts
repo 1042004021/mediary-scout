@@ -57,6 +57,16 @@ import {
   type AgentMemorySummary,
   type AgentMemoryScope,
 } from "./agent-memory.js";
+import {
+  userMessageFromRow,
+  type EpisodeSource,
+  type PendingReplacement,
+  type RejectedResource,
+  type UserMessage,
+  type UserMessageRow,
+  type UserMessageScope,
+  type UserRequestStore,
+} from "./user-requests.js";
 
 type Queryable = Pool | PoolClient;
 
@@ -173,6 +183,56 @@ const SCHEMA = `
     last_used_at text,
     source_run_id text,
     UNIQUE (account_id, scope, title_key, name)
+  );
+  CREATE TABLE IF NOT EXISTS user_messages (
+    id text PRIMARY KEY,
+    account_id text NOT NULL,
+    drive text NOT NULL DEFAULT '',
+    title_key text NOT NULL,
+    body text NOT NULL,
+    episode_tags text NOT NULL DEFAULT '[]',
+    status text NOT NULL,
+    urgent boolean NOT NULL DEFAULT false,
+    run_id text,
+    reply text,
+    created_at text NOT NULL,
+    updated_at text NOT NULL,
+    processed_at text
+  );
+  CREATE INDEX IF NOT EXISTS user_messages_work ON user_messages (account_id, drive, title_key, status);
+  CREATE TABLE IF NOT EXISTS pending_replacements (
+    account_id text NOT NULL,
+    drive text NOT NULL DEFAULT '',
+    title_key text NOT NULL,
+    episode text NOT NULL,
+    message_id text NOT NULL,
+    requested_at text NOT NULL,
+    PRIMARY KEY (account_id, drive, title_key, episode)
+  );
+  CREATE TABLE IF NOT EXISTS rejected_resources (
+    id text PRIMARY KEY,
+    account_id text NOT NULL,
+    title_key text NOT NULL,
+    episode text NOT NULL,
+    link_key text,
+    label text NOT NULL,
+    size_bytes bigint,
+    reason text NOT NULL,
+    message_id text,
+    created_at text NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS rejected_resources_work ON rejected_resources (account_id, title_key);
+  CREATE TABLE IF NOT EXISTS episode_sources (
+    account_id text NOT NULL,
+    drive text NOT NULL DEFAULT '',
+    title_key text NOT NULL,
+    episode text NOT NULL,
+    link_key text,
+    label text NOT NULL,
+    size_bytes bigint,
+    run_id text NOT NULL,
+    recorded_at text NOT NULL,
+    PRIMARY KEY (account_id, drive, title_key, episode)
   );
   CREATE TABLE IF NOT EXISTS account_settings (
     account_id text NOT NULL,
@@ -1413,6 +1473,173 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
     ]);
   }
 
+  // ---- user requests (see user-requests.ts)
+  async createUserMessage(input: Parameters<UserRequestStore["createUserMessage"]>[0]): Promise<UserMessage> {
+    await this.ensureSchema();
+    const result = await this.pool.query<UserMessageRow>(
+      "INSERT INTO user_messages (id, account_id, drive, title_key, body, episode_tags, status, urgent, run_id, reply, created_at, updated_at, processed_at) " +
+        "VALUES ($1, $2, $3, $4, $5, $6, 'pending', EXISTS (SELECT 1 FROM user_messages WHERE account_id = $2 AND drive = $3 AND title_key = $4 AND status = 'processing'), NULL, NULL, $7, $7, NULL) RETURNING *",
+      [`msg_${globalThis.crypto.randomUUID()}`, input.accountId, input.drive, input.titleKey, input.body, JSON.stringify(input.episodeTags), input.now],
+    );
+    return userMessageFromRow(result.rows[0]!);
+  }
+
+  async listUserMessages(scope: UserMessageScope): Promise<UserMessage[]> {
+    await this.ensureSchema();
+    const result = await this.pool.query<UserMessageRow>(
+      "SELECT * FROM user_messages WHERE account_id = $1 AND drive = $2 AND title_key = $3 AND status <> 'withdrawn' ORDER BY created_at DESC, id DESC",
+      [scope.accountId, scope.drive, scope.titleKey],
+    );
+    return result.rows.map(userMessageFromRow);
+  }
+
+  async editUserMessage(input: Parameters<UserRequestStore["editUserMessage"]>[0]): Promise<UserMessage | null> {
+    await this.ensureSchema();
+    const result = await this.pool.query<UserMessageRow>(
+      "UPDATE user_messages SET body = $1, episode_tags = $2, updated_at = $3 WHERE id = $4 AND account_id = $5 AND status = 'pending' RETURNING *",
+      [input.body, JSON.stringify(input.episodeTags), input.now, input.id, input.accountId],
+    );
+    return result.rows[0] ? userMessageFromRow(result.rows[0]) : null;
+  }
+
+  async withdrawUserMessage(input: Parameters<UserRequestStore["withdrawUserMessage"]>[0]): Promise<boolean> {
+    await this.ensureSchema();
+    const result = await this.pool.query(
+      "UPDATE user_messages SET status = 'withdrawn', updated_at = $1 WHERE id = $2 AND account_id = $3 AND status = 'pending'",
+      [input.now, input.id, input.accountId],
+    );
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  async markUserMessagesUrgent(input: Parameters<UserRequestStore["markUserMessagesUrgent"]>[0]): Promise<number> {
+    await this.ensureSchema();
+    const result = await this.pool.query(
+      "UPDATE user_messages SET urgent = true, updated_at = $1 WHERE account_id = $2 AND drive = $3 AND title_key = $4 AND status = 'pending'",
+      [input.now, input.accountId, input.drive, input.titleKey],
+    );
+    return result.rowCount ?? 0;
+  }
+
+  async claimUserMessages(input: Parameters<UserRequestStore["claimUserMessages"]>[0]): Promise<UserMessage[]> {
+    await this.ensureSchema();
+    // One UPDATE … RETURNING: a concurrent edit/withdraw either lands before (and is
+    // claimed as edited) or finds status <> 'pending' and does nothing.
+    const result = await this.pool.query<UserMessageRow>(
+      "UPDATE user_messages SET status = 'processing', run_id = $1, updated_at = $2 WHERE account_id = $3 AND drive = $4 AND title_key = $5 AND status = 'pending' RETURNING *",
+      [input.runId, input.now, input.accountId, input.drive, input.titleKey],
+    );
+    return result.rows.map(userMessageFromRow).sort(compareUserMessagesCreated);
+  }
+
+  async finishUserMessages(input: Parameters<UserRequestStore["finishUserMessages"]>[0]): Promise<void> {
+    await this.ensureSchema();
+    await this.pool.query(
+      "UPDATE user_messages SET status = 'done', reply = $1, processed_at = $2, updated_at = $2 WHERE run_id = $3 AND status = 'processing'",
+      [JSON.stringify(input.reply), input.now, input.runId],
+    );
+  }
+
+  async releaseUserMessages(input: Parameters<UserRequestStore["releaseUserMessages"]>[0]): Promise<void> {
+    await this.ensureSchema();
+    await this.pool.query(
+      "UPDATE user_messages SET status = 'pending', urgent = true, run_id = NULL, updated_at = $1 WHERE run_id = $2 AND status = 'processing'",
+      [input.now, input.runId],
+    );
+  }
+
+  async listWorksWithPendingMessages(input: { urgentOnly: boolean }): Promise<UserMessageScope[]> {
+    await this.ensureSchema();
+    const result = await this.pool.query<{ account_id: string; drive: string; title_key: string }>(
+      `SELECT DISTINCT account_id, drive, title_key FROM user_messages WHERE status = 'pending'${input.urgentOnly ? " AND urgent" : ""} ORDER BY account_id, drive, title_key`,
+    );
+    return result.rows.map((r) => ({ accountId: r.account_id, drive: r.drive, titleKey: r.title_key }));
+  }
+
+  async listPendingReplacements(scope: UserMessageScope): Promise<PendingReplacement[]> {
+    await this.ensureSchema();
+    const result = await this.pool.query<Record<string, string>>(
+      "SELECT * FROM pending_replacements WHERE account_id = $1 AND drive = $2 AND title_key = $3 ORDER BY episode",
+      [scope.accountId, scope.drive, scope.titleKey],
+    );
+    return result.rows.map((r) => ({ accountId: r["account_id"]!, drive: r["drive"]!, titleKey: r["title_key"]!, episode: r["episode"]!, messageId: r["message_id"]!, requestedAt: r["requested_at"]! }));
+  }
+
+  async listWorksWithPendingReplacements(): Promise<UserMessageScope[]> {
+    await this.ensureSchema();
+    const result = await this.pool.query<{ account_id: string; drive: string; title_key: string }>(
+      "SELECT DISTINCT account_id, drive, title_key FROM pending_replacements ORDER BY account_id, drive, title_key",
+    );
+    return result.rows.map((r) => ({ accountId: r.account_id, drive: r.drive, titleKey: r.title_key }));
+  }
+
+  async addPendingReplacements(input: Parameters<UserRequestStore["addPendingReplacements"]>[0]): Promise<void> {
+    await this.ensureSchema();
+    if (input.episodes.length === 0) return;
+    await this.pool.query(
+      "INSERT INTO pending_replacements (account_id, drive, title_key, episode, message_id, requested_at) " +
+        "SELECT $1, $2, $3, e, $5, $6 FROM unnest($4::text[]) AS e ON CONFLICT DO NOTHING",
+      [input.accountId, input.drive, input.titleKey, input.episodes, input.messageId, input.now],
+    );
+  }
+
+  async removePendingReplacements(input: Parameters<UserRequestStore["removePendingReplacements"]>[0]): Promise<number> {
+    await this.ensureSchema();
+    const result = await this.pool.query(
+      "DELETE FROM pending_replacements WHERE account_id = $1 AND drive = $2 AND title_key = $3 AND episode = ANY($4::text[])",
+      [input.accountId, input.drive, input.titleKey, input.episodes],
+    );
+    return result.rowCount ?? 0;
+  }
+
+  async addRejectedResources(input: Parameters<UserRequestStore["addRejectedResources"]>[0]): Promise<void> {
+    await this.ensureSchema();
+    await this.withTransaction(async (client) => {
+      for (const i of input.items) {
+        await client.query(
+          "INSERT INTO rejected_resources (id, account_id, title_key, episode, link_key, label, size_bytes, reason, message_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+          [`rej_${globalThis.crypto.randomUUID()}`, input.accountId, input.titleKey, i.episode, i.linkKey, i.label, i.sizeBytes, i.reason, i.messageId, input.now],
+        );
+      }
+    });
+  }
+
+  async listRejectedResources(input: { accountId: string; titleKey: string }): Promise<RejectedResource[]> {
+    await this.ensureSchema();
+    const result = await this.pool.query<Record<string, unknown>>(
+      "SELECT * FROM rejected_resources WHERE account_id = $1 AND title_key = $2 ORDER BY created_at, id",
+      [input.accountId, input.titleKey],
+    );
+    return result.rows.map((r) => ({
+      id: String(r["id"]), accountId: String(r["account_id"]), titleKey: String(r["title_key"]), episode: String(r["episode"]),
+      linkKey: (r["link_key"] as string | null) ?? null, label: String(r["label"]),
+      sizeBytes: r["size_bytes"] === null ? null : Number(r["size_bytes"]),
+      reason: String(r["reason"]), messageId: (r["message_id"] as string | null) ?? null, createdAt: String(r["created_at"]),
+    }));
+  }
+
+  async upsertEpisodeSource(input: EpisodeSource): Promise<void> {
+    await this.ensureSchema();
+    await this.pool.query(
+      "INSERT INTO episode_sources (account_id, drive, title_key, episode, link_key, label, size_bytes, run_id, recorded_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) " +
+        "ON CONFLICT (account_id, drive, title_key, episode) DO UPDATE SET link_key = EXCLUDED.link_key, label = EXCLUDED.label, size_bytes = EXCLUDED.size_bytes, run_id = EXCLUDED.run_id, recorded_at = EXCLUDED.recorded_at",
+      [input.accountId, input.drive, input.titleKey, input.episode, input.linkKey, input.label, input.sizeBytes, input.runId, input.recordedAt],
+    );
+  }
+
+  async listEpisodeSources(scope: UserMessageScope): Promise<EpisodeSource[]> {
+    await this.ensureSchema();
+    const result = await this.pool.query<Record<string, unknown>>(
+      "SELECT * FROM episode_sources WHERE account_id = $1 AND drive = $2 AND title_key = $3 ORDER BY episode",
+      [scope.accountId, scope.drive, scope.titleKey],
+    );
+    return result.rows.map((r) => ({
+      accountId: String(r["account_id"]), drive: String(r["drive"]), titleKey: String(r["title_key"]), episode: String(r["episode"]),
+      linkKey: (r["link_key"] as string | null) ?? null, label: String(r["label"]),
+      sizeBytes: r["size_bytes"] === null ? null : Number(r["size_bytes"]),
+      runId: String(r["run_id"]), recordedAt: String(r["recorded_at"]),
+    }));
+  }
+
   // ---- private ----
 
   private async withTransaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
@@ -1760,4 +1987,9 @@ function connectedStorageFromRow(row: Record<string, unknown>): ConnectedStorage
     frozenAt: (row.frozen_at as string | null | undefined) ?? null,
     createdAt: String(row.created_at),
   };
+}
+
+/** Oldest first, id as the tie-break (RETURNING has no ORDER BY). */
+function compareUserMessagesCreated(a: UserMessage, b: UserMessage): number {
+  return a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 }
