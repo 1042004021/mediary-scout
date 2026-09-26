@@ -307,7 +307,6 @@ describe("runAcquisitionAgent — the real AI SDK tool-loop over the sandbox", (
         requestedEpisodes: ["S01E01"],
         onReject: async () => {},
         onReport: async (r) => { reported.push(...r); },
-        isRejected: async () => false,
       },
     });
     let calls = 0;

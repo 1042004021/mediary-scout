@@ -137,6 +137,35 @@ async function keptDuplicatesOption(input: {
   }
 }
 
+/** This work's rejected resources (account + work scoped), for every run of it: the
+ *  search filter and the transfer-time guard keep a patrol from landing what the
+ *  user rejected. Read lazily on every search/transfer; a failing read is logged and
+ *  treated as an empty list (fail open — it must never fail a patrol). */
+function rejectedLookupOption(input: {
+  repository: WorkflowRepository;
+  accountId?: string;
+  title: MediaTitle;
+}): { rejectedLookup: NonNullable<RunTvAcquisitionV2Request["rejectedLookup"]> } {
+  const accountId = input.accountId ?? DEFAULT_ACCOUNT_ID;
+  return {
+    rejectedLookup: {
+      list: async () => {
+        try {
+          return (await input.repository.listRejectedResources({ accountId, titleKey: input.title.id })).map((r) => ({
+            episode: r.episode,
+            linkKey: r.linkKey,
+            label: r.label,
+            sizeBytes: r.sizeBytes,
+          }));
+        } catch (error) {
+          console.error(`[user-message] could not read rejected resources of ${input.title.id}: ${String(error).slice(0, 300)}`);
+          return [];
+        }
+      },
+    },
+  };
+}
+
 /** The run's onProgress: live activity progress (for the activity page) AND the
  *  durable per-step trace (for post-mortem复盘), combined + isolated so one can't
  *  break the other. `apiCallCount` surfaces the 115 budget burn per step (real 115
@@ -224,6 +253,7 @@ export async function runType2InitializationV2AndPersist(
     }),
     ...passthrough(input),
     ...(await keptDuplicatesOption(input)),
+    ...rejectedLookupOption(input),
   });
 
   await persistSingleSeason({
@@ -273,6 +303,7 @@ export async function runType3MonitoringV2AndPersist(
     }),
     ...passthrough(input),
     ...(await keptDuplicatesOption(input)),
+    ...rejectedLookupOption(input),
   });
 
   await persistSingleSeason({
@@ -323,6 +354,7 @@ export async function runSeriesInitializationV2AndPersist(
     }),
     ...passthrough(input),
     ...(await keptDuplicatesOption(input)),
+    ...rejectedLookupOption(input),
   });
 
   // Stamp completion AFTER the run; one finishedAt shared across all season
@@ -425,6 +457,7 @@ export async function runReplaceRequestV2AndPersist(
     }),
     ...passthrough(input),
     ...(await keptDuplicatesOption(input)),
+    ...rejectedLookupOption(input),
   });
 
   const finishedAt = now();
@@ -522,6 +555,7 @@ export async function runMovieAcquisitionV2AndPersist(input: {
     ...(input.userRequest === undefined ? {} : { userRequest: input.userRequest }),
     ...(input.priorObtained === undefined ? {} : { priorObtained: input.priorObtained }),
     ...(await keptDuplicatesOption(input)),
+    ...rejectedLookupOption(input),
     ...memoryOption(input),
   });
 

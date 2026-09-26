@@ -65,6 +65,8 @@ export interface RunMovieAcquisitionV2Request {
   priorObtained?: boolean;
   /** See orchestrator.keptDuplicates (["MOVIE"] when the film has a kept replacement). */
   keptDuplicates?: string[];
+  /** See orchestrator.rejectedLookup. */
+  rejectedLookup?: RunAcquisitionV2Request["rejectedLookup"];
   onProgress?: (event: AgentToolEvent) => void;
   now?: () => string;
 }
@@ -122,6 +124,7 @@ export async function runMovieAcquisitionV2(
     ...(request.memory ? { memory: request.memory } : {}),
     ...(request.userRequest ? { userRequest: request.userRequest } : {}),
     ...(request.keptDuplicates?.length ? { keptDuplicates: request.keptDuplicates } : {}),
+    ...(request.rejectedLookup ? { rejectedLookup: request.rejectedLookup } : {}),
     ...(request.onProgress ? { onProgress: request.onProgress } : {}),
   });
 

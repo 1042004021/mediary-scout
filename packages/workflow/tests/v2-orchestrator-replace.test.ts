@@ -430,7 +430,16 @@ describe("runAcquisitionV2 — user replace request", () => {
         return text("done");
       },
     });
-    const result = await runAcquisitionV2(baseRequest(model, exec, rejectedRows));
+    const req = baseRequest(model, exec, rejectedRows);
+    // Both requested episodes were rejected by an earlier run: no need to reject again first.
+    req.userRequest = {
+      ...req.userRequest!,
+      prompt: {
+        ...req.userRequest!.prompt,
+        rejected: ["S01E13", "S01E24"].map((episode) => ({ episode, label: "x.mkv", sizeBytes: 1, reason: "发蓝" })),
+      },
+    };
+    const result = await runAcquisitionV2(req);
     expect(String(transferOutput?.error)).toMatch(/SANDBOX_CANDIDATE_REJECTED/);
     expect(result.outcome.transferAttempts).toEqual([]);
   });

@@ -272,6 +272,31 @@ describe("runMovieAcquisitionV2 forwards jevJudge to the orchestrator", () => {
   });
 });
 
+describe("runMovieAcquisitionV2 forwards rejectedLookup to the orchestrator", () => {
+  it("an ordinary movie run reads the rejected list on search", async () => {
+    let reads = 0;
+    await runMovieAcquisitionV2({
+      title,
+      resourceProvider: emptyProvider(),
+      storage: new FakeStorageExecutor(),
+      model: scriptModel([
+        { tool: "searchResources", input: { keyword: "盗梦空间 Inception" } },
+        { tool: "reportNoCoverage", input: { reason: "threading test" } },
+      ]),
+      workflowRunId: "run-rejected-movie",
+      moviesParentDirectoryId: "movies_root",
+      rejectedLookup: {
+        list: async () => {
+          reads += 1;
+          return [];
+        },
+      },
+      now: () => "2026-06-14T00:00:00.000Z",
+    });
+    expect(reads).toBeGreaterThan(0);
+  });
+});
+
 describe("runMovieAcquisitionV2 — user request (replace_request run)", () => {
   it("the old film stays obtained when it is not replaced; the request reaches the prompt and the tools", async () => {
     const executor = new FakeStorageExecutor();

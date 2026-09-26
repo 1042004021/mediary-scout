@@ -100,6 +100,14 @@ export interface RunAcquisitionV2Request {
    *  episode_sources rows). Their existing files are protected for the whole run and
    *  named in the prompt, so keep-larger dedup never undoes a replacement. */
   keptDuplicates?: string[];
+  /** This work's rejected resources (account + work scoped: the user said "not this
+   *  one", on any drive). Read on every search to filter them out, and again at every
+   *  transfer — in EVERY run of the work, not only replace runs, so a patrol never
+   *  lands what the user rejected. A failing read fails open (logged). On a replace
+   *  run userRequest.rejectedStore is the source instead (same rows). */
+  rejectedLookup?: {
+    list: () => Promise<Array<{ episode?: string; linkKey: string | null; label: string; sizeBytes: number | null }>>;
+  };
   /** A replace_request run (user message). See docs/superpowers/specs/2026-09-26-user-message-replace-design.md. */
   userRequest?: {
     /** Episodes the user named or that are still pending (movie: ["MOVIE"]). Added to the need. */
@@ -141,6 +149,9 @@ export interface RunAcquisitionV2Result extends AcquisitionAgentResult {
 
 export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promise<RunAcquisitionV2Result> {
   const registry = new CandidateRegistry();
+  // Where the stored rejected list comes from (see rejectedLookup). Absent = no
+  // rejection filtering at all (callers that do not know the work).
+  const rejectedSource: RunAcquisitionV2Request["rejectedLookup"] = request.userRequest?.rejectedStore ?? request.rejectedLookup;
   // Wrapping HERE (not at the call site) is what makes the pre-warm and every agent
   // searchResources go through the same filter — they all funnel through this adapter.
   const searchProvider = request.jevJudge
@@ -153,7 +164,7 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
     ...(request.deadLinkStore ? { deadLinkStore: request.deadLinkStore } : {}),
     // Re-read on every search (closure over the collectors declared below; first
     // called only once the agent searches).
-    ...(request.userRequest ? { rejectedResources: { list: () => listRejected() } } : {}),
+    ...(rejectedSource ? { rejectedResources: { list: () => listRejected() } } : {}),
   });
   const storage = new RealStorageV2({
     executor: request.executor,
@@ -177,10 +188,23 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
   const replaceRejected: NonNullable<RunAcquisitionV2Result["replacement"]>["rejected"] = [];
   const oldFiles = new Set<string>();
   let rejectedPersistFailed = false;
+  // Concurrent callers share one in-flight read (the sandbox re-checks every cached
+  // candidate at once after a rejection); nothing is cached past that read.
+  let storedInFlight: Promise<Array<{ linkKey: string | null; label: string; sizeBytes: number | null }>> | null = null;
+  const readStored = () => {
+    if (!storedInFlight) {
+      storedInFlight = Promise.resolve()
+        .then(() => rejectedSource?.list() ?? [])
+        .finally(() => {
+          storedInFlight = null;
+        });
+    }
+    return storedInFlight;
+  };
   const listRejected = async (): Promise<Array<{ linkKey: string | null; label: string; sizeBytes: number | null }>> => {
     let stored: Array<{ linkKey: string | null; label: string; sizeBytes: number | null }> = [];
     try {
-      stored = (await userRequest?.rejectedStore.list()) ?? [];
+      stored = await readStored();
     } catch (error) {
       console.log(`[user-message] run ${request.workflowRunId} rejected list read failed: ${errorText(error)}`);
     }
@@ -224,10 +248,30 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
     ...(request.searchProfile === undefined ? {} : { searchProfile: request.searchProfile }),
     ...(memoryBinding ? { memory: memoryBinding } : {}),
     ...((request.keptDuplicates?.length ?? 0) > 0 ? { protectExistingFiles: true } : {}),
+    ...(rejectedSource
+      ? {
+          isRejected: async (candidate: { id: string; title: string }) => {
+            // Transfer-time guard for what the search filter could not catch (the raw
+            // pre-search may predate a rejection; a repeated keyword is cached).
+            try {
+              const rows = await listRejected();
+              const key = deadLinkKey(String(registry.get(candidate.id)?.providerPayload?.["url"] ?? ""))?.key;
+              return rows.some(
+                (r) => (key !== undefined && r.linkKey === key) || resourceFingerprintMatches(candidate.title, r),
+              );
+            } catch (error) {
+              console.log(`[user-message] run ${request.workflowRunId} rejected check failed (allowing): ${errorText(error)}`);
+              return false;
+            }
+          },
+        }
+      : {}),
     ...(userRequest
       ? {
           replace: {
             requestedEpisodes: userRequest.requestedEpisodes,
+            // Stored rejections from earlier runs: a 待换 re-check need not reject again.
+            alreadyRejectedEpisodes: [...new Set(userRequest.prompt.rejected.map((r) => r.episode))],
             onReject: async (items) => {
               // Skip what is already rejected (same episode + label + size), in the
               // store or earlier this run — the agent may reject the same file twice.
@@ -283,20 +327,6 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
                       }
                     : {}),
                 });
-              }
-            },
-            isRejected: async (candidate) => {
-              // Transfer-time guard for what the search filter could not catch (the raw
-              // pre-search ran before the rejection; a repeated keyword is cached).
-              try {
-                const rows = await listRejected();
-                const key = deadLinkKey(String(registry.get(candidate.id)?.providerPayload?.["url"] ?? ""))?.key;
-                return rows.some(
-                  (r) => (key !== undefined && r.linkKey === key) || resourceFingerprintMatches(candidate.title, r),
-                );
-              } catch (error) {
-                console.log(`[user-message] run ${request.workflowRunId} rejected check failed (allowing): ${errorText(error)}`);
-                return false;
               }
             },
           },

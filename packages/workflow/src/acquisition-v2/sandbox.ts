@@ -215,14 +215,19 @@ export interface TaskSandboxOptions {
    *  per-episode outcomes. Absent = the replace tools refuse. */
   replace?: {
     requestedEpisodes: string[];
+    /** Requested episodes whose current source an earlier run already rejected (the
+     *  stored list). When every requested episode is in here the agent may transfer
+     *  without calling rejectCurrentSource again — see assertRejectedFirst. */
+    alreadyRejectedEpisodes?: string[];
     onReject: (items: Array<{ episode: string; label: string; sizeBytes: number; reason: string; path: string }>) => Promise<void>;
     onReport: (results: Array<{ episode: string; outcome: "replaced" | "not_found"; candidateId?: string; note: string }>) => Promise<void>;
-    /** Whether a search candidate is a copy of a resource the user rejected. The
-     *  search-side filter cannot catch everything within one run (the raw pre-search
-     *  ran before the rejection; a repeated keyword returns the cached snapshot), so
-     *  every transfer asks again. */
-    isRejected: (candidate: { id: string; title: string }) => Promise<boolean>;
   };
+  /** Whether a search candidate is a copy of a resource the user rejected for this
+   *  work (any run — the rejected list is account + work scoped, not replace-only).
+   *  The search-side filter cannot catch everything within one run (the raw
+   *  pre-search may predate a rejection; a repeated keyword returns the cached
+   *  snapshot), so every transfer asks again. Absent = no transfer-time guard. */
+  isRejected?: (candidate: { id: string; title: string }) => Promise<boolean>;
   /** Any run of a work that has kept old + replacement copies (episode_sources):
    *  files already in the target dirs at the start are protected like in a replace
    *  run (never deleted, moved, renamed or flattened away), without the replace
@@ -334,7 +339,10 @@ export class TaskSandbox {
    *  so a transfer that threw still counts). Read by hasTransferEvidence. */
   private transferAttempted = false;
   private readonly replace: TaskSandboxOptions["replace"];
+  private readonly isRejected: TaskSandboxOptions["isRejected"];
   private readonly protectExistingFiles: boolean;
+  /** Set once captureProtectedFiles has listed the target dirs (see assertRejectedFirst). */
+  private protectedCaptured = false;
   /** Replace runs: every file in a target dir when the run started (the user's
    *  current copy — it must survive the run), keyed by id, with its dir label
    *  ("Season 01", or "" for the movie dir). Only these can be rejected. */
@@ -343,7 +351,9 @@ export class TaskSandbox {
   private readonly reportedEpisodes = new Map<string, "replaced" | "not_found">();
   /** Episodes the agent rejected via rejectCurrentSource (in order). */
   private readonly rejectedEpisodes: string[] = [];
-  /** Candidates whose transfer succeeded this run (reportReplacement's evidence). */
+  /** Candidates that landed this run (reportReplacement's evidence): a succeeded
+   *  attempt, or a failed one that still materialized files (quark marks some
+   *  landings failed — the landing point is the truth, not the status flag). */
   private readonly succeededCandidates = new Set<string>();
 
   constructor(options: TaskSandboxOptions) {
@@ -366,6 +376,7 @@ export class TaskSandbox {
     this.subtitleProvider = options.subtitleProvider;
     this.memory = options.memory;
     this.replace = options.replace;
+    this.isRejected = options.isRejected;
     this.protectExistingFiles = options.protectExistingFiles === true;
   }
 
@@ -655,7 +666,8 @@ export class TaskSandbox {
     if (!candidate) {
       throw new Error(`SANDBOX_CANDIDATE_NOT_IN_SNAPSHOT: ${input.candidateId} is not in ${input.snapshotId}`);
     }
-    if (this.replace && (await this.replace.isRejected({ id: candidate.id, title: candidate.title }))) {
+    this.assertRejectedFirst();
+    if (this.isRejected && (await this.isRejected({ id: candidate.id, title: candidate.title }))) {
       throw new Error(
         `SANDBOX_CANDIDATE_REJECTED: ${input.candidateId} is a copy of a resource the user rejected — pick a different one`,
       );
@@ -665,7 +677,9 @@ export class TaskSandbox {
       candidateId: input.candidateId,
       intoDirectoryId: this.stagingDirectoryId,
     });
-    if (attempt.status === "succeeded") this.succeededCandidates.add(input.candidateId);
+    if (attempt.status === "succeeded" || attempt.materializedFileIds.length > 0) {
+      this.succeededCandidates.add(input.candidateId);
+    }
     const staging = await this.storage.listTree({ directoryId: this.stagingDirectoryId });
     // A systemic block ONLY when nothing actually landed — a provider can mark an
     // attempt failed yet materialize files (e.g. quark); the truth is the landing
@@ -713,6 +727,7 @@ export class TaskSandbox {
     if (input.candidateIds.length === 0) {
       throw new Error("SANDBOX_NO_CANDIDATES: transferUntilLanded needs at least one candidate");
     }
+    this.assertRejectedFirst();
     for (const candidateId of input.candidateIds) {
       const observed = [...this.observedSnapshots.values()].some((snapshot) =>
         snapshot.candidates.some((candidate) => candidate.id === candidateId),
@@ -733,9 +748,9 @@ export class TaskSandbox {
     let transferredCandidateId: string | null = null;
     let systemicBlock: { reason: string } | undefined;
     for (const candidateId of input.candidateIds) {
-      // Replace run: a copy of what the user rejected is skipped like a dead link
-      // (recorded, not transferred) so the rest of the agent's ordered list still runs.
-      if (this.replace && (await this.replace.isRejected({ id: candidateId, title: this.observedTitle(candidateId) }))) {
+      // A copy of what the user rejected is skipped like a dead link (recorded, not
+      // transferred) so the rest of the agent's ordered list still runs.
+      if (this.isRejected && (await this.isRejected({ id: candidateId, title: this.observedTitle(candidateId) }))) {
         attempts.push({ candidateId, status: "failed", providerMessage: "user rejected" });
         continue;
       }
@@ -754,6 +769,9 @@ export class TaskSandbox {
         transferredCandidateId = candidateId;
         break;
       }
+      // Failed but landed (quark): it landed as far as the replace checks go. The
+      // loop itself is unchanged — it still decides on the status as before.
+      if (attempt.materializedFileIds.length > 0) this.succeededCandidates.add(candidateId);
       // Layer-1: stop on the first failure that is a SYSTEMIC block (quota / auth /
       // VIP) — it may come after one or more dead-link failures, but once we see a
       // systemic one every remaining candidate will fail the same way, so don't
@@ -1092,6 +1110,52 @@ export class TaskSandbox {
         this.protectedFiles.set(file.id, { file, dirLabel: "" });
       }
     }
+    this.protectedCaptured = true;
+  }
+
+  /** Replace runs: nothing may be transferred before the user's current copy is
+   *  rejected. The raw snapshot is pre-warmed before the agent can reject anything,
+   *  so a model that transfers first could land the very file the user complained
+   *  about. Escape hatches (the gate would only get in the way):
+   *  - rejectCurrentSource has succeeded at least once this run;
+   *  - every requested episode already has a stored rejection from an earlier run
+   *    (a 待换 re-check — its copies are filtered from search and refused anyway).
+   *    Only when there is at least one requested episode: with none (a message with
+   *    no tags), the agent reads the episodes from the words and must reject them;
+   *  - the target dirs held no file at all when the run started (nothing to reject). */
+  private assertRejectedFirst(): void {
+    if (!this.replace) return;
+    if (this.rejectedEpisodes.length > 0) return;
+    const requested = this.replace.requestedEpisodes;
+    const already = new Set(this.replace.alreadyRejectedEpisodes ?? []);
+    if (requested.length > 0 && requested.every((episode) => already.has(episode))) return;
+    if (this.protectedCaptured && this.protectedFiles.size === 0) return;
+    throw new Error(
+      "SANDBOX_REJECT_FIRST: call rejectCurrentSource for the files the user complained about before transferring",
+    );
+  }
+
+  /** After a rejection: drop the newly rejected copies from what the agent can read
+   *  back for free (the raw pre-warm via viewResourceSnapshot, and every cached
+   *  keyword a deduped searchResources returns). observedSnapshots keep the full
+   *  snapshots — transfer validation and persistence need them; the transfer-time
+   *  guard still refuses a rejected id the agent remembers. */
+  private async refilterCachedSnapshots(): Promise<void> {
+    const isRejected = this.isRejected;
+    if (!isRejected) return;
+    const filtered = new Map<ResourceSnapshotV2, ResourceSnapshotV2>();
+    const refilter = async (snapshot: ResourceSnapshotV2): Promise<ResourceSnapshotV2> => {
+      const done = filtered.get(snapshot);
+      if (done) return done;
+      // Asked all at once: the caller can answer the whole batch from one read.
+      const hits = await Promise.all(snapshot.candidates.map((c) => isRejected({ id: c.id, title: c.title })));
+      const keep = snapshot.candidates.filter((_, index) => !hits[index]);
+      const next = keep.length === snapshot.candidates.length ? snapshot : { ...snapshot, candidates: keep };
+      filtered.set(snapshot, next);
+      return next;
+    };
+    for (const [keyword, snapshot] of this.snapshotByKeyword) this.snapshotByKeyword.set(keyword, await refilter(snapshot));
+    if (this.rawSnapshot) this.rawSnapshot = await refilter(this.rawSnapshot);
   }
 
   private assertNotProtected(fileIds: string[]): void {
@@ -1162,6 +1226,7 @@ export class TaskSandbox {
       if (!this.need.includes(episode)) this.need.push(episode);
       if (!this.rejectedEpisodes.includes(episode)) this.rejectedEpisodes.push(episode);
     }
+    await this.refilterCachedSnapshots();
     return { rejected: items.length };
   }
 

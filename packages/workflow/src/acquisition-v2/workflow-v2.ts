@@ -70,6 +70,8 @@ export interface RunAcquisitionV2WorkflowRequest {
   userRequest?: RunAcquisitionV2Request["userRequest"];
   /** See orchestrator.keptDuplicates. */
   keptDuplicates?: string[];
+  /** See orchestrator.rejectedLookup. */
+  rejectedLookup?: RunAcquisitionV2Request["rejectedLookup"];
   onProgress?: (event: AgentToolEvent) => void;
 }
 
@@ -182,6 +184,7 @@ export async function runAcquisitionV2Workflow(
     ...(request.memory ? { memory: request.memory } : {}),
     ...(request.userRequest ? { userRequest: request.userRequest } : {}),
     ...(request.keptDuplicates?.length ? { keptDuplicates: request.keptDuplicates } : {}),
+    ...(request.rejectedLookup ? { rejectedLookup: request.rejectedLookup } : {}),
     ...(request.onProgress ? { onProgress: request.onProgress } : {}),
   });
 

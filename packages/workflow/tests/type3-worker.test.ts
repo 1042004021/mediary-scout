@@ -958,3 +958,153 @@ describe("runScheduledType3Monitoring — user requests", () => {
     expect((await repository.listActiveWorkflowRuns()).map((run) => run.title.id)).toEqual(["title_show"]);
   });
 });
+
+describe("runScheduledType3Monitoring — the user's rejected list applies to ordinary runs", () => {
+  const ACCOUNT = "acct_default";
+  const OLD_TITLE = "Show show S01E02 [OldGroup] [1.3G]";
+  const NEW_TITLE = "Show show S01E02 [NewGroup] [1.1G]";
+  const OLD_LINK = `magnet:?xt=urn:btih:${"a".repeat(40)}`;
+
+  function provider() {
+    return new FakeResourceProvider({
+      keywordResults: {
+        "Show show": [
+          { title: OLD_TITLE, providerPayload: { url: OLD_LINK } },
+          { title: NEW_TITLE, providerPayload: { url: `magnet:?xt=urn:btih:${"b".repeat(40)}` } },
+        ],
+      },
+    });
+  }
+
+  function lastToolOutput(prompt: unknown, toolName: string): any {
+    const messages = prompt as Array<{ role: string; content: unknown }>;
+    for (let m = messages.length - 1; m >= 0; m--) {
+      const message = messages[m]!;
+      if (message.role !== "tool" || !Array.isArray(message.content)) continue;
+      for (const part of message.content as Array<{ type: string; toolName?: string; output?: { value?: unknown } }>) {
+        if (part.type === "tool-result" && part.toolName === toolName) return part.output?.value;
+      }
+    }
+    return undefined;
+  }
+
+  const step = (name: string, input: unknown, i: number) => ({
+    content: [{ type: "tool-call" as const, toolCallId: `c${i}`, toolName: name, input: JSON.stringify(input) }],
+    finishReason: { unified: "tool-calls" as const, raw: "tool-calls" as const },
+    usage: USAGE,
+    warnings: [],
+  });
+  const done = () => ({ content: [{ type: "text" as const, text: "done" }], finishReason: { unified: "stop" as const, raw: "stop" as const }, usage: USAGE, warnings: [] });
+
+  async function gapShow() {
+    const repository = new InMemoryWorkflowRepository();
+    const { title, season } = trackedFixture();
+    // E02 is a real gap, so the patrol runs the agent.
+    await seedTrackedSeason({ repository, title, season, obtainedCodes: ["S01E01"] });
+    const storage = new FakeStorageExecutor();
+    await seedV2Season(storage, title, season, ["S01E01"]);
+    return { repository, storage, title };
+  }
+
+  const rejectOld = (repository: InMemoryWorkflowRepository, titleKey: string) =>
+    repository.addRejectedResources({
+      accountId: ACCOUNT,
+      titleKey,
+      now: fixedNow(),
+      items: [{ episode: "S01E02", linkKey: `magnet:${"a".repeat(40)}`, label: "Something else.mkv", sizeBytes: 1, reason: "假片", messageId: null }],
+    });
+
+  it("a stored rejection is filtered out of an ordinary patrol's search", async () => {
+    const { repository, storage, title } = await gapShow();
+    await rejectOld(repository, title.id);
+    let doc = "";
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        i += 1;
+        if (i === 1) return step("viewResourceSnapshot", {}, i);
+        if (i === 2) {
+          doc = String(lastToolOutput(options.prompt, "viewResourceSnapshot")?.document);
+          return step("reportNoCoverage", { reason: "x" }, i);
+        }
+        return done();
+      },
+    });
+
+    await runScheduledType3Monitoring({ repository, resourceProvider: provider(), storage, model, storageParentDirectoryId: "library_root", now: fixedNow });
+
+    expect(doc).toContain("NewGroup");
+    expect(doc).not.toContain("OldGroup");
+  });
+
+  it("a candidate rejected after the raw pre-search is refused at transfer in an ordinary patrol", async () => {
+    const { repository, storage, title } = await gapShow();
+    let transferOutput: any;
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        i += 1;
+        if (i === 1) return step("viewResourceSnapshot", {}, i);
+        if (i === 2) {
+          // Rejected meanwhile (a replace run of the same work on another drive).
+          await rejectOld(repository, title.id);
+          const doc = String(lastToolOutput(options.prompt, "viewResourceSnapshot").document);
+          const row = /\[(s(\d+)-\d+)\] Show show S01E02 \[OldGroup\]/.exec(doc)!;
+          return step("transferCandidate", { snapshotId: `s${row[2]}`, candidateId: row[1] }, i);
+        }
+        if (i === 3) {
+          transferOutput = lastToolOutput(options.prompt, "transferCandidate");
+          return step("reportNoCoverage", { reason: "x" }, i);
+        }
+        return done();
+      },
+    });
+
+    await runScheduledType3Monitoring({
+      repository,
+      resourceProvider: provider(),
+      storage,
+      model,
+      storageParentDirectoryId: "library_root",
+      now: fixedNow,
+      createWorkflowRunId: () => "run_rejected_guard",
+    });
+
+    expect(String(transferOutput?.error)).toMatch(/SANDBOX_CANDIDATE_REJECTED/);
+    expect((await repository.getWorkflowRunSnapshot("run_rejected_guard"))?.transferAttempts).toEqual([]);
+  });
+
+  it("a failing rejected-list read never fails the patrol (fails open)", async () => {
+    const { repository, storage } = await gapShow();
+    repository.listRejectedResources = async () => {
+      throw new Error("rejected_resources table missing");
+    };
+    let doc = "";
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        i += 1;
+        if (i === 1) return step("viewResourceSnapshot", {}, i);
+        if (i === 2) {
+          doc = String(lastToolOutput(options.prompt, "viewResourceSnapshot")?.document);
+          return step("reportNoCoverage", { reason: "x" }, i);
+        }
+        return done();
+      },
+    });
+
+    const outcomes = await runScheduledType3Monitoring({
+      repository,
+      resourceProvider: provider(),
+      storage,
+      model,
+      storageParentDirectoryId: "library_root",
+      now: fixedNow,
+      createWorkflowRunId: () => "run_rejected_down",
+    });
+
+    expect(outcomes).toEqual([expect.objectContaining({ status: "ran" })]);
+    expect((await repository.getWorkflowRunSnapshot("run_rejected_down"))?.workflowRun.status).not.toBe("failed");
+    expect(doc).toContain("OldGroup");
+  });
+});

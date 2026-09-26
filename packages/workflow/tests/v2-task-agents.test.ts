@@ -487,7 +487,7 @@ describe("replace tools registration", () => {
       provider: new FakeResourceProviderV2(),
       need: [],
       targetSeasonDirectoryIds: { 1: "season" },
-      replace: { requestedEpisodes: ["S01E13"], onReject: async () => undefined, onReport: async () => undefined, isRejected: async () => false },
+      replace: { requestedEpisodes: ["S01E13"], onReject: async () => undefined, onReport: async () => undefined },
     });
     const tools = buildSandboxToolSet(sandbox) as Record<string, ExecutableTool>;
     await expect(tools.finish!.execute({}, {})).resolves.toEqual({ error: expect.stringContaining("SANDBOX_REPORT_REQUIRED: S01E13") });
