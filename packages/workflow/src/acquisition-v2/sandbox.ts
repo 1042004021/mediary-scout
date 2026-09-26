@@ -209,6 +209,20 @@ export interface TaskSandboxOptions {
     legacyProvider?: string;
     now?: () => string;
   };
+  /** A replace_request run: the user asked for these episodes to be swapped. Files
+   *  already in the target dirs when the run starts are protected (never deleted,
+   *  moved or renamed); the agent rejects the current source and reports
+   *  per-episode outcomes. Absent = the replace tools refuse. */
+  replace?: {
+    requestedEpisodes: string[];
+    onReject: (items: Array<{ episode: string; label: string; sizeBytes: number; reason: string; path: string }>) => Promise<void>;
+    onReport: (results: Array<{ episode: string; outcome: "replaced" | "not_found"; candidateId?: string; note: string }>) => Promise<void>;
+    /** Whether a search candidate is a copy of a resource the user rejected. The
+     *  search-side filter cannot catch everything within one run (the raw pre-search
+     *  ran before the rejection; a repeated keyword returns the cached snapshot), so
+     *  every transfer asks again. */
+    isRejected: (candidate: { id: string; title: string }) => Promise<boolean>;
+  };
 }
 
 /** What the models see of a memory entry (no persistence identifiers). */
@@ -274,7 +288,7 @@ export class TaskSandbox {
   private readonly seasonDirs: Map<number, string>;
   /** A movie task's one target directory (movies have no seasons). */
   private readonly movieDir: string | undefined;
-  private readonly need: readonly string[];
+  private readonly need: string[];
   private readonly titleTerms: readonly string[];
   private readonly subtitleFallback: boolean;
   /** Reserve-zone threshold (movie 8+2) — undefined disables the reserve zone. */
@@ -314,6 +328,15 @@ export class TaskSandbox {
   /** Set the moment a video/subtitle transfer is ATTEMPTED (before the provider call,
    *  so a transfer that threw still counts). Read by hasTransferEvidence. */
   private transferAttempted = false;
+  private readonly replace: TaskSandboxOptions["replace"];
+  /** Replace runs: every file id in a target dir when the run started (the user's
+   *  current copy — it must survive the run). */
+  private readonly protectedFileIds = new Set<string>();
+  private readonly reportedEpisodes = new Set<string>();
+  /** Episodes the agent rejected via rejectCurrentSource (in order). */
+  private readonly rejectedEpisodes: string[] = [];
+  /** Candidates whose transfer succeeded this run (reportReplacement's evidence). */
+  private readonly succeededCandidates = new Set<string>();
 
   constructor(options: TaskSandboxOptions) {
     this.provider = options.provider;
@@ -330,10 +353,11 @@ export class TaskSandbox {
       Object.entries(options.targetSeasonDirectoryIds ?? {}).map(([season, id]) => [Number(season), id]),
     );
     this.movieDir = options.targetMovieDirectoryId;
-    this.need = options.need ?? [];
+    this.need = [...(options.need ?? [])];
     this.titleTerms = options.titleTerms ?? [];
     this.subtitleProvider = options.subtitleProvider;
     this.memory = options.memory;
+    this.replace = options.replace;
   }
 
   /** Every scoped target directory (all seasons + the movie) — the union used for
@@ -603,14 +627,21 @@ export class TaskSandbox {
     if (!snapshot) {
       throw new Error(`SANDBOX_SNAPSHOT_NOT_OBSERVED: ${input.snapshotId} was not seen in this task`);
     }
-    if (!snapshot.candidates.some((candidate) => candidate.id === input.candidateId)) {
+    const candidate = snapshot.candidates.find((c) => c.id === input.candidateId);
+    if (!candidate) {
       throw new Error(`SANDBOX_CANDIDATE_NOT_IN_SNAPSHOT: ${input.candidateId} is not in ${input.snapshotId}`);
+    }
+    if (this.replace && (await this.replace.isRejected({ id: candidate.id, title: candidate.title }))) {
+      throw new Error(
+        `SANDBOX_CANDIDATE_REJECTED: ${input.candidateId} is a copy of a resource the user rejected — pick a different one`,
+      );
     }
     this.transferAttempted = true;
     const attempt = await this.storage.transferCandidate({
       candidateId: input.candidateId,
       intoDirectoryId: this.stagingDirectoryId,
     });
+    if (attempt.status === "succeeded") this.succeededCandidates.add(input.candidateId);
     const staging = await this.storage.listTree({ directoryId: this.stagingDirectoryId });
     // A systemic block ONLY when nothing actually landed — a provider can mark an
     // attempt failed yet materialize files (e.g. quark); the truth is the landing
@@ -678,6 +709,12 @@ export class TaskSandbox {
     let transferredCandidateId: string | null = null;
     let systemicBlock: { reason: string } | undefined;
     for (const candidateId of input.candidateIds) {
+      // Replace run: a copy of what the user rejected is skipped like a dead link
+      // (recorded, not transferred) so the rest of the agent's ordered list still runs.
+      if (this.replace && (await this.replace.isRejected({ id: candidateId, title: this.observedTitle(candidateId) }))) {
+        attempts.push({ candidateId, status: "failed", providerMessage: "user rejected" });
+        continue;
+      }
       this.transferAttempted = true;
       const attempt = await this.storage.transferCandidate({
         candidateId,
@@ -689,6 +726,7 @@ export class TaskSandbox {
         ...(attempt.providerMessage ? { providerMessage: attempt.providerMessage } : {}),
       });
       if (attempt.status === "succeeded") {
+        this.succeededCandidates.add(candidateId);
         transferredCandidateId = candidateId;
         break;
       }
@@ -754,6 +792,8 @@ export class TaskSandbox {
     if (outOfScope.length > 0) {
       throw new Error(`SANDBOX_FILES_NOT_IN_STAGING: ${outOfScope.join(",")}`);
     }
+    // A movie's staging IS its movie dir, so the old film sits "in staging" too.
+    this.assertNotProtected(resolved.flatMap((move) => move.fileIds));
     // Execute each move (the system does the per-file moves under the hood).
     for (const move of resolved) {
       await this.storage.moveFiles({ fileIds: move.fileIds, targetDirectoryId: move.targetDir });
@@ -779,6 +819,7 @@ export class TaskSandbox {
     if (!this.storage) {
       throw new Error("SANDBOX: no storage configured");
     }
+    this.assertNotProtected(input.fileIds);
     const directoryId =
       input.directory === "season" ? this.resolveTargetDir(input.season) : this.stagingDirectoryId;
     if (!directoryId) {
@@ -844,13 +885,18 @@ export class TaskSandbox {
       throw new Error("SANDBOX_NOT_A_MOVIE: flattenMovie is movie-only");
     }
     const root = this.movieDir;
-    const nested = (await this.storage.listTree({ directoryId: root })).filter(
-      (file) => (file.isVideo || file.isSubtitle) && file.path.includes("/"),
+    const tree = await this.storage.listTree({ directoryId: root });
+    // Replace run: the old film (and anything beside it) stays exactly where it was —
+    // it is neither lifted nor swept away with a wrapper.
+    const nested = tree.filter(
+      (file) => (file.isVideo || file.isSubtitle) && file.path.includes("/") && !this.protectedFileIds.has(file.id),
     );
     if (nested.length > 0) {
       await this.storage.moveFiles({ fileIds: nested.map((file) => file.id), targetDirectoryId: root });
     }
+    const protectedPaths = tree.filter((file) => this.protectedFileIds.has(file.id)).map((file) => file.path);
     for (const wrapper of await this.storage.listSubdirectories({ directoryId: root })) {
+      if (protectedPaths.some((path) => path.startsWith(`${wrapper.path}/`))) continue;
       await this.storage.removeDirectory({ directoryId: wrapper.id });
     }
     return { movie: await this.storage.listTree({ directoryId: root }) };
@@ -960,6 +1006,116 @@ export class TaskSandbox {
       // let the recovery turn look for itself (its inspect tools report the error).
       return true;
     }
+  }
+
+  // ── User replace request tools ────────────────────────────────────────────
+  /** Whether this run carries a user replace request (the replace tools are
+   *  registered only when it does). */
+  hasReplace(): boolean {
+    return this.replace !== undefined;
+  }
+
+  /** The current coverage need (read-only copy). */
+  needed(): string[] {
+    return [...this.need];
+  }
+
+  /** Called once before the agent starts: every file already in a target dir is the
+   *  user's current copy and must survive this run. */
+  async captureProtectedFiles(): Promise<void> {
+    if (!this.replace || !this.storage) return;
+    for (const directoryId of this.allTargetDirIds()) {
+      for (const file of await this.storage.listTree({ directoryId })) this.protectedFileIds.add(file.id);
+    }
+  }
+
+  private assertNotProtected(fileIds: string[]): void {
+    const hit = fileIds.filter((id) => this.protectedFileIds.has(id));
+    if (hit.length > 0) {
+      throw new Error(
+        `SANDBOX_FILE_PROTECTED: ${hit.join(",")} was in the library before this run — the user deletes old copies, never the agent`,
+      );
+    }
+  }
+
+  /** A candidate's title from the snapshots observed this run ("" when unseen). */
+  private observedTitle(candidateId: string): string {
+    for (const snapshot of this.observedSnapshots.values()) {
+      const hit = snapshot.candidates.find((c) => c.id === candidateId);
+      if (hit) return hit.title;
+    }
+    return "";
+  }
+
+  /** Reject the current file(s) of the episodes the user complained about: the system
+   *  records name + size (the caller adds the link when known) so every copy is hidden
+   *  from later searches and refused at transfer. The files stay in place. The episodes
+   *  join the need, so one the agent read from the user's words (no tag) can still pass
+   *  the transfer gate. Movie: episodes [] = the film ("MOVIE"). */
+  async rejectCurrentSource(input: { episodes: string[]; fileIds: string[]; reason: string }): Promise<{ rejected: number }> {
+    if (!this.replace || !this.storage) throw new Error("SANDBOX_NO_REPLACE: this run has no user request");
+    if (input.fileIds.length === 0) {
+      throw new Error("SANDBOX_NO_FILES: pass the fileIds of the current copy (from inspectTargetDir)");
+    }
+    const byId = new Map<string, { file: SimTreeFile; dir: string }>();
+    for (const [season, directoryId] of this.seasonDirs) {
+      for (const file of await this.storage.listTree({ directoryId })) {
+        byId.set(file.id, { file, dir: `Season ${String(season).padStart(2, "0")}` });
+      }
+    }
+    if (this.movieDir !== undefined) {
+      for (const file of await this.storage.listTree({ directoryId: this.movieDir })) byId.set(file.id, { file, dir: "" });
+    }
+    const missing = input.fileIds.filter((id) => !byId.has(id));
+    if (missing.length > 0) throw new Error(`SANDBOX_FILES_NOT_IN_TARGET: ${missing.join(",")}`);
+    const episodes = input.episodes.length > 0 ? input.episodes : ["MOVIE"];
+    const reason = input.reason.slice(0, 200);
+    const items = input.fileIds.flatMap((id) => {
+      const { file, dir } = byId.get(id)!;
+      const path = dir ? `${dir}/${file.path}` : file.path;
+      const label = file.path.split("/").pop()!;
+      return episodes.map((episode) => ({ episode, label, sizeBytes: file.sizeBytes, reason, path }));
+    });
+    await this.replace.onReject(items);
+    for (const episode of episodes) {
+      if (!this.need.includes(episode)) this.need.push(episode);
+      if (!this.rejectedEpisodes.includes(episode)) this.rejectedEpisodes.push(episode);
+    }
+    return { rejected: items.length };
+  }
+
+  /** Per-episode outcome of the request. "replaced" is accepted only when the episode
+   *  was marked obtained this run AND its candidate really landed this run; the whole
+   *  call is refused otherwise (nothing recorded). An episode is recorded once. */
+  async reportReplacement(input: {
+    results: Array<{ episode: string; outcome: "replaced" | "not_found"; candidateId?: string; note: string }>;
+  }): Promise<{ recorded: number }> {
+    if (!this.replace) throw new Error("SANDBOX_NO_REPLACE: this run has no user request");
+    for (const r of input.results) {
+      if (r.outcome !== "replaced") continue;
+      if (!this.obtainedCodes.has(r.episode)) {
+        throw new Error(`SANDBOX_REPLACEMENT_NOT_MARKED: ${r.episode} was not marked obtained this run`);
+      }
+      if (!r.candidateId || !this.succeededCandidates.has(r.candidateId)) {
+        throw new Error(`SANDBOX_REPLACEMENT_NO_TRANSFER: ${r.candidateId ?? "(none)"} did not land in this run`);
+      }
+    }
+    const fresh = input.results.filter((r) => !this.reportedEpisodes.has(r.episode));
+    for (const r of fresh) this.reportedEpisodes.add(r.episode);
+    if (fresh.length > 0) await this.replace.onReport(fresh.map((r) => ({ ...r, note: r.note.slice(0, 200) })));
+    return { recorded: fresh.length };
+  }
+
+  /** End of run: every episode the user asked about (tags / pending) or the agent
+   *  rejected, that the agent did not report, is not_found — so it stays 待换 and later
+   *  patrols keep looking. */
+  async finalizeReplacement(): Promise<void> {
+    if (!this.replace) return;
+    const left = [...new Set([...this.replace.requestedEpisodes, ...this.rejectedEpisodes])].filter(
+      (e) => !this.reportedEpisodes.has(e),
+    );
+    for (const e of left) this.reportedEpisodes.add(e);
+    if (left.length > 0) await this.replace.onReport(left.map((episode) => ({ episode, outcome: "not_found", note: "" })));
   }
 
   // ── Agent memory tools ────────────────────────────────────────────────────
@@ -1494,6 +1650,7 @@ export class TaskSandbox {
             `SANDBOX_NOT_A_SUBTITLE: ${fileId} is not a subtitle file; only subtitles may be renamed`,
           );
         }
+        this.assertNotProtected([fileId]);
         if (/[\\/]/.test(newName)) {
           throw new Error(
             `SANDBOX_INVALID_SUBTITLE_NAME: newName must be a bare filename without path separators`,
