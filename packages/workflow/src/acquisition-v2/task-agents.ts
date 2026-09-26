@@ -5,6 +5,9 @@ import type { TaskSandbox } from "./sandbox.js";
 import { skillIndexForAgent } from "./skill.js";
 import { getStorageBrand } from "../storage-brands.js";
 import { stripMemoryFence, type AgentMemory } from "../agent-memory.js";
+import { userRequestBlock, type UserRequestPromptInput } from "./user-request-block.js";
+
+export { userRequestBlock, type UserRequestPromptInput } from "./user-request-block.js";
 
 /**
  * The 字字泣血 mandate: the agent MUST read its skill manual before acting and
@@ -90,6 +93,9 @@ export interface TaskAgentPromptOptions {
     /** Its brand: older notes were tagged with the brand and count as this drive's. */
     currentBrand?: string;
   };
+  /** A replace_request run: the user's messages, this work's rejected resources and
+   *  the episodes still pending a replacement. Absent/empty = no block. */
+  userRequests?: UserRequestPromptInput;
 }
 
 /** A brand-specific transfer-model note. 夸克/天翼 = 转存分享链 only; 光鸭 and
@@ -226,7 +232,7 @@ export function buildTvAnimeSystemPrompt(options: TaskAgentPromptOptions): strin
   return `${SANDBOX_BOUNDARY}
 
 ${skillMandate("tv")}
-${memoryBlock(options)}${rawSnapshotPointer(options)}${subtitleSnapshotPointer(options)}
+${memoryBlock(options)}${userRequestBlock(options)}${rawSnapshotPointer(options)}${subtitleSnapshotPointer(options)}
 You own the COMPLETE acquisition judgment for one OR MORE seasons of a TV/anime title in scope: keyword strategy, target matching, season/episode coverage, package recognition + normalization, provider-ahead reasoning, staging→season extraction, residue classification, same-episode dedup grouping, and marking. It is ONE deliberation, not separate filters. The need is simply "应有 vs 实有 = which episodes are still missing"; it may span several seasons.
 
 Target matching:
@@ -258,7 +264,7 @@ export function buildMovieSystemPrompt(options: TaskAgentPromptOptions): string 
   return `${SANDBOX_BOUNDARY}
 
 ${skillMandate("movie")}
-${memoryBlock(options)}${rawSnapshotPointer(options)}${subtitleSnapshotPointer(options)}
+${memoryBlock(options)}${userRequestBlock(options)}${rawSnapshotPointer(options)}${subtitleSnapshotPointer(options)}
 You own the COMPLETE acquisition judgment for ONE movie: target正片 identification (guard against remakes/wrong films — cross-check BOTH title AND year), main-file selection, quality tradeoff, rejection of extras/trailers/foreign works, import cleanup, and marking. A movie is a SINGLE video file — there are no seasons or episodes; its one synthetic coverage token is "MOVIE".
 
 Identity (the hard part): the candidate must be THIS film, not a remake, sequel, prequel, or same-IP different film. Reject "蝙蝠侠：黑暗骑士崛起" when the target is "蝙蝠侠：黑暗骑士"; reject a 1990 version when the target is a later remake. When identity is unclear, do not transfer speculatively.

@@ -225,6 +225,33 @@ export function buildSandboxToolSet(
       execute: (args: { candidateIds: string[] }) => asEvidence(() => sandbox.transferUntilLanded(args)),
     };
   }
+  // User replace request: registered only when the run carries one (like memory below).
+  if (sandbox.hasReplace?.()) {
+    tools["rejectCurrentSource"] = {
+      description:
+        "User request run only. Reject the CURRENT file(s) of the episodes the user complained about: pass the episode codes (movie: []) and the fileIds you saw in inspectTargetDir. The system records name+size (+link when known) and from then on hides every copy of it from your searches and refuses to transfer one. The files stay in place — never delete them.",
+      inputSchema: z.object({ episodes: z.array(z.string()), fileIds: z.array(z.string()), reason: z.string() }),
+      execute: (args: { episodes: string[]; fileIds: string[]; reason: string }) =>
+        asEvidence(() => sandbox.rejectCurrentSource(args)),
+    };
+    tools["reportReplacement"] = {
+      description:
+        'User request run only. Report, per requested episode, whether you replaced it: {episode, outcome:"replaced", candidateId, note} after the new file is moved and marked obtained, or {episode, outcome:"not_found", note} with one 中文 sentence on why. The system checks that a "replaced" episode was marked and its candidate really landed.',
+      inputSchema: z.object({
+        results: z.array(
+          z.object({
+            episode: z.string(),
+            outcome: z.enum(["replaced", "not_found"]),
+            candidateId: z.string().optional(),
+            note: z.string(),
+          }),
+        ),
+      }),
+      execute: (args: {
+        results: Array<{ episode: string; outcome: "replaced" | "not_found"; candidateId?: string; note: string }>;
+      }) => asEvidence(() => sandbox.reportReplacement(args)),
+    };
+  }
   // Read-only memory access DURING acquisition: the prompt shows the global memory as
   // an index, so the agent needs a way to read a body. Writes/deletes stay in the
   // post-run reflection turn only.

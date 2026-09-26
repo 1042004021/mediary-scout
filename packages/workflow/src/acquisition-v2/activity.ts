@@ -93,6 +93,10 @@ export function interpretTool(toolName: string, args: Record<string, unknown> = 
       const count = asArray(args.renames).length;
       return { activity: count > 1 ? `正在重命名 ${count} 个字幕…` : "正在重命名字幕…", phase: "organize" };
     }
+    case "rejectCurrentSource":
+      return { activity: "正在记下你不要的那份资源…", phase: "search" };
+    case "reportReplacement":
+      return { activity: "正在整理换源结果…", phase: "finalize" };
     case "finish":
       return { activity: "正在收尾…", phase: "finalize" };
     case "reportNoCoverage":
