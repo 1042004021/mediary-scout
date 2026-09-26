@@ -270,8 +270,15 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
       ? {
           replace: {
             requestedEpisodes: userRequest.requestedEpisodes,
-            // Stored rejections from earlier runs: a 待换 re-check need not reject again.
-            alreadyRejectedEpisodes: [...new Set(userRequest.prompt.rejected.map((r) => r.episode))],
+            // Stored rejections from earlier runs let a PENDING-ONLY re-check (no new
+            // message this run — the earlier rejection is why we are here) skip
+            // rejecting again. A NEW message means the user is unhappy with what is in
+            // place NOW (which may itself be an earlier replacement) — that file must
+            // be rejected this run before anything transfers, so the bypass is withheld.
+            alreadyRejectedEpisodes:
+              userRequest.prompt.messages.length === 0
+                ? [...new Set(userRequest.prompt.rejected.map((r) => r.episode))]
+                : [],
             onReject: async (items) => {
               // Skip what is already rejected (same episode + label + size), in the
               // store or earlier this run — the agent may reject the same file twice.

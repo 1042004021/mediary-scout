@@ -431,16 +431,89 @@ describe("runAcquisitionV2 — user replace request", () => {
       },
     });
     const req = baseRequest(model, exec, rejectedRows);
-    // Both requested episodes were rejected by an earlier run: no need to reject again first.
+    // Pending-only re-check (no NEW message this run): both requested episodes were
+    // rejected by an earlier run, so no need to reject again first.
     req.userRequest = {
       ...req.userRequest!,
       prompt: {
         ...req.userRequest!.prompt,
+        messages: [],
+        pending: ["S01E13", "S01E24"],
         rejected: ["S01E13", "S01E24"].map((episode) => ({ episode, label: "x.mkv", sizeBytes: 1, reason: "发蓝" })),
       },
     };
     const result = await runAcquisitionV2(req);
     expect(String(transferOutput?.error)).toMatch(/SANDBOX_CANDIDATE_REJECTED/);
+    expect(result.outcome.transferAttempts).toEqual([]);
+  });
+
+  it("pending-only re-check (stored rejection, no new message): transfer allowed without rejectCurrentSource", async () => {
+    const rejectedRows: RejectedRow[] = [];
+    const exec = executor();
+    let transferOutput: any;
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        i += 1;
+        if (i === 1) return tool("searchResources", { keyword: "Show 13" }, i);
+        if (i === 2) {
+          const search = lastToolOutput(options.prompt, "searchResources");
+          const alias = (search.snapshot.candidates as Array<{ id: string; title: string }>).find((c) => c.title === NEKOMOE_TITLE)!.id;
+          return tool("transferCandidate", { snapshotId: search.snapshot.id, candidateId: alias }, i);
+        }
+        if (i === 3) transferOutput = lastToolOutput(options.prompt, "transferCandidate");
+        return text("done");
+      },
+    });
+    const req = baseRequest(model, exec, rejectedRows);
+    req.userRequest = {
+      ...req.userRequest!,
+      requestedEpisodes: ["S01E13"],
+      prompt: {
+        // No new message this run — the stored rejection is why we are re-checking.
+        messages: [],
+        pending: ["S01E13"],
+        rejected: [{ episode: "S01E13", label: "Show - 13 [CR 1080p].mkv", sizeBytes: OLD_SIZE, reason: "发蓝" }],
+      },
+    };
+    const result = await runAcquisitionV2(req);
+    expect(transferOutput?.attempt?.status).toBe("succeeded");
+    expect(result.outcome.transferAttempts.some((a) => a.status === "succeeded")).toBe(true);
+  });
+
+  it("a NEW message naming an already-stored-rejected episode still requires rejectCurrentSource first (the current file may itself be an earlier replacement)", async () => {
+    const rejectedRows: RejectedRow[] = [];
+    const exec = executor();
+    let transferOutput: any;
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        i += 1;
+        if (i === 1) return tool("searchResources", { keyword: "Show 13" }, i);
+        if (i === 2) {
+          const search = lastToolOutput(options.prompt, "searchResources");
+          const alias = (search.snapshot.candidates as Array<{ id: string; title: string }>).find((c) => c.title === NEKOMOE_TITLE)!.id;
+          return tool("transferCandidate", { snapshotId: search.snapshot.id, candidateId: alias }, i);
+        }
+        if (i === 3) transferOutput = lastToolOutput(options.prompt, "transferCandidate");
+        return text("done");
+      },
+    });
+    const req = baseRequest(model, exec, rejectedRows);
+    req.userRequest = {
+      ...req.userRequest!,
+      requestedEpisodes: ["S01E13"],
+      prompt: {
+        // A NEW message about the same episode: the current file (which may be an
+        // earlier replacement) must be rejected fresh — the old stored rejection
+        // must not open the gate.
+        messages: [{ body: "还是不对", episodeTags: ["S01E13"], createdAt: NOW }],
+        pending: [],
+        rejected: [{ episode: "S01E13", label: "Show - 13 [CR 1080p].mkv", sizeBytes: OLD_SIZE, reason: "发蓝" }],
+      },
+    };
+    const result = await runAcquisitionV2(req);
+    expect(String(transferOutput?.error)).toMatch(/SANDBOX_REJECT_FIRST/);
     expect(result.outcome.transferAttempts).toEqual([]);
   });
 

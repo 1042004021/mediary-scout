@@ -1119,7 +1119,11 @@ export class TaskSandbox {
    *  about. Escape hatches (the gate would only get in the way):
    *  - rejectCurrentSource has succeeded at least once this run;
    *  - every requested episode already has a stored rejection from an earlier run
-   *    (a 待换 re-check — its copies are filtered from search and refused anyway).
+   *    (a 待换 re-check — its copies are filtered from search and refused anyway). The
+   *    caller (runAcquisitionV2) only fills this in for a PENDING-ONLY re-check (no new
+   *    message this run): a new message means the user is unhappy with the file in
+   *    place now, which may itself be an earlier replacement — that must be rejected
+   *    fresh, so the caller passes [] and this hatch closes.
    *    Only when there is at least one requested episode: with none (a message with
    *    no tags), the agent reads the episodes from the words and must reject them;
    *  - the target dirs held no file at all when the run started (nothing to reject). */
