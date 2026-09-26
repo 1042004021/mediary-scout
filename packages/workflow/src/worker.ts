@@ -32,6 +32,10 @@ import {
 } from "./runner-v2.js";
 import { syncSeasonAgainstMetadata } from "./season-sync.js";
 import { isBrandStorageAuthError } from "./storage-auth-error.js";
+import { userMessageDrive } from "./user-requests.js";
+// Circular with replace-request.ts (it uses this module's claim helpers); both sides
+// only call the other's functions at run time, never at module evaluation.
+import { queueReplaceRequest } from "./replace-request.js";
 
 async function maybeFreezeOnBrandAuthError(input: {
   connectedStorageId: string | null | undefined;
@@ -467,6 +471,22 @@ export async function runScheduledType3Monitoring(input: {
   // Cross-account: patrol EVERY user's tracked shows, each under its owner's creds.
   const trackedStates = await input.repository.listAllTrackedSeasonStates();
 
+  // Works with a user message or an unfinished replacement run as ONE replace_request
+  // (it covers every season and includes the gaps), so this sweep skips their seasons.
+  // Queued, not run here: the queue worker claims it right after the sweep.
+  const requestWorks = [
+    ...(await input.repository.listWorksWithPendingMessages({ urgentOnly: false })),
+    ...(await input.repository.listWorksWithPendingReplacements()),
+  ];
+  const requestKeys = new Set(requestWorks.map((w) => JSON.stringify([w.accountId, w.drive, w.titleKey])));
+  for (const key of requestKeys) {
+    const [accountId, drive, titleKey] = JSON.parse(key) as [string, string, string];
+    await queueReplaceRequest({ repository: input.repository, work: { accountId, drive, titleKey }, now });
+  }
+  const patrolStates = trackedStates.filter(
+    (s) => !requestKeys.has(JSON.stringify([s.accountId, userMessageDrive(s.connectedStorageId), s.title.id])),
+  );
+
   // One drive at a time, several drives side by side (see runKeyedPool). The key
   // is the drive the run will actually land on: a state with no bound drive runs
   // on its account's default drive, so it must share that drive's key, not get
@@ -485,7 +505,7 @@ export async function runScheduledType3Monitoring(input: {
   const driveKeys =
     concurrency > 1
       ? await Promise.all(
-          trackedStates.map(async (state) => {
+          patrolStates.map(async (state) => {
             const drive = state.connectedStorageId ?? (await defaultDriveOf(state.accountId));
             // No drive at all → the process-wide fallback executor (env cookie / fake),
             // which every such account shares: one key for all of them.
@@ -493,12 +513,12 @@ export async function runScheduledType3Monitoring(input: {
           }),
         )
       : [];
-  const keyByState = new Map(trackedStates.map((state, index) => [state, driveKeys[index] ?? ""]));
+  const keyByState = new Map(patrolStates.map((state, index) => [state, driveKeys[index] ?? ""]));
   // A throw from one state's setup (drive client, DB reservation) is an infra
   // failure: it aborts the sweep as the serial loop did, so the caller can release
   // today's claimed slots and retry. Failures inside a run are outcomes, not throws.
   const perState = await runKeyedPool(
-    trackedStates,
+    patrolStates,
     { concurrency, keyOf: (state) => keyByState.get(state)! },
     (state) => patrolTrackedState({ input, state, now }),
   );

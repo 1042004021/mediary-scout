@@ -757,3 +757,82 @@ describe("runScheduledType3Monitoring — agent memory reaches the engine", () =
     expect(systems[0]).toContain("TV-MEMORY-SENTINEL");
   });
 });
+
+describe("runScheduledType3Monitoring — user requests", () => {
+  // seedTrackedSeason saves under the default account with no bound drive.
+  const WORK = { accountId: "acct_default", drive: "", titleKey: "title_show" };
+
+  async function completeShow() {
+    const repository = new InMemoryWorkflowRepository();
+    const { title, season } = trackedFixture();
+    await seedTrackedSeason({ repository, title, season, obtainedCodes: ["S01E01", "S01E02"] });
+    const storage = new FakeStorageExecutor();
+    await seedV2Season(storage, title, season, ["S01E01", "S01E02"]);
+    return { repository, storage, season };
+  }
+
+  async function patrol(repository: InMemoryWorkflowRepository, storage: FakeStorageExecutor) {
+    let n = 0;
+    return runScheduledType3Monitoring({
+      repository,
+      resourceProvider: emptyProvider(),
+      storage,
+      model: throwingModel(),
+      storageParentDirectoryId: "library_root",
+      now: fixedNow,
+      createWorkflowRunId: () => `run_patrol_${(n += 1)}`,
+    });
+  }
+
+  it("a pending (non-urgent) message queues a replace_request and skips the work's ordinary patrol", async () => {
+    const { repository, storage, season } = await completeShow();
+    await repository.createUserMessage({ ...WORK, body: "第 1 集发蓝", episodeTags: ["S01E01"], now: fixedNow() });
+
+    const outcomes = await patrol(repository, storage);
+
+    expect(outcomes.filter((o) => o.trackedSeasonId === season.id)).toEqual([]);
+    const active = await repository.listActiveWorkflowRuns();
+    expect(active.map((run) => [run.workflowRun.kind, run.workflowRun.status, run.title.id])).toEqual([
+      ["replace_request", "queued", "title_show"],
+    ]);
+    expect(await repository.getWorkflowRunSnapshot("run_patrol_2")).toBeNull();
+    // The message itself waits for the run; the patrol does not claim it.
+    expect((await repository.listUserMessages(WORK))[0]?.status).toBe("pending");
+  });
+
+  it("an episode still 待换 from an earlier run (no message) queues a replace_request too", async () => {
+    const { repository, storage, season } = await completeShow();
+    await repository.addPendingReplacements({ ...WORK, episodes: ["S01E02"], messageId: "msg_old", now: fixedNow() });
+
+    const outcomes = await patrol(repository, storage);
+
+    expect(outcomes.filter((o) => o.trackedSeasonId === season.id)).toEqual([]);
+    expect((await repository.listActiveWorkflowRuns()).map((run) => run.workflowRun.kind)).toEqual(["replace_request"]);
+  });
+
+  it("no message and nothing 待换 → the patrol is unchanged (no replace_request)", async () => {
+    const { repository, storage, season } = await completeShow();
+
+    const outcomes = await patrol(repository, storage);
+
+    expect(outcomes).toEqual([
+      expect.objectContaining({ trackedSeasonId: season.id, status: "ran", workflowRunId: "run_patrol_1" }),
+    ]);
+    expect((await repository.getWorkflowRunSnapshot("run_patrol_1"))?.workflowRun.kind).toBe("type3_monitor");
+    expect(await repository.listActiveWorkflowRuns()).toEqual([]);
+  });
+
+  it("only the work with a request is taken out of the sweep; another show is patrolled as before", async () => {
+    const { repository, storage, season } = await completeShow();
+    const other = trackedFixture("other");
+    await seedTrackedSeason({ repository, title: other.title, season: other.season, obtainedCodes: ["S01E01", "S01E02"] });
+    await seedV2Season(storage, other.title, other.season, ["S01E01", "S01E02"]);
+    await repository.createUserMessage({ ...WORK, body: "换", episodeTags: [], now: fixedNow() });
+
+    const outcomes = await patrol(repository, storage);
+
+    expect(outcomes.map((o) => o.trackedSeasonId)).toEqual([other.season.id]);
+    expect(outcomes.map((o) => o.trackedSeasonId)).not.toContain(season.id);
+    expect((await repository.listActiveWorkflowRuns()).map((run) => run.title.id)).toEqual(["title_show"]);
+  });
+});

@@ -38,7 +38,9 @@ import {
   queueSeriesInitialization,
   queueTrackingInitialization,
   reserveMovie,
+  enqueueUrgentReplaceRequests,
   runQueuedMovieAcquisition,
+  runQueuedReplaceRequest,
   runQueuedSeriesInitialization,
   runQueuedType2Workflow,
   resolveDriveSourceLabels,
@@ -993,6 +995,13 @@ export async function runNextQueuedWorkflow() {
   const resolveAccountContext = buildAccountContextResolver();
   const startedAt = new Date().toISOString();
   const onAuthErrorFreeze = (id: string, reason: string) => freezeConnectedStorage(id, reason);
+  // Urgent user messages ("现在处理", written mid-run, or retry after a failure) get a
+  // replace_request as soon as the queue is free — never waiting for the patrol.
+  try {
+    await enqueueUrgentReplaceRequests({ repository });
+  } catch (error) {
+    console.error(`[user-message] urgent scan failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
   const type2 = await runQueuedType2Workflow({
     repository,
     resourceProvider: await getWorkerResourceProvider(),
@@ -1038,8 +1047,25 @@ export async function runNextQueuedWorkflow() {
   });
   if (movie.status !== "idle") {
     await pushNotificationsSince(repository, startedAt);
+    return movie;
   }
-  return movie;
+  const replace = await runQueuedReplaceRequest({
+    repository,
+    resourceProvider: await getWorkerResourceProvider(),
+    storage,
+    model,
+    ...language,
+    ...quality,
+    storageParentDirectoryId: parents.tv,
+    animeStorageParentDirectoryId: parents.anime,
+    moviesParentDirectoryId: parents.movies,
+    resolveAccountContext,
+    onAuthErrorFreeze,
+  });
+  if (replace.status !== "idle") {
+    await pushNotificationsSince(repository, startedAt);
+  }
+  return replace;
 }
 
 /** The user's preferred subtitle language for acquisition search, or undefined
