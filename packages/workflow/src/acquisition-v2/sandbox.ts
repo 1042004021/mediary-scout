@@ -223,6 +223,11 @@ export interface TaskSandboxOptions {
      *  every transfer asks again. */
     isRejected: (candidate: { id: string; title: string }) => Promise<boolean>;
   };
+  /** Any run of a work that has kept old + replacement copies (episode_sources):
+   *  files already in the target dirs at the start are protected like in a replace
+   *  run (never deleted, moved, renamed or flattened away), without the replace
+   *  tools. The sandbox has no file↔episode map, so it protects all of them. */
+  protectExistingFiles?: boolean;
 }
 
 /** What the models see of a memory entry (no persistence identifiers). */
@@ -329,6 +334,7 @@ export class TaskSandbox {
    *  so a transfer that threw still counts). Read by hasTransferEvidence. */
   private transferAttempted = false;
   private readonly replace: TaskSandboxOptions["replace"];
+  private readonly protectExistingFiles: boolean;
   /** Replace runs: every file in a target dir when the run started (the user's
    *  current copy — it must survive the run), keyed by id, with its dir label
    *  ("Season 01", or "" for the movie dir). Only these can be rejected. */
@@ -360,6 +366,7 @@ export class TaskSandbox {
     this.subtitleProvider = options.subtitleProvider;
     this.memory = options.memory;
     this.replace = options.replace;
+    this.protectExistingFiles = options.protectExistingFiles === true;
   }
 
   /** Every scoped target directory (all seasons + the movie) — the union used for
@@ -1072,9 +1079,10 @@ export class TaskSandbox {
   }
 
   /** Called once before the agent starts: every file already in a target dir is the
-   *  user's current copy and must survive this run. */
+   *  user's current copy and must survive this run (replace run, or a work with kept
+   *  old + replacement copies — see protectExistingFiles). */
   async captureProtectedFiles(): Promise<void> {
-    if (!this.replace || !this.storage) return;
+    if ((!this.replace && !this.protectExistingFiles) || !this.storage) return;
     for (const [season, directoryId] of this.seasonDirs) {
       const dirLabel = `Season ${String(season).padStart(2, "0")}`;
       for (const file of await this.storage.listTree({ directoryId })) this.protectedFiles.set(file.id, { file, dirLabel });

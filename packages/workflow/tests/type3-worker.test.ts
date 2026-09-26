@@ -871,6 +871,54 @@ describe("runScheduledType3Monitoring — user requests", () => {
     expect(outcomes.map((o) => o.trackedSeasonId)).toEqual([other.season.id]);
   });
 
+  it("a work with replaced episodes (old + new copies kept) protects its existing files from the patrol's dedup", async () => {
+    const run = async (withSource: boolean) => {
+      const repository = new InMemoryWorkflowRepository();
+      const { title, season } = trackedFixture();
+      // E02 is a real gap, so the patrol runs the agent.
+      await seedTrackedSeason({ repository, title, season, obtainedCodes: ["S01E01"] });
+      const storage = new FakeStorageExecutor();
+      const seasonDir = await seedV2Season(storage, title, season, ["S01E01"]);
+      if (withSource) {
+        await repository.upsertEpisodeSource({ ...WORK, episode: "S01E01", linkKey: null, label: "new", sizeBytes: null, runId: "run_old", recordedAt: fixedNow() });
+      }
+      let system = "";
+      let deleteResult: unknown;
+      let i = 0;
+      const model = new MockLanguageModelV3({
+        doGenerate: async (options) => {
+          i += 1;
+          if (i === 1) {
+            system = JSON.stringify(options.prompt.find((m) => m.role === "system") ?? "");
+            return {
+              content: [{ type: "tool-call" as const, toolCallId: "c1", toolName: "deleteFiles", input: JSON.stringify({ directory: "season", season: 1, fileIds: ["present_S01E01_0"] }) }],
+              finishReason: { unified: "tool-calls" as const, raw: "tool-calls" as const },
+              usage: USAGE,
+              warnings: [],
+            };
+          }
+          const messages = options.prompt as Array<{ role: string; content: Array<{ type: string; output?: { value?: unknown } }> }>;
+          // Once: the memory reflection turn calls the model again afterwards.
+          if (i === 2) deleteResult = messages.filter((m) => m.role === "tool").at(-1)?.content[0]?.output?.value;
+          return { content: [{ type: "text" as const, text: "done" }], finishReason: { unified: "stop" as const, raw: "stop" as const }, usage: USAGE, warnings: [] };
+        },
+      });
+      await runScheduledType3Monitoring({ repository, resourceProvider: emptyProvider(), storage, model, storageParentDirectoryId: "library_root", now: fixedNow });
+      return { system, deleteResult, left: (await storage.listTree({ directoryId: seasonDir })).map((f) => f.providerFileId) };
+    };
+
+    const kept = await run(true);
+    expect(kept.system).toContain("S01E01");
+    expect(kept.system).toMatch(/intentionally kept duplicates/);
+    expect(kept.deleteResult).toEqual({ error: expect.stringContaining("SANDBOX_FILE_PROTECTED") });
+    expect(kept.left).toEqual(["present_S01E01_0"]);
+
+    const plain = await run(false);
+    expect(plain.system).not.toMatch(/intentionally kept duplicates/);
+    expect(plain.deleteResult).not.toHaveProperty("error");
+    expect(plain.left).toEqual([]);
+  });
+
   it("only the work with a request is taken out of the sweep; another show is patrolled as before", async () => {
     const { repository, storage, season } = await completeShow();
     const other = trackedFixture("other");

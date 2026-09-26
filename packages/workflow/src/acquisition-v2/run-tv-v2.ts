@@ -54,6 +54,8 @@ export interface RunTvAcquisitionV2Request {
   memory?: { store: AgentMemoryStore; accountId: string; drive?: string };
   /** A replace_request run (see orchestrator.userRequest). */
   userRequest?: RunAcquisitionV2WorkflowRequest["userRequest"];
+  /** See orchestrator.keptDuplicates. */
+  keptDuplicates?: string[];
   onProgress?: (event: AgentToolEvent) => void;
   now?: () => string;
 }
@@ -100,6 +102,7 @@ export async function runTvAcquisitionV2(request: RunTvAcquisitionV2Request): Pr
     ...(request.deadLinkStore ? { deadLinkStore: request.deadLinkStore } : {}),
     ...(request.memory ? { memory: request.memory } : {}),
     ...(request.userRequest ? { userRequest: request.userRequest } : {}),
+    ...(request.keptDuplicates?.length ? { keptDuplicates: request.keptDuplicates } : {}),
     ...(request.onProgress ? { onProgress: request.onProgress } : {}),
   });
 

@@ -96,6 +96,10 @@ export interface RunAcquisitionV2Request {
     drive?: string;
     now?: () => string;
   };
+  /** Episodes of this work that carry an old + replacement copy on purpose (the
+   *  episode_sources rows). Their existing files are protected for the whole run and
+   *  named in the prompt, so keep-larger dedup never undoes a replacement. */
+  keptDuplicates?: string[];
   /** A replace_request run (user message). See docs/superpowers/specs/2026-09-26-user-message-replace-design.md. */
   userRequest?: {
     /** Episodes the user named or that are still pending (movie: ["MOVIE"]). Added to the need. */
@@ -219,6 +223,7 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
     ...(request.searchBudget === undefined ? {} : { searchBudget: request.searchBudget }),
     ...(request.searchProfile === undefined ? {} : { searchProfile: request.searchProfile }),
     ...(memoryBinding ? { memory: memoryBinding } : {}),
+    ...((request.keptDuplicates?.length ?? 0) > 0 ? { protectExistingFiles: true } : {}),
     ...(userRequest
       ? {
           replace: {
@@ -298,10 +303,10 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
         }
       : {}),
   });
-  // Replace run: record every file already in the target dirs BEFORE anything can
-  // touch them. Not best-effort — the protection is the whole safety story, so a
-  // failing listing fails the run.
-  if (userRequest) await sandbox.captureProtectedFiles();
+  // Replace run (or kept duplicates): record every file already in the target dirs
+  // BEFORE anything can touch them. Not best-effort — the protection is the whole
+  // safety story, so a failing listing fails the run.
+  if (userRequest || (request.keptDuplicates?.length ?? 0) > 0) await sandbox.captureProtectedFiles();
   const loadedMemory = await loadMemoryForRun(request, memoryBinding);
 
   // Pre-warm the raw snapshot (bare title) BEFORE building the system prompt, so the
@@ -393,6 +398,7 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
         }
       : {}),
     ...(userRequest ? { userRequests: userRequest.prompt } : {}),
+    ...((request.keptDuplicates?.length ?? 0) > 0 ? { keptDuplicates: request.keptDuplicates } : {}),
   };
 
   const result =

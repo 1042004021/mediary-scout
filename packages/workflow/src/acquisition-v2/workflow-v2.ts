@@ -68,6 +68,8 @@ export interface RunAcquisitionV2WorkflowRequest {
   /** A replace_request run (see orchestrator.userRequest). Its episodes join the
    *  agent's need, and the run goes ahead even when nothing is missing. */
   userRequest?: RunAcquisitionV2Request["userRequest"];
+  /** See orchestrator.keptDuplicates. */
+  keptDuplicates?: string[];
   onProgress?: (event: AgentToolEvent) => void;
 }
 
@@ -179,6 +181,7 @@ export async function runAcquisitionV2Workflow(
     ...(request.deadLinkStore ? { deadLinkStore: request.deadLinkStore } : {}),
     ...(request.memory ? { memory: request.memory } : {}),
     ...(request.userRequest ? { userRequest: request.userRequest } : {}),
+    ...(request.keptDuplicates?.length ? { keptDuplicates: request.keptDuplicates } : {}),
     ...(request.onProgress ? { onProgress: request.onProgress } : {}),
   });
 

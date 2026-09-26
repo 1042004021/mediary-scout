@@ -440,6 +440,24 @@ describe("user request block", () => {
   });
 });
 
+describe("user request rules — old and new copies coexist", () => {
+  const req = { messages: [{ body: "13 发蓝", episodeTags: ["S01E13"], createdAt: "2026-09-26T06:00:00.000Z" }], rejected: [], pending: [] };
+
+  it("the requested episodes skip keep-larger dedup entirely (the smaller NEW file must survive too)", () => {
+    const block = userRequestBlock({ userRequests: req });
+    expect(block).toContain("For the requested episodes the old and new copies are meant to coexist: skip keep-larger dedup for them entirely; delete neither.");
+  });
+
+  it("kept duplicates from earlier replacements are named in both system prompts, only when there are some", () => {
+    for (const build of [buildTvAnimeSystemPrompt, buildMovieSystemPrompt]) {
+      const withKept = build({ keptDuplicates: ["S01E13", "S01E24"] });
+      expect(withKept).toMatch(/intentionally kept duplicates \(old \+ replacement\) — do not dedup or delete them: S01E13, S01E24/);
+      expect(build({})).not.toMatch(/intentionally kept duplicates/);
+      expect(build({ keptDuplicates: [] })).not.toMatch(/intentionally kept duplicates/);
+    }
+  });
+});
+
 describe("replace tools registration", () => {
   type ExecutableTool = { execute: (args: unknown, options: unknown) => Promise<unknown> };
   it("registers rejectCurrentSource + reportReplacement only when the sandbox carries a replace request", async () => {

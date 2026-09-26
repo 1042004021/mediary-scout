@@ -18,6 +18,7 @@ import { runMovieAcquisitionV2, type MovieAcquisitionV2Result, type RunMovieAcqu
 import type { JevJudge } from "./jev-judge.js";
 import type { ResourceProvider, StorageExecutor } from "./ports.js";
 import type { WorkflowRepository } from "./repository.js";
+import { userMessageDrive } from "./user-requests.js";
 
 /**
  * Phase 7d — production persist wrappers on the V2 engine. These mirror the old
@@ -111,6 +112,23 @@ function memoryOption(input: {
   return { memory: { store: input.repository, accountId: input.accountId ?? DEFAULT_ACCOUNT_ID, ...(drive ? { drive } : {}) } };
 }
 
+/** Episodes of this work (on this drive) that hold an old + replacement copy on
+ *  purpose — every run of it protects its existing files and says so to the agent,
+ *  so a later keep-larger dedup cannot undo a replacement. */
+async function keptDuplicatesOption(input: {
+  repository: WorkflowRepository;
+  accountId?: string;
+  connectedStorageId?: string | null;
+  title: MediaTitle;
+}): Promise<{ keptDuplicates?: string[] }> {
+  const sources = await input.repository.listEpisodeSources({
+    accountId: input.accountId ?? DEFAULT_ACCOUNT_ID,
+    drive: userMessageDrive(input.connectedStorageId),
+    titleKey: input.title.id,
+  });
+  return sources.length > 0 ? { keptDuplicates: sources.map((s) => s.episode) } : {};
+}
+
 /** The run's onProgress: live activity progress (for the activity page) AND the
  *  durable per-step trace (for post-mortem复盘), combined + isolated so one can't
  *  break the other. `apiCallCount` surfaces the 115 budget burn per step (real 115
@@ -197,6 +215,7 @@ export async function runType2InitializationV2AndPersist(
       storage: input.storage,
     }),
     ...passthrough(input),
+    ...(await keptDuplicatesOption(input)),
   });
 
   await persistSingleSeason({
@@ -245,6 +264,7 @@ export async function runType3MonitoringV2AndPersist(
       storage: input.storage,
     }),
     ...passthrough(input),
+    ...(await keptDuplicatesOption(input)),
   });
 
   await persistSingleSeason({
@@ -294,6 +314,7 @@ export async function runSeriesInitializationV2AndPersist(
       storage: input.storage,
     }),
     ...passthrough(input),
+    ...(await keptDuplicatesOption(input)),
   });
 
   // Stamp completion AFTER the run; one finishedAt shared across all season
@@ -393,6 +414,7 @@ export async function runReplaceRequestV2AndPersist(
       storage: input.storage,
     }),
     ...passthrough(input),
+    ...(await keptDuplicatesOption(input)),
   });
 
   const finishedAt = now();
@@ -480,6 +502,7 @@ export async function runMovieAcquisitionV2AndPersist(input: {
     ...(input.jevJudge === undefined ? {} : { jevJudge: input.jevJudge }),
     ...(input.userRequest === undefined ? {} : { userRequest: input.userRequest }),
     ...(input.priorObtained === undefined ? {} : { priorObtained: input.priorObtained }),
+    ...(await keptDuplicatesOption(input)),
     ...memoryOption(input),
   });
 

@@ -96,6 +96,16 @@ export interface TaskAgentPromptOptions {
   /** A replace_request run: the user's messages, this work's rejected resources and
    *  the episodes still pending a replacement. Absent/empty = no block. */
   userRequests?: UserRequestPromptInput;
+  /** Episodes an earlier replace run gave a second copy (old + replacement, both
+   *  kept on purpose). Absent/empty = no line. */
+  keptDuplicates?: string[];
+}
+
+/** The kept old + replacement copies, so keep-larger dedup does not undo a replacement. */
+function keptDuplicatesLine(options: Pick<TaskAgentPromptOptions, "keptDuplicates">): string {
+  const kept = options.keptDuplicates ?? [];
+  if (kept.length === 0) return "";
+  return `\n♻️ Episodes with intentionally kept duplicates (old + replacement) — do not dedup or delete them: ${kept.join(", ")}. The files that were already here are protected (the system refuses to delete, move or rename them).\n`;
 }
 
 /** A brand-specific transfer-model note. 夸克/天翼 = 转存分享链 only; 光鸭 and
@@ -232,7 +242,7 @@ export function buildTvAnimeSystemPrompt(options: TaskAgentPromptOptions): strin
   return `${SANDBOX_BOUNDARY}
 
 ${skillMandate("tv")}
-${memoryBlock(options)}${userRequestBlock(options)}${rawSnapshotPointer(options)}${subtitleSnapshotPointer(options)}
+${memoryBlock(options)}${userRequestBlock(options)}${keptDuplicatesLine(options)}${rawSnapshotPointer(options)}${subtitleSnapshotPointer(options)}
 You own the COMPLETE acquisition judgment for one OR MORE seasons of a TV/anime title in scope: keyword strategy, target matching, season/episode coverage, package recognition + normalization, provider-ahead reasoning, staging→season extraction, residue classification, same-episode dedup grouping, and marking. It is ONE deliberation, not separate filters. The need is simply "应有 vs 实有 = which episodes are still missing"; it may span several seasons.
 
 Target matching:
@@ -264,7 +274,7 @@ export function buildMovieSystemPrompt(options: TaskAgentPromptOptions): string 
   return `${SANDBOX_BOUNDARY}
 
 ${skillMandate("movie")}
-${memoryBlock(options)}${userRequestBlock(options)}${rawSnapshotPointer(options)}${subtitleSnapshotPointer(options)}
+${memoryBlock(options)}${userRequestBlock(options)}${keptDuplicatesLine(options)}${rawSnapshotPointer(options)}${subtitleSnapshotPointer(options)}
 You own the COMPLETE acquisition judgment for ONE movie: target正片 identification (guard against remakes/wrong films — cross-check BOTH title AND year), main-file selection, quality tradeoff, rejection of extras/trailers/foreign works, import cleanup, and marking. A movie is a SINGLE video file — there are no seasons or episodes; its one synthetic coverage token is "MOVIE".
 
 Identity (the hard part): the candidate must be THIS film, not a remake, sequel, prequel, or same-IP different film. Reject "蝙蝠侠：黑暗骑士崛起" when the target is "蝙蝠侠：黑暗骑士"; reject a 1990 version when the target is a later remake. When identity is unclear, do not transfer speculatively.
