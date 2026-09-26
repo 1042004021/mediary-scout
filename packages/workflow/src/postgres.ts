@@ -74,6 +74,7 @@ import {
   type UserMessageRow,
   type UserMessageScope,
   type UserRequestStore,
+  userMessageDrive,
 } from "./user-requests.js";
 
 type Queryable = Pool | PoolClient;
@@ -744,7 +745,23 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       // Only an init run owns its season's tracking; a cancelled replace_request is
       // just removed, and any messages it held go back to pending.
       if (!tearsDownTrackingOnCancel(run.kind)) {
-        if (run.kind === "replace_request") await releaseUserMessagesWith(client, workflowRunId, new Date().toISOString(), true);
+        if (run.kind === "replace_request") {
+          // The user cancelled: nothing of this work stays urgent, or the idle scan would
+          // queue it again within seconds. It waits for the patrol (or 现在处理).
+          const now = new Date().toISOString();
+          await releaseUserMessagesWith(client, workflowRunId, now, false);
+          const season = await client.query("SELECT media_title_id FROM tracked_seasons WHERE id = $1 AND connected_storage_id = $2", [
+            seasonId,
+            storageValue,
+          ]);
+          const titleKey = season.rows[0]?.media_title_id as string | undefined;
+          if (titleKey !== undefined) {
+            await client.query(
+              "UPDATE user_messages SET urgent = false, updated_at = $1 WHERE account_id = $2 AND drive = $3 AND title_key = $4 AND status = 'pending' AND urgent",
+              [now, owner, userMessageDrive(ownerStorage === UNSCOPED_STORAGE ? null : ownerStorage), titleKey],
+            );
+          }
+        }
         return { status: "cancelled" as const };
       }
       // Only tear down the tracking when no OTHER run on the SAME (season, drive)

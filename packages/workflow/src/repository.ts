@@ -32,6 +32,7 @@ import {
   type UserMessage,
   type UserMessageScope,
   type UserRequestStore,
+  userMessageDrive,
 } from "./user-requests.js";
 import type {
   Account,
@@ -198,6 +199,10 @@ export interface WorkflowRepository extends DeadLinkStore, AgentMemoryStore, Use
    * 获取 click never happened. Refuses (not_cancellable) once the worker has
    * claimed it (running) or it is otherwise non-queued; that race is expected.
    * Pure DB: a queued run has created no 115 directories yet.
+   *
+   * A replace_request owns no tracking: only the run goes, and every pending message
+   * of its work (those it held included) ends up pending and NOT urgent, so the idle
+   * scan does not queue it right back — it waits for the patrol.
    */
   cancelQueuedWorkflowRun(
     workflowRunId: string,
@@ -1084,7 +1089,18 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     // run, any messages it held go back to pending.
     if (!tearsDownTrackingOnCancel(stored.workflowRun.kind)) {
       if (stored.workflowRun.kind === "replace_request") {
-        await this.releaseUserMessages({ runId: workflowRunId, now: new Date().toISOString() });
+        // The user cancelled: nothing of this work stays urgent, or the idle scan would
+        // queue it again within seconds. It waits for the patrol (or 现在处理).
+        const now = new Date().toISOString();
+        await this.releaseUserMessages({ runId: workflowRunId, now, urgent: false });
+        const work = {
+          accountId: stored.accountId ?? DEFAULT_ACCOUNT_ID,
+          drive: userMessageDrive(stored.connectedStorageId),
+          titleKey: stored.title.id,
+        };
+        for (const m of this.userMessages.values()) {
+          if (sameWork(m, work) && m.status === "pending" && m.urgent) Object.assign(m, { urgent: false, updatedAt: now });
+        }
       }
       return { status: "cancelled" };
     }

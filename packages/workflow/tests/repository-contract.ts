@@ -1365,7 +1365,38 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         const after = await repo.getTrackedSeasonState("season_rc", scope);
         expect(after?.episodes).toEqual(tracked!.episodes);
         expect(await repo.listTrackedSeasonStates(scope)).toHaveLength(1);
-        expect((await repo.listUserMessages(work))[0]).toMatchObject({ status: "pending", urgent: true, runId: null });
+        // Back to pending but NOT urgent: the idle scan would re-queue it within seconds.
+        expect((await repo.listUserMessages(work))[0]).toMatchObject({ status: "pending", urgent: false, runId: null });
+      });
+
+      it("cancelling a queued replace_request sticks: the work's urgent pending messages wait for the patrol", async () => {
+        const repo = await fresh();
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_rs" };
+        await repo.saveWorkflowRunSnapshot(queuedRun({ id: "rs", status: "succeeded", connectedStorageId: "cs_rs" }));
+        const base = queuedRun({ id: "rs", connectedStorageId: "cs_rs" });
+        await repo.saveWorkflowRunSnapshot({
+          ...base,
+          workflowRun: { ...base.workflowRun, id: "rs_replace", kind: "replace_request", startedAt: "2026-06-12T00:00:00.000Z" },
+        });
+        const work = { accountId: "acct_default", drive: "cs_rs", titleKey: "title_rs" };
+        const other = { ...work, titleKey: "title_other" };
+        // 现在处理 was pressed (urgent), and one more message came in after it.
+        await repo.createUserMessage({ ...work, body: "换 1", episodeTags: [], now: "2026-06-12T00:00:00.000Z" });
+        await repo.markUserMessagesUrgent({ ...work, now: "2026-06-12T00:00:01.000Z" });
+        await repo.createUserMessage({ ...work, body: "也换 2", episodeTags: [], now: "2026-06-12T00:00:02.000Z" });
+        await repo.markUserMessagesUrgent({ ...work, now: "2026-06-12T00:00:03.000Z" });
+        // Another work's urgent message is not the user's cancel.
+        await repo.createUserMessage({ ...other, body: "别动我", episodeTags: [], now: "2026-06-12T00:00:00.000Z" });
+        await repo.markUserMessagesUrgent({ ...other, now: "2026-06-12T00:00:01.000Z" });
+
+        expect((await repo.cancelQueuedWorkflowRun("rs_replace", scope)).status).toBe("cancelled");
+
+        expect((await repo.listUserMessages(work)).map((m) => [m.status, m.urgent])).toEqual([
+          ["pending", false],
+          ["pending", false],
+        ]);
+        expect(await repo.listWorksWithPendingMessages({ urgentOnly: true })).toEqual([other]);
+        expect(await repo.listWorksWithPendingMessages({ urgentOnly: false })).toEqual(expect.arrayContaining([work, other]));
       });
 
       it("cancelQueuedWorkflowRun of the ONLY run of a replace_request season still leaves the tracking", async () => {

@@ -43,6 +43,7 @@ import {
   type UserMessageRow,
   type UserMessageScope,
   type UserRequestStore,
+  userMessageDrive,
 } from "./user-requests.js";
 import { MAGNET_DEAD_LINK_TTL_MS } from "./acquisition-v2/dead-links.js";
 import type {
@@ -881,7 +882,22 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
       // Only an init run owns its season's tracking; a cancelled replace_request is
       // just removed, and any messages it held go back to pending.
       if (!tearsDownTrackingOnCancel(run.kind)) {
-        if (run.kind === "replace_request") this.releaseUserMessagesSync(workflowRunId, new Date().toISOString(), true);
+        if (run.kind === "replace_request") {
+          // The user cancelled: nothing of this work stays urgent, or the idle scan would
+          // queue it again within seconds. It waits for the patrol (or 现在处理).
+          const now = new Date().toISOString();
+          this.releaseUserMessagesSync(workflowRunId, now, false);
+          const season = this.db
+            .prepare("SELECT media_title_id FROM tracked_seasons WHERE id = ? AND connected_storage_id = ?")
+            .get(seasonId, storageValue) as { media_title_id: string } | undefined;
+          if (season) {
+            this.db
+              .prepare(
+                "UPDATE user_messages SET urgent = 0, updated_at = ? WHERE account_id = ? AND drive = ? AND title_key = ? AND status = 'pending' AND urgent = 1",
+              )
+              .run(now, owner, userMessageDrive(ownerStorage), season.media_title_id);
+          }
+        }
         return { status: "cancelled" as const };
       }
       // Only tear down the tracking when no OTHER run on the SAME (season, drive)
