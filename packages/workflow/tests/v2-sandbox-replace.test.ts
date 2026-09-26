@@ -62,6 +62,90 @@ describe("TaskSandbox — replace", () => {
     await expect(plain.reportReplacement({ results: [] })).rejects.toThrow(/NO_REPLACE/);
   });
 
+  it("rejectCurrentSource on a TV run needs episode codes in this run's seasons", async () => {
+    const { sandbox, old13 } = await setup();
+    await expect(sandbox.rejectCurrentSource({ episodes: [], fileIds: [old13], reason: "x" })).rejects.toThrow(
+      /SANDBOX_EPISODES_REQUIRED/,
+    );
+    for (const bad of ["MOVIE", "13", "S1E13", "S02E13"]) {
+      await expect(sandbox.rejectCurrentSource({ episodes: [bad], fileIds: [old13], reason: "x" })).rejects.toThrow(
+        `SANDBOX_EPISODE_OUT_OF_SCOPE: ${bad}`,
+      );
+    }
+    expect(sandbox.needed()).toEqual([]);
+  });
+
+  it("rejectCurrentSource refuses a file that landed during this run (only pre-run files), without re-listing the season", async () => {
+    const { sandbox, storage, season, old13 } = await setup();
+    await storage.transferCandidate({ candidateId: "cand_new13", intoDirectoryId: season });
+    const landed = (await storage.listTree({ directoryId: season })).find((f) => f.path.includes("Nekomoe"))!.id;
+    await expect(sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [landed], reason: "x" })).rejects.toThrow(
+      /SANDBOX_FILES_NOT_IN_TARGET/,
+    );
+    // The pre-run map is the source of truth: no listTree call at reject time.
+    let listed = 0;
+    const listTree = storage.listTree.bind(storage);
+    storage.listTree = async (input) => { listed += 1; return listTree(input); };
+    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
+    expect(listed).toBe(0);
+  });
+
+  it("reportReplacement validates episode codes and only accepts requested or rejected episodes", async () => {
+    const { sandbox, results, old24 } = await setup();
+    await expect(sandbox.reportReplacement({ results: [{ episode: "S02E01", outcome: "not_found", note: "" }] })).rejects.toThrow(
+      /SANDBOX_EPISODE_OUT_OF_SCOPE/,
+    );
+    await expect(sandbox.reportReplacement({ results: [{ episode: "S01E25", outcome: "not_found", note: "" }] })).rejects.toThrow(
+      /SANDBOX_EPISODE_NOT_REQUESTED/,
+    );
+    await sandbox.rejectCurrentSource({ episodes: ["S01E25"], fileIds: [old24], reason: "x" });
+    await sandbox.reportReplacement({ results: [{ episode: "S01E25", outcome: "not_found", note: "没找到" }] });
+    expect(results).toMatchObject([{ episode: "S01E25", outcome: "not_found" }]);
+  });
+
+  it("reportReplacement: conflicting outcomes in one call are refused; same-outcome duplicates keep the first", async () => {
+    const { sandbox, results } = await setup();
+    await expect(
+      sandbox.reportReplacement({
+        results: [
+          { episode: "S01E13", outcome: "not_found", note: "a" },
+          { episode: "S01E13", outcome: "replaced", candidateId: "cand_new13", note: "b" },
+        ],
+      }),
+    ).rejects.toThrow(/SANDBOX_REPORT_CONFLICT/);
+    expect(results).toEqual([]);
+    const out = await sandbox.reportReplacement({
+      results: [
+        { episode: "S01E13", outcome: "not_found", note: "first" },
+        { episode: "S01E13", outcome: "not_found", note: "second" },
+      ],
+    });
+    expect(out).toEqual({ recorded: 1, ignored: [] });
+    expect(results).toMatchObject([{ episode: "S01E13", outcome: "not_found", note: "first" }]);
+  });
+
+  it("reportReplacement: an earlier not_found can be upgraded to replaced; other repeats are ignored and listed", async () => {
+    const { sandbox, results, old13 } = await setup();
+    await sandbox.reportReplacement({ results: [{ episode: "S01E13", outcome: "not_found", note: "还没找到" }] });
+    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
+    const snap = (await sandbox.searchResources("Show")).snapshot!;
+    await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_new13" });
+    await sandbox.markObtained({ codes: ["S01E13"] });
+    const up = await sandbox.reportReplacement({
+      results: [{ episode: "S01E13", outcome: "replaced", candidateId: "cand_new13", note: "喵萌版" }],
+    });
+    expect(up).toEqual({ recorded: 1, ignored: [] });
+    const again = await sandbox.reportReplacement({ results: [{ episode: "S01E13", outcome: "not_found", note: "x" }] });
+    expect(again).toEqual({ recorded: 0, ignored: [{ episode: "S01E13", reason: "already reported replaced" }] });
+    await sandbox.finalizeReplacement();
+    expect(results).toMatchObject([
+      { episode: "S01E13", outcome: "not_found" },
+      { episode: "S01E13", outcome: "replaced", candidateId: "cand_new13" },
+      { episode: "S01E24", outcome: "not_found" },
+    ]);
+    expect(results).toHaveLength(3);
+  });
+
   it("files that existed before the run can never be deleted", async () => {
     const { sandbox, old13 } = await setup();
     await expect(sandbox.deleteFiles({ directory: "season", season: 1, fileIds: [old13] })).rejects.toThrow(/PROTECTED/);
@@ -208,6 +292,19 @@ describe("TaskSandbox — replace (movie: the movie dir is also staging)", () =>
       { candidateId: "good_share", status: "succeeded" },
     ]);
     expect(result.transferredCandidateId).toBe("good_share");
+  });
+
+  it("rejectCurrentSource on a movie run accepts only [] or [\"MOVIE\"]", async () => {
+    const { sandbox, old } = await movieSetup();
+    const video = old.find((f) => f.isVideo)!.id;
+    await expect(sandbox.rejectCurrentSource({ episodes: ["S01E01"], fileIds: [video], reason: "x" })).rejects.toThrow(
+      /SANDBOX_EPISODE_OUT_OF_SCOPE/,
+    );
+    await sandbox.rejectCurrentSource({ episodes: ["MOVIE"], fileIds: [video], reason: "x" });
+    await sandbox.rejectCurrentSource({ episodes: [], fileIds: [video], reason: "x" });
+    await expect(sandbox.reportReplacement({ results: [{ episode: "S01E01", outcome: "not_found", note: "" }] })).rejects.toThrow(
+      /SANDBOX_EPISODE_OUT_OF_SCOPE/,
+    );
   });
 
   it("a succeeded transferUntilLanded candidate counts as landed for reportReplacement", async () => {
