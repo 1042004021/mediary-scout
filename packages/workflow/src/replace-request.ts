@@ -358,10 +358,16 @@ export async function runQueuedReplaceRequest(
       runId,
       ...(replacement?.rejectedPersistFailed ? { rejectedNotSaved: true } : {}),
     };
+    // One retry: a message left in processing is only released by the idle scan after
+    // the grace period, and then re-run from scratch — a transient hiccup should not cost that.
     try {
       await repository.finishUserMessages({ runId, reply, now: now() });
-    } catch (error) {
-      console.error(`[user-message] run ${runId} could not write the reply: ${String(error)}`);
+    } catch (firstError) {
+      try {
+        await repository.finishUserMessages({ runId, reply, now: now() });
+      } catch (error) {
+        console.error(`[user-message] run ${runId} could not write the reply (retried once): ${String(firstError)} / ${String(error)}`);
+      }
     }
   }
   return { status: "ran", workflowRunId: runId, workflowStatus };

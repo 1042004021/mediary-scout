@@ -655,6 +655,46 @@ describe("runQueuedReplaceRequest — scope, metadata and bookkeeping", () => {
     expect((await repository.listUserMessages(WORK))[0]).toMatchObject({ status: "done", runId: "run_rr_book" });
   });
 
+  it("a reply write that fails once is retried, so the message still gets its reply", async () => {
+    const { repository, title, season } = await trackedShow();
+    const storage = new FakeStorageExecutor();
+    await seedV2Season(storage, title, season, ["S01E01", "S01E02"]);
+    await repository.createUserMessage({ ...WORK, body: "1 集发蓝", episodeTags: ["S01E01"], now: NOW });
+    await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => "run_rr_retry" });
+    const finish = repository.finishUserMessages.bind(repository);
+    let calls = 0;
+    repository.finishUserMessages = async (input) => {
+      calls += 1;
+      if (calls === 1) throw new Error("connection reset");
+      return finish(input);
+    };
+
+    const result = await runQueuedReplaceRequest(baseRun(repository, storage, reportingModel(["S01E01"])));
+
+    expect(result).toMatchObject({ status: "ran", workflowRunId: "run_rr_retry" });
+    expect(calls).toBe(2);
+    expect((await repository.listUserMessages(WORK))[0]).toMatchObject({ status: "done", runId: "run_rr_retry" });
+  });
+
+  it("a reply write that keeps failing gives up after one retry without failing the run", async () => {
+    const { repository, title, season } = await trackedShow();
+    const storage = new FakeStorageExecutor();
+    await seedV2Season(storage, title, season, ["S01E01", "S01E02"]);
+    await repository.createUserMessage({ ...WORK, body: "1 集发蓝", episodeTags: ["S01E01"], now: NOW });
+    await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => "run_rr_giveup" });
+    let calls = 0;
+    repository.finishUserMessages = async () => {
+      calls += 1;
+      throw new Error("db down");
+    };
+
+    const result = await runQueuedReplaceRequest(baseRun(repository, storage, reportingModel(["S01E01"])));
+
+    expect(result).toMatchObject({ status: "ran", workflowRunId: "run_rr_giveup" });
+    expect(calls).toBe(2);
+    expect((await repository.getWorkflowRunSnapshot("run_rr_giveup", SCOPE))?.workflowRun.status).not.toBe("failed");
+  });
+
   it("a work no longer tracked fails without writing its queue-time episodes back", async () => {
     const { repository } = await trackedShow();
     await repository.createUserMessage({ ...WORK, body: "换", episodeTags: [], now: NOW });
