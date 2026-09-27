@@ -1024,3 +1024,128 @@ export async function deleteAgentMemoryAction(address: MemoryAddressInput, name:
     return { success: false, message: `删除没成功：${String(error)}` };
   }
 }
+
+// ── User messages (work detail page) ─────────────────────────────────────────
+// One sentence asking the agent to replace bad episodes, or a bad film. Same guards and
+// result shape as the memory actions; the card refreshes the page itself afterwards, as
+// the notes panel does. The work-level actions file under resolveMessageWork's work,
+// the key the engine looks up — never a key derived from the page's storageId alone.
+const MESSAGE_NOT_TRACKED = "这部作品没有在这块网盘上追踪";
+const MESSAGE_ALREADY_TAKEN = "agent 已经开始处理这条留言了";
+
+interface MessageWorkInput {
+  tmdbId: number;
+  mediaType: "movie" | "tv";
+  // The page's workspace drive (undefined = primary), as for requestSeasonAction.
+  storageId: string | undefined;
+}
+
+/** The caller's work for this title on the page's drive; null when it is not tracked
+ *  there. Throws for an unauthenticated caller (→ the action's catch). */
+async function messageWorkFor(input: MessageWorkInput) {
+  const { getActiveWorkspaceScope, getWorkflowRepository, requireAuthenticatedAccountId } = await import("../lib/workflow-runtime");
+  const { resolveMessageWork } = await import("../lib/user-message-server");
+  await requireAuthenticatedAccountId();
+  const repo = getWorkflowRepository();
+  const scope = await getActiveWorkspaceScope(input.storageId);
+  return { repo, work: await resolveMessageWork({ repo, scope, tmdbId: input.tmdbId, mediaType: input.mediaType }) };
+}
+
+export async function postUserMessageAction(
+  input: MessageWorkInput & { body: string; episodeTags: string[] },
+): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const { validateUserMessageInput } = await import("@media-track/workflow");
+    const { repo, work } = await messageWorkFor(input);
+    if (!work) return { success: false, message: MESSAGE_NOT_TRACKED };
+    const invalid = validateUserMessageInput(input);
+    if (invalid) return { success: false, message: invalid };
+    await repo.createUserMessage({ ...work, body: input.body.trim(), episodeTags: input.episodeTags, now: new Date().toISOString() });
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: `留言没发出去：${String(error)}` };
+  }
+}
+
+/** Only while the message waits; once a run holds it the store refuses. */
+export async function editUserMessageAction(input: { id: string; body: string; episodeTags: string[] }): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const { getWorkflowRepository, requireAuthenticatedAccountId } = await import("../lib/workflow-runtime");
+    const { validateUserMessageInput } = await import("@media-track/workflow");
+    const accountId = await requireAuthenticatedAccountId();
+    const invalid = validateUserMessageInput(input);
+    if (invalid) return { success: false, message: invalid };
+    const edited = await getWorkflowRepository().editUserMessage({
+      accountId,
+      id: input.id,
+      body: input.body.trim(),
+      episodeTags: input.episodeTags,
+      now: new Date().toISOString(),
+    });
+    return edited ? { success: true } : { success: false, message: MESSAGE_ALREADY_TAKEN };
+  } catch (error) {
+    return { success: false, message: `修改没成功：${String(error)}` };
+  }
+}
+
+export async function withdrawUserMessageAction(input: { id: string }): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const { getWorkflowRepository, requireAuthenticatedAccountId } = await import("../lib/workflow-runtime");
+    const accountId = await requireAuthenticatedAccountId();
+    const withdrawn = await getWorkflowRepository().withdrawUserMessage({ accountId, id: input.id, now: new Date().toISOString() });
+    return withdrawn ? { success: true } : { success: false, message: MESSAGE_ALREADY_TAKEN };
+  } catch (error) {
+    return { success: false, message: `撤回没成功：${String(error)}` };
+  }
+}
+
+/** 「现在处理」: the work's waiting messages skip the patrol. `queued: false` = a run of
+ *  this work is already queued or running (it picks them up, or they go right after it
+ *  via the idle-queue scan), or nothing was waiting any more. */
+export async function processMessagesNowAction(
+  input: MessageWorkInput,
+): Promise<PushSettingsActionResult & { queued?: boolean }> {
+  assertNotDemo();
+  try {
+    const { repo, work } = await messageWorkFor(input);
+    if (!work) return { success: false, message: MESSAGE_NOT_TRACKED };
+    // Like every acquire entry point: never queue a run that can only fail in the worker.
+    const preflight = await acquireLlmNotConfigured();
+    if (preflight) return { success: false, message: preflight.message };
+    const drive = (await repo.listConnectedStorages(work.accountId)).find((s) => s.id === work.drive);
+    if (drive?.status === "frozen") return { success: false, message: "这块网盘登录已失效，重新绑定后再处理" };
+    const { queueReplaceRequest } = await import("@media-track/workflow");
+    // Claimed or withdrawn since the page loaded: nothing left to hurry.
+    if ((await repo.markUserMessagesUrgent({ ...work, now: new Date().toISOString() })) === 0) {
+      return { success: true, queued: false };
+    }
+    const result = await queueReplaceRequest({ repository: repo, work, origin: "user" });
+    if (result.status === "not_tracked") return { success: false, message: MESSAGE_NOT_TRACKED };
+    return { success: true, queued: result.status === "queued" };
+  } catch (error) {
+    return { success: false, message: `没能开始处理：${String(error)}` };
+  }
+}
+
+/** 「不换了」: these episodes stay as they are; the patrol stops looking for them. */
+export async function keepEpisodesAsIsAction(
+  input: MessageWorkInput & { episodes: string[] },
+): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const { USER_MESSAGE_LIMITS } = await import("@media-track/workflow");
+    const { repo, work } = await messageWorkFor(input);
+    if (!work) return { success: false, message: MESSAGE_NOT_TRACKED };
+    const { episodes } = input;
+    if (!Array.isArray(episodes) || episodes.length > USER_MESSAGE_LIMITS.tagsMax || episodes.some((e) => typeof e !== "string")) {
+      return { success: false, message: "集数不对" };
+    }
+    await repo.removePendingReplacements({ ...work, episodes });
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: `没能保存：${String(error)}` };
+  }
+}
