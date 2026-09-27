@@ -458,6 +458,15 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
     const connectedStorageId = snapshot.connectedStorageId ?? UNSCOPED_STORAGE;
 
     return this.withTransaction(async (client) => {
+      if (input.blockIfTitleHasActiveRun === true) {
+        // READ COMMITTED alone lets two concurrent reservations both see no active
+        // run for the title and both insert. Serialize them per (account, drive,
+        // title) for the rest of this transaction.
+        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
+          `workflow_title:${accountId}:${snapshot.connectedStorageId ?? ""}:${snapshot.season.mediaTitleId}`,
+        ]);
+      }
+
       await this.expireStaleActiveWorkflowRuns(client, input);
 
       if (input.blockIfTitleHasActiveRun === true) {

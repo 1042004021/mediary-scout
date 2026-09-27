@@ -617,6 +617,34 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         expect(again.status).toBe("already_active");
       });
 
+      it("two concurrent title-locked reservations for the same title: exactly one is reserved", async () => {
+        const repo = await fresh();
+        // Different seasons AND kinds, so only the title lock (not the per-season+kind
+        // check) can keep the second one out. Postgres runs both transactions at once.
+        const base = workflowPersistenceFixture();
+        const reserveFor = (id: string, seasonId: string, kind: "type2_init" | "replace_request") =>
+          repo.reserveWorkflowRun(
+            reIded(id, {
+              season: { ...base.season, id: seasonId, seasonNumber: seasonId === "season_x1" ? 1 : 2 },
+              workflowRun: { ...base.workflowRun, id, kind, status: "queued" as const, trackedSeasonId: seasonId, finishedAt: null },
+              episodes: [],
+              connectedStorageId: "cs_lock",
+              blockIfTitleHasActiveRun: true,
+            }),
+          );
+        for (let round = 0; round < 5; round++) {
+          const results = await Promise.all([
+            reserveFor(`run_c1_${round}`, "season_x1", "type2_init"),
+            reserveFor(`run_c2_${round}`, "season_x2", "replace_request"),
+          ]);
+          expect(results.map((r) => r.status).sort()).toEqual(["already_active", "reserved"]);
+          // Clear the winner so the next round races again from an idle title.
+          const winner = results.find((r) => r.status === "reserved") as { snapshot: { workflowRun: { id: string } } };
+          const done = await repo.getWorkflowRunSnapshot(winner.snapshot.workflowRun.id);
+          await repo.saveWorkflowRunSnapshot({ ...done!, workflowRun: { ...done!.workflowRun, status: "succeeded", finishedAt: "2026-06-11T03:00:00.000Z" } });
+        }
+      });
+
       it("blockIfEpisodeStatesExist returns already_has_episode_state when the scoped bucket is non-empty", async () => {
         const repo = await fresh();
         // Seed episode states via a TERMINAL (succeeded) run so the active-run check

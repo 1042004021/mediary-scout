@@ -894,7 +894,9 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
       }
     }
 
-    const activeRun = await this.findActiveWorkflowRun({
+    // Synchronous on purpose: an await between the title check above and the set
+    // below would let two concurrent reservations both pass the check.
+    const activeRun = this.findActiveWorkflowRunSync({
       trackedSeasonId: snapshot.season.id,
       kind: snapshot.workflowRun.kind,
       accountId: reservingScope.accountId,
@@ -1000,6 +1002,15 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     accountId?: string;
     connectedStorageId?: string | null;
   }): Promise<PersistedWorkflowRunSnapshot | null> {
+    return this.findActiveWorkflowRunSync(input);
+  }
+
+  private findActiveWorkflowRunSync(input: {
+    trackedSeasonId: string;
+    kind: WorkflowKind;
+    accountId?: string;
+    connectedStorageId?: string | null;
+  }): PersistedWorkflowRunSnapshot | null {
     const scope = normalizeScope(
       input.accountId === undefined
         ? undefined
