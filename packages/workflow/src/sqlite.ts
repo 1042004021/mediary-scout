@@ -968,6 +968,9 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
     }
     const targetSeasonIds = [...new Set(states.map((state) => state.season.id))];
     const storageValue = scope.connectedStorageId ?? UNSCOPED_STORAGE;
+    const accountId = scope.accountId ?? DEFAULT_ACCOUNT_ID;
+    const drive = userMessageDrive(scope.connectedStorageId);
+    const titleKey = states[0]!.title.id;
 
     return this.db.transaction(
       (): { status: "untracked" | "not_found" | "in_flight"; removedSeasons: number } => {
@@ -975,7 +978,13 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
         const hasRunning = targetSeasonIds.some((seasonId) =>
           this.selectWorkflowRuns(seasonId, storageValue).some((run) => run.status === "running"),
         );
-        if (hasRunning) {
+        // …and a queued or running replace_request of the work, whichever season it is
+        // recorded on: it covers every season tracked when it starts and writes a record for
+        // each when it ends, so a season untracked in between would be tracked again.
+        const replaceActive = this.selectWorkflowRunsForTitle(titleKey, accountId, storageValue).some(
+          (run) => run.kind === "replace_request" && isActiveWorkflowStatus(run.status),
+        );
+        if (hasRunning || replaceActive) {
           return { status: "in_flight" as const, removedSeasons: 0 };
         }
         // For each season: delete all run children + runs, then tear down the season.
@@ -1008,9 +1017,6 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
         // the user re-tracks. Processing messages are untouched (a running run
         // already refused above; nothing here is mid-flight). Untracking the last
         // season still tracked on this drive, one season at a time, is the whole work.
-        const accountId = scope.accountId ?? DEFAULT_ACCOUNT_ID;
-        const drive = userMessageDrive(scope.connectedStorageId);
-        const titleKey = states[0]!.title.id;
         const workGone = seasonNumber === undefined || this.selectWorkflowRunsForTitle(titleKey, accountId, storageValue).length === 0;
         if (workGone) {
           const now = new Date().toISOString();

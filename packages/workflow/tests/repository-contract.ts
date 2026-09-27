@@ -1572,6 +1572,54 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         expect(await repo.listTrackedSeasonStates(scope)).toHaveLength(1);
       });
 
+      it("untrackTitle refuses (in_flight) every season of a title while a replace_request of it on that drive is queued or running — also a season the run is not recorded on", async () => {
+        const repo = await fresh();
+        const base = queuedRun({ id: "ur1", status: "succeeded", connectedStorageId: "cs_ur", tmdbId: 876, type: "tv", seasonNumber: 1 });
+        await repo.saveWorkflowRunSnapshot(base);
+        await repo.saveWorkflowRunSnapshot({
+          ...base,
+          season: { ...base.season, id: "season_ur2", seasonNumber: 2 },
+          workflowRun: { ...base.workflowRun, id: "ur2", trackedSeasonId: "season_ur2" },
+          episodes: base.episodes.map((e) => ({ ...e, trackedSeasonId: "season_ur2" })),
+        });
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_ur" };
+        const work = { accountId: "acct_default", drive: "cs_ur", titleKey: "title_ur1" };
+        // Reserved on the lowest season (the lock); it covers S2 too and writes S2's record when it ends.
+        expect(await queueReplaceRequest({ repository: repo, work, now: () => "2026-09-27T00:00:00.000Z", createWorkflowRunId: () => "ur_replace" })).toEqual({
+          status: "queued",
+          workflowRunId: "ur_replace",
+        });
+
+        expect(await repo.untrackTitle(876, scope, "tv", 2)).toEqual({ status: "in_flight", removedSeasons: 0 });
+        await repo.claimNextQueuedWorkflowRun({ kind: "replace_request", now: "2026-09-27T00:00:01.000Z" });
+        expect(await repo.untrackTitle(876, scope, "tv", 2)).toEqual({ status: "in_flight", removedSeasons: 0 });
+        expect(await repo.untrackTitle(876, scope, "tv")).toEqual({ status: "in_flight", removedSeasons: 0 });
+        expect((await repo.listTrackedSeasonStates(scope)).map((s) => s.season.seasonNumber)).toEqual([1, 2]);
+
+        // Once it has ended, the season can go.
+        const running = await repo.getWorkflowRunSnapshot("ur_replace", scope);
+        await repo.saveWorkflowRunSnapshot({
+          ...running!,
+          workflowRun: { ...running!.workflowRun, status: "succeeded", finishedAt: "2026-09-27T00:05:00.000Z" },
+        });
+        expect(await repo.untrackTitle(876, scope, "tv", 2)).toEqual({ status: "untracked", removedSeasons: 1 });
+        expect((await repo.listTrackedSeasonStates(scope)).map((s) => s.season.seasonNumber)).toEqual([1]);
+      });
+
+      it("a replace_request of the same title on ANOTHER drive does not hold back untracking it here", async () => {
+        const repo = await fresh();
+        const here = queuedRun({ id: "ux1", status: "succeeded", connectedStorageId: "cs_ux_here", tmdbId: 765, type: "tv" });
+        await repo.saveWorkflowRunSnapshot(here);
+        await repo.saveWorkflowRunSnapshot({ ...here, connectedStorageId: "cs_ux_there", workflowRun: { ...here.workflowRun, id: "ux1_there" } });
+        const there = { accountId: "acct_default", drive: "cs_ux_there", titleKey: "title_ux1" };
+        expect((await queueReplaceRequest({ repository: repo, work: there, now: () => "2026-09-27T00:00:00.000Z", createWorkflowRunId: () => "ux_replace" })).status).toBe("queued");
+
+        expect(await repo.untrackTitle(765, { accountId: "acct_default", connectedStorageId: "cs_ux_here" }, "tv")).toEqual({
+          status: "untracked",
+          removedSeasons: 1,
+        });
+      });
+
       it("untrackTitle (whole title) withdraws pending messages and drops pending replacements for that work only", async () => {
         const repo = await fresh();
         await repo.saveWorkflowRunSnapshot(

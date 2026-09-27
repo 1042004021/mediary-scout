@@ -231,7 +231,9 @@ export interface WorkflowRepository extends DeadLinkStore, AgentMemoryStore, Use
    *  runs/子表/episodes/season,条件删全局 title)。`mediaKind` 区分 TMDB 的
    *  movie/tv id 命名空间(同一数字 id 可同时是 movie 和 tv);"tv" 同时覆盖 tv 与
    *  anime(同一 tv 命名空间)。seasonNumber 给定=只删该季。任一目标季有 running run
-   *  时拒绝(in_flight)。不碰网盘文件。 */
+   *  时拒绝(in_flight);这部作品在本盘有排队中或进行中的 replace_request 时也拒绝
+   *  (它记在最低一季上,结束时会给覆盖到的每一季写记录,中途取消的季会被写回来)。
+   *  不碰网盘文件。 */
   untrackTitle(
     tmdbId: number,
     scope: WorkflowScope,
@@ -1185,6 +1187,7 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     }
     const targetSeasonIds = new Set(states.map((state) => state.season.id));
     const storageValue = scope.connectedStorageId ?? UNSCOPED_STORAGE;
+    const work = { accountId: scope.accountId ?? DEFAULT_ACCOUNT_ID, drive: userMessageDrive(scope.connectedStorageId), titleKey: states[0]!.title.id };
 
     // In-flight guard: a running run on any target season → refuse, delete nothing.
     const hasRunning = Array.from(this.workflowRuns.values()).some(
@@ -1193,7 +1196,17 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
         scopeMatches(scope, snapshot.accountId, snapshot.connectedStorageId) &&
         snapshot.workflowRun.status === "running",
     );
-    if (hasRunning) {
+    // …and a queued or running replace_request of the work, whichever season it is recorded
+    // on: it covers every season tracked when it starts and writes a record for each when it
+    // ends (`${runId}_s<n>` beside the lock season's), so a season untracked in between would
+    // be tracked again. Refuse until it has ended (or is cancelled).
+    const replaceActive = Array.from(this.workflowRuns.values()).some(
+      (snapshot) =>
+        snapshot.workflowRun.kind === "replace_request" &&
+        isActiveWorkflowStatus(snapshot.workflowRun.status) &&
+        sameWork(workOfRun(snapshot), work),
+    );
+    if (hasRunning || replaceActive) {
       return { status: "in_flight", removedSeasons: 0 };
     }
 
@@ -1221,7 +1234,6 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     // the user re-tracks. Processing messages are untouched (a running run
     // already refused above; nothing here is mid-flight). Untracking the last
     // season still tracked on this drive, one season at a time, is the whole work.
-    const work = { accountId: scope.accountId ?? DEFAULT_ACCOUNT_ID, drive: userMessageDrive(scope.connectedStorageId), titleKey: states[0]!.title.id };
     const workGone =
       seasonNumber === undefined ||
       !Array.from(this.workflowRuns.values()).some((snapshot) => sameWork(workOfRun(snapshot), work));

@@ -940,6 +940,37 @@ describe("runQueuedReplaceRequest — scope, metadata and bookkeeping", () => {
     expect(done?.reply?.results.map((r) => r.episode)).toEqual(["S01E01"]);
   });
 
+  it("a season cannot be untracked while the work's replace run is running, so the run cannot bring it back when it saves", async () => {
+    const { repository, title, season } = await trackedShow();
+    const season2: TrackedSeason = { ...season, id: "tmdb_tv_42_s2", seasonNumber: 2, storageDirectoryId: "dir_s2" };
+    await seedTrackedSeason({ repository, title, season: season2, obtainedCodes: ["S02E01", "S02E02"] });
+    const storage = new FakeStorageExecutor();
+    await seedV2Season(storage, title, season, ["S01E01", "S01E02"]);
+    await repository.createUserMessage({ ...WORK, body: "第一季第一集发蓝", episodeTags: ["S01E01"], now: NOW });
+    await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => "run_rr_untrack" });
+    let untrackMidRun: unknown;
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => {
+        i += 1;
+        if (i === 1) {
+          // The user clicks 「取消第 2 季追踪」 while the run (recorded on season 1) works.
+          untrackMidRun = await repository.untrackTitle(42, SCOPE, "tv", 2);
+          return tool("reportReplacement", { results: [{ episode: "S01E01", outcome: "not_found", note: "没找到" }] }, i);
+        }
+        return text("done");
+      },
+    });
+
+    await runQueuedReplaceRequest(baseRun(repository, storage, model));
+
+    expect(untrackMidRun).toEqual({ status: "in_flight", removedSeasons: 0 });
+    expect((await repository.listTrackedSeasonStates(SCOPE)).map((s) => s.season.seasonNumber)).toEqual([1, 2]);
+    // Afterwards it goes through, and stays gone.
+    expect(await repository.untrackTitle(42, SCOPE, "tv", 2)).toEqual({ status: "untracked", removedSeasons: 1 });
+    expect((await repository.listTrackedSeasonStates(SCOPE)).map((s) => s.season.seasonNumber)).toEqual([1]);
+  });
+
   it("only out-of-scope 待换 rows and no message: the rows are deleted and the run ends empty", async () => {
     const { repository } = await trackedShow();
     await repository.addPendingReplacements({ ...WORK, episodes: ["S05E01"], messageId: "msg_old", now: NOW });

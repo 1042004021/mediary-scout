@@ -343,8 +343,8 @@ export async function runQueuedReplaceRequest(
       // and SQLite load a run through its tracked_seasons row (loading it throws; SQLite's
       // tracked list, built from run rows, throws too), and InMemory derives tracking from
       // the run records themselves. It does not happen to a claimed run in practice:
-      // untrackTitle refuses while a run of the season is running, so this only covers a
-      // read that disagrees with the claim.
+      // untrackTitle refuses while a replace run of the work is queued or running, so this
+      // only covers a read that disagrees with the claim.
       const current = await workStates(repository, work).then(
         (states) => states.find((s) => s.season.id === claimed.season.id) ?? null,
         () => undefined,

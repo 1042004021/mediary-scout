@@ -858,6 +858,11 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
     }
     const targetSeasonIds = states.map((state) => state.season.id);
     const storageValue = scope.connectedStorageId ?? UNSCOPED_STORAGE;
+    const workScope = {
+      accountId: scope.accountId ?? DEFAULT_ACCOUNT_ID,
+      drive: userMessageDrive(scope.connectedStorageId),
+      titleKey: states[0]!.title.id,
+    };
 
     return this.withTransaction(async (client) => {
       await this.ensureSchema();
@@ -867,7 +872,13 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
           "AND payload->>'status' = 'running' LIMIT 1",
         [targetSeasonIds, storageValue],
       );
-      if ((running.rowCount ?? 0) > 0) {
+      // …and a queued or running replace_request of the work, whichever season it is
+      // recorded on: it covers every season tracked when it starts and writes a record for
+      // each when it ends, so a season untracked in between would be tracked again.
+      const replaceActive = (await this.selectWorkflowRunsForTitle(client, workScope.titleKey, workScope.accountId, storageValue)).some(
+        (run) => run.kind === "replace_request" && isActiveWorkflowStatus(run.status),
+      );
+      if ((running.rowCount ?? 0) > 0 || replaceActive) {
         return { status: "in_flight" as const, removedSeasons: 0 };
       }
       // For each season: delete all run children + runs, then tear down the season.
@@ -909,11 +920,6 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       // the user re-tracks. Processing messages are untouched (a running run
       // already refused above; nothing here is mid-flight). Untracking the last
       // season still tracked on this drive, one season at a time, is the whole work.
-      const workScope = {
-        accountId: scope.accountId ?? DEFAULT_ACCOUNT_ID,
-        drive: userMessageDrive(scope.connectedStorageId),
-        titleKey: states[0]!.title.id,
-      };
       await lockUserMessageWork(client, workScope);
       const workGone =
         seasonNumber === undefined ||
