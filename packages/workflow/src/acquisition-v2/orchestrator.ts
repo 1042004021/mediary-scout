@@ -115,6 +115,11 @@ export interface RunAcquisitionV2Request {
     /** Episodes the user named or that are still pending (movie: ["MOVIE"]). Added to the need. */
     requestedEpisodes: string[];
     prompt: UserRequestPromptInput;
+    /** Episode → link key of the copy an earlier replace run put in place (the
+     *  episode_sources rows). A rejection of that episode carries the link, so the same
+     *  resource is refused under any name: in the store, and for the rest of this run
+     *  even when the store write fails. */
+    sourceLinkKeys?: Record<string, string>;
     rejectedStore: {
       /** `episode` lets a repeated rejection be skipped (see onReject). */
       list: () => Promise<Array<{ episode?: string; linkKey: string | null; label: string; sizeBytes: number | null }>>;
@@ -150,7 +155,8 @@ export interface RunAcquisitionV2Result extends AcquisitionAgentResult {
       sizeBytes?: number;
       note: string;
     }>;
-    rejected: Array<{ episode: string; label: string; sizeBytes: number | null; reason: string }>;
+    /** linkKey: the episode's recorded source link it was rejected by too (null = none known). */
+    rejected: Array<{ episode: string; label: string; sizeBytes: number | null; linkKey: string | null; reason: string }>;
     /** Paths (relative to the library dir) of the rejected files, still in place. */
     oldFiles: string[];
     /** Whether the agent identified an episode in this run (a successful
@@ -202,8 +208,9 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
     }
     for (const e of userRequest.requestedEpisodes) if (!need.includes(e)) need.push(e);
   }
-  // Replace run collectors. Rejections made this run are also kept here, so they are
-  // honoured for the rest of the run even when the store write failed (spec §7).
+  // Replace run collectors. Rejections made this run are also kept here, with the link
+  // they are rejected by, so they are honoured for the rest of the run even when the
+  // store write failed (spec §7).
   const replaceResults = new Map<string, NonNullable<RunAcquisitionV2Result["replacement"]>["results"][number]>();
   const replaceRejected: NonNullable<RunAcquisitionV2Result["replacement"]>["rejected"] = [];
   const oldFiles = new Set<string>();
@@ -228,7 +235,7 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
     } catch (error) {
       console.log(`[user-message] run ${request.workflowRunId} rejected list read failed: ${errorText(error)}`);
     }
-    return [...stored, ...replaceRejected.map((r) => ({ linkKey: null, label: r.label, sizeBytes: r.sizeBytes }))];
+    return [...stored, ...replaceRejected.map((r) => ({ linkKey: r.linkKey, label: r.label, sizeBytes: r.sizeBytes }))];
   };
   // The title key is computed HERE from the target — the agent never supplies it.
   const memoryNow = request.memory?.now ?? (() => new Date().toISOString());
@@ -329,13 +336,18 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
               });
               for (const i of items) oldFiles.add(i.path);
               if (fresh.length === 0) return;
-              for (const i of fresh) {
-                replaceRejected.push({ episode: i.episode, label: i.label, sizeBytes: i.sizeBytes, reason: i.reason });
-              }
+              // An episode replaced once before has a known link: reject it by link too,
+              // not only name+size — here and in the store.
+              const rows = fresh.map((i) => ({
+                episode: i.episode,
+                linkKey: userRequest.sourceLinkKeys?.[i.episode] ?? null,
+                label: i.label,
+                sizeBytes: i.sizeBytes,
+                reason: i.reason,
+              }));
+              replaceRejected.push(...rows);
               try {
-                await userRequest.rejectedStore.add(
-                  fresh.map((i) => ({ episode: i.episode, linkKey: null, label: i.label, sizeBytes: i.sizeBytes, reason: i.reason })),
-                );
+                await userRequest.rejectedStore.add(rows);
               } catch (error) {
                 // Best-effort (spec §7): the run goes on and the reply says the list was not saved.
                 rejectedPersistFailed = true;

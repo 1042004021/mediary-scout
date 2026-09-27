@@ -277,6 +277,8 @@ export async function runQueuedReplaceRequest(
         pending,
         ...(movie ? { filmObtained } : {}),
       },
+      // An episode replaced once before has a known link: its rejection carries it.
+      sourceLinkKeys: Object.fromEntries(sources.flatMap((s): Array<[string, string]> => (s.linkKey ? [[s.episode, s.linkKey]] : []))),
       rejectedStore: {
         list: async () =>
           (await repository.listRejectedResources({ accountId: work.accountId, titleKey: work.titleKey })).map((r) => ({
@@ -285,17 +287,12 @@ export async function runQueuedReplaceRequest(
             label: r.label,
             sizeBytes: r.sizeBytes,
           })),
-        // An episode replaced once before has a known link: reject it by link too, not only name+size.
         add: (rows) =>
           repository.addRejectedResources({
             accountId: work.accountId,
             titleKey: work.titleKey,
             now: now(),
-            items: rows.map((r) => ({
-              ...r,
-              linkKey: r.linkKey ?? sources.find((s) => s.episode === r.episode)?.linkKey ?? null,
-              messageId: messageFor(messages, r.episode)?.id ?? null,
-            })),
+            items: rows.map((r) => ({ ...r, messageId: messageFor(messages, r.episode)?.id ?? null })),
           }),
       },
     };

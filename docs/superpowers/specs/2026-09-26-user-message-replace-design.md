@@ -198,3 +198,4 @@
 - **内容审查后的恢复轮**：只能整理、汇报、收尾，不能搜索或转存；换源 run 里也能 `rejectCurrentSource`，没带集数的留言要认出集数才能 finish。
 - **提示词**：换源 run 只有一个第一步（先 `inspectTargetDir`，再 `rejectCurrentSource`），结尾顺序是 `markObtained` → `reportReplacement` → finish；电影只在原本已获取时才说「片子已在库里」。
 - **未绑盘作品**：Postgres 读追踪季时把 `__unscoped__` 映射回 `null`，留言用 `""` 作为盘键，两边才能对上。
+- **拒绝名单写失败，本轮照样按来源链接挡**：这一集以前换过源（有 `episode_sources` 记录）时，拒绝带上那份的链接键；写入失败时本轮内存里的拒绝也带着它，搜索过滤和转存前复查照样挡住同一链接改了名的副本（标题里没有大小也挡）。

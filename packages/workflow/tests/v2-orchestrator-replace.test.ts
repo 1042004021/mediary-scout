@@ -328,6 +328,86 @@ describe("runAcquisitionV2 — user replace request", () => {
     expect(result.replacement?.rejectedPersistFailed).toBe(true);
   });
 
+  it("a rejected list that could not be saved still refuses the episode's recorded source link for the rest of the run — under another name, with no size in the title", async () => {
+    // The episode's current copy was put in place by an earlier replace run
+    // (episode_sources), so its link is known. The pre-search and a later search
+    // both carry that same link renamed, with no size a fingerprint could match.
+    const SOURCE_KEY = `magnet:${"c".repeat(40)}`;
+    const RENAMED_TITLE = "Show.13.WEB-DL.Another.Group";
+    const sameLinkProvider: ResourceProvider = {
+      search: async ({ keyword }) => {
+        const snapshotId = `snap_${keyword}`;
+        const candidates: ResourceCandidate[] =
+          keyword === "Show" || keyword === "Show 13"
+            ? [
+                { id: "cand_samelink", snapshotId, index: 0, title: RENAMED_TITLE, type: "magnet", source: "pansou", providerPayload: { url: `magnet:?xt=urn:btih:${"c".repeat(40)}` } },
+                { id: "cand_nekomoe", snapshotId, index: 1, title: NEKOMOE_TITLE, type: "magnet", source: "pansou", providerPayload: { url: `magnet:?xt=urn:btih:${"b".repeat(40)}` } },
+              ]
+            : [];
+        return { id: snapshotId, provider: "pansou", keyword, candidates, createdAt: NOW };
+      },
+    };
+    const exec = new FakeStorageExecutor({
+      directories: { staging: [], season: seasonFiles() },
+      transferOutcomes: {
+        cand_samelink: {
+          status: "succeeded",
+          providerMessage: "ok",
+          files: [{ id: "same13", storageDirectoryId: "staging", name: "Show.13.mkv", sizeBytes: OLD_SIZE, episodeCode: "S01E13", providerFileId: "same13" }],
+        },
+      },
+    });
+    let rawRow: RegExpExecArray | null = null;
+    let transferOutput: any;
+    let searched: string[] = [];
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        i += 1;
+        if (i === 1) return tool("viewResourceSnapshot", {}, i);
+        if (i === 2) {
+          // Remembered from the pre-search, before the rejection hides it.
+          rawRow = /\[(s(\d+)-\d+)\] Show\.13\.WEB-DL\.Another\.Group/.exec(String(lastToolOutput(options.prompt, "viewResourceSnapshot").document));
+          return tool("rejectCurrentSource", { episodes: ["S01E13"], fileIds: ["old13"], reason: "发蓝" }, i);
+        }
+        if (i === 3) return tool("rejectCurrentSource", { episodes: ["S01E24"], fileIds: ["old24"], reason: "发蓝" }, i);
+        if (i === 4) return tool("transferCandidate", { snapshotId: `s${rawRow![2]}`, candidateId: rawRow![1] }, i);
+        if (i === 5) {
+          transferOutput = lastToolOutput(options.prompt, "transferCandidate");
+          return tool("searchResources", { keyword: "Show 13" }, i);
+        }
+        if (i === 6) {
+          searched = (lastToolOutput(options.prompt, "searchResources").snapshot.candidates as Array<{ title: string }>).map((c) => c.title);
+        }
+        return text("done");
+      },
+    });
+    const req = { ...baseRequest(model, exec, []), provider: sameLinkProvider };
+    req.userRequest = {
+      ...req.userRequest!,
+      sourceLinkKeys: { S01E13: SOURCE_KEY },
+      rejectedStore: {
+        list: async () => [],
+        add: async () => {
+          throw new Error("db down");
+        },
+      },
+    };
+
+    const result = await runAcquisitionV2(req);
+
+    expect(rawRow).not.toBeNull();
+    expect(String(transferOutput?.error)).toMatch(/SANDBOX_CANDIDATE_REJECTED/);
+    expect(result.outcome.transferAttempts).toEqual([]);
+    expect(searched).not.toContain(RENAMED_TITLE);
+    expect(searched).toContain(NEKOMOE_TITLE);
+    expect(result.replacement?.rejectedPersistFailed).toBe(true);
+    expect(result.replacement?.rejected).toEqual([
+      expect.objectContaining({ episode: "S01E13", linkKey: SOURCE_KEY }),
+      expect.objectContaining({ episode: "S01E24", linkKey: null }),
+    ]);
+  });
+
   it("the reflection digest carries the per-episode outcome and tells the model not to note rejections", async () => {
     let reflectionPrompt = "";
     let i = 0;

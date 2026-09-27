@@ -812,6 +812,82 @@ describe("runQueuedReplaceRequest", () => {
     expect(message?.reply).toMatchObject({ rejectedNotSaved: true, results: [{ episode: "S01E01", outcome: "not_found" }] });
   });
 
+  it("an episode replaced before: when its rejection cannot be saved, its recorded source link is still refused for the rest of the run (renamed, no size in the title)", async () => {
+    const { repository, title, season } = await trackedShow();
+    const SOURCE_KEY = `magnet:${"c".repeat(40)}`;
+    const RENAMED_TITLE = "Show.01.WEB-DL.Another.Group";
+    const storage = new FakeStorageExecutor({
+      transferOutcomes: {
+        cand_samelink: {
+          status: "succeeded",
+          providerMessage: "ok",
+          files: [{ id: "same01", storageDirectoryId: "staging", name: "Show.01.mkv", sizeBytes: 1_000_000_000, episodeCode: "S01E01", providerFileId: "same01" }],
+        },
+      },
+    });
+    await seedV2Season(storage, title, season, ["S01E01", "S01E02"]);
+    // An earlier replace run put S01E01's current copy in place: its link is known.
+    await repository.upsertEpisodeSource({ ...WORK, episode: "S01E01", linkKey: SOURCE_KEY, label: "[OldGroup] Show 01 [1.0G]", sizeBytes: 1_000_000_000, runId: "run_earlier", recordedAt: NOW });
+    await repository.createUserMessage({ ...WORK, body: "第 1 集还是不对", episodeTags: ["S01E01"], now: NOW });
+    await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => "run_rr_srclink" });
+    const attempted: Array<{ episode: string; linkKey: string | null }> = [];
+    repository.addRejectedResources = async (input) => {
+      attempted.push(...input.items);
+      throw new Error("db down");
+    };
+    // Every "Show…" search (the pre-search included) carries that same link under another name.
+    const sameLinkProvider: ResourceProvider = {
+      search: async ({ keyword }) => ({
+        id: `snap_${keyword}`,
+        provider: "pansou",
+        keyword,
+        candidates: keyword.startsWith("Show")
+          ? [
+              { id: "cand_samelink", snapshotId: `snap_${keyword}`, index: 0, title: RENAMED_TITLE, type: "magnet", source: "pansou", providerPayload: { url: `magnet:?xt=urn:btih:${"c".repeat(40)}` } },
+              { id: "cand_new", snapshotId: `snap_${keyword}`, index: 1, title: NEW_TITLE, type: "magnet", source: "pansou", providerPayload: { url: `magnet:?xt=urn:btih:${"b".repeat(40)}` } },
+            ]
+          : [],
+        createdAt: NOW,
+      }),
+    };
+    let rawRow: RegExpExecArray | null = null;
+    let transferOutput: any;
+    let searched: string[] = [];
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        i += 1;
+        if (i === 1) return tool("viewResourceSnapshot", {}, i);
+        if (i === 2) {
+          // Remembered from the pre-search, before the rejection hides it.
+          rawRow = /\[(s(\d+)-\d+)\] Show\.01\.WEB-DL\.Another\.Group/.exec(String(lastToolOutput(options.prompt, "viewResourceSnapshot").document));
+          return tool("rejectCurrentSource", { episodes: ["S01E01"], fileIds: ["present_S01E01"], reason: "还是不对" }, i);
+        }
+        if (i === 3) return tool("transferCandidate", { snapshotId: `s${rawRow![2]}`, candidateId: rawRow![1] }, i);
+        if (i === 4) {
+          transferOutput = lastToolOutput(options.prompt, "transferCandidate");
+          return tool("searchResources", { keyword: "Show 01" }, i);
+        }
+        if (i === 5) {
+          searched = (lastToolOutput(options.prompt, "searchResources").snapshot.candidates as Array<{ title: string }>).map((c) => c.title);
+          return tool("reportReplacement", { results: [{ episode: "S01E01", outcome: "not_found", note: "只有同一份" }] }, i);
+        }
+        return text("done");
+      },
+    });
+
+    await runQueuedReplaceRequest({ ...baseRun(repository, storage, model), resourceProvider: sameLinkProvider });
+
+    expect(rawRow).not.toBeNull();
+    expect(String(transferOutput?.error)).toMatch(/SANDBOX_CANDIDATE_REJECTED/);
+    expect(searched).not.toContain(RENAMED_TITLE);
+    expect(searched).toContain(NEW_TITLE);
+    // The store was asked to keep the rejection by that link too.
+    expect(attempted).toEqual([expect.objectContaining({ episode: "S01E01", linkKey: SOURCE_KEY })]);
+    const [message] = await repository.listUserMessages(WORK);
+    expect(message?.reply).toMatchObject({ rejectedNotSaved: true, results: [{ episode: "S01E01", outcome: "not_found" }] });
+  });
+
   it("a TV message without tags whose episodes the agent never identifies: done with an unidentified reply, nothing kept 待换", async () => {
     const { repository, title, season } = await trackedShow();
     const storage = new FakeStorageExecutor();
