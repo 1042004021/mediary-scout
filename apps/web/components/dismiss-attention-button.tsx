@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useTransition } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter } from "../lib/use-router";
 
 /**
  * 条目级删除按钮（client）。成功后走 router.refresh() 让服务端重渲染 inbox——

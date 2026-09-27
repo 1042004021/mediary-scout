@@ -2,7 +2,7 @@
 
 import { LoaderCircle, Trash2 } from "lucide-react";
 import { useState, useTransition } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter } from "../lib/use-router";
 import { untrackTitleAction } from "../app/actions";
 import { runAction } from "../lib/run-action";
 import { isDemoModeClient } from "../lib/demo-mode";

@@ -5,7 +5,7 @@
  * · row hover · delete :focus-visible · pending · deleted + undo · error · empty (hidden) */
 
 import { useEffect, useRef, useState, useTransition } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter } from "../lib/use-router";
 import { X } from "lucide-react";
 import { deleteAgentMemoryAction, setAgentMemoryEnabledAction } from "../app/actions";
 import { runAction } from "../lib/run-action";

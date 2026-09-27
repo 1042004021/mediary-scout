@@ -2,7 +2,7 @@
 
 import { useState, useTransition } from "react";
 import { Check, ExternalLink, LoaderCircle } from "lucide-react";
-import { useRouter } from "next/navigation";
+import { useRouter } from "../lib/use-router";
 import { connectQuarkAction } from "../app/actions";
 import { runAction } from "../lib/run-action";
 

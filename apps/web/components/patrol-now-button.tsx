@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useTransition } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter } from "../lib/use-router";
 import { LoaderCircle, Radar } from "lucide-react";
 import { runPatrolNowAction } from "../app/actions";
 import { runAction } from "../lib/run-action";

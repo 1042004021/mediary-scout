@@ -2,7 +2,7 @@
 
 import { CalendarClock, Check, LoaderCircle, Plus } from "lucide-react";
 import { useState, useTransition } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter } from "../lib/use-router";
 import { requestTrackingAction, type RequestTrackingActionResult } from "../app/actions";
 import { runAction } from "../lib/run-action";
 // Import the type from the narrow subpath, NOT the root barrel: the barrel

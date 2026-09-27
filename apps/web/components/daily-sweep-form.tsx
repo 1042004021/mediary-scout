@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useTransition } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter } from "../lib/use-router";
 import { LoaderCircle, Plus, X } from "lucide-react";
 import { saveDailySweepTimesAction } from "../app/actions";
 import { runAction } from "../lib/run-action";

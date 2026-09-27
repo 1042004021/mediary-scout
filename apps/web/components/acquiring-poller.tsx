@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter } from "../lib/use-router";
 
 /**
  * The "获取中 / disabled" state is owned by the SERVER (a queued/running

@@ -2,7 +2,7 @@
 
 import { Check, DownloadCloud, Layers, LoaderCircle } from "lucide-react";
 import { useState, useTransition } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter } from "../lib/use-router";
 import {
   requestRemainingAction,
   requestSeasonAction,
