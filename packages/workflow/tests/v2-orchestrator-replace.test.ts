@@ -531,6 +531,90 @@ describe("runAcquisitionV2 — user replace request", () => {
     expect(result.outcome.transferAttempts).toEqual([]);
   });
 
+  it("replacement.identified tells whether the agent identified an episode this run (a successful rejectCurrentSource)", async () => {
+    let n = 0;
+    const reportsOnly = new MockLanguageModelV3({
+      doGenerate: async () => {
+        n += 1;
+        if (n === 1) return tool("reportReplacement", { results: ["S01E13", "S01E24"].map((episode) => ({ episode, outcome: "not_found", note: "没找到" })) }, n);
+        return text("done");
+      },
+    });
+    expect((await runAcquisitionV2(baseRequest(reportsOnly, executor(), []))).replacement?.identified).toBe(false);
+    // A declaration that an episode has no file here identifies it too.
+    let i = 0;
+    const declares = new MockLanguageModelV3({
+      doGenerate: async () => {
+        i += 1;
+        if (i === 1) return tool("rejectCurrentSource", { episodes: ["S01E05"], fileIds: [], reason: "第 5 集也要换" }, i);
+        return text("done");
+      },
+    });
+    expect((await runAcquisitionV2(baseRequest(declares, executor(), []))).replacement?.identified).toBe(true);
+  });
+
+  it("a TV message without tags: finish waits for an episode identified this run — an episode already requested does not count", async () => {
+    let finishOutput: any;
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        i += 1;
+        if (i === 1) return tool("reportReplacement", { results: [{ episode: "S01E13", outcome: "not_found", note: "还是没有" }] }, i);
+        if (i === 2) return tool("finish", {}, i);
+        if (i === 3) finishOutput = lastToolOutput(options.prompt, "finish");
+        return text("done");
+      },
+    });
+    const req = baseRequest(model, executor(), []);
+    req.userRequest = {
+      ...req.userRequest!,
+      // E13 is still waiting from an earlier request; the new message names no episode.
+      requestedEpisodes: ["S01E13"],
+      prompt: { messages: [{ body: "有一集发蓝", episodeTags: [], createdAt: NOW }], rejected: [], pending: ["S01E13"] },
+    };
+    const result = await runAcquisitionV2(req);
+    expect(String(finishOutput?.error)).toMatch(/^SANDBOX_NO_EPISODE_IDENTIFIED/);
+    expect(result.replacement?.identified).toBe(false);
+    expect(result.replacement?.results).toEqual([{ episode: "S01E13", outcome: "not_found", note: "还是没有" }]);
+  });
+
+  it("a movie message without tags means the film: finish needs only MOVIE reported, nothing identified from words", async () => {
+    const exec = new FakeStorageExecutor({
+      directories: {
+        film: [{ id: "oldfilm", storageDirectoryId: "film", name: "Film.2010.KnockOff.mkv", sizeBytes: 4_000_000_000, episodeCode: null, providerFileId: "oldfilm" }],
+      },
+    });
+    let finishOutput: any;
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        i += 1;
+        if (i === 1) return tool("reportReplacement", { results: [{ episode: "MOVIE", outcome: "not_found", note: "没有正版" }] }, i);
+        if (i === 2) return tool("finish", {}, i);
+        if (i === 3) finishOutput = lastToolOutput(options.prompt, "finish");
+        return text("done");
+      },
+    });
+    const result = await runAcquisitionV2({
+      provider: provider(),
+      executor: exec,
+      model,
+      workflowRunId: "run-replace-movie",
+      target: { kind: "movie", title: "Film", aliases: [], year: 2010, qualityPreference: "4K", tmdbId: 7 },
+      stagingDirectoryId: "film",
+      targetMovieDirectoryId: "film",
+      userRequest: {
+        requestedEpisodes: ["MOVIE"],
+        prompt: { messages: [{ body: "这是假片", episodeTags: [], createdAt: NOW }], rejected: [], pending: [] },
+        rejectedStore: { list: async () => [], add: async () => undefined },
+      },
+    });
+    // The finish went through: the coverage summary, not a refusal.
+    expect(finishOutput).toMatchObject({ coverageMet: false, missing: ["MOVIE"] });
+    expect(finishOutput).not.toHaveProperty("error");
+    expect(result.replacement?.results).toEqual([{ episode: "MOVIE", outcome: "not_found", note: "没有正版" }]);
+  });
+
   it("no user request → no replace tools, no user-request block, no replacement result", async () => {
     let tools: string[] = [];
     let system = "";

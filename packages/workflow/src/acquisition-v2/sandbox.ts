@@ -223,10 +223,16 @@ export interface TaskSandboxOptions {
   replace?: {
     requestedEpisodes: string[];
     /** Whether the run carries at least one user message (false = a pending-only
-     *  re-check of 待换 episodes). A message is words the agent reads episodes from: a
-     *  TV message without tags requests none by itself, so declareFinish refuses until
-     *  the agent has identified at least one. */
+     *  re-check of 待换 episodes). With a message and nothing requested at all,
+     *  declareFinish refuses until the agent has identified at least one episode. */
     hasMessages: boolean;
+    /** TV messages in this run without episode tags (0 on a movie run: a message about
+     *  a film means the film). Such a message is words the agent reads episodes from,
+     *  and the episodes requested up front (older 待换 rows, other messages' tags) say
+     *  nothing about it — so while this is > 0, declareFinish refuses until the agent
+     *  has identified an episode THIS run (see identifiedThisRun). Which message an
+     *  episode came from is the agent's call; the system only asks for one. */
+    untaggedMessages: number;
     /** Requested episodes whose current source an earlier run already rejected (the
      *  stored list). When every requested episode is in here the agent may transfer
      *  without calling rejectCurrentSource again — see assertRejectedFirst. */
@@ -1036,16 +1042,19 @@ export class TaskSandbox {
   }
 
   /** The agent's `finish` tool. On a replace run it is refused while an episode the
-   *  user asked about (or the agent rejected) has no reportReplacement yet, and — on a
-   *  run with a message — while no episode is identified at all: a TV message without
-   *  tags requests none, the agent reads them from the words, and finishing with none
-   *  would record nothing (the request would be lost). The error goes back to the agent
-   *  and the loop continues (the step cap and the recovery turn still end it;
-   *  finalizeReplacement then records the rest as not_found, and a run that still
-   *  identified nothing answers the message as unidentified). */
+   *  user asked about (or the agent rejected) has no reportReplacement yet, and while a
+   *  message's episodes are not identified: a run with a message but nothing requested
+   *  at all, or with a TV message without tags and no episode identified this run —
+   *  the agent reads them from the words, and the episodes requested up front (older
+   *  待换 rows, other messages' tags) say nothing about that message. Finishing then
+   *  would drop its request. The error goes back to the agent and the loop continues
+   *  (the step cap and the recovery turn still end it; finalizeReplacement then records
+   *  the rest as not_found, and a message whose episodes were never identified is
+   *  answered as unidentified). */
   async declareFinish(): Promise<Awaited<ReturnType<TaskSandbox["finish"]>>> {
     if (this.replace) {
-      if (this.replace.hasMessages && this.replaceEpisodes().length === 0) {
+      const nothingRequested = this.replace.hasMessages && this.replaceEpisodes().length === 0;
+      if (nothingRequested || (this.replace.untaggedMessages > 0 && !this.identifiedThisRun())) {
         throw new Error(
           "SANDBOX_NO_EPISODE_IDENTIFIED: work out from the user's words which episode(s) they mean, call rejectCurrentSource for them (fileIds [] for an episode with no file), then reportReplacement",
         );
@@ -1182,6 +1191,14 @@ export class TaskSandbox {
    *  registered only when it does). */
   hasReplace(): boolean {
     return this.replace !== undefined;
+  }
+
+  /** Whether the agent identified at least one episode in THIS run: a successful
+   *  rejectCurrentSource (a rejection, or the declaration that an episode has no file
+   *  here). Being requested up front (a tag, a 待换 row) is not identifying — nothing
+   *  was read from a message's words for it. */
+  identifiedThisRun(): boolean {
+    return this.rejectedEpisodes.length > 0 || this.noFileEpisodes.length > 0;
   }
 
   /** Called once before the agent starts: every file already in a target dir is the

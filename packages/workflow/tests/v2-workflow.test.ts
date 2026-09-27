@@ -329,6 +329,7 @@ describe("runAcquisitionV2Workflow — user request (replace_request run)", () =
       results: [{ episode: "S01E13", outcome: "not_found", note: "只找到同一版本" }],
       rejected: [expect.objectContaining({ episode: "S01E13", label: "Show - 13 [CR 1080p].mkv" })],
       oldFiles: ["Season 01/Show - 13 [CR 1080p].mkv"],
+      identified: true,
     });
     expect((await executor.listTree({ directoryId: seasonId })).map((f) => f.providerFileId)).toContain("old13");
   });

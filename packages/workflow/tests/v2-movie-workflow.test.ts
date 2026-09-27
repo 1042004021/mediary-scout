@@ -351,6 +351,7 @@ describe("runMovieAcquisitionV2 — user request (replace_request run)", () => {
       results: [{ episode: "MOVIE", outcome: "not_found", note: "没有正版" }],
       rejected: [expect.objectContaining({ episode: "MOVIE", label: "Inception.2010.KnockOff.mkv" })],
       oldFiles: ["Inception.2010.KnockOff.mkv"],
+      identified: true,
     });
     expect((await executor.listTree({ directoryId: movieDir })).map((f) => f.providerFileId)).toContain("oldfilm");
   });

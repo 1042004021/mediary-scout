@@ -143,6 +143,10 @@ export interface RunAcquisitionV2Result extends AcquisitionAgentResult {
     rejected: Array<{ episode: string; label: string; sizeBytes: number | null; reason: string }>;
     /** Paths (relative to the library dir) of the rejected files, still in place. */
     oldFiles: string[];
+    /** Whether the agent identified an episode in this run (a successful
+     *  rejectCurrentSource, a no-file declaration included). False with a TV message
+     *  without tags = no episode came out of its words (see UserMessageReply.unidentified). */
+    identified: boolean;
     /** The rejected list could not be saved: this run still honoured it, the next
      *  run will not know it (the reply says so). */
     rejectedPersistFailed?: boolean;
@@ -279,6 +283,11 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
             // A message is words to read episodes from (an untagged TV message requests
             // none up front); a pending-only re-check has only its 待换 episodes.
             hasMessages: userRequest.prompt.messages.length > 0,
+            // An untagged TV message needs an episode identified in THIS run: the
+            // episodes already requested (older 待换 rows, other messages' tags) say
+            // nothing about it. A movie message means the film (requested as MOVIE).
+            untaggedMessages:
+              request.target.kind === "tv" ? userRequest.prompt.messages.filter((m) => m.episodeTags.length === 0).length : 0,
             // Stored rejections from earlier runs let a PENDING-ONLY re-check (no new
             // message this run — the earlier rejection is why we are here) skip
             // rejecting again. A NEW message means the user is unhappy with what is in
@@ -524,6 +533,7 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
             results: [...replaceResults.values()],
             rejected: replaceRejected,
             oldFiles: [...oldFiles],
+            identified: sandbox.identifiedThisRun(),
             ...(rejectedPersistFailed ? { rejectedPersistFailed: true } : {}),
           },
         }

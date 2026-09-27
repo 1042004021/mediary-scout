@@ -183,6 +183,9 @@ export async function runQueuedReplaceRequest(
   let sources: EpisodeSource[] = [];
   let replacement: RunAcquisitionV2Result["replacement"];
   let workflowStatus: WorkflowStatus;
+  /** A TV message this run carries names no (in-scope) episode: its episodes are read
+   *  from the words, so the reply says whether any came out (see UserMessageReply.unidentified). */
+  let untaggedTvMessage = false;
   try {
     messages = await repository.claimUserMessages({ ...work, runId, now: now() });
     const states = await workStates(repository, work);
@@ -266,6 +269,9 @@ export async function runQueuedReplaceRequest(
           }),
       },
     };
+    // Same message list the agent sees (tags narrowed to the tracked seasons). A film's
+    // message always means the film.
+    untaggedTvMessage = !movie && userRequest.prompt.messages.some((m) => m.episodeTags.length === 0);
 
     // A patrol-queued run reports into the daily digest; a 待换 re-check with no new
     // message that replaced nothing is routine (see stampReplaceNotification).
@@ -394,10 +400,12 @@ export async function runQueuedReplaceRequest(
       oldFiles: replacement?.oldFiles ?? [],
       runId,
       ...(replacement?.rejectedPersistFailed ? { rejectedNotSaved: true } : {}),
-      // No episode came out of the messages (a TV message without tags, none worked out
-      // from the words; a movie always has its MOVIE result): nothing is kept 待换, so
-      // say so. Releasing the messages instead would only run the same thing again.
-      ...(results.length === 0 ? { unidentified: true } : {}),
+      // No episode came out of a TV message without tags: none was worked out from its
+      // words this run (the results, if any, are other messages' or older 待换 episodes),
+      // or no episode at all came out of the run (a movie always has its MOVIE result).
+      // Nothing is kept 待换 for that message, so say so. Releasing the messages instead
+      // would only run the same thing again.
+      ...(results.length === 0 || (untaggedTvMessage && replacement?.identified === false) ? { unidentified: true } : {}),
     };
     // One retry: a message left in processing is only released by the idle scan after
     // the grace period, and then re-run from scratch — a transient hiccup should not cost that.

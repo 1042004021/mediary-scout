@@ -433,7 +433,7 @@ describe("user request block", () => {
   it("asks a TV work to read the episodes of an untagged message from its words first, and says finish waits for it", () => {
     const text = userRequestBlock({ userRequests: base });
     expect(text).toContain(
-      "- A TV message without [episodes: …] tags still means particular episodes: work out from its words which ones, and call rejectCurrentSource for them before anything else (fileIds [] for an episode with no file). finish is refused until at least one episode is identified.",
+      "- A TV message without [episodes: …] tags still means particular episodes: work out from its words which ones, and call rejectCurrentSource for them before anything else (fileIds [] for an episode with no file). finish is refused until you have done so at least once in this run — the episodes already requested (tagged, or still waiting from earlier requests) do not count.",
     );
     // A rule, not user data: above the fence.
     expect(text.indexOf("A TV message without")).toBeLessThan(text.indexOf("\n<user_requests>\n"));
@@ -512,7 +512,7 @@ describe("replace tools registration", () => {
         provider: new FakeResourceProviderV2(),
         need: [],
         targetSeasonDirectoryIds: { 1: "season" },
-        replace: { requestedEpisodes: ["S01E13"], hasMessages: true, onReject: async () => undefined, onReport: async () => undefined },
+        replace: { requestedEpisodes: ["S01E13"], hasMessages: true, untaggedMessages: 0, onReject: async () => undefined, onReport: async () => undefined },
       }),
     ) as Record<string, DescribedTool>;
     expect(replace.finish?.description).toContain("refused until every requested episode has a reportReplacement");
@@ -527,7 +527,7 @@ describe("replace tools registration", () => {
       provider: new FakeResourceProviderV2(),
       need: [],
       targetSeasonDirectoryIds: { 1: "season" },
-      replace: { requestedEpisodes: ["S01E13"], hasMessages: true, onReject: async () => undefined, onReport: async () => undefined },
+      replace: { requestedEpisodes: ["S01E13"], hasMessages: true, untaggedMessages: 0, onReject: async () => undefined, onReport: async () => undefined },
     });
     const tools = buildSandboxToolSet(sandbox) as Record<string, ExecutableTool>;
     await expect(tools.finish!.execute({}, {})).resolves.toEqual({ error: expect.stringContaining("SANDBOX_REPORT_REQUIRED: S01E13") });

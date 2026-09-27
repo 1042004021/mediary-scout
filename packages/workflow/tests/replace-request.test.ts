@@ -613,6 +613,43 @@ describe("runQueuedReplaceRequest", () => {
     expect(done!.reply).toEqual({ results: [], oldFiles: [], runId: "run_rr_untagged", unidentified: true });
     expect(await repository.listPendingReplacements(WORK)).toEqual([]);
   });
+
+  it("an untagged message beside a 待换 episode: re-checking only the 待换 one leaves the message unidentified, the 待换 result kept", async () => {
+    const { repository, title, season } = await trackedShow();
+    const storage = new FakeStorageExecutor();
+    await seedV2Season(storage, title, season, ["S01E01", "S01E02"]);
+    await repository.addPendingReplacements({ ...WORK, episodes: ["S01E02"], messageId: "msg_old", now: NOW });
+    const message = await repository.createUserMessage({ ...WORK, body: "有一集字幕对不上", episodeTags: [], now: NOW });
+    await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => "run_rr_untagged_pending" });
+    let finishOutput: any;
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        i += 1;
+        // Only the older 待换 episode is looked at; nothing is read from the new words.
+        if (i === 1) return tool("reportReplacement", { results: [{ episode: "S01E02", outcome: "not_found", note: "还是没有" }] }, i);
+        if (i === 2) return tool("finish", {}, i);
+        if (i === 3) finishOutput = lastToolOutput(options.prompt, "finish");
+        return text("看不出新留言说的是哪一集");
+      },
+    });
+
+    const result = await runQueuedReplaceRequest(baseRun(repository, storage, model));
+
+    expect(result).toMatchObject({ status: "ran", workflowRunId: "run_rr_untagged_pending" });
+    // The 待换 episode does not stand in for the new message's episodes.
+    expect(String(finishOutput?.error)).toMatch(/^SANDBOX_NO_EPISODE_IDENTIFIED/);
+    const [done] = await repository.listUserMessages(WORK);
+    expect(done).toMatchObject({ id: message.id, status: "done", runId: "run_rr_untagged_pending" });
+    expect(done!.reply).toEqual({
+      results: [{ episode: "S01E02", outcome: "not_found", note: "还是没有" }],
+      oldFiles: [],
+      runId: "run_rr_untagged_pending",
+      unidentified: true,
+    });
+    // The 待换 episode stays pending, still on the message that asked for it.
+    expect((await repository.listPendingReplacements(WORK)).map((p) => [p.episode, p.messageId])).toEqual([["S01E02", "msg_old"]]);
+  });
 });
 
 /** A model that only reports the given episodes not_found, capturing the user prompt. */
@@ -905,6 +942,10 @@ describe("runQueuedReplaceRequest — scope, metadata and bookkeeping", () => {
 
     const run = await repository.getWorkflowRunSnapshot("run_rr_movie5", SCOPE);
     expect(run?.episodes[0]?.obtained).toBe(false);
+    // A film's message always means the film: never "unidentified", though nothing was rejected.
+    const [message] = await repository.listUserMessages(work);
+    expect(message?.reply?.results).toEqual([{ episode: "MOVIE", outcome: "not_found", note: "没找到" }]);
+    expect(message?.reply).not.toHaveProperty("unidentified");
   });
 });
 

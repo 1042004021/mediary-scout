@@ -41,6 +41,8 @@ async function setup(
       requestedEpisodes: ["S01E13", "S01E24"],
       // Stored rejections are only passed on a pending-only re-check (no message), as in the orchestrator.
       hasMessages: options.alreadyRejectedEpisodes === undefined,
+      // The message (when there is one) names its episodes.
+      untaggedMessages: 0,
       ...(options.alreadyRejectedEpisodes ? { alreadyRejectedEpisodes: options.alreadyRejectedEpisodes } : {}),
       onReject: async (items) => { rejected.push(...items); },
       onReport: async (r) => { results.push(...r); },
@@ -221,7 +223,7 @@ describe("TaskSandbox — replace", () => {
       storage, stagingDirectoryId: staging, targetSeasonDirectoryIds: { 1: season },
       // E13 is obtained but requested; E14 is genuinely missing.
       need: ["S01E13", "S01E14"],
-      replace: { requestedEpisodes: ["S01E13"], hasMessages: true, onReject: async () => {}, onReport: async () => {} },
+      replace: { requestedEpisodes: ["S01E13"], hasMessages: true, untaggedMessages: 0, onReject: async () => {}, onReport: async () => {} },
     });
     await sandbox.captureProtectedFiles();
     await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
@@ -268,7 +270,7 @@ describe("TaskSandbox — replace", () => {
       storage, stagingDirectoryId: staging, targetSeasonDirectoryIds: { 1: season },
       // E14 is a plain gap; E13 is obtained but requested.
       need: ["S01E14"],
-      replace: { requestedEpisodes: ["S01E13"], hasMessages: true, onReject: async () => {}, onReport: async () => {} },
+      replace: { requestedEpisodes: ["S01E13"], hasMessages: true, untaggedMessages: 0, onReject: async () => {}, onReport: async () => {} },
     });
     await sandbox.captureProtectedFiles();
     await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
@@ -413,25 +415,29 @@ describe("TaskSandbox — replace", () => {
 });
 
 describe("TaskSandbox — replace: finish needs an identified episode when the run carries a message", () => {
-  /** A TV replace run whose message has no episode tags: nothing is requested up front. */
-  async function untaggedTv(hasMessages: boolean) {
-    const storage = new Storage115Simulator({ packs: {} });
+  const NO_EPISODE_IDENTIFIED =
+    "SANDBOX_NO_EPISODE_IDENTIFIED: work out from the user's words which episode(s) they mean, call rejectCurrentSource for them (fileIds [] for an episode with no file), then reportReplacement";
+
+  /** A TV replace run on a season that holds the user's current E13. */
+  async function tvRun(replace: { requestedEpisodes: string[]; hasMessages: boolean; untaggedMessages: number }) {
+    const storage = new Storage115Simulator({ packs: { old_pack: { files: [{ path: "Show - 13.mkv", sizeBytes: 1 }] } } });
     const staging = await storage.createDirectory({ name: "staging", parentId: "root" });
     const season = await storage.createDirectory({ name: "Season 01", parentId: "root" });
+    await storage.transferCandidate({ candidateId: "old_pack", intoDirectoryId: season });
+    const old13 = (await storage.listTree({ directoryId: season }))[0]!.id;
     const sandbox = new TaskSandbox({
       provider: new FakeResourceProviderV2(),
       storage, stagingDirectoryId: staging, targetSeasonDirectoryIds: { 1: season }, need: [],
-      replace: { requestedEpisodes: [], hasMessages, onReject: async () => {}, onReport: async () => {} },
+      replace: { ...replace, onReject: async () => {}, onReport: async () => {} },
     });
     await sandbox.captureProtectedFiles();
-    return sandbox;
+    return { sandbox, old13 };
   }
 
   it("TV, message without tags: finish is refused until an episode is identified from the words; then only the reports are required", async () => {
-    const sandbox = await untaggedTv(true);
-    await expect(sandbox.declareFinish()).rejects.toThrow(
-      "SANDBOX_NO_EPISODE_IDENTIFIED: work out from the user's words which episode(s) they mean, call rejectCurrentSource for them (fileIds [] for an episode with no file), then reportReplacement",
-    );
+    // Nothing is requested up front: the message has no episode tags.
+    const { sandbox } = await tvRun({ requestedEpisodes: [], hasMessages: true, untaggedMessages: 1 });
+    await expect(sandbox.declareFinish()).rejects.toThrow(NO_EPISODE_IDENTIFIED);
     // The workflow's own end-of-run summary is never gated.
     await expect(sandbox.finish()).resolves.toMatchObject({ obtained: [], missing: [] });
     // The agent reads "第 5 集" from the words; there is no file of it here.
@@ -441,8 +447,36 @@ describe("TaskSandbox — replace: finish needs an identified episode when the r
     await expect(sandbox.declareFinish()).resolves.toMatchObject({ coverageMet: false, missing: ["S01E05"] });
   });
 
+  it("an untagged message beside an older 待换 episode: reporting the 待换 one is not enough — finish waits for an episode identified THIS run", async () => {
+    // E13 is still waiting from an earlier request; the new message names no episode.
+    const { sandbox } = await tvRun({ requestedEpisodes: ["S01E13"], hasMessages: true, untaggedMessages: 1 });
+    await sandbox.reportReplacement({ results: [{ episode: "S01E13", outcome: "not_found", note: "还是没有" }] });
+    await expect(sandbox.declareFinish()).rejects.toThrow(NO_EPISODE_IDENTIFIED);
+    expect(sandbox.identifiedThisRun()).toBe(false);
+    // The agent reads "第 5 集" from the new message; there is no file of it here.
+    await sandbox.rejectCurrentSource({ episodes: ["S01E05"], fileIds: [], reason: "第 5 集也发蓝" });
+    expect(sandbox.identifiedThisRun()).toBe(true);
+    await expect(sandbox.declareFinish()).rejects.toThrow("SANDBOX_REPORT_REQUIRED: S01E05");
+    await sandbox.reportReplacement({ results: [{ episode: "S01E05", outcome: "not_found", note: "没找到" }] });
+    await expect(sandbox.declareFinish()).resolves.toMatchObject({ coverageMet: false });
+  });
+
+  it("any episode identified this run lifts it — rejecting the 待换 episode's current file too (which message an episode came from is the agent's call)", async () => {
+    const { sandbox, old13 } = await tvRun({ requestedEpisodes: ["S01E13"], hasMessages: true, untaggedMessages: 1 });
+    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "还是发蓝" });
+    await sandbox.reportReplacement({ results: [{ episode: "S01E13", outcome: "not_found", note: "没找到" }] });
+    await expect(sandbox.declareFinish()).resolves.toMatchObject({ coverageMet: false });
+  });
+
+  it("tagged messages only: reporting every requested episode is enough, nothing has to be identified from words", async () => {
+    const { sandbox } = await tvRun({ requestedEpisodes: ["S01E13"], hasMessages: true, untaggedMessages: 0 });
+    await sandbox.reportReplacement({ results: [{ episode: "S01E13", outcome: "not_found", note: "没找到" }] });
+    await expect(sandbox.declareFinish()).resolves.toMatchObject({ coverageMet: false });
+    expect(sandbox.identifiedThisRun()).toBe(false);
+  });
+
   it("a pending-only re-check (no message) is not asked to identify anything from words", async () => {
-    const sandbox = await untaggedTv(false);
+    const { sandbox } = await tvRun({ requestedEpisodes: [], hasMessages: false, untaggedMessages: 0 });
     await expect(sandbox.declareFinish()).resolves.toMatchObject({ obtained: [], missing: [] });
   });
 
@@ -452,8 +486,9 @@ describe("TaskSandbox — replace: finish needs an identified episode when the r
     const sandbox = new TaskSandbox({
       provider: new FakeResourceProviderV2(),
       storage, stagingDirectoryId: movieDir, targetMovieDirectoryId: movieDir, need: ["MOVIE"],
-      // runQueuedReplaceRequest requests ["MOVIE"] for an untagged movie message.
-      replace: { requestedEpisodes: ["MOVIE"], hasMessages: true, onReject: async () => {}, onReport: async () => {} },
+      // runQueuedReplaceRequest requests ["MOVIE"] for an untagged movie message, and the
+      // orchestrator counts no untagged message on a movie run: its message means the film.
+      replace: { requestedEpisodes: ["MOVIE"], hasMessages: true, untaggedMessages: 0, onReject: async () => {}, onReport: async () => {} },
     });
     await sandbox.captureProtectedFiles();
     await expect(sandbox.declareFinish()).rejects.toThrow("SANDBOX_REPORT_REQUIRED: MOVIE");
@@ -546,7 +581,7 @@ describe("TaskSandbox — replace: reject before transfer", () => {
     const sandbox = new TaskSandbox({
       provider: new FakeResourceProviderV2({ results: { Show: [{ id: "cand_new13", title: "[Nekomoe] Show 13" }] } }),
       storage, stagingDirectoryId: staging, targetSeasonDirectoryIds: { 1: season }, need: [],
-      replace: { requestedEpisodes: [], hasMessages: true, onReject: async () => {}, onReport: async () => {} },
+      replace: { requestedEpisodes: [], hasMessages: true, untaggedMessages: 1, onReject: async () => {}, onReport: async () => {} },
     });
     await sandbox.captureProtectedFiles();
     const snap = (await sandbox.searchResources("Show")).snapshot!;
@@ -589,7 +624,7 @@ describe("TaskSandbox — replace: reject before transfer", () => {
     const sandbox = new TaskSandbox({
       provider: new FakeResourceProviderV2({ results: { Show: [{ id: "cand_new13", title: "[Nekomoe] Show 13" }] } }),
       storage, stagingDirectoryId: staging, targetSeasonDirectoryIds: { 1: season }, need: [],
-      replace: { requestedEpisodes: ["S01E13"], hasMessages: true, onReject: async () => {}, onReport: async () => {} },
+      replace: { requestedEpisodes: ["S01E13"], hasMessages: true, untaggedMessages: 0, onReject: async () => {}, onReport: async () => {} },
     });
     // Before the capture the sandbox does not know the dirs are empty: still gated.
     const snap = (await sandbox.searchResources("Show")).snapshot!;
@@ -609,7 +644,7 @@ describe("TaskSandbox — replace: reject before transfer", () => {
     const sandbox = new TaskSandbox({
       provider: new FakeResourceProviderV2({ results: { film: [{ id: "good_share", title: "Film 2160p" }] } }),
       storage, stagingDirectoryId: movieDir, targetMovieDirectoryId: movieDir, need: ["MOVIE"],
-      replace: { requestedEpisodes: ["MOVIE"], hasMessages: true, onReject: async () => {}, onReport: async () => {} },
+      replace: { requestedEpisodes: ["MOVIE"], hasMessages: true, untaggedMessages: 0, onReject: async () => {}, onReport: async () => {} },
     });
     await sandbox.captureProtectedFiles();
     await sandbox.searchResources("film");
@@ -695,7 +730,7 @@ describe("TaskSandbox — replace: a failed attempt that still landed files", ()
     const sandbox = new TaskSandbox({
       provider: new FakeResourceProviderV2({ results: { film: [{ id: "good_share", title: "Film 2160p" }] } }),
       storage, stagingDirectoryId: movieDir, targetMovieDirectoryId: movieDir, need: ["MOVIE"],
-      replace: { requestedEpisodes: ["MOVIE"], hasMessages: true, onReject: async () => {}, onReport: async (r) => { results.push(...r); } },
+      replace: { requestedEpisodes: ["MOVIE"], hasMessages: true, untaggedMessages: 0, onReject: async () => {}, onReport: async (r) => { results.push(...r); } },
     });
     await sandbox.captureProtectedFiles();
     const old = (await storage.listTree({ directoryId: movieDir }))[0]!;
@@ -794,7 +829,7 @@ describe("TaskSandbox — replace: a replaced names that episode's own new file(
         results: { Show: [{ id: "c13", title: "[Nekomoe] Show 13" }, { id: "c24", title: "[Nekomoe] Show 24" }, { id: "pack", title: "[Pack] Show S01" }] },
       }),
       storage, stagingDirectoryId: staging, targetSeasonDirectoryIds: { 1: season }, need: [],
-      replace: { requestedEpisodes: ["S01E13", "S01E24"], hasMessages: true, onReject: async () => {}, onReport: async (r) => { results.push(...r); } },
+      replace: { requestedEpisodes: ["S01E13", "S01E24"], hasMessages: true, untaggedMessages: 0, onReject: async () => {}, onReport: async (r) => { results.push(...r); } },
     });
     await sandbox.captureProtectedFiles();
     await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
@@ -965,6 +1000,7 @@ describe("TaskSandbox — replace (movie: the movie dir is also staging)", () =>
       replace: {
         requestedEpisodes: ["MOVIE"],
         hasMessages: true,
+        untaggedMessages: 0,
         onReject: async () => {},
         onReport: async (r) => { results.push(...r); },
       },
@@ -1099,7 +1135,7 @@ describe("TaskSandbox — replace: the transfer-time rejection check behind the 
     const seen: Array<{ id: string; title: string }> = [];
     const sandbox = new TaskSandbox({
       provider, storage, stagingDirectoryId: movieDir, targetMovieDirectoryId: movieDir, need: ["MOVIE"],
-      replace: { requestedEpisodes: ["MOVIE"], hasMessages: true, onReject: async () => {}, onReport: async () => {} },
+      replace: { requestedEpisodes: ["MOVIE"], hasMessages: true, untaggedMessages: 0, onReject: async () => {}, onReport: async () => {} },
       // Stands in for the orchestrator's name+size fingerprint against the rejected file.
       isRejected: async (candidate) => {
         seen.push(candidate);
