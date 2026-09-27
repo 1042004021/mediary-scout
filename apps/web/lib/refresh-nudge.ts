@@ -2,24 +2,26 @@ type TimerId = ReturnType<typeof setTimeout>;
 
 /**
  * Call `bump` every `intervalMs` (default 200) until `durationMs` (default
- * 5000) has elapsed, including a bump on the deadline when it lands on an
- * interval. Returns a cancel function. Each call is its own schedule: cancelling
- * one does not stop another.
+ * 5000) of wall-clock time has passed. A tick that fires before the deadline
+ * still bumps; one that fires on or after it stops. Returns a cancel function.
+ * Each call is its own schedule: cancelling one does not stop another.
  */
 export function scheduleRefreshNudges(
   bump: () => void,
   opts?: {
     intervalMs?: number;
     durationMs?: number;
+    now?: () => number;
     setTimer?: (fn: () => void, ms: number) => TimerId;
     clearTimer?: (id: TimerId) => void;
   },
 ): () => void {
   const intervalMs = opts?.intervalMs ?? 200;
   const durationMs = opts?.durationMs ?? 5_000;
+  const now = opts?.now ?? Date.now;
   const setTimer = opts?.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
   const clearTimer = opts?.clearTimer ?? ((id) => clearTimeout(id));
-  let elapsed = 0;
+  const start = now();
   let timer: TimerId | null = null;
   let stopped = false;
   const cancel = () => {
@@ -31,16 +33,12 @@ export function scheduleRefreshNudges(
   const tick = () => {
     timer = null;
     if (stopped) return;
-    elapsed += intervalMs;
-    if (elapsed > durationMs) {
+    if (now() - start >= durationMs) {
       cancel();
       return;
     }
     bump();
-    if (stopped || elapsed >= durationMs) {
-      cancel();
-      return;
-    }
+    if (stopped) return;
     timer = setTimer(tick, intervalMs);
   };
   timer = setTimer(tick, intervalMs);

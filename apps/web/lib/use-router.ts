@@ -25,9 +25,12 @@ export function useRouter(): AppRouter {
   const router = useNextRouter();
   const [, setTick] = useState(0);
   const cancelRef = useRef<(() => void) | null>(null);
+  const mountedRef = useRef(false);
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
+      mountedRef.current = false;
       cancelRef.current?.();
       cancelRef.current = null;
     };
@@ -38,6 +41,7 @@ export function useRouter(): AppRouter {
       ...router,
       refresh() {
         router.refresh();
+        if (!mountedRef.current) return;
         cancelRef.current?.();
         cancelRef.current = scheduleRefreshNudges(() => {
           setTick((n) => n + 1);

@@ -15,9 +15,10 @@ describe("scheduleRefreshNudges", () => {
       bumps += 1;
     }, { intervalMs: 200, durationMs: 1_000 });
     vi.advanceTimersByTime(1_000);
-    expect(bumps).toBe(5);
+    // Ticks at 200, 400, 600 and 800. The tick at 1000 is on the deadline and does not bump.
+    expect(bumps).toBe(4);
     vi.advanceTimersByTime(2_000);
-    expect(bumps).toBe(5);
+    expect(bumps).toBe(4);
   });
 
   it("cancel stops further bumps", () => {
@@ -47,8 +48,26 @@ describe("scheduleRefreshNudges", () => {
     cancelFirst();
     vi.advanceTimersByTime(800);
     expect(first).toBe(1);
-    expect(second).toBe(5);
+    expect(second).toBe(4);
     vi.advanceTimersByTime(2_000);
-    expect(second).toBe(5);
+    expect(second).toBe(4);
+  });
+
+  it("stops after the wall-clock duration when each tick is delayed", () => {
+    let bumps = 0;
+    scheduleRefreshNudges(() => {
+      bumps += 1;
+    }, {
+      intervalMs: 200,
+      durationMs: 5_000,
+      now: () => Date.now(),
+      setTimer: (fn) => setTimeout(fn, 1_000),
+    });
+    vi.advanceTimersByTime(6_000);
+    expect(bumps).toBeGreaterThan(0);
+    expect(bumps).toBeLessThanOrEqual(5);
+    const settled = bumps;
+    vi.advanceTimersByTime(10_000);
+    expect(bumps).toBe(settled);
   });
 });
