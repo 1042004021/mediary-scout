@@ -105,16 +105,27 @@ interface Leftover {
   directoryName: string;
   fileCount: number;
   totalBytes: number;
+  /** listTree still saw no files, but the directory has subdirectories. */
+  unknownContents: boolean;
 }
 
 const ADVICE = "这些文件不在季目录里，请到网盘手动处理。";
+/** Deeper than the executors' default (6). A real pack's files sit inside a few wrappers. */
+const JANITOR_LIST_DEPTH = 20;
+
+function leftoverLine(item: Leftover): string {
+  if (item.unknownContents) {
+    return `${item.showName} / ${item.directoryName}：有子目录，文件数未知`;
+  }
+  return `${item.showName} / ${item.directoryName}：${item.fileCount} 个文件，${formatBytes(item.totalBytes)}`;
+}
 
 function leftoverBody(items: Leftover[]): string {
-  const lines = items
-    .slice(0, 10)
-    .map((item) => `${item.showName} / ${item.directoryName}：${item.fileCount} 个文件，${formatBytes(item.totalBytes)}`);
+  const lines = items.slice(0, 10).map(leftoverLine);
   if (items.length > 10) {
-    const totalBytes = items.reduce((sum, item) => sum + item.totalBytes, 0);
+    const totalBytes = items
+      .filter((item) => !item.unknownContents)
+      .reduce((sum, item) => sum + item.totalBytes, 0);
     lines.push(`…等共 ${items.length} 个目录，合计 ${formatBytes(totalBytes)}`);
   }
   lines.push(ADVICE);
@@ -268,9 +279,9 @@ async function sweepDrive(
         if (snapshot && isActiveWorkflowStatus(snapshot.workflowRun.status)) {
           continue;
         }
-        const tree = await pace(() => executor.listTree({ directoryId: child.id }));
-        // listTree stops at its depth, so a dir with only deeper files looks empty.
-        // A subdirectory means the orphan is not empty; leave it and report it.
+        const tree = await pace(() => executor.listTree({ directoryId: child.id, maxDepth: JANITOR_LIST_DEPTH }));
+        // Still empty after a deep walk: a subdirectory means files may sit further
+        // down. Do not delete, and do not report a made-up zero.
         const subdirs = tree.length === 0 ? await pace(() => executor.listChildDirectories(child.id)) : [];
         if (tree.length === 0 && subdirs.length === 0) {
           const result = await pace(() => executor.removeDirectory(child.id));
@@ -284,13 +295,17 @@ async function sweepDrive(
         if (reported.has(reportedToken(drive.storageId, child.id))) {
           continue;
         }
-        const totalBytes = tree.reduce((sum, file) => sum + (Number.isFinite(file.sizeBytes) ? file.sizeBytes : 0), 0);
+        const unknownContents = tree.length === 0;
+        const totalBytes = unknownContents
+          ? 0
+          : tree.reduce((sum, file) => sum + (Number.isFinite(file.sizeBytes) ? file.sizeBytes : 0), 0);
         pending.push({
           showName: show.name,
           directoryId: child.id,
           directoryName: child.name,
           fileCount: tree.length,
           totalBytes,
+          unknownContents,
         });
       }
     } catch (error) {

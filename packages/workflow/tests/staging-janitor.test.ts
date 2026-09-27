@@ -528,7 +528,46 @@ describe("sweepOrphanStagingDirs", () => {
       (note) => note.kind === "staging_leftover",
     );
     expect(notes).toHaveLength(1);
-    expect(notes[0]?.body).toContain("Deep Show / staging-run-deep：0 个文件");
+    expect(notes[0]?.body).toContain("Deep Show / staging-run-deep：有子目录，文件数未知");
+    expect(notes[0]?.body).not.toContain("0 个文件");
+  });
+
+  it("asks listTree for maxDepth 20 and reports the files that depth reaches", async () => {
+    const depths: Array<number | undefined> = [];
+    const repo = new InMemoryWorkflowRepository();
+    await sweepOrphanStagingDirs({
+      repository: repo,
+      now: NOW,
+      drives: [
+        drive({
+          storageId: "drive-depth",
+          executor: {
+            async listChildDirectories(parentId: string) {
+              if (parentId === "tv") return [{ id: "show", name: "Deep Show" }];
+              if (parentId === "show") return [{ id: "stg-deep", name: "staging-run-deep" }];
+              return [{ id: "nested", name: "pack" }];
+            },
+            async listTree(input: { directoryId: string; maxDepth?: number }) {
+              depths.push(input.maxDepth);
+              if ((input.maxDepth ?? 0) >= 20) {
+                return [{ path: "pack/a.mkv", providerFileId: "f1", sizeBytes: 2 * 1024 * 1024 }];
+              }
+              return [];
+            },
+            async removeDirectory() {
+              return { removed: true };
+            },
+          },
+        }),
+      ],
+    });
+    expect(depths).toEqual([20]);
+    const notes = (await repo.listNotifications({ accountId: "acct" })).filter(
+      (note) => note.kind === "staging_leftover",
+    );
+    expect(notes).toHaveLength(1);
+    expect(notes[0]?.body).toContain("Deep Show / staging-run-deep：1 个文件，2 MB");
+    expect(notes[0]?.body).not.toContain("文件数未知");
   });
 
   it("removes a staging dir that has no files and no subdirectories", async () => {
