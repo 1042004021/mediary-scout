@@ -83,4 +83,49 @@ describe("TaskSandbox.flattenMovie — automatic video+subtitle extraction (movi
     expect(result.movie.map((f) => f.path).sort()).toEqual(["Inception.mkv", "Inception.zh.ass"]);
     expect(await sandbox.inspectStagingDirs()).toEqual([]); // wrapper removed
   });
+
+  it("removes only the top-level wrapper when subdirectories are listed parents-first and a missing dir throws", async () => {
+    const provider = new FakeResourceProviderV2({ results: { x: [{ id: "film", title: "Film" }] } });
+    const storage = new Storage115Simulator({
+      packs: {
+        film: {
+          files: [
+            { path: "Release/film.mkv", sizeBytes: 100 },
+            { path: "Release/Subs/film.srt", sizeBytes: 3 },
+          ],
+        },
+      },
+    });
+    const movieDir = await storage.createDirectory({ name: "Film (2026)", parentId: "root" });
+    const sandbox = new TaskSandbox({
+      provider,
+      storage,
+      stagingDirectoryId: movieDir,
+      targetMovieDirectoryId: movieDir,
+      need: ["MOVIE"],
+    });
+    const search = await sandbox.searchResources("x");
+    await sandbox.transferCandidate({ snapshotId: search.snapshot!.id, candidateId: "film" });
+
+    const listed = await storage.listSubdirectories({ directoryId: movieDir });
+    expect(listed.map((dir) => dir.path)).toEqual(["Release", "Release/Subs"]);
+    const releaseId = listed.find((dir) => dir.path === "Release")!.id;
+    const remove = storage.removeDirectory.bind(storage);
+    const removed: string[] = [];
+    storage.removeDirectory = async (input) => {
+      if (!removed.includes(input.directoryId) && removed.length > 0) {
+        // The parent removal already deleted this dir: 115's getDirectoryInfo
+        // returns {"state":false} and the executor throws instead of no-op.
+        throw new Error(`WRITE_SCOPE_VIOLATION: unable to verify remove directory target cid=${input.directoryId}`);
+      }
+      removed.push(input.directoryId);
+      return remove(input);
+    };
+
+    const result = await sandbox.flattenMovie();
+
+    expect(result.movie.map((file) => file.path).sort()).toEqual(["film.mkv", "film.srt"]);
+    expect(removed).toEqual([releaseId]);
+    expect(await sandbox.inspectStagingDirs()).toEqual([]);
+  });
 });

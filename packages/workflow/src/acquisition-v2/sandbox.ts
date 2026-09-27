@@ -1030,6 +1030,10 @@ export class TaskSandbox {
     }
     const protectedPaths = tree.filter((file) => this.protectedFiles.has(file.id)).map((file) => file.path);
     for (const wrapper of await this.storage.listSubdirectories({ directoryId: root })) {
+      // 115 lists subdirectories recursively, parents before children. Removing a
+      // wrapper deletes its subtree, so a nested path is already gone — removing it
+      // next throws WRITE_SCOPE_VIOLATION on a movie dir that is already clean.
+      if (wrapper.path.includes("/")) continue;
       if (protectedPaths.some((path) => path.startsWith(`${wrapper.path}/`))) continue;
       await this.storage.removeDirectory({ directoryId: wrapper.id });
     }
