@@ -480,7 +480,7 @@ describe("runQueuedReplaceRequest", () => {
     expect((await repository.listPendingReplacements(WORK)).map((p) => p.episode)).toEqual(["S02E01"]);
   });
 
-  it("a failing model releases the messages as urgent and leaves the library untouched", async () => {
+  it("a failing model releases the messages to the patrol (not urgent: a final failure) and leaves the library untouched", async () => {
     const { repository, season } = await trackedShow();
     await repository.createUserMessage({ ...WORK, body: "换第 1 集", episodeTags: ["S01E01"], now: NOW });
     await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => "run_rr_fail" });
@@ -490,7 +490,7 @@ describe("runQueuedReplaceRequest", () => {
 
     expect(result).toMatchObject({ status: "failed", workflowRunId: "run_rr_fail" });
     const [message] = await repository.listUserMessages(WORK);
-    expect(message).toMatchObject({ status: "pending", urgent: true, runId: null });
+    expect(message).toMatchObject({ status: "pending", urgent: false, runId: null });
     const run = await repository.getWorkflowRunSnapshot("run_rr_fail", { accountId: "acct_1", connectedStorageId: DRIVE });
     expect(run?.workflowRun.status).toBe("failed");
     // A failed replace keeps the lock season's episodes (a failed type2 init would clear them).
@@ -1277,17 +1277,18 @@ describe("replace_request crash recovery", () => {
     expect(await enqueueUrgentReplaceRequests({ repository, now: fixedNow })).toBe(0);
   });
 
-  it("the idle scan releases messages stranded in processing by a run that is gone, and queues them", async () => {
+  it("the idle scan hands messages stranded in processing by a run that is gone back to the patrol (pending, not urgent)", async () => {
     const { repository } = await trackedShow();
     await repository.createUserMessage({ ...WORK, body: "换第 1 集", episodeTags: ["S01E01"], now: NOW });
     // Claimed by a run that never got saved (or was pruned/cancelled out from under it).
     await repository.claimUserMessages({ ...WORK, runId: "run_vanished", now: NOW });
 
-    expect(await enqueueUrgentReplaceRequests({ repository, now: () => "2026-09-26T08:30:00.000Z" })).toBe(1);
+    expect(await enqueueUrgentReplaceRequests({ repository, now: () => "2026-09-26T08:30:00.000Z" })).toBe(0);
 
-    expect((await repository.listUserMessages(WORK))[0]).toMatchObject({ status: "pending", urgent: true, runId: null });
-    const active = await repository.listActiveWorkflowRuns(SCOPE);
-    expect(active.map((r) => r.workflowRun.kind)).toEqual(["replace_request"]);
+    expect((await repository.listUserMessages(WORK))[0]).toMatchObject({ status: "pending", urgent: false, runId: null });
+    expect(await repository.listActiveWorkflowRuns(SCOPE)).toEqual([]);
+    // The next patrol queues it (every pending message counts there).
+    expect(await repository.listWorksWithPendingMessages({ urgentOnly: false })).toEqual([WORK]);
   });
 });
 
@@ -1368,11 +1369,116 @@ describe("enqueueUrgentReplaceRequests", () => {
     await repository.createUserMessage({ ...WORK, body: "换第 1 集", episodeTags: ["S01E01"], now: NOW });
     await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => "run_rr_f1" });
     await runQueuedReplaceRequest(baseRun(repository, new FakeStorageExecutor(), throwingModel()));
-    expect((await repository.listUserMessages(WORK))[0]).toMatchObject({ status: "pending", urgent: true });
+    expect((await repository.listUserMessages(WORK))[0]).toMatchObject({ status: "pending", urgent: false });
 
     expect(await enqueueUrgentReplaceRequests({ repository, now: () => "2026-09-26T08:00:05.000Z" })).toBe(0);
     // The user presses 现在处理 again.
     await repository.markUserMessagesUrgent({ ...WORK, now: "2026-09-26T08:30:00.000Z" });
     expect(await enqueueUrgentReplaceRequests({ repository, now: () => "2026-09-26T08:30:01.000Z" })).toBe(1);
+  });
+});
+
+describe("replace_request failure — who retries, and how the failure is labelled", () => {
+  const SCOPE = { accountId: "acct_1", connectedStorageId: DRIVE };
+
+  it("a final failure hands the messages to the patrol: the run's own and one written during the run lose their urgency, and the idle scan leaves them alone", async () => {
+    const { repository } = await trackedShow();
+    await repository.createUserMessage({ ...WORK, body: "A: 换第 1 集", episodeTags: ["S01E01"], now: NOW });
+    await repository.markUserMessagesUrgent({ ...WORK, now: NOW }); // 现在处理
+    await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => "run_rr_final" });
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => {
+        // Written while the run holds A, so it is urgent ("right after this one").
+        await repository.createUserMessage({ ...WORK, body: "B: 还有第 2 集", episodeTags: ["S01E02"], now: "2026-09-26T08:00:01.000Z" });
+        throw new Error("401 Unauthorized: invalid api key");
+      },
+    });
+
+    const result = await runQueuedReplaceRequest(baseRun(repository, new FakeStorageExecutor(), model));
+
+    expect(result).toMatchObject({ status: "failed", workflowRunId: "run_rr_final" });
+    expect((await repository.listUserMessages(WORK)).map((m) => [m.body, m.status, m.urgent])).toEqual([
+      ["B: 还有第 2 集", "pending", false],
+      ["A: 换第 1 集", "pending", false],
+    ]);
+    let queued = 0;
+    for (let t = 1; t <= 5; t++) {
+      queued += await enqueueUrgentReplaceRequests({ repository, now: () => new Date(Date.parse(NOW) + t * 3000).toISOString() });
+    }
+    expect(queued).toBe(0);
+    expect(await repository.listActiveWorkflowRuns(SCOPE)).toEqual([]);
+  });
+
+  it("a transient failure re-queues the run and keeps its messages urgent for it; the idle scan does not queue a second run", async () => {
+    const { repository } = await trackedShow();
+    await repository.createUserMessage({ ...WORK, body: "换第 1 集", episodeTags: ["S01E01"], now: NOW });
+    await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => "run_rr_transient" });
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => {
+        throw new Error("fetch failed: ECONNRESET");
+      },
+    });
+
+    const result = await runQueuedReplaceRequest(baseRun(repository, new FakeStorageExecutor(), model));
+
+    expect(result).toMatchObject({ status: "ran", workflowRunId: "run_rr_transient", workflowStatus: "queued" });
+    expect((await repository.listUserMessages(WORK))[0]).toMatchObject({ status: "pending", urgent: true, runId: null });
+    expect(await enqueueUrgentReplaceRequests({ repository, now: () => "2026-09-26T08:00:03.000Z" })).toBe(0);
+    expect((await repository.listActiveWorkflowRuns(SCOPE)).map((r) => [r.workflowRun.id, r.workflowRun.status])).toEqual([
+      ["run_rr_transient", "queued"],
+    ]);
+  });
+
+  it("when even saving the failure fails, the messages still go back to pending — not urgent", async () => {
+    const { repository } = await trackedShow();
+    await repository.createUserMessage({ ...WORK, body: "换第 1 集", episodeTags: ["S01E01"], now: NOW });
+    await repository.markUserMessagesUrgent({ ...WORK, now: NOW });
+    await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => "run_rr_savefail" });
+    repository.saveWorkflowRunSnapshot = async () => {
+      throw new Error("db down");
+    };
+
+    await expect(runQueuedReplaceRequest(baseRun(repository, new FakeStorageExecutor(), throwingModel()))).rejects.toThrow("db down");
+
+    expect((await repository.listUserMessages(WORK))[0]).toMatchObject({ status: "pending", urgent: false, runId: null });
+  });
+
+  it("a replace run's failure and retry notices are title-level: an S02 request is never labelled with the lock season", async () => {
+    const cases = [
+      { runId: "run_rr_f2", error: "agent model unavailable", status: "failed" },
+      { runId: "run_rr_r2", error: "fetch failed: ECONNRESET", status: "retrying" },
+    ] as const;
+    for (const { runId, error, status } of cases) {
+      const { repository, title, season } = await trackedShow();
+      const season2: TrackedSeason = { ...season, id: "tmdb_tv_42_s2", seasonNumber: 2, storageDirectoryId: "dir_s2" };
+      await seedTrackedSeason({ repository, title, season: season2, obtainedCodes: ["S02E01", "S02E02"] });
+      await repository.createUserMessage({ ...WORK, body: "第二季第一集没字幕", episodeTags: ["S02E01"], now: NOW });
+      await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => runId });
+      const model = new MockLanguageModelV3({
+        doGenerate: async () => {
+          throw new Error(error);
+        },
+      });
+
+      await runQueuedReplaceRequest(baseRun(repository, new FakeStorageExecutor(), model));
+
+      const run = await repository.getWorkflowRunSnapshot(runId, SCOPE);
+      expect(run?.notifications.map((n) => n.report?.status)).toEqual([status]);
+      expect(run?.notifications[0]?.report?.seasonLabel).toBeNull();
+      expect(run?.notifications[0]?.body).not.toMatch(/第 \d+ 季/);
+    }
+  });
+
+  it("an urgent message of a work no longer tracked on its drive goes to the patrol after one idle scan, not re-scanned every tick", async () => {
+    const { repository } = await trackedShow();
+    // Nothing of this work is tracked on that drive (its last season was untracked).
+    const gone = { ...WORK, drive: "cs_gone" };
+    await repository.createUserMessage({ ...gone, body: "换第 1 集", episodeTags: ["S01E01"], now: NOW });
+    await repository.markUserMessagesUrgent({ ...gone, now: NOW });
+
+    expect(await enqueueUrgentReplaceRequests({ repository, now: () => "2026-09-26T08:00:03.000Z" })).toBe(0);
+
+    expect((await repository.listUserMessages(gone))[0]).toMatchObject({ status: "pending", urgent: false });
+    expect(await repository.listWorksWithPendingMessages({ urgentOnly: true })).toEqual([]);
   });
 });

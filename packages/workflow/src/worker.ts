@@ -187,8 +187,11 @@ function failureReport(
 ): NotificationReport {
   return {
     titleName: claimed.title.title,
+    // A replace_request covers every tracked season of the work and is only recorded
+    // on its lowest one (the lock): naming that season would label an S02 request
+    // 「第 1 季」. Title-level, like its success report (buildReplacementReport).
     seasonLabel:
-      claimed.title.type !== "movie" && claimed.season.seasonNumber
+      claimed.title.type !== "movie" && claimed.workflowRun.kind !== "replace_request" && claimed.season.seasonNumber
         ? `第 ${claimed.season.seasonNumber} 季`
         : null,
     status,

@@ -690,8 +690,14 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
         const recovered = recoverOrphanRunningRun(workflowRun, now);
         this.upsertWorkflowRun(recovered.run);
         if (recovered.action === "requeue") requeued += 1;
-        // A replace run that will never run again hands its messages back (retry).
-        else if (recovered.run.kind === "replace_request") this.releaseUserMessagesSync(recovered.run.id, now, false);
+        // A replace run that will never run again hands its work back to the patrol: its
+        // messages go back to pending, and none of the work's messages stays urgent (a run
+        // that crashed the worker over and over must not be retried on every idle tick).
+        else if (recovered.run.kind === "replace_request") {
+          this.releaseUserMessagesSync(recovered.run.id, now, false);
+          const work = this.workOfRunSync(recovered.run.id);
+          if (work) this.clearUserMessagesUrgentSync(work, now);
+        }
       }
       return requeued;
     })();
@@ -893,11 +899,10 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
             .prepare("SELECT media_title_id FROM tracked_seasons WHERE id = ? AND connected_storage_id = ?")
             .get(seasonId, storageValue) as { media_title_id: string } | undefined;
           if (season) {
-            this.db
-              .prepare(
-                "UPDATE user_messages SET urgent = 0, updated_at = ? WHERE account_id = ? AND drive = ? AND title_key = ? AND status = 'pending' AND urgent = 1",
-              )
-              .run(now, owner, userMessageDrive(ownerStorage), season.media_title_id);
+            this.clearUserMessagesUrgentSync(
+              { accountId: owner, drive: userMessageDrive(ownerStorage), titleKey: season.media_title_id },
+              now,
+            );
           }
         }
         return { status: "cancelled" as const };
@@ -1001,11 +1006,13 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
         // would revive an old replace request the moment the title is re-tracked.
         // episode_sources and rejected_resources stay — they're useful history if
         // the user re-tracks. Processing messages are untouched (a running run
-        // already refused above; nothing here is mid-flight).
+        // already refused above; nothing here is mid-flight). Untracking the last
+        // season still tracked on this drive, one season at a time, is the whole work.
         const accountId = scope.accountId ?? DEFAULT_ACCOUNT_ID;
         const drive = userMessageDrive(scope.connectedStorageId);
         const titleKey = states[0]!.title.id;
-        if (seasonNumber === undefined) {
+        const workGone = seasonNumber === undefined || this.selectWorkflowRunsForTitle(titleKey, accountId, storageValue).length === 0;
+        if (workGone) {
           const now = new Date().toISOString();
           this.db
             .prepare(
@@ -1782,6 +1789,33 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
       .run(input.now, input.accountId, input.drive, input.titleKey).changes;
   }
 
+  async clearUserMessagesUrgent(input: Parameters<UserRequestStore["clearUserMessagesUrgent"]>[0]): Promise<number> {
+    return this.clearUserMessagesUrgentSync(input, input.now);
+  }
+
+  /** Sync form, for use inside a db.transaction (cancel, crash recovery). */
+  private clearUserMessagesUrgentSync(work: UserMessageScope, now: string): number {
+    return this.db
+      .prepare(
+        "UPDATE user_messages SET urgent = 0, updated_at = ? WHERE account_id = ? AND drive = ? AND title_key = ? AND status = 'pending' AND urgent = 1",
+      )
+      .run(now, work.accountId, work.drive, work.titleKey).changes;
+  }
+
+  /** The work (account, drive, title) of a stored run: its own row plus its season's. */
+  private workOfRunSync(runId: string): UserMessageScope | null {
+    const row = this.db
+      .prepare(
+        "SELECT r.account_id AS account_id, r.connected_storage_id AS connected_storage_id, s.media_title_id AS media_title_id " +
+          "FROM workflow_runs r JOIN tracked_seasons s ON s.id = r.tracked_season_id AND s.connected_storage_id = r.connected_storage_id " +
+          "WHERE r.id = ?",
+      )
+      .get(runId) as { account_id: string | null; connected_storage_id: string | null; media_title_id: string } | undefined;
+    if (!row) return null;
+    const storage = row.connected_storage_id === UNSCOPED_STORAGE ? null : row.connected_storage_id;
+    return { accountId: row.account_id ?? DEFAULT_ACCOUNT_ID, drive: userMessageDrive(storage), titleKey: row.media_title_id };
+  }
+
   async claimUserMessages(input: Parameters<UserRequestStore["claimUserMessages"]>[0]): Promise<UserMessage[]> {
     // One UPDATE … RETURNING. Idempotent per run: the rows this run already holds
     // come back too, so a run requeued after a crash re-claims its own messages.
@@ -1811,10 +1845,11 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
   }
 
   async releaseOrphanedUserMessages(input: { now: string; finishedBefore: string }): Promise<number> {
-    // A processing message whose run is gone, or finished before the cutoff.
+    // A processing message whose run is gone, or finished before the cutoff: back to
+    // pending for the patrol (not urgent), like every other way a run ends unfinished.
     return this.db
       .prepare(
-        "UPDATE user_messages SET status = 'pending', urgent = 1, run_id = NULL, updated_at = ? WHERE status = 'processing' AND NOT EXISTS (" +
+        "UPDATE user_messages SET status = 'pending', urgent = 0, run_id = NULL, updated_at = ? WHERE status = 'processing' AND NOT EXISTS (" +
           "SELECT 1 FROM workflow_runs r WHERE r.id = user_messages.run_id AND (json_extract(r.payload, '$.status') IN ('queued', 'running') " +
           "OR json_extract(r.payload, '$.finishedAt') >= ?))",
       )

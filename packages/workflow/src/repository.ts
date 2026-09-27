@@ -754,6 +754,22 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     return n;
   }
 
+  async clearUserMessagesUrgent(input: Parameters<UserRequestStore["clearUserMessagesUrgent"]>[0]): Promise<number> {
+    return this.clearUserMessagesUrgentSync(input, input.now);
+  }
+
+  /** Sync form: cancel and crash recovery run it with no await in between. */
+  private clearUserMessagesUrgentSync(work: UserMessageScope, now: string): number {
+    let n = 0;
+    for (const m of this.userMessages.values()) {
+      if (sameWork(m, work) && m.status === "pending" && m.urgent) {
+        Object.assign(m, { urgent: false, updatedAt: now });
+        n += 1;
+      }
+    }
+    return n;
+  }
+
   async claimUserMessages(input: Parameters<UserRequestStore["claimUserMessages"]>[0]): Promise<UserMessage[]> {
     const claimed: UserMessage[] = [];
     for (const m of this.userMessages.values()) {
@@ -790,7 +806,7 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
       if (run && isActiveWorkflowStatus(run.workflowRun.status)) continue;
       const finishedAt = run?.workflowRun.finishedAt;
       if (run && finishedAt && finishedAt >= input.finishedBefore) continue;
-      Object.assign(m, { status: "pending", urgent: true, runId: null, updatedAt: input.now });
+      Object.assign(m, { status: "pending", urgent: false, runId: null, updatedAt: input.now });
       n += 1;
     }
     return n;
@@ -1000,8 +1016,13 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
         workflowRun: recovered.run,
       });
       if (recovered.action === "requeue") requeued += 1;
-      // A replace run that will never run again hands its messages back (retry).
-      else if (recovered.run.kind === "replace_request") await this.releaseUserMessages({ runId: id, now, urgent: false });
+      // A replace run that will never run again hands its work back to the patrol: its
+      // messages go back to pending, and none of the work's messages stays urgent (a run
+      // that crashed the worker over and over must not be retried on every idle tick).
+      else if (recovered.run.kind === "replace_request") {
+        await this.releaseUserMessages({ runId: id, now, urgent: false });
+        this.clearUserMessagesUrgentSync(workOfRun(snapshot), now);
+      }
     }
     return requeued;
   }
@@ -1125,14 +1146,7 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
         // queue it again within seconds. It waits for the patrol (or 现在处理).
         const now = new Date().toISOString();
         await this.releaseUserMessages({ runId: workflowRunId, now, urgent: false });
-        const work = {
-          accountId: stored.accountId ?? DEFAULT_ACCOUNT_ID,
-          drive: userMessageDrive(stored.connectedStorageId),
-          titleKey: stored.title.id,
-        };
-        for (const m of this.userMessages.values()) {
-          if (sameWork(m, work) && m.status === "pending" && m.urgent) Object.assign(m, { urgent: false, updatedAt: now });
-        }
+        this.clearUserMessagesUrgentSync(workOfRun(stored), now);
       }
       return { status: "cancelled" };
     }
@@ -1205,9 +1219,13 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     // would revive an old replace request the moment the title is re-tracked.
     // episode_sources and rejected_resources stay — they're useful history if
     // the user re-tracks. Processing messages are untouched (a running run
-    // already refused above; nothing here is mid-flight).
+    // already refused above; nothing here is mid-flight). Untracking the last
+    // season still tracked on this drive, one season at a time, is the whole work.
     const work = { accountId: scope.accountId ?? DEFAULT_ACCOUNT_ID, drive: userMessageDrive(scope.connectedStorageId), titleKey: states[0]!.title.id };
-    if (seasonNumber === undefined) {
+    const workGone =
+      seasonNumber === undefined ||
+      !Array.from(this.workflowRuns.values()).some((snapshot) => sameWork(workOfRun(snapshot), work));
+    if (workGone) {
       const now = new Date().toISOString();
       for (const m of this.userMessages.values()) {
         if (sameWork(m, work) && m.status === "pending") Object.assign(m, { status: "withdrawn", updatedAt: now });
@@ -1841,6 +1859,15 @@ export function compareTrackedSeasonStates(a: TrackedSeasonState, b: TrackedSeas
 
 function sameWork(a: UserMessageScope, b: UserMessageScope): boolean {
   return a.accountId === b.accountId && a.drive === b.drive && a.titleKey === b.titleKey;
+}
+
+/** The work (account, drive, title) a run belongs to — the key of its user messages. */
+function workOfRun(snapshot: Pick<PersistWorkflowRunSnapshotInput, "accountId" | "connectedStorageId" | "title">): UserMessageScope {
+  return {
+    accountId: snapshot.accountId ?? DEFAULT_ACCOUNT_ID,
+    drive: userMessageDrive(snapshot.connectedStorageId),
+    titleKey: snapshot.title.id,
+  };
 }
 
 function workKey(scope: UserMessageScope, episode: string): string {

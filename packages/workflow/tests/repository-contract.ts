@@ -205,10 +205,37 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         expect(await repo.releaseOrphanedUserMessages({ now: t1, finishedBefore: t1 })).toBe(2);
         expect((await repo.listUserMessages(works[0]!))[0]).toMatchObject({ status: "processing", runId: "run_live" });
         expect((await repo.listUserMessages(works[1]!))[0]).toMatchObject({ status: "processing", runId: "run_just_done" });
+        // Handed to the patrol, like every other way a run ends without finishing its messages.
         for (const work of works.slice(2)) {
-          expect((await repo.listUserMessages(work))[0]).toMatchObject({ status: "pending", urgent: true, runId: null, updatedAt: t1 });
+          expect((await repo.listUserMessages(work))[0]).toMatchObject({ status: "pending", urgent: false, runId: null, updatedAt: t1 });
         }
         expect(await repo.releaseOrphanedUserMessages({ now: t1, finishedBefore: t1 })).toBe(0);
+      });
+
+      it("clearUserMessagesUrgent hands this work's pending messages to the patrol, and only them", async () => {
+        const repo = await fresh();
+        const otherTitle = { ...scope, titleKey: "tmdb_tv_2" };
+        const otherDrive = { ...scope, drive: "cs_2" };
+        const held = await repo.createUserMessage({ ...scope, body: "held by a run", episodeTags: [], now: t0 });
+        await repo.claimUserMessages({ ...scope, runId: "run_1", now: t0 });
+        // Written while the first one is processing: urgent.
+        const later = await repo.createUserMessage({ ...scope, body: "written mid-run", episodeTags: [], now: "2026-09-26T00:00:30.000Z" });
+        expect(later.urgent).toBe(true);
+        for (const work of [otherTitle, otherDrive]) {
+          await repo.createUserMessage({ ...work, body: "someone else", episodeTags: [], now: t0 });
+          await repo.markUserMessagesUrgent({ ...work, now: t0 });
+        }
+
+        expect(await repo.clearUserMessagesUrgent({ ...scope, now: t1 })).toBe(1);
+
+        expect((await repo.listUserMessages(scope)).map((m) => [m.id, m.status, m.urgent, m.updatedAt])).toEqual([
+          [later.id, "pending", false, t1],
+          [held.id, "processing", false, t0],
+        ]);
+        const urgentWorks = await repo.listWorksWithPendingMessages({ urgentOnly: true });
+        expect(urgentWorks).toHaveLength(2);
+        expect(urgentWorks).toEqual(expect.arrayContaining([otherTitle, otherDrive]));
+        expect(await repo.clearUserMessagesUrgent({ ...scope, now: t1 })).toBe(0);
       });
 
       it("markUserMessagesUrgent and listWorksWithPendingMessages", async () => {
@@ -870,6 +897,31 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         // Not urgent: a run that crashed the worker five times waits for the patrol or 现在处理.
         expect((await repo.listUserMessages({ ...work, titleKey: `${work.titleKey}_rr_capped` }))[0]).toMatchObject({ status: "pending", urgent: false, runId: null });
         expect((await repo.listUserMessages({ ...work, titleKey: `${work.titleKey}_rr_requeued` }))[0]).toMatchObject({ status: "processing", runId: "rr_requeued" });
+      });
+
+      it("requeueRunningWorkflowRuns: a replace run failed at the cap also takes the urgency off the rest of its work's pending messages", async () => {
+        const repo = await fresh();
+        const snap = queued("rr_cap_work", { startedAt: "2026-06-11T00:00:00.000Z", connectedStorageId: "cs_rw" });
+        await repo.saveWorkflowRunSnapshot({
+          ...snap,
+          workflowRun: { ...snap.workflowRun, kind: "replace_request", status: "running", finishedAt: null, orphanRequeueCount: 5 },
+        });
+        // The run's own work: its title on its drive.
+        const work = { accountId: "acct_default", drive: "cs_rw", titleKey: snap.title.id };
+        const other = { ...work, titleKey: "title_untouched" };
+        await repo.createUserMessage({ ...work, body: "claimed", episodeTags: [], now: "2026-06-11T00:00:00.000Z" });
+        await repo.claimUserMessages({ ...work, runId: "rr_cap_work", now: "2026-06-11T00:00:00.000Z" });
+        await repo.createUserMessage({ ...work, body: "written mid-run", episodeTags: [], now: "2026-06-11T00:00:05.000Z" });
+        await repo.createUserMessage({ ...other, body: "another work", episodeTags: [], now: "2026-06-11T00:00:00.000Z" });
+        await repo.markUserMessagesUrgent({ ...other, now: "2026-06-11T00:00:00.000Z" });
+
+        expect(await repo.requeueRunningWorkflowRuns("2026-06-11T03:00:00.000Z")).toBe(0);
+
+        expect((await repo.listUserMessages(work)).map((m) => [m.body, m.status, m.urgent])).toEqual([
+          ["written mid-run", "pending", false],
+          ["claimed", "pending", false],
+        ]);
+        expect(await repo.listWorksWithPendingMessages({ urgentOnly: true })).toEqual([other]);
       });
 
       it("requeueRunningWorkflowRuns terminates an orphaned type3_monitor instead of queueing it", async () => {
@@ -1587,6 +1639,39 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         expect((await repo.listPendingReplacements(work)).map((p) => p.episode)).toEqual(["S02E01"]);
         const [msg] = await repo.listUserMessages(work);
         expect(msg).toMatchObject({ status: "pending", id: pending.id });
+      });
+
+      it("untrackTitle (single season) of the LAST season tracked on that drive withdraws the work's pending messages and all its 待换 rows, like a whole-title untrack", async () => {
+        const repo = await fresh();
+        const base = queuedRun({ id: "ul1", status: "succeeded", connectedStorageId: "cs_ul", tmdbId: 987, type: "tv", seasonNumber: 1 });
+        await repo.saveWorkflowRunSnapshot(base);
+        await repo.saveWorkflowRunSnapshot({
+          ...base,
+          season: { ...base.season, id: "season_ul2", seasonNumber: 2 },
+          workflowRun: { ...base.workflowRun, id: "ul2", trackedSeasonId: "season_ul2" },
+          episodes: base.episodes.map((e) => ({ ...e, trackedSeasonId: "season_ul2" })),
+        });
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_ul" };
+        const work = { accountId: "acct_default", drive: "cs_ul", titleKey: "title_ul1" };
+        const t0 = "2026-09-26T00:00:00.000Z";
+        const msg = await repo.createUserMessage({ ...work, body: "换", episodeTags: [], now: t0 });
+        await repo.markUserMessagesUrgent({ ...work, now: t0 });
+        // S03 was never tracked here: a stale row that only a whole-work cleanup removes.
+        await repo.addPendingReplacements({ ...work, episodes: ["S01E01", "S02E01", "S03E01"], messageId: msg.id, now: t0 });
+        // The same title on another drive is another work.
+        const otherDrive = { ...work, drive: "cs_ul_other" };
+        await repo.createUserMessage({ ...otherDrive, body: "别的盘", episodeTags: [], now: t0 });
+
+        // One season at a time: S02 is still tracked, so the message stays.
+        expect(await repo.untrackTitle(987, scope, "tv", 1)).toEqual({ status: "untracked", removedSeasons: 1 });
+        expect((await repo.listUserMessages(work))[0]).toMatchObject({ id: msg.id, status: "pending" });
+        // The last one: nothing of the title is tracked on this drive any more.
+        expect(await repo.untrackTitle(987, scope, "tv", 2)).toEqual({ status: "untracked", removedSeasons: 1 });
+
+        expect(await repo.listUserMessages(work)).toEqual([]);
+        expect(await repo.listPendingReplacements(work)).toEqual([]);
+        expect(await repo.listWorksWithPendingMessages({ urgentOnly: true })).toEqual([]);
+        expect((await repo.listUserMessages(otherDrive))[0]).toMatchObject({ status: "pending" });
       });
 
       it("retryFailedWorkflowRun requeues a failed run so it becomes claimable", async () => {

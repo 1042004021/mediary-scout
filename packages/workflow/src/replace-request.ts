@@ -112,41 +112,51 @@ export async function enqueueUrgentReplaceRequests(input: {
 }): Promise<number> {
   const nowIso = (input.now ?? (() => new Date().toISOString()))();
   // A worker that died between claiming messages and finishing them leaves them in
-  // processing with no live run: hand them back first so the scan below sees them.
+  // processing with no live run: hand them back (to the patrol) first.
   await input.repository.releaseOrphanedUserMessages({
     now: nowIso,
     finishedBefore: new Date(Date.parse(nowIso) - ORPHANED_MESSAGE_GRACE_MS).toISOString(),
   });
   let n = 0;
+  // A run that failed for good hands its whole work to the patrol (see
+  // releaseAfterFailure), so a broken setup (dead LLM key, missing library dir) is never
+  // retried here every few seconds; 现在处理 makes the work urgent again.
   for (const work of await input.repository.listWorksWithPendingMessages({ urgentOnly: true })) {
-    // A run that failed for good released its messages as urgent. Re-queueing it on
-    // every idle tick would retry a broken setup (dead LLM key, missing library dir)
-    // every few seconds, each with a failure push. After such a failure only 现在处理
-    // or editing one of its messages (both touch an urgent message) brings it back
-    // here — a new message is not urgent. The patrol still retries it on its own schedule.
-    if (await failedSinceLastTouch(input.repository, work)) continue;
     const result = await queueReplaceRequest({ repository: input.repository, work, ...(input.now ? { now: input.now } : {}) });
     if (result.status === "queued") n += 1;
+    // Nothing of the work is tracked on its drive any more: no run can ever take these
+    // messages, so stop scanning them every tick (untracking withdraws them; this covers
+    // whatever slipped past that).
+    if (result.status === "not_tracked") await input.repository.clearUserMessagesUrgent({ ...work, now: nowIso });
   }
   return n;
 }
 
-async function failedSinceLastTouch(repository: WorkflowRepository, work: UserMessageScope): Promise<boolean> {
-  const urgent = (await repository.listUserMessages(work)).filter((m) => m.status === "pending" && m.urgent);
-  const lastTouch = urgent.map((m) => m.updatedAt).sort().at(-1);
-  if (lastTouch === undefined) return false;
-  // A null storage scope is account-wide: the run's own drive must match exactly, or a
-  // failure of the same title on another drive would hold back the unbound work.
-  const scope = { accountId: work.accountId, connectedStorageId: work.drive === "" ? null : work.drive };
-  const notifications = await repository.listNotifications({ ...scope, since: lastTouch, limit: 500 });
-  for (const notification of notifications) {
-    // handleWorkflowRunFailure stamps the failure notification with the run's kind.
-    if (notification.kind !== "replace_request") continue;
-    const run = await repository.getWorkflowRunSnapshot(notification.workflowRunId, scope);
-    if (!run || userMessageDrive(run.connectedStorageId) !== work.drive) continue;
-    if (run.title.id === work.titleKey && run.workflowRun.status === "failed") return true;
+/** After a failed run its messages go back to pending. A run queued again (a transient
+ *  error, retried after a backoff of at least a minute — so this release always lands
+ *  before the retry can claim them) keeps them urgent: they wait for that retry, and the
+ *  idle scan cannot queue a second run beside it. A final failure — or one that could
+ *  not even be recorded — hands the whole work to the patrol: none of its messages stays
+ *  urgent (one written during the run included), or the idle scan would retry a broken
+ *  setup every few seconds. Best-effort: logged, never thrown. */
+async function releaseAfterFailure(input: {
+  repository: WorkflowRepository;
+  work: UserMessageScope;
+  runId: string;
+  requeued: boolean;
+  now: () => string;
+}): Promise<void> {
+  try {
+    await input.repository.releaseUserMessages({ runId: input.runId, now: input.now(), urgent: input.requeued });
+  } catch (error) {
+    console.error(`[user-message] run ${input.runId} could not release its messages: ${String(error)}`);
   }
-  return false;
+  if (input.requeued) return;
+  try {
+    await input.repository.clearUserMessagesUrgent({ ...input.work, now: input.now() });
+  } catch (error) {
+    console.error(`[user-message] run ${input.runId} could not hand its work to the patrol: ${String(error)}`);
+  }
 }
 
 type UserRequest = NonNullable<RunAcquisitionV2Request["userRequest"]>;
@@ -320,46 +330,49 @@ export async function runQueuedReplaceRequest(
       workflowStatus = result.status;
     }
   } catch (error) {
-    // Messages go back to pending (urgent) for a retry; the library stays as it was.
+    // The library stays as it was. The failure is recorded first: whether the run is
+    // queued again decides who picks the messages up (see releaseAfterFailure).
+    let requeued = false;
     try {
-      await repository.releaseUserMessages({ runId, now: now() });
-    } catch (releaseError) {
-      console.error(`[user-message] run ${runId} could not release its messages: ${String(releaseError)}`);
+      // The failure record keeps the lock season's CURRENT episodes, not the queue-time
+      // copy; none at all when the work is no longer tracked here. Only when the read
+      // itself fails does the queue-time copy stand in (never wipe a real library).
+      //
+      // "No longer tracked" still saves the season (with no episodes): the repository port
+      // has no status-only run write, and a run row without its season is worse — Postgres
+      // and SQLite load a run through its tracked_seasons row (loading it throws; SQLite's
+      // tracked list, built from run rows, throws too), and InMemory derives tracking from
+      // the run records themselves. It does not happen to a claimed run in practice:
+      // untrackTitle refuses while a run of the season is running, so this only covers a
+      // read that disagrees with the claim.
+      const current = await workStates(repository, work).then(
+        (states) => states.find((s) => s.season.id === claimed.season.id) ?? null,
+        () => undefined,
+      );
+      const handled = await handleWorkflowRunFailure({
+        claimed:
+          current === undefined
+            ? claimed
+            : current === null
+              ? { ...claimed, episodes: [] }
+              : { ...claimed, season: current.season, episodes: current.episodes },
+        error,
+        repository,
+        now,
+        // A patrol-queued failure joins the daily digest (trigger "scheduled"), matching the
+        // success path (see stampReplaceNotification / the `notice.trigger` above); a user
+        // request keeps its individual "user" push.
+        notificationTrigger: queuedBy(claimed.workflowRun.auditEvents) === "patrol" ? "scheduled" : "user",
+        ...(input.onAuthErrorFreeze === undefined ? {} : { onAuthErrorFreeze: input.onAuthErrorFreeze }),
+      });
+      requeued = handled.status === "auto_requeued";
+      return requeued
+        ? { status: "ran", workflowRunId: handled.workflowRunId, workflowStatus: "queued" }
+        : { status: "failed", workflowRunId: handled.workflowRunId, errorMessage: handled.errorMessage };
+    } finally {
+      // Also when the failure could not even be recorded (requeued stays false).
+      await releaseAfterFailure({ repository, work, runId, requeued, now });
     }
-    // The failure record keeps the lock season's CURRENT episodes, not the queue-time
-    // copy; none at all when the work is no longer tracked here. Only when the read
-    // itself fails does the queue-time copy stand in (never wipe a real library).
-    //
-    // "No longer tracked" still saves the season (with no episodes): the repository port
-    // has no status-only run write, and a run row without its season is worse — Postgres
-    // and SQLite load a run through its tracked_seasons row (loading it throws; SQLite's
-    // tracked list, built from run rows, throws too), and InMemory derives tracking from
-    // the run records themselves. It does not happen to a claimed run in practice:
-    // untrackTitle refuses while a run of the season is running, so this only covers a
-    // read that disagrees with the claim.
-    const current = await workStates(repository, work).then(
-      (states) => states.find((s) => s.season.id === claimed.season.id) ?? null,
-      () => undefined,
-    );
-    const handled = await handleWorkflowRunFailure({
-      claimed:
-        current === undefined
-          ? claimed
-          : current === null
-            ? { ...claimed, episodes: [] }
-            : { ...claimed, season: current.season, episodes: current.episodes },
-      error,
-      repository,
-      now,
-      // A patrol-queued failure joins the daily digest (trigger "scheduled"), matching the
-      // success path (see stampReplaceNotification / the `notice.trigger` above); a user
-      // request keeps its individual "user" push.
-      notificationTrigger: queuedBy(claimed.workflowRun.auditEvents) === "patrol" ? "scheduled" : "user",
-      ...(input.onAuthErrorFreeze === undefined ? {} : { onAuthErrorFreeze: input.onAuthErrorFreeze }),
-    });
-    return handled.status === "auto_requeued"
-      ? { status: "ran", workflowRunId: handled.workflowRunId, workflowStatus: "queued" }
-      : { status: "failed", workflowRunId: handled.workflowRunId, errorMessage: handled.errorMessage };
   }
 
   // The run itself succeeded and is saved. What follows is bookkeeping: a failure
