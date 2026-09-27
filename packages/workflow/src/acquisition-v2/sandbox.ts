@@ -467,12 +467,12 @@ export class TaskSandbox {
     return [...new Set([...this.replace.requestedEpisodes, ...this.rejectedEpisodes, ...this.noFileEpisodes])];
   }
 
-  /** Whether a need token counts toward coverage. A replace-guarded episode counts
-   *  only once reportReplacement recorded it replaced (which checks its mark, a landed
-   *  candidate and the episode's own new files in the target). A mark alone is not
-   *  enough: it may predate the rejection, or be unlocked by a transfer that carried a
-   *  different episode — either way the old file would close the transfer gate before
-   *  this episode was ever replaced. */
+  /** Whether a marked token counts: toward coverage, and as obtained in finish(). A
+   *  replace-guarded episode counts only once reportReplacement recorded it replaced
+   *  (which checks its mark, a landed candidate and the episode's own new files in the
+   *  target). A mark alone is not enough: it may predate the rejection, or be unlocked
+   *  by a transfer that carried a different episode — either way the old file would
+   *  close the transfer gate before this episode was ever replaced. */
   private countsAsObtained(token: string): boolean {
     if (!this.obtainedCodes.has(token)) return false;
     return !this.replaceGuardedEpisodes().has(token) || this.reportedEpisodes.get(token) === "replaced";
@@ -961,8 +961,8 @@ export class TaskSandbox {
    *  such a mark is refused (whole call, nothing recorded) until at least one
    *  transfer succeeded this run. Deliberately coarse — any landed transfer unlocks
    *  the mark; which episodes that transfer carried stays the agent's judgment. The
-   *  mark still does not count toward coverage until reportReplacement records the
-   *  episode replaced (see countsAsObtained). */
+   *  mark still neither counts toward coverage nor leaves the sandbox in finish()
+   *  until reportReplacement records the episode replaced (see countsAsObtained). */
   async markObtained(input: { codes: string[]; subtitleFallback?: boolean }): Promise<{ confirmed: string[] }> {
     if (this.replace && this.succeededCandidates.size === 0) {
       const guarded = this.replaceGuardedEpisodes();
@@ -1068,6 +1068,12 @@ export class TaskSandbox {
       return m ? [Number(m[1]), Number(m[2])] : null;
     };
     const obtained = [...this.obtainedCodes]
+      // Replace runs: a requested/rejected episode leaves here only once it was reported
+      // replaced. The workflow unions these codes into the persisted obtained set, and
+      // any landed transfer unlocks the mark — so a bare mark would persist an episode
+      // whose replacement was not_found (one declared file-less was never obtained).
+      // Outside a replace run every mark counts, as before.
+      .filter((code) => this.countsAsObtained(code))
       .filter((code) => needSet.has(code) || parse(code) !== null)
       // Order by (season, episode) NUMERICALLY — a lexical sort misorders ≥100
       // (S01E100 < S01E99). Non-episode tokens (e.g. the movie "MOVIE") sort last.

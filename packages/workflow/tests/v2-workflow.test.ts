@@ -333,6 +333,89 @@ describe("runAcquisitionV2Workflow — user request (replace_request run)", () =
     expect((await executor.listTree({ directoryId: seasonId })).map((f) => f.providerFileId)).toContain("old13");
   });
 
+  it("an episode declared file-less, marked after another episode's transfer and reported not_found, is not reconciled as obtained", async () => {
+    const executor = new FakeStorageExecutor({
+      transferOutcomes: {
+        cand_new13: {
+          status: "succeeded",
+          providerMessage: "ok",
+          files: [{ id: "new13", storageDirectoryId: "staging", name: "[Nekomoe] Show 13.mkv", sizeBytes: 1_000_000_000, episodeCode: "S01E13", providerFileId: "new13" }],
+        },
+      },
+    });
+    const showId = await executor.createDirectory({ name: "Show (2024) {tmdb-42}", parentId: "tv_root" });
+    const seasonId = await executor.createDirectory({ name: "Season 01", parentId: showId });
+    executor.seedDirectoryFiles(seasonId, [
+      { id: "old13", storageDirectoryId: seasonId, name: "Show - 13 [CR 1080p].mkv", sizeBytes: 1_400_000_000, episodeCode: "S01E13", providerFileId: "old13" },
+    ]);
+    // Every search (the raw pre-search "Show" included) returns the one new E13 release.
+    const provider: ResourceProvider = {
+      search: async ({ keyword }) => ({
+        id: `snap_${keyword}`,
+        provider: "pansou",
+        keyword,
+        createdAt: "2026-09-26T08:00:00.000Z",
+        candidates: [
+          { id: "cand_new13", snapshotId: `snap_${keyword}`, index: 0, title: "[Nekomoe] Show 13 [1.0G]", type: "magnet", source: "pansou", providerPayload: { url: `magnet:?xt=urn:btih:${"b".repeat(40)}` } },
+        ],
+      }),
+    };
+    let calls = 0;
+    const tool = (name: string, input: unknown) => ({
+      content: [{ type: "tool-call" as const, toolCallId: `c${calls}`, toolName: name, input: JSON.stringify(input) }],
+      finishReason: { unified: "tool-calls" as const, raw: "tool-calls" as const },
+      usage: USAGE,
+      warnings: [],
+    });
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => {
+        calls += 1;
+        if (calls === 1) return tool("rejectCurrentSource", { episodes: ["S01E13"], fileIds: ["old13"], reason: "发蓝" });
+        // E24 was never obtained — no file to reject, declared instead.
+        if (calls === 2) return tool("rejectCurrentSource", { episodes: ["S01E24"], fileIds: [], reason: "24 也要" });
+        // The raw pre-search is the first snapshot the agent sees (s1).
+        if (calls === 3) return tool("transferCandidate", { snapshotId: "s1", candidateId: "s1-1" });
+        if (calls === 4) return tool("moveToSeason", { moves: [{ season: 1, fileIds: ["new13"] }] });
+        // Something landed, so the marks are accepted — E24's too, though only E13 landed.
+        if (calls === 5) return tool("markObtained", { codes: ["S01E13", "S01E24"] });
+        if (calls === 6) {
+          return tool("reportReplacement", {
+            results: [
+              { episode: "S01E13", outcome: "replaced", candidateId: "s1-1", fileIds: ["new13"], note: "喵萌版" },
+              { episode: "S01E24", outcome: "not_found", note: "没找到" },
+            ],
+          });
+        }
+        if (calls === 7) return tool("finish", {});
+        return { content: [{ type: "text" as const, text: "done" }], finishReason: { unified: "stop" as const, raw: "stop" as const }, usage: USAGE, warnings: [] };
+      },
+    });
+    const ALL_BUT_24 = Array.from({ length: 23 }, (_, n) => `S01E${String(n + 1).padStart(2, "0")}`);
+
+    const result = await runAcquisitionV2Workflow({
+      provider,
+      executor,
+      model,
+      workflowRunId: "run-ur-e24",
+      title: { name: "Show", year: 2024, aliases: [], tmdbId: 42 },
+      categoryParentId: "tv_root",
+      seasons: [{ seasonNumber: 1, latestAiredEpisode: 24 }],
+      qualityPreference: "1080p",
+      priorObtained: ALL_BUT_24,
+      userRequest,
+    });
+
+    expect(result.missingBefore).toEqual(["S01E24"]);
+    expect(result.replacement?.results).toEqual([
+      expect.objectContaining({ episode: "S01E13", outcome: "replaced", candidateId: "cand_new13" }),
+      { episode: "S01E24", outcome: "not_found", note: "没找到" },
+    ]);
+    // E13 was obtained before and was replaced; E24 got only a mark, never a replacement.
+    expect(result.obtained).toContain("S01E13");
+    expect(result.obtained).not.toContain("S01E24");
+    expect(result.stillMissing).toEqual(["S01E24"]);
+  });
+
   it("no user request on a fully obtained show: the no-op short-circuit still skips the agent", async () => {
     const { executor } = await seededExecutor();
     let calls = 0;

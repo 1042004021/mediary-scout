@@ -247,6 +247,58 @@ describe("TaskSandbox — replace", () => {
     expect(sandbox.isCoverageMet()).toBe(true);
   });
 
+  it("a guarded episode leaves the sandbox obtained only once reported replaced: one declared file-less, marked after an unrelated transfer and reported not_found, does not", async () => {
+    const storage = new Storage115Simulator({
+      packs: {
+        old_pack: { files: [{ path: "Show - 13 [CR 1080p].mkv", sizeBytes: 1_400_000_000 }] },
+        cand_new13: { files: [{ path: "[Nekomoe] Show - 13 [1080p].mkv", sizeBytes: 1_100_000_000 }] },
+        cand_e14: { files: [{ path: "Show - 14 [CR 1080p].mkv", sizeBytes: 1_400_000_000 }] },
+      },
+    });
+    const staging = await storage.createDirectory({ name: "staging", parentId: "root" });
+    const season = await storage.createDirectory({ name: "Season 01", parentId: "root" });
+    await storage.transferCandidate({ candidateId: "old_pack", intoDirectoryId: season });
+    const old13 = (await storage.listTree({ directoryId: season }))[0]!.id;
+    const sandbox = new TaskSandbox({
+      provider: new FakeResourceProviderV2({
+        results: { Show: [{ id: "cand_new13", title: "[Nekomoe] Show 13" }, { id: "cand_e14", title: "Show 14" }] },
+      }),
+      storage, stagingDirectoryId: staging, targetSeasonDirectoryIds: { 1: season },
+      // E14 is a plain gap; E13 is obtained but requested.
+      need: ["S01E14"],
+      replace: { requestedEpisodes: ["S01E13"], onReject: async () => {}, onReport: async () => {} },
+    });
+    await sandbox.captureProtectedFiles();
+    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
+    // E24 has no file in the library: declared, not rejected — guarded all the same.
+    await sandbox.rejectCurrentSource({ episodes: ["S01E24"], fileIds: [], reason: "24 集也要换" });
+    const snap = (await sandbox.searchResources("Show")).snapshot!;
+    const new13 = (await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_new13" })).attempt.materializedFileIds;
+    const e14 = (await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_e14" })).attempt.materializedFileIds;
+    await sandbox.moveToSeason({ moves: [{ season: 1, fileIds: [...new13, ...e14] }] });
+    // Any landed transfer unlocks the marks — E24's too, though nothing of E24 landed.
+    await sandbox.markObtained({ codes: ["S01E13", "S01E14", "S01E24"] });
+    // Not reported yet: only the plain gap leaves the sandbox obtained.
+    expect((await sandbox.finish()).obtained).toEqual(["S01E14"]);
+    await sandbox.reportReplacement({
+      results: [
+        { episode: "S01E13", outcome: "replaced", candidateId: "cand_new13", fileIds: new13, note: "喵萌版" },
+        { episode: "S01E24", outcome: "not_found", note: "没找到" },
+      ],
+    });
+    const summary = await sandbox.finish();
+    expect(summary.obtained).toEqual(["S01E13", "S01E14"]);
+    expect(summary.missing).toEqual(["S01E24"]);
+    // The agent's own finish tool tells the same story.
+    await expect(sandbox.declareFinish()).resolves.toMatchObject({ obtained: ["S01E13", "S01E14"], missing: ["S01E24"] });
+  });
+
+  it("outside a replace run every marked code leaves the sandbox unchanged, beyond-need codes included", async () => {
+    const sandbox = new TaskSandbox({ provider: new FakeResourceProviderV2(), need: ["S01E13", "S01E14"] });
+    await sandbox.markObtained({ codes: ["S01E14", "S01E13", "S01E15"] });
+    expect((await sandbox.finish()).obtained).toEqual(["S01E13", "S01E14", "S01E15"]);
+  });
+
   it("files that existed before the run can never be deleted", async () => {
     const { sandbox, old13 } = await setup();
     await expect(sandbox.deleteFiles({ directory: "season", season: 1, fileIds: [old13] })).rejects.toThrow(/PROTECTED/);

@@ -191,7 +191,9 @@ export async function runAcquisitionV2Workflow(
   // Reconcile from the AGENT'S coverage (its markObtained), NOT a 115 re-scan:
   // 实有 after = prior DB marks ∪ what the agent marked this run (§1.13/§7b).
   // An episode the user asked to replace is in priorObtained, so it stays obtained
-  // whether or not the replacement landed.
+  // whether or not the replacement landed. The agent's side carries such an episode
+  // only once it was reported replaced (sandbox finish): one declared file-less and
+  // reported not_found never becomes obtained on a bare mark.
   const after = syncSeasonNeed({
     seasons: seasonsForSync,
     obtained: [...priorObtained, ...v2.coverage.obtained],
