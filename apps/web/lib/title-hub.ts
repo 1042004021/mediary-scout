@@ -135,9 +135,10 @@ const seriesTargetMemo = createTtlMemo<PreparedSeriesTarget>({
 
 /**
  * Season metadata + artwork for a title, independent of tracking state.
- * Live TMDB when configured (cached 6h per title; a miss is remembered for a
- * minute so refresh does not wait on it again), demo candidates otherwise,
- * null when the title is unknown to both.
+ * Live TMDB when configured (cached 6h per title). A miss is remembered for a
+ * minute so refresh does not wait on it again. A refetch that fails keeps the
+ * last successful payload instead of blanking the season list. Demo candidates
+ * otherwise; null when the title was never known.
  */
 async function seriesTargetFor(tmdbId: number): Promise<PreparedSeriesTarget | null> {
   if (process.env.MEDIA_TRACK_SEARCH_PROVIDER === "tmdb") {

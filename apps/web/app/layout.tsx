@@ -1,7 +1,6 @@
 import type { Metadata } from "next";
 import { Analytics } from "@vercel/analytics/next";
 import "./globals.css";
-import { RefreshPaint } from "../components/refresh-paint";
 import { isDemoMode } from "../lib/demo-mode";
 
 export const metadata: Metadata = {
@@ -31,7 +30,6 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
           </div>
         ) : null}
         {children}
-        <RefreshPaint />
         {/* Vercel Web Analytics — DEMO deploy only: gated on isDemoMode() so a
             self-hosted instance never loads the Vercel insights script (no 404 /
             no third-party beacon off-Vercel). */}

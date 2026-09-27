@@ -42,6 +42,49 @@ describe("createTtlMemo", () => {
     expect(loads).toBe(2);
   });
 
+  it("returns the last success when a refetch fails, and does not retry during the miss TTL", async () => {
+    let now = 1_000;
+    let mode: "ok" | "null" | "throw" = "ok";
+    let loads = 0;
+    const get = createTtlMemo<{ id: number }>({
+      now: () => now,
+      successTtlMs: 50,
+      failureTtlMs: 10,
+      load: async (key) => {
+        loads += 1;
+        if (mode === "throw") throw new Error("tmdb down");
+        if (mode === "null") return null;
+        return { id: key };
+      },
+    });
+    expect(await get(4)).toEqual({ id: 4 });
+    now += 50;
+    mode = "throw";
+    expect(await get(4)).toEqual({ id: 4 });
+    expect(loads).toBe(2);
+    expect(await get(4)).toEqual({ id: 4 });
+    expect(loads).toBe(2);
+    now += 10;
+    mode = "null";
+    expect(await get(4)).toEqual({ id: 4 });
+    expect(loads).toBe(3);
+  });
+
+  it("returns null when a failing load has no prior success", async () => {
+    let loads = 0;
+    const get = createTtlMemo<string>({
+      successTtlMs: 50,
+      failureTtlMs: 10_000,
+      load: async () => {
+        loads += 1;
+        throw new Error("tmdb down");
+      },
+    });
+    await expect(get(1)).resolves.toBeNull();
+    await expect(get(1)).resolves.toBeNull();
+    expect(loads).toBe(1);
+  });
+
   it("shares one load across concurrent callers", async () => {
     let loads = 0;
     let release: () => void = () => undefined;

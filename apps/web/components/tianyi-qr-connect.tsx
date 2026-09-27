@@ -2,7 +2,7 @@
 
 import { LoaderCircle, QrCode, RefreshCw } from "lucide-react";
 import { useRef, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter } from "../lib/use-router";
 
 /** The FULL TianyiQrSession round-trips through the browser (the 天翼 poll needs
  *  uuid/paramId/lt/… — not just a token like quark). `cookies` is the STATEFUL

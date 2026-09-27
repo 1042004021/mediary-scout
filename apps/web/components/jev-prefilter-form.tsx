@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, useTransition } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter } from "../lib/use-router";
 import { Check, LoaderCircle, Trash2 } from "lucide-react";
 import { saveJevConfigAction, clearJevConfigAction, setJevPrefilterEnabledAction } from "../app/actions";
 import { runAction } from "../lib/run-action";

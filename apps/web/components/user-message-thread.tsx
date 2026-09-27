@@ -8,7 +8,7 @@
 
 import { useEffect, useId, useRef, useState, useTransition, type FocusEvent, type KeyboardEvent, type MouseEvent } from "react";
 import { createPortal, flushSync } from "react-dom";
-import { useRouter } from "next/navigation";
+import { useRouter } from "../lib/use-router";
 import {
   editUserMessageAction,
   keepEpisodesAsIsAction,

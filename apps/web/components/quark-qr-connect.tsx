@@ -2,7 +2,7 @@
 
 import { LoaderCircle, QrCode, RefreshCw } from "lucide-react";
 import { useRef, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter } from "../lib/use-router";
 
 type Session = { token: string; qrcodeContent: string };
 type Phase = "idle" | "loading" | "waiting" | "scanned" | "confirming" | "done" | "expired" | "error";

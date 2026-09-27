@@ -2,7 +2,7 @@
 
 import { useState, useTransition } from "react";
 import { Check, ExternalLink, LoaderCircle } from "lucide-react";
-import { useRouter } from "next/navigation";
+import { useRouter } from "../lib/use-router";
 import { connectTianyiSsonAction } from "../app/actions";
 import { runAction } from "../lib/run-action";
 

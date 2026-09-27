@@ -2,7 +2,7 @@
 
 import { useState, useTransition } from "react";
 import { Check, ExternalLink, LoaderCircle, Wand2 } from "lucide-react";
-import { useRouter } from "next/navigation";
+import { useRouter } from "../lib/use-router";
 import { connectGuangYaAction } from "../app/actions";
 import { runAction } from "../lib/run-action";
 import { extractGuangYaTokens, parseTokenPaste, sanitizeToken } from "../lib/guangya-token-paste";

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useTransition } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter } from "../lib/use-router";
 import { Check, LoaderCircle } from "lucide-react";
 import { saveLlmConfigAction } from "../app/actions";
 import { runAction } from "../lib/run-action";
