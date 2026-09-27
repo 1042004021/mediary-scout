@@ -603,6 +603,93 @@ describe("sweepOrphanStagingDirs", () => {
     expect(notes).toHaveLength(0);
   });
 
+  it("leaves a recently finished run's staging alone and removes one that settled over an hour ago", async () => {
+    const repo = new InMemoryWorkflowRepository();
+    await saveRun(repo, {
+      id: "run-recent",
+      status: "failed",
+      startedAt: "2026-09-27T02:40:00.000Z",
+      finishedAt: "2026-09-27T02:50:00.000Z",
+    });
+    await saveRun(repo, {
+      id: "run-old",
+      status: "failed",
+      startedAt: "2026-09-27T00:30:00.000Z",
+      finishedAt: "2026-09-27T01:00:00.000Z",
+    });
+    const disk = memoryDrive({
+      dirs: [
+        { id: "tv", name: "TV", parentId: "root" },
+        { id: "show", name: "Show", parentId: "tv" },
+        { id: "stg-recent", name: "staging-run-recent", parentId: "show" },
+        { id: "stg-old", name: "staging-run-old", parentId: "show" },
+        { id: "stg-missing", name: "staging-run-missing", parentId: "show" },
+      ],
+    });
+    await sweepOrphanStagingDirs({
+      repository: repo,
+      now: NOW,
+      drives: [drive({ storageId: "drive-settle", executor: disk.executor })],
+    });
+    expect(disk.removed.sort()).toEqual(["stg-missing", "stg-old"]);
+    expect(disk.dirs.some((dir) => dir.id === "stg-recent")).toBe(true);
+    const notes = (await repo.listNotifications({ accountId: "acct" })).filter(
+      (note) => note.kind === "staging_leftover",
+    );
+    expect(notes).toHaveLength(0);
+  });
+
+  it("does not remove a staging dir whose run becomes active before the delete", async () => {
+    const inner = new InMemoryWorkflowRepository();
+    await saveRun(inner, {
+      id: "run-flip",
+      status: "failed",
+      startedAt: "2026-09-27T00:30:00.000Z",
+      finishedAt: "2026-09-27T01:00:00.000Z",
+    });
+    let reads = 0;
+    const repo = {
+      getWorkflowRunSnapshot: async (id: string, scope?: string) => {
+        const snapshot = await inner.getWorkflowRunSnapshot(id, scope);
+        if (id !== "run-flip" || !snapshot) return snapshot;
+        reads += 1;
+        if (reads < 2) return snapshot;
+        return { ...snapshot, workflowRun: { ...snapshot.workflowRun, status: "running" as const } };
+      },
+      getAccountSetting: (accountId: string, key: string) => inner.getAccountSetting(accountId, key),
+      setAccountSetting: (accountId: string, key: string, value: string) =>
+        inner.setAccountSetting(accountId, key, value),
+      saveWorkflowRunSnapshot: (input: Parameters<InMemoryWorkflowRepository["saveWorkflowRunSnapshot"]>[0]) =>
+        inner.saveWorkflowRunSnapshot(input),
+    };
+    const removed: string[] = [];
+    await sweepOrphanStagingDirs({
+      repository: repo,
+      now: NOW,
+      drives: [
+        drive({
+          storageId: "drive-flip",
+          executor: {
+            async listChildDirectories(parentId: string) {
+              if (parentId === "tv") return [{ id: "show", name: "Show" }];
+              if (parentId === "show") return [{ id: "stg-flip", name: "staging-run-flip" }];
+              return [];
+            },
+            async listTree() {
+              return [];
+            },
+            async removeDirectory(id: string) {
+              removed.push(id);
+              return { removed: true };
+            },
+          },
+        }),
+      ],
+    });
+    expect(removed).toEqual([]);
+    expect(reads).toBeGreaterThanOrEqual(2);
+  });
+
   it("does not touch a drive whose executor cannot list and remove", async () => {
     const repo = new InMemoryWorkflowRepository();
     let listed = false;

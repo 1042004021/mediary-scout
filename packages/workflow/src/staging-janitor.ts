@@ -4,6 +4,8 @@ import type { StorageExecutor } from "./ports.js";
 import { isActiveWorkflowStatus, type WorkflowRepository } from "./repository.js";
 
 const REPORTED_SETTING_KEY = "staging_leftover_reported";
+/** A failed run is requeued on the same id within 15 minutes. Don't touch its staging until that window is long gone. */
+const SWEEP_SETTLE_MS = 60 * 60 * 1000;
 
 export interface StagingJanitorDrive {
   accountId: string;
@@ -74,6 +76,17 @@ type SweepRepository = Pick<
   WorkflowRepository,
   "getWorkflowRunSnapshot" | "getAccountSetting" | "setAccountSetting" | "saveWorkflowRunSnapshot"
 >;
+
+function settledForSweep(
+  snapshot: Awaited<ReturnType<SweepRepository["getWorkflowRunSnapshot"]>>,
+  now: string,
+): boolean {
+  if (!snapshot) return true;
+  if (isActiveWorkflowStatus(snapshot.workflowRun.status)) return false;
+  const at = snapshot.workflowRun.finishedAt ?? snapshot.workflowRun.startedAt;
+  const age = Date.parse(now) - Date.parse(at);
+  return Number.isFinite(age) && age > SWEEP_SETTLE_MS;
+}
 
 type CapableExecutor = Pick<StorageExecutor, "listChildDirectories" | "listTree" | "removeDirectory">;
 
@@ -276,7 +289,9 @@ async function sweepDrive(
           continue;
         }
         const snapshot = await repository.getWorkflowRunSnapshot(runId, drive.accountId);
-        if (snapshot && isActiveWorkflowStatus(snapshot.workflowRun.status)) {
+        // Missing, or finished more than an hour ago. A run that just failed can be
+        // requeued on this same id and recreate this directory.
+        if (!settledForSweep(snapshot, now)) {
           continue;
         }
         const tree = await pace(() => executor.listTree({ directoryId: child.id, maxDepth: JANITOR_LIST_DEPTH }));
@@ -284,6 +299,10 @@ async function sweepDrive(
         // down. Do not delete, and do not report a made-up zero.
         const subdirs = tree.length === 0 ? await pace(() => executor.listChildDirectories(child.id)) : [];
         if (tree.length === 0 && subdirs.length === 0) {
+          const again = await repository.getWorkflowRunSnapshot(runId, drive.accountId);
+          if ((again && isActiveWorkflowStatus(again.workflowRun.status)) || (!snapshot && again)) {
+            continue;
+          }
           const result = await pace(() => executor.removeDirectory(child.id));
           if (result.removed) {
             removed += 1;

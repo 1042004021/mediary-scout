@@ -1028,9 +1028,20 @@ export class TaskSandbox {
       return { season: move.season, targetDir, fileIds: move.fileIds };
     });
     // Validate ALL fileIds against the current staging snapshot before any move.
-    const stagingIds = new Set(
-      (await this.storage.listTree({ directoryId: this.stagingDirectoryId })).map((file) => file.id),
-    );
+    // A budget refusal here never reaches the move loop, so it has to hold the
+    // ids itself — otherwise markObtained plus harness cleanup deletes the only copies.
+    let stagingTree;
+    try {
+      stagingTree = await this.storage.listTree({ directoryId: this.stagingDirectoryId });
+    } catch (error) {
+      const ids = resolved.flatMap((move) => move.fileIds);
+      for (const fileId of ids) this.unmovedFileIds.add(fileId);
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `MOVE_NOT_DONE: these files did NOT move (${ids.join(", ")}). Do not markObtained their episodes this run — they are still only in staging. ${reason}`,
+      );
+    }
+    const stagingIds = new Set(stagingTree.map((file) => file.id));
     const outOfScope = resolved.flatMap((move) => move.fileIds).filter((fileId) => !stagingIds.has(fileId));
     if (outOfScope.length > 0) {
       throw new Error(`SANDBOX_FILES_NOT_IN_STAGING: ${outOfScope.join(",")}`);

@@ -50,8 +50,13 @@ class StuckFileExecutor extends FakeStorageExecutor {
   moveAttempts = 0;
   failMoves = 1;
   deleted: string[] = [];
+  /** The moveToSeason preflight listing is refused (115 wall), before any move. */
+  failPreflight = false;
 
   override async listTree(): Promise<Array<{ path: string; providerFileId: string; sizeBytes: number }>> {
+    if (this.failPreflight) {
+      throw new Error("PAN115_RATE_LIMIT: API call budget exhausted before listItems");
+    }
     return [{ path: "ep.mkv", providerFileId: "stuck-1", sizeBytes: 10 }];
   }
 
@@ -212,6 +217,27 @@ describe("discardStaging refuses while a failed move's files are still in stagin
     const sentence = "discardStaging is refused while files whose move failed are still in staging.";
     expect(readSkillSection("tv")).toContain(sentence);
     expect(buildTvAnimeSystemPrompt({})).toContain(sentence);
+  });
+});
+
+describe("moveToSeason preflight listing failure", () => {
+  it("holds every requested id when the staging listing is refused", async () => {
+    const { sandbox, storage, first, second } = await stagedSandbox();
+    storage.listTree = async () => {
+      throw new Error("PAN115_RATE_LIMIT: API call budget exhausted before listItems");
+    };
+    await expect(sandbox.moveToSeason({ moves: [{ season: 1, fileIds: [first, second] }] })).rejects.toThrow(
+      new RegExp(`MOVE_NOT_DONE: these files did NOT move \\(${first}, ${second}\\)\\.`),
+    );
+    expect(sandbox.unmovedStagingFileIds()).toEqual([first, second]);
+  });
+
+  it("does not hold an id the sandbox itself rejected as not in staging", async () => {
+    const { sandbox } = await stagedSandbox();
+    await expect(sandbox.moveToSeason({ moves: [{ season: 1, fileIds: ["not-in-staging"] }] })).rejects.toThrow(
+      /SANDBOX_FILES_NOT_IN_STAGING/,
+    );
+    expect(sandbox.unmovedStagingFileIds()).toEqual([]);
   });
 });
 
@@ -394,6 +420,24 @@ describe("runAcquisitionV2Workflow does not delete files whose move failed", () 
     expect(executor.deleted).toEqual(["stuck-1"]);
     expect(result.auditEvents.some((event) => event.type === "staging_kept_unmoved_files")).toBe(false);
     expect(executor.removed).toContain(result.directories.stagingDirectoryId);
+  });
+
+  it("preflight listing refusal keeps staging even though the move never started", async () => {
+    const executor = new StuckFileExecutor();
+    executor.failPreflight = true;
+    let step = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => {
+        step += 1;
+        if (step === 1) return tool("moveToSeason", { moves: [{ season: 1, fileIds: ["stuck-1"] }] }, step);
+        return tool("finish", {}, step);
+      },
+    });
+    const result = await runAcquisitionV2Workflow(workflowRequest(executor, model));
+    const kept = result.auditEvents.filter((event) => event.type === "staging_kept_unmoved_files");
+    expect(kept).toHaveLength(1);
+    expect(kept[0]?.data).toMatchObject({ fileCount: 1 });
+    expect(executor.removed).not.toContain(result.directories.stagingDirectoryId);
   });
 
   it("a run with no failed move still removes staging and records no kept event", async () => {
