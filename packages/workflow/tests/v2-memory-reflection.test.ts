@@ -221,6 +221,11 @@ describe("reflection never writes give-up notes (2026-09-25 replay of 202 produc
     expect(REFLECTION_SYSTEM).toMatch(/TMDB, which you must take as given/);
     expect(REFLECTION_SYSTEM).toMatch(/no "今天\/今日" conclusions, no drive quota/);
     expect(REFLECTION_SYSTEM).toMatch(/NEVER tell the next run to avoid the bare title/);
+    // A transfer the run threw away is not evidence the source works.
+    expect(REFLECTION_SYSTEM).toMatch(/files were all thrown away/);
+    expect(REFLECTION_SYSTEM).toMatch(/never record it as "works"/);
+    expect(REFLECTION_SYSTEM).toMatch(/that share only holds episodes 1–12/);
+    expect(REFLECTION_SYSTEM).toMatch(/as avoid/);
     // Real production titles as examples leaked into notes about those same works.
     expect(REFLECTION_SYSTEM).not.toMatch(/冰之城墙|氷の城壁|阳光电影/);
   });

@@ -257,6 +257,10 @@ export interface TaskSandboxOptions {
    *  pre-search may predate a rejection; a repeated keyword returns the cached
    *  snapshot), so every transfer asks again. Absent = no transfer-time guard. */
   isRejected?: (candidate: { id: string; title: string }) => Promise<boolean>;
+  /** Link identity of a candidate the agent names (resourceLinkKey of its url).
+   *  Null when the candidate has no share/magnet identity. The agent only sees
+   *  titles, so two titles of one link are indistinguishable without this. */
+  linkOf?: (candidateId: string) => string | null;
   /** Any run of a work that has kept old + replacement copies (episode_sources):
    *  files already in the target dirs at the start are protected like in a replace
    *  run (never deleted, moved, renamed or flattened away), without the replace
@@ -396,6 +400,14 @@ export class TaskSandbox {
    *  a made-up id never counts. Where such a file is NOW is read from the target dirs
    *  when the agent reports (reportReplacement). */
   private readonly materializedBy = new Map<string, string>();
+  /** file id → where it stands. Only "kept" made it into a target directory.
+   *  A movie lands in its own directory, so those files start kept. Anything
+   *  still "staging" when fate is read (end of run) was thrown away, same as
+   *  a file deleted or discarded with the staging dir. */
+  private readonly filePlace = new Map<string, "kept" | "staging" | "thrown">();
+  private readonly linkOf: TaskSandboxOptions["linkOf"];
+  /** Link key → the first candidate alias whose transfer landed files this run. */
+  private readonly landedByLink = new Map<string, string>();
   /** File → the episode it backs, for every "replaced" recorded this run. One new file
    *  backs one episode: E24 can never be reported replaced by E13's file. A backing file
    *  can no longer be deleted this run (see deleteFiles). */
@@ -422,6 +434,7 @@ export class TaskSandbox {
     this.memory = options.memory;
     this.replace = options.replace;
     this.isRejected = options.isRejected;
+    this.linkOf = options.linkOf;
     this.protectExistingFiles = options.protectExistingFiles === true;
   }
 
@@ -452,7 +465,66 @@ export class TaskSandbox {
   /** Remember which candidate materialized which files this run (reportReplacement
    *  checks the files an agent names for an episode against it). */
   private recordMaterialized(candidateId: string, fileIds: string[]): void {
-    for (const id of fileIds) this.materializedBy.set(id, candidateId);
+    const initial = this.isMovieRun() ? "kept" : "staging";
+    for (const id of fileIds) {
+      this.materializedBy.set(id, candidateId);
+      if (!this.filePlace.has(id)) this.filePlace.set(id, initial);
+    }
+  }
+
+  private markKept(fileIds: readonly string[]): void {
+    for (const id of fileIds) {
+      if (this.materializedBy.has(id) && this.filePlace.get(id) !== "thrown") this.filePlace.set(id, "kept");
+    }
+  }
+
+  private markThrown(fileIds: readonly string[]): void {
+    for (const id of fileIds) {
+      if (this.materializedBy.has(id)) this.filePlace.set(id, "thrown");
+    }
+  }
+
+  /** The alias that already landed this link, or null. A link with no identity,
+   *  or whose earlier transfer landed nothing, is not blocked. */
+  private landedLinkOwner(candidateId: string): string | null {
+    const link = this.linkOf?.(candidateId);
+    if (!link) return null;
+    return this.landedByLink.get(link) ?? null;
+  }
+
+  private noteLandedLink(candidateId: string): void {
+    const link = this.linkOf?.(candidateId);
+    if (!link || this.landedByLink.has(link)) return;
+    this.landedByLink.set(link, candidateId);
+  }
+
+  private fateOf(fileIds: Iterable<string>): { kept: number; thrownAway: number } {
+    let kept = 0;
+    let thrownAway = 0;
+    for (const id of fileIds) {
+      if (this.filePlace.get(id) === "kept") kept += 1;
+      else thrownAway += 1;
+    }
+    return { kept, thrownAway };
+  }
+
+  /** What became of the files one candidate materialized. Files still in staging
+   *  count as thrown away — this is read after the run, for the reflection. */
+  materializedFate(candidateId: string): { kept: number; thrownAway: number } {
+    const ids: string[] = [];
+    for (const [fileId, owner] of this.materializedBy) {
+      if (owner === candidateId) ids.push(fileId);
+    }
+    return this.fateOf(ids);
+  }
+
+  /** Same counts for an explicit file-id list (a persisted attempt's ids, which
+   *  are keyed by the provider's real candidate id, not the agent's alias).
+   *  Undefined when this run did not materialize any of them. */
+  materializedFateOf(fileIds: readonly string[]): { kept: number; thrownAway: number } | undefined {
+    const known = fileIds.filter((id) => this.materializedBy.has(id));
+    if (known.length === 0) return undefined;
+    return this.fateOf(known);
   }
 
   /** Whether every needed token has been confirmed obtained — the gate that
@@ -740,6 +812,12 @@ export class TaskSandbox {
         `SANDBOX_CANDIDATE_REJECTED: ${input.candidateId} is a copy of a resource the user rejected — pick a different one`,
       );
     }
+    const alreadyLanded = this.landedLinkOwner(input.candidateId);
+    if (alreadyLanded) {
+      throw new Error(
+        `SANDBOX_SAME_LINK: ${input.candidateId} is the same link as ${alreadyLanded}, whose files already landed this run — inspect them instead of transferring again`,
+      );
+    }
     this.transferAttempted = true;
     const attempt = await this.storage.transferCandidate({
       candidateId: input.candidateId,
@@ -748,6 +826,7 @@ export class TaskSandbox {
     if (attempt.status === "succeeded" || attempt.materializedFileIds.length > 0) {
       this.succeededCandidates.add(input.candidateId);
       this.recordMaterialized(input.candidateId, attempt.materializedFileIds);
+      this.noteLandedLink(input.candidateId);
     }
     const staging = await this.storage.listTree({ directoryId: this.stagingDirectoryId });
     // A systemic block ONLY when nothing actually landed — a provider can mark an
@@ -823,6 +902,17 @@ export class TaskSandbox {
         attempts.push({ candidateId, status: "failed", providerMessage: "user rejected" });
         continue;
       }
+      // Same as a rejected copy: record it and keep going, so the rest of the
+      // ranked list still runs. Those files already landed under the earlier alias.
+      const alreadyLanded = this.landedLinkOwner(candidateId);
+      if (alreadyLanded) {
+        attempts.push({
+          candidateId,
+          status: "failed",
+          providerMessage: `same link as ${alreadyLanded} already landed this run`,
+        });
+        continue;
+      }
       this.transferAttempted = true;
       const attempt = await this.storage.transferCandidate({
         candidateId,
@@ -833,17 +923,16 @@ export class TaskSandbox {
         status: attempt.status,
         ...(attempt.providerMessage ? { providerMessage: attempt.providerMessage } : {}),
       });
-      if (attempt.status === "succeeded") {
+      // Failed-but-landed (quark) counts too: the landing point, not the status flag.
+      // The loop still stops only on succeeded.
+      if (attempt.status === "succeeded" || attempt.materializedFileIds.length > 0) {
         this.succeededCandidates.add(candidateId);
         this.recordMaterialized(candidateId, attempt.materializedFileIds);
+        this.noteLandedLink(candidateId);
+      }
+      if (attempt.status === "succeeded") {
         transferredCandidateId = candidateId;
         break;
-      }
-      // Failed but landed (quark): it landed as far as the replace checks go. The
-      // loop itself is unchanged — it still decides on the status as before.
-      if (attempt.materializedFileIds.length > 0) {
-        this.succeededCandidates.add(candidateId);
-        this.recordMaterialized(candidateId, attempt.materializedFileIds);
       }
       // Layer-1: stop on the first failure that is a SYSTEMIC block (quota / auth /
       // VIP) — it may come after one or more dead-link failures, but once we see a
@@ -912,6 +1001,8 @@ export class TaskSandbox {
     // Execute each move (the system does the per-file moves under the hood).
     for (const move of resolved) {
       await this.storage.moveFiles({ fileIds: move.fileIds, targetDirectoryId: move.targetDir });
+      // A movie's target IS staging, so those files were already kept at landing.
+      if (move.targetDir !== this.stagingDirectoryId) this.markKept(move.fileIds);
     }
     // Force-reread every touched target season + staging for one-shot verification.
     const seasons: Record<number, SimTreeFile[]> = {};
@@ -950,6 +1041,7 @@ export class TaskSandbox {
       throw new Error(`SANDBOX_FILES_NOT_IN_${input.directory.toUpperCase()}: ${outOfScope.join(",")}`);
     }
     const { deleted } = await this.storage.deleteFiles({ directoryId, fileIds: input.fileIds });
+    this.markThrown(deleted);
     return { deleted, directory: await this.storage.listTree({ directoryId }) };
   }
 
@@ -1035,7 +1127,9 @@ export class TaskSandbox {
       // next throws WRITE_SCOPE_VIOLATION on a movie dir that is already clean.
       if (wrapper.path.includes("/")) continue;
       if (protectedPaths.some((path) => path.startsWith(`${wrapper.path}/`))) continue;
-      await this.storage.removeDirectory({ directoryId: wrapper.id });
+      const removed = await this.storage.removeDirectory({ directoryId: wrapper.id });
+      // Covers and nfo go with the wrapper. The files just lifted stay kept.
+      this.markThrown(removed.removed);
     }
     return { movie: await this.storage.listTree({ directoryId: root }) };
   }
@@ -1813,8 +1907,8 @@ export class TaskSandbox {
   }
 
   /** Read-only tool: view the pre-warmed raw snapshot as a structured document.
-   *  Free, repeatable, does NOT consume search budget. Returns id + title for each
-   *  candidate (truncated at 120 if excessive). */
+   *  Free, repeatable, does NOT consume search budget. Each row is id + title,
+   *  plus · 发布 YYYY-MM-DD when postedAt is known (truncated at 120 if excessive). */
   viewResourceSnapshot(): { document: string; candidateCount: number } {
     if (!this.rawSnapshot) {
       return {
@@ -1836,7 +1930,8 @@ export class TaskSandbox {
     let document = `📋 Raw snapshot (${total} candidates):\n\n`;
 
     for (const candidate of truncated) {
-      document += `[${candidate.id}] ${candidate.title}\n`;
+      const posted = candidate.postedAt ? ` · 发布 ${candidate.postedAt}` : "";
+      document += `[${candidate.id}] ${candidate.title}${posted}\n`;
     }
 
     if (remaining > 0) {

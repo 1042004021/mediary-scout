@@ -10,7 +10,8 @@ import type { ResourceProviderV2, ResourceSnapshotV2 } from "./fake-provider.js"
  * Phase 6 — the real PanSou provider as a ResourceProviderV2. It runs the real
  * search, records each candidate's full payload in the shared registry (so the
  * storage adapter can transfer by id), and hands the agent only the V2 view:
- * id/title — never the raw url or provider index.
+ * id, title, and postedAt (YYYY-MM-DD) when the payload date is real — never
+ * the raw url or provider index.
  *
  * The ids the agent sees are short run-local aliases (snapshot `s2`, candidate
  * `s2-14`), not the provider's `pansou_<runId>_<hash>_candidate_14`: the long form
@@ -123,10 +124,14 @@ export class RealResourceProviderV2 implements ResourceProviderV2 {
     return {
       id: snapshotAlias,
       keyword: snapshot.keyword,
-      candidates: kept.map((candidate) => ({
-        id: aliasOf.get(candidate.id)!,
-        title: candidate.title,
-      })),
+      candidates: kept.map((candidate) => {
+        const postedAt = postedAtFromDatetime(candidate.providerPayload?.["datetime"]);
+        return {
+          id: aliasOf.get(candidate.id)!,
+          title: candidate.title,
+          ...(postedAt ? { postedAt } : {}),
+        };
+      }),
       // 源健康态必须穿过这个边界。它在这里被丢掉过一次,后果是 6 天里源挂着,
       // agent 只看到空候选、照常 reportNoCoverage,用户看到「暂未找到可用资源」。
       ...(snapshot.sourceHealth ? { sourceHealth: snapshot.sourceHealth } : {}),
@@ -161,6 +166,21 @@ export class RealResourceProviderV2 implements ResourceProviderV2 {
       return [];
     }
   }
+}
+
+/** YYYY-MM-DD when `datetime` is a real calendar date. PanSou sends
+ *  `0001-01-01T00:00:00Z` for unknown, and a year before 2000 is not a post date. */
+function postedAtFromDatetime(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const match = /^(\d{4})-(\d{2})-(\d{2})(?:$|T)/.exec(value.trim());
+  if (!match) return undefined;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (year < 2000) return undefined;
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return undefined;
+  return `${match[1]}-${match[2]}-${match[3]}`;
 }
 
 /** Caps a read-failure message logged in the hot search path — some providers'
