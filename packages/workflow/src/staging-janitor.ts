@@ -22,6 +22,13 @@ export interface StagingJanitorClock {
 }
 
 const PAN123_MIN_INTERVAL_MS = 1500;
+/** One paced call can paginate. 123 answers the burst with code=100011. Two backoffs, then give up. */
+const RATE_LIMIT_BACKOFF_MS = [3000, 6000];
+
+function isRateLimited(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /code=100011|请勿频繁操作/.test(message);
+}
 
 const realtimeClock: StagingJanitorClock = {
   now: () => Date.now(),
@@ -32,20 +39,34 @@ function minIntervalMs(provider: string): number {
   return provider === "pan123" ? PAN123_MIN_INTERVAL_MS : 0;
 }
 
-/** Start-to-start gap. The first call does not wait. gap 0 never sleeps. */
+/** Start-to-start gap. The first call does not wait. gap 0 never sleeps.
+ *  A code=100011 / 请勿频繁操作 waits 3s then 6s and retries; the third such
+ *  failure, or any other error, propagates. */
 function pacerFor(gapMs: number, clock: StagingJanitorClock): <T>(run: () => Promise<T>) => Promise<T> {
   let last = Number.NEGATIVE_INFINITY;
   return async function pace<T>(run: () => Promise<T>): Promise<T> {
-    if (gapMs > 0 && Number.isFinite(last)) {
-      const wait = gapMs - (clock.now() - last);
-      if (wait > 0) {
-        await clock.sleep(wait);
+    let attempt = 0;
+    for (;;) {
+      if (gapMs > 0 && Number.isFinite(last)) {
+        const wait = gapMs - (clock.now() - last);
+        if (wait > 0) {
+          await clock.sleep(wait);
+        }
+      }
+      if (gapMs > 0) {
+        last = clock.now();
+      }
+      try {
+        return await run();
+      } catch (error) {
+        const backoff = RATE_LIMIT_BACKOFF_MS[attempt];
+        if (backoff === undefined || !isRateLimited(error)) {
+          throw error;
+        }
+        attempt += 1;
+        await clock.sleep(backoff);
       }
     }
-    if (gapMs > 0) {
-      last = clock.now();
-    }
-    return run();
   };
 }
 
@@ -208,15 +229,16 @@ async function sweepDrive(
   repository: SweepRepository,
   now: string,
   clock: StagingJanitorClock,
-): Promise<{ removed: number; reported: number }> {
+): Promise<{ removed: number; reported: number; notRemoved: number }> {
   if (drive.status !== "active" || !canSweep(drive.executor)) {
-    return { removed: 0, reported: 0 };
+    return { removed: 0, reported: 0, notRemoved: 0 };
   }
   const executor = drive.executor;
   const pace = pacerFor(minIntervalMs(drive.provider), clock);
   const reported = await loadReported(repository, drive.accountId);
   const pending: Leftover[] = [];
   let removed = 0;
+  let notRemoved = 0;
 
   const shows: Array<{ id: string; name: string }> = [];
   for (const categoryId of [drive.tvCid, drive.animeCid]) {
@@ -251,6 +273,8 @@ async function sweepDrive(
           const result = await pace(() => executor.removeDirectory(child.id));
           if (result.removed) {
             removed += 1;
+          } else {
+            notRemoved += 1;
           }
           continue;
         }
@@ -275,7 +299,7 @@ async function sweepDrive(
 
   const newlyReported = await flush();
   await repository.setAccountSetting(drive.accountId, cursorKey(drive.storageId), "");
-  return { removed, reported: newlyReported };
+  return { removed, reported: newlyReported, notRemoved };
 }
 
 /**
@@ -301,8 +325,12 @@ export async function sweepOrphanStagingDirs(input: {
   for (const drive of input.drives) {
     try {
       const counts = await sweepDrive(drive, input.repository, input.now, clock);
+      const removal =
+        counts.notRemoved > 0
+          ? `removed ${counts.removed} empty (${counts.notRemoved} could not be removed)`
+          : `removed ${counts.removed} empty`;
       log(
-        `[patrol] staging janitor ${drive.storageId}: removed ${counts.removed} empty, reported ${counts.reported} non-empty`,
+        `[patrol] staging janitor ${drive.storageId}: ${removal}, reported ${counts.reported} non-empty`,
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

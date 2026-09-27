@@ -382,6 +382,116 @@ describe("sweepOrphanStagingDirs", () => {
     expect(await repo.getAccountSetting("acct", "staging_janitor_cursor:drive-resume")).toBe("");
   });
 
+  it("retries a 100011 inside one listTree, then finishes the walk", async () => {
+    let now = 0;
+    const sleeps: number[] = [];
+    const clock = {
+      now: () => now,
+      sleep: async (ms: number) => {
+        sleeps.push(ms);
+        now += ms;
+      },
+    };
+    let trees = 0;
+    const executor = {
+      async listChildDirectories(parentId: string) {
+        if (parentId === "tv") return [{ id: "show", name: "Show" }];
+        return [{ id: "stg", name: "staging-old" }];
+      },
+      async listTree() {
+        trees += 1;
+        if (trees === 1) {
+          throw new Error("PAN123_FAILED(/file/list/new): code=100011 请勿频繁操作");
+        }
+        return [];
+      },
+      async removeDirectory() {
+        return { removed: true };
+      },
+    };
+    const repo = new InMemoryWorkflowRepository();
+    const logs: string[] = [];
+    await sweepOrphanStagingDirs({
+      repository: repo,
+      now: NOW,
+      clock,
+      log: (line) => logs.push(line),
+      drives: [drive({ storageId: "d-retry", provider: "pan115", executor })],
+    });
+    expect(trees).toBe(2);
+    expect(sleeps).toContain(3000);
+    expect(logs.some((line) => /d-retry: removed 1 empty, reported 0 non-empty/.test(line))).toBe(true);
+  });
+
+  it("propagates a 100011 after two retries and saves the resume cursor", async () => {
+    let now = 0;
+    const sleeps: number[] = [];
+    const clock = {
+      now: () => now,
+      sleep: async (ms: number) => {
+        sleeps.push(ms);
+        now += ms;
+      },
+    };
+    let trees = 0;
+    const executor = {
+      async listChildDirectories(parentId: string) {
+        if (parentId === "tv") return [{ id: "show", name: "Show" }];
+        return [{ id: "stg", name: "staging-old" }];
+      },
+      async listTree() {
+        trees += 1;
+        throw new Error("PAN123_FAILED(/file/list/new): code=100011 请勿频繁操作");
+      },
+      async removeDirectory() {
+        return { removed: true };
+      },
+    };
+    const repo = new InMemoryWorkflowRepository();
+    const logs: string[] = [];
+    await sweepOrphanStagingDirs({
+      repository: repo,
+      now: NOW,
+      clock,
+      log: (line) => logs.push(line),
+      drives: [drive({ storageId: "d-limit", provider: "pan115", executor })],
+    });
+    expect(trees).toBe(3);
+    expect(sleeps).toEqual([3000, 6000]);
+    expect(await repo.getAccountSetting("acct", "staging_janitor_cursor:d-limit")).toBe("show");
+    expect(logs.some((line) => /d-limit: failed: .*100011/.test(line))).toBe(true);
+  });
+
+  it("logs an empty orphan whose removeDirectory returned removed:false", async () => {
+    const repo = new InMemoryWorkflowRepository();
+    const logs: string[] = [];
+    await sweepOrphanStagingDirs({
+      repository: repo,
+      now: NOW,
+      log: (line) => logs.push(line),
+      drives: [
+        drive({
+          storageId: "drive-stuck",
+          executor: {
+            async listChildDirectories(parentId: string) {
+              if (parentId === "tv") return [{ id: "show", name: "Show" }];
+              return [{ id: "stg", name: "staging-old" }];
+            },
+            async listTree() {
+              return [];
+            },
+            async removeDirectory() {
+              return { removed: false };
+            },
+          },
+        }),
+      ],
+    });
+    expect(logs).toContain(
+      "[patrol] staging janitor drive-stuck: removed 0 empty (1 could not be removed), reported 0 non-empty",
+    );
+  });
+
   it("does not touch a drive whose executor cannot list and remove", async () => {
     const repo = new InMemoryWorkflowRepository();
     let listed = false;

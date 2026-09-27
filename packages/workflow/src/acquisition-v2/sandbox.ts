@@ -1042,8 +1042,12 @@ export class TaskSandbox {
     // files did not move. The agent otherwise marks the episodes obtained and the
     // only copies sit in staging (2026-09-27, 14 episodes).
     for (const move of resolved) {
+      // null = moveFiles threw before any list. A returned list, even a short one,
+      // is the ids already in the season; only the rest are still only in staging.
+      let landed: readonly string[] | null = null;
       try {
         const moved = await this.storage.moveFiles({ fileIds: move.fileIds, targetDirectoryId: move.targetDir });
+        landed = moved.moved;
         // A movie's target IS staging, so those files were already kept at landing.
         // 115 can answer ok:false and return moved: [] — those files are still in staging.
         if (move.targetDir !== this.stagingDirectoryId) this.markKept(moved.moved);
@@ -1054,11 +1058,10 @@ export class TaskSandbox {
           this.unmovedFileIds.delete(fileId);
         }
       } catch (error) {
-        // The whole batch stays "unmoved". A partial moveFiles still leaves the
-        // already-moved ids here until a later full move or deleteFiles clears them;
-        // keeping the dir is the safe side of that ambiguity.
+        const landedIds = new Set(landed ?? []);
         for (const fileId of move.fileIds) {
-          this.unmovedFileIds.add(fileId);
+          if (landedIds.has(fileId)) this.unmovedFileIds.delete(fileId);
+          else this.unmovedFileIds.add(fileId);
         }
         const reason = error instanceof Error ? error.message : String(error);
         throw new Error(

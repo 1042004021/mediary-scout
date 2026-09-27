@@ -215,6 +215,41 @@ describe("discardStaging refuses while a failed move's files are still in stagin
   });
 });
 
+describe("a partial move tracks only the ids that stayed behind", () => {
+  it("moveFiles returning moved: [f1] for [f1, f2] leaves only f2 unmoved, and moving f2 then allows discardStaging", async () => {
+    const { sandbox, storage, stagingDirectoryId, first, second } = await stagedSandbox();
+    const removed: string[] = [];
+    const realRemove = storage.removeDirectory.bind(storage);
+    storage.removeDirectory = async (input) => {
+      removed.push(input.directoryId);
+      return realRemove(input);
+    };
+    const realMove = storage.moveFiles.bind(storage);
+    let partial = true;
+    storage.moveFiles = async (input) => {
+      if (partial) {
+        return { moved: [first] };
+      }
+      return realMove(input);
+    };
+    await expect(sandbox.moveToSeason({ moves: [{ season: 1, fileIds: [first, second] }] })).rejects.toThrow(/MOVE_NOT_DONE/);
+    expect(sandbox.unmovedStagingFileIds()).toEqual([second]);
+    partial = false;
+    await sandbox.moveToSeason({ moves: [{ season: 1, fileIds: [second] }] });
+    await sandbox.discardStaging();
+    expect(removed).toEqual([stagingDirectoryId]);
+  });
+
+  it("a moveFiles that throws still marks every requested id unmoved", async () => {
+    const { sandbox, storage, first, second } = await stagedSandbox();
+    storage.moveFiles = async () => {
+      throw new Error("PAN115_RATE_LIMIT: API call budget exhausted before moveItems");
+    };
+    await expect(sandbox.moveToSeason({ moves: [{ season: 1, fileIds: [first, second] }] })).rejects.toThrow(/MOVE_NOT_DONE/);
+    expect(sandbox.unmovedStagingFileIds()).toEqual([first, second]);
+  });
+});
+
 describe("withStagingCleanup keeps staging when unmoved files remain", () => {
   it("does not remove the dir and records staging_kept_unmoved_files", async () => {
     const removed: string[] = [];
