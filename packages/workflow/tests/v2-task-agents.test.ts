@@ -438,6 +438,11 @@ describe("user request block", () => {
     // A rule, not user data: above the fence.
     expect(text.indexOf("A TV message without")).toBeLessThan(text.indexOf("\n<user_requests>\n"));
   });
+  it("asks reportReplacement for the new VIDEO file (subtitles only beside it), and says a file gone from the target does not count", () => {
+    const text = userRequestBlock({ userRequests: base });
+    expect(text).toContain("naming THAT episode's own new VIDEO file(s) in fileIds (its subtitles may be included; a subtitle alone does not count)");
+    expect(text).toContain("a file that is not in the target directory when you report (still in staging, or deleted) does NOT count as replaced");
+  });
   it("is part of both system prompts, right after the memory block", () => {
     for (const build of [buildTvAnimeSystemPrompt, buildMovieSystemPrompt]) {
       const prompt = build({ userRequests: base });
@@ -520,6 +525,22 @@ describe("replace tools registration", () => {
       "for a message that names no episode, until you have worked out from its words which episode(s) the user means and passed them to rejectCurrentSource (fileIds [] for an episode with no file)",
     );
     expect(plain.finish?.description).not.toContain("names no episode");
+  });
+
+  it("the reportReplacement description asks for the new video (subtitles may ride along) and says the directories are read when reporting", () => {
+    type DescribedTool = { description?: string };
+    const tools = buildSandboxToolSet(
+      new TaskSandbox({
+        provider: new FakeResourceProviderV2(),
+        need: [],
+        targetSeasonDirectoryIds: { 1: "season" },
+        replace: { requestedEpisodes: ["S01E13"], hasMessages: true, untaggedMessages: 0, onReject: async () => undefined, onReport: async () => undefined },
+      }),
+    ) as Record<string, DescribedTool>;
+    expect(tools.reportReplacement?.description).toContain("its subtitles may be included, but at least one must be the video (a subtitle alone is refused)");
+    expect(tools.reportReplacement?.description).toContain(
+      "It then lists the season/movie directories: a named file that is not there now (still in staging, or deleted since) records that episode not_found",
+    );
   });
 
   it("the finish tool of a replace run returns the report requirement as evidence, not a crash", async () => {

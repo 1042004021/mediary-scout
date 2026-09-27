@@ -650,6 +650,46 @@ describe("runQueuedReplaceRequest", () => {
     // The 待换 episode stays pending, still on the message that asked for it.
     expect((await repository.listPendingReplacements(WORK)).map((p) => [p.episode, p.messageId])).toEqual([["S01E02", "msg_old"]]);
   });
+
+  it("a new file moved in and deleted again before the report is no replacement: no episode source, the episode stays 待换", async () => {
+    const { repository, title, season } = await trackedShow();
+    const storage = storageWithNewRelease();
+    const seasonDir = await seedV2Season(storage, title, season, ["S01E01", "S01E02"]);
+    const message = await repository.createUserMessage({ ...WORK, body: "1 集发蓝", episodeTags: ["S01E01"], now: NOW });
+    await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => "run_rr_deleted_new" });
+    let reportOutput: any;
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        i += 1;
+        if (i === 1) return tool("rejectCurrentSource", { episodes: ["S01E01"], fileIds: ["present_S01E01"], reason: "发蓝" }, i);
+        if (i === 2) return tool("searchResources", { keyword: "Show 01" }, i);
+        if (i === 3) {
+          const search = lastToolOutput(options.prompt, "searchResources");
+          return tool("transferCandidate", { snapshotId: search.snapshot.id, candidateId: search.snapshot.candidates[0].id }, i);
+        }
+        if (i === 4) return tool("moveToSeason", { moves: [{ season: 1, fileIds: ["new01"] }] }, i);
+        // The new file is deleted again before the report.
+        if (i === 5) return tool("deleteFiles", { directory: "season", season: 1, fileIds: ["new01"] }, i);
+        if (i === 6) return tool("markObtained", { codes: ["S01E01"] }, i);
+        if (i === 7) {
+          const search = lastToolOutput(options.prompt, "searchResources");
+          return tool("reportReplacement", { results: [{ episode: "S01E01", outcome: "replaced", candidateId: search.snapshot.candidates[0].id, fileIds: ["new01"], note: "新版" }] }, i);
+        }
+        if (i === 8) reportOutput = lastToolOutput(options.prompt, "reportReplacement");
+        return text("done");
+      },
+    });
+
+    await runQueuedReplaceRequest(baseRun(repository, storage, model));
+
+    expect(reportOutput?.notInTarget).toEqual([{ episode: "S01E01", reason: expect.stringContaining("not in the target directory now: new01") }]);
+    expect((await storage.listTree({ directoryId: seasonDir })).map((f) => f.providerFileId)).not.toContain("new01");
+    expect(await repository.listEpisodeSources(WORK)).toEqual([]);
+    expect((await repository.listPendingReplacements(WORK)).map((p) => [p.episode, p.messageId])).toEqual([["S01E01", message.id]]);
+    const [done] = await repository.listUserMessages(WORK);
+    expect(done?.reply?.results).toEqual([{ episode: "S01E01", outcome: "not_found", note: expect.stringContaining("不算完成替换") }]);
+  });
 });
 
 /** A model that only reports the given episodes not_found, capturing the user prompt. */
