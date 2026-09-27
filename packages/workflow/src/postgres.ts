@@ -2112,8 +2112,7 @@ function connectedStorageFromRow(row: Record<string, unknown>): ConnectedStorage
   };
 }
 
-/** Transaction-scoped lock on one work's user messages (create vs claim). */
-/** processing(runId) → pending + urgent, on the pool or inside a transaction. */
+/** processing(runId) → pending (urgent or not), on the pool or inside a transaction. */
 async function releaseUserMessagesWith(db: Pick<PoolClient, "query">, runId: string, now: string, urgent: boolean): Promise<void> {
   await db.query(
     "UPDATE user_messages SET status = 'pending', urgent = $3, run_id = NULL, updated_at = $1 WHERE run_id = $2 AND status = 'processing'",
@@ -2121,6 +2120,7 @@ async function releaseUserMessagesWith(db: Pick<PoolClient, "query">, runId: str
   );
 }
 
+/** Transaction-scoped lock on one work's user messages (create vs claim). */
 async function lockUserMessageWork(client: PoolClient, scope: UserMessageScope): Promise<void> {
   await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
     `user_messages:${scope.accountId}:${scope.drive}:${scope.titleKey}`,
