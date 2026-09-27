@@ -18,6 +18,7 @@ import {
   type LibraryWallStateValue,
   type TitleAggregateState,
 } from "./title-aggregate";
+import { createTtlMemo } from "./series-target-memo";
 import { InMemoryJsonCache, PostgresMediaSearchCache, type DurableJsonCache } from "./tmdb-cache";
 import {
   ensureDemoSeeded,
@@ -89,9 +90,10 @@ export interface MovieHubView {
 export type DetailView = TitleHubView | MovieHubView;
 
 const SERIES_TARGET_TTL_MS = 6 * 60 * 60 * 1000;
-// L1: per-process in-memory cache (fast, but resets on every restart — which is
-// why a cold detail-page load paid a live TMDB round-trip every dev restart).
-const seriesTargetCache = new Map<number, { value: PreparedSeriesTarget; expiresAt: number }>();
+/** A miss (unknown id, or TMDB timed out) must not be retried on the refresh
+ *  that follows the load which just learned it. Short on purpose: a real
+ *  outage should not hide season metadata for the success TTL. */
+const SERIES_TARGET_MISS_TTL_MS = 60_000;
 // L2: durable Postgres cache, so the season list + artwork survive restarts and
 // the page renders from the DB instead of re-hitting TMDB on every cold load.
 let durableTargetCache: DurableJsonCache | null = null;
@@ -108,36 +110,38 @@ function getDurableTargetCache(): DurableJsonCache {
   return durableTargetCache;
 }
 
+async function loadSeriesTarget(tmdbId: number): Promise<PreparedSeriesTarget | null> {
+  const durable = getDurableTargetCache();
+  const fromDb = await durable.getJson<PreparedSeriesTarget>(`series-target:${tmdbId}`);
+  if (fromDb) return fromDb;
+  try {
+    const value = await prepareSeriesTarget({
+      tmdbId,
+      qualityPreference: process.env.MEDIA_TRACK_DEFAULT_QUALITY ?? "4K",
+      metadataProvider: createTmdbMetadataProvider(await getTmdbAccesses(getAccountScopedSettings(await getCurrentAccountId()))),
+    });
+    await durable.setJson(`series-target:${tmdbId}`, value, SERIES_TARGET_TTL_MS);
+    return value;
+  } catch {
+    return null;
+  }
+}
+
+const seriesTargetMemo = createTtlMemo<PreparedSeriesTarget>({
+  successTtlMs: SERIES_TARGET_TTL_MS,
+  failureTtlMs: SERIES_TARGET_MISS_TTL_MS,
+  load: loadSeriesTarget,
+});
+
 /**
  * Season metadata + artwork for a title, independent of tracking state.
- * Live TMDB when configured (cached 6h per title), demo candidates otherwise,
+ * Live TMDB when configured (cached 6h per title; a miss is remembered for a
+ * minute so refresh does not wait on it again), demo candidates otherwise,
  * null when the title is unknown to both.
  */
 async function seriesTargetFor(tmdbId: number): Promise<PreparedSeriesTarget | null> {
   if (process.env.MEDIA_TRACK_SEARCH_PROVIDER === "tmdb") {
-    const cached = seriesTargetCache.get(tmdbId);
-    if (cached && cached.expiresAt > Date.now()) {
-      return cached.value;
-    }
-    const durable = getDurableTargetCache();
-    const fromDb = await durable.getJson<PreparedSeriesTarget>(`series-target:${tmdbId}`);
-    if (fromDb) {
-      // DB hit — warm L1 and skip the TMDB round-trip (this is the cold-load fix).
-      seriesTargetCache.set(tmdbId, { value: fromDb, expiresAt: Date.now() + SERIES_TARGET_TTL_MS });
-      return fromDb;
-    }
-    try {
-      const value = await prepareSeriesTarget({
-        tmdbId,
-        qualityPreference: process.env.MEDIA_TRACK_DEFAULT_QUALITY ?? "4K",
-        metadataProvider: createTmdbMetadataProvider(await getTmdbAccesses(getAccountScopedSettings(await getCurrentAccountId()))),
-      });
-      seriesTargetCache.set(tmdbId, { value, expiresAt: Date.now() + SERIES_TARGET_TTL_MS });
-      await durable.setJson(`series-target:${tmdbId}`, value, SERIES_TARGET_TTL_MS);
-      return value;
-    } catch {
-      return seriesTargetCache.get(tmdbId)?.value ?? null;
-    }
+    return seriesTargetMemo(tmdbId);
   }
 
   const candidate = findDemoCandidateByTmdbId(tmdbId);
