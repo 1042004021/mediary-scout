@@ -1276,6 +1276,130 @@ describe("runQueuedReplaceRequest — scope, metadata and bookkeeping", () => {
   });
 });
 
+describe("runQueuedReplaceRequest — 不换了 while the run works", () => {
+  const CODES = Array.from({ length: 24 }, (_, i) => `S01E${String(i + 1).padStart(2, "0")}`);
+
+  /** A 24-episode season, every episode obtained, its files in the library. */
+  async function longShow() {
+    const repository = new InMemoryWorkflowRepository();
+    const { title, season: base } = trackedFixture();
+    const season: TrackedSeason = { ...base, totalEpisodes: 24, latestAiredEpisode: 24 };
+    await seedTrackedSeason({ repository, title, season, obtainedCodes: CODES });
+    const storage = new FakeStorageExecutor();
+    await seedV2Season(storage, title, season, CODES);
+    return { repository, storage };
+  }
+
+  /** The user's 不换了: the episodes' 待换 rows are deleted. */
+  const dropPending = (repository: InMemoryWorkflowRepository, episodes: string[]) =>
+    repository.removePendingReplacements({ ...WORK, episodes });
+
+  it("a 待换-only episode the user dropped mid-run stays dropped when the run does not find it; a tagged episode not found stays 待换", async () => {
+    const { repository, storage } = await longShow();
+    await repository.addPendingReplacements({ ...WORK, episodes: ["S01E24"], messageId: "msg_old", now: NOW });
+    const message = await repository.createUserMessage({ ...WORK, body: "13 集发蓝", episodeTags: ["S01E13"], now: NOW });
+    await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => "run_rr_dropped" });
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => {
+        i += 1;
+        if (i === 1) {
+          await dropPending(repository, ["S01E24"]);
+          return tool(
+            "reportReplacement",
+            { results: [{ episode: "S01E13", outcome: "not_found", note: "没找到" }, { episode: "S01E24", outcome: "not_found", note: "还是没有" }] },
+            i,
+          );
+        }
+        return text("done");
+      },
+    });
+
+    const result = await runQueuedReplaceRequest(baseRun(repository, storage, model));
+
+    expect(result).toMatchObject({ status: "ran", workflowRunId: "run_rr_dropped", workflowStatus: "succeeded" });
+    expect((await repository.listPendingReplacements(WORK)).map((p) => [p.episode, p.messageId])).toEqual([["S01E13", message.id]]);
+    // The reply still says what the run found for each episode.
+    const [done] = await repository.listUserMessages(WORK);
+    expect(done?.reply?.results.map((r) => [r.episode, r.outcome])).toEqual([["S01E13", "not_found"], ["S01E24", "not_found"]]);
+  });
+
+  it("a dropped 待换 episode whose copy the agent rejects afresh this run is written back; re-rejecting the copy already on the list is no new request", async () => {
+    const { repository, storage } = await longShow();
+    await repository.addPendingReplacements({ ...WORK, episodes: ["S01E20", "S01E24"], messageId: "msg_old", now: NOW });
+    // E24's current copy was rejected by the run that left it 待换; E20's never was.
+    await repository.addRejectedResources({
+      accountId: "acct_1",
+      titleKey: "tmdb_tv_42",
+      now: NOW,
+      items: [{ episode: "S01E24", linkKey: null, label: "Show.S01E24.mkv", sizeBytes: 1_000_000_000, reason: "发蓝", messageId: "msg_old" }],
+    });
+    await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => "run_rr_rejected" });
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => {
+        i += 1;
+        if (i === 1) return tool("rejectCurrentSource", { episodes: ["S01E24"], fileIds: ["present_S01E24"], reason: "发蓝" }, i);
+        if (i === 2) return tool("rejectCurrentSource", { episodes: ["S01E20"], fileIds: ["present_S01E20"], reason: "口型对不上" }, i);
+        if (i === 3) {
+          await dropPending(repository, ["S01E20", "S01E24"]);
+          return tool(
+            "reportReplacement",
+            { results: [{ episode: "S01E20", outcome: "not_found", note: "没找到" }, { episode: "S01E24", outcome: "not_found", note: "还是没有" }] },
+            i,
+          );
+        }
+        return text("done");
+      },
+    });
+
+    const result = await runQueuedReplaceRequest(baseRun(repository, storage, model));
+
+    expect(result).toMatchObject({ status: "ran", workflowRunId: "run_rr_rejected", workflowStatus: "succeeded" });
+    // Only E20 got a new rejection this run (E24's copy was already on the list).
+    expect((await repository.listRejectedResources({ accountId: "acct_1", titleKey: "tmdb_tv_42" })).map((r) => r.episode).sort()).toEqual(["S01E20", "S01E24"]);
+    expect((await repository.listPendingReplacements(WORK)).map((p) => [p.episode, p.messageId])).toEqual([["S01E20", "msg_old"]]);
+  });
+
+  it("a film's new message asks for the film again: dropped mid-run and not found, it is 待换 again", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    const title: MediaTitle = { id: "tmdb_movie_55", tmdbId: 55, type: "movie", title: "Film", originalTitle: "Film", year: 2010, aliases: [] };
+    const season = movieAnchorSeason({ titleId: title.id, qualityPreference: "4K", storageDirectoryId: "dir_movie" });
+    await repository.saveWorkflowRunSnapshot({
+      accountId: "acct_1",
+      connectedStorageId: DRIVE,
+      title,
+      season,
+      workflowRun: { id: "seed_movie55", kind: "movie_init", status: "no_coverage", trackedSeasonId: season.id, startedAt: "2026-09-01T00:00:00.000Z", finishedAt: "2026-09-01T00:00:00.000Z", auditEvents: [] },
+      episodes: createEpisodeStates({ trackedSeasonId: season.id, seasonNumber: 1, totalEpisodes: 1, latestAiredEpisode: 1 }),
+      resourceSnapshots: [],
+      decisions: [],
+      transferAttempts: [],
+      notifications: [],
+    });
+    const work = { accountId: "acct_1", drive: DRIVE, titleKey: title.id };
+    await repository.addPendingReplacements({ ...work, episodes: ["MOVIE"], messageId: "msg_old", now: NOW });
+    // A film's message means the film, with or without a tag (this one has none).
+    await repository.createUserMessage({ ...work, body: "还是假片", episodeTags: [], now: NOW });
+    await queueReplaceRequest({ repository, work, now: fixedNow, createWorkflowRunId: () => "run_rr_movie55" });
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => {
+        i += 1;
+        if (i === 1) {
+          await repository.removePendingReplacements({ ...work, episodes: ["MOVIE"] });
+          return tool("reportReplacement", { results: [{ episode: "MOVIE", outcome: "not_found", note: "没找到" }] }, i);
+        }
+        return text("done");
+      },
+    });
+
+    await runQueuedReplaceRequest(baseRun(repository, new FakeStorageExecutor(), model));
+
+    expect((await repository.listPendingReplacements(work)).map((p) => [p.episode, p.messageId])).toEqual([["MOVIE", "msg_old"]]);
+  });
+});
+
 describe("replace_request notifications — patrol vs user", () => {
   const SCOPE = { accountId: "acct_1", connectedStorageId: DRIVE };
 

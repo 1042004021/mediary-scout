@@ -403,7 +403,9 @@ export async function runQueuedReplaceRequest(
     ...r,
     sizeBytes: r.sizeBytes ?? (r.label ? parseSizeFromTitle(r.label) : null),
   }));
-  const outcome = { repository, work, runId, results, messages, pendingRows, now };
+  const rejectedEpisodes = (replacement?.rejected ?? []).map((r) => r.episode);
+  const film = claimed.title.type === "movie";
+  const outcome = { repository, work, runId, results, messages, pendingRows, rejectedEpisodes, film, now };
   try {
     await recordReplacementOutcome(outcome);
   } catch (firstError) {
@@ -471,12 +473,28 @@ async function recordReplacementOutcome(input: {
   runId: string;
   results: Array<{ episode: string; outcome: "replaced" | "not_found"; label?: string; linkKey?: string | null; sizeBytes: number | null }>;
   messages: UserMessage[];
+  /** The work's 待换 rows when the run claimed its work. */
   pendingRows: Array<{ episode: string; messageId: string }>;
+  /** Episodes whose copy the agent rejected this run (a rejection this run added to the list). */
+  rejectedEpisodes: string[];
+  /** A film: each of its messages means the film, tagged or not. */
+  film: boolean;
   now: () => string;
 }): Promise<void> {
   const { repository, work, messages, pendingRows, now } = input;
   const replaced = input.results.filter((r) => r.outcome === "replaced");
-  const notFound = input.results.filter((r) => r.outcome === "not_found").map((r) => r.episode);
+  // An episode that was already 待换 when the run started is written back only when this
+  // run asked for it again: a message the run carries names it (a film's message means
+  // the film), or the agent rejected a copy of it this run. Otherwise its row is left as
+  // it is — still there, or deleted by the user's 「不换了」 while the run worked, and then
+  // it stays deleted.
+  const pendingAtStart = new Set(pendingRows.map((p) => p.episode));
+  const askedByMessages = input.film ? (messages.length > 0 ? ["MOVIE"] : []) : messages.flatMap((m) => m.episodeTags);
+  const askedAgain = new Set([...askedByMessages, ...input.rejectedEpisodes]);
+  const notFound = input.results
+    .filter((r) => r.outcome === "not_found")
+    .map((r) => r.episode)
+    .filter((episode) => !pendingAtStart.has(episode) || askedAgain.has(episode));
   // Per episode, the source first and only then its 待换 row: a failed write leaves
   // the row in place, so the episode comes back next patrol. A pending-only run has no
   // message to release — the row is the only thing that remembers the request.
