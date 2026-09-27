@@ -26,6 +26,7 @@ import {
   isActiveWorkflowStatus,
   isQueueClaimableKind,
   isStaleActiveWorkflowRun,
+  titleBlockFilter,
   type PersistedWorkflowRunSnapshot,
   type PersistWorkflowRunSnapshotInput,
   type ReserveWorkflowRunInput,
@@ -464,8 +465,9 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
     const accountId = snapshot.accountId ?? DEFAULT_ACCOUNT_ID;
     const connectedStorageId = snapshot.connectedStorageId ?? UNSCOPED_STORAGE;
 
+    const blocksTitle = titleBlockFilter(input);
     return this.withTransaction(async (client) => {
-      if (input.blockIfTitleHasActiveRun === true) {
+      if (blocksTitle) {
         // READ COMMITTED alone lets two concurrent reservations both see no active
         // run for the title and both insert. Serialize them per (account, drive,
         // title) for the rest of this transaction.
@@ -476,9 +478,9 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
 
       await this.expireStaleActiveWorkflowRuns(client, input);
 
-      if (input.blockIfTitleHasActiveRun === true) {
+      if (blocksTitle) {
         const titleActive = (await this.selectWorkflowRunsForTitle(client, snapshot.season.mediaTitleId, accountId, connectedStorageId))
-          .filter((workflowRun) => isActiveWorkflowStatus(workflowRun.status))
+          .filter((workflowRun) => isActiveWorkflowStatus(workflowRun.status) && blocksTitle(workflowRun))
           .sort((a, b) => b.startedAt.localeCompare(a.startedAt))[0];
         if (titleActive) {
           const activeSnapshot = await this.loadWorkflowRunSnapshot(client, titleActive.id);

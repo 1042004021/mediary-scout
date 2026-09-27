@@ -398,6 +398,47 @@ describe("runScheduledType3Monitoring (V2 engine)", () => {
     expect(saved?.workflowRun.kind).toBe("movie_init");
   });
 
+  it("a movie patrol is skipped_active when a replace_request for the film is reserved after the sweep's filter", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    const movie: MediaTitle = {
+      id: "tmdb_movie_872585", tmdbId: 872585, type: "movie", title: "奥本海默", originalTitle: "Oppenheimer", year: 2023, aliases: [],
+    };
+    const season = {
+      id: `${movie.id}_movie`, mediaTitleId: movie.id, seasonNumber: 1, status: "completed" as const, qualityPreference: "4K" as const,
+      storageDirectoryId: "", totalEpisodes: 1, latestAiredEpisode: 1, latestAiredSource: "manual" as const,
+    };
+    const episodes = createEpisodeStates({ trackedSeasonId: season.id, seasonNumber: 1, totalEpisodes: 1, latestAiredEpisode: 1 });
+    const empty = { resourceSnapshots: [], decisions: [], transferAttempts: [], notifications: [] };
+    await repository.saveWorkflowRunSnapshot({
+      title: movie, season, episodes, ...empty,
+      workflowRun: { id: "seed_movie", kind: "movie_init", status: "no_coverage", trackedSeasonId: season.id, startedAt: fixedNow(), finishedAt: fixedNow(), auditEvents: [] },
+    });
+    const reserve = repository.reserveWorkflowRun.bind(repository);
+    repository.reserveWorkflowRun = async (input) => {
+      if (input.workflowRun.kind === "movie_init") {
+        await reserve({
+          title: movie, season, episodes, ...empty, blockIfTitleHasActiveRun: true,
+          workflowRun: { id: "run_replace_late", kind: "replace_request", status: "queued", trackedSeasonId: season.id, startedAt: fixedNow(), finishedAt: null, auditEvents: [] },
+        });
+      }
+      return reserve(input);
+    };
+
+    const outcomes = await runScheduledType3Monitoring({
+      repository,
+      resourceProvider: emptyProvider(),
+      storage: new FakeStorageExecutor(),
+      model: noCoverageModel(),
+      storageParentDirectoryId: "tv_root",
+      moviesParentDirectoryId: "movies_root",
+      now: fixedNow,
+      createWorkflowRunId: () => "run_movie_patrol",
+    });
+
+    expect(outcomes).toEqual([{ trackedSeasonId: season.id, status: "skipped_active" }]);
+    expect(await repository.getWorkflowRunSnapshot("run_movie_patrol")).toBeNull();
+  });
+
   it("does NOT patrol a reserved film whose release date is still in the future (air-time gate)", async () => {
     const repository = new InMemoryWorkflowRepository();
     await reserveMovie({
@@ -852,6 +893,34 @@ describe("runScheduledType3Monitoring — user requests", () => {
 
     expect(outcomes.filter((o) => o.trackedSeasonId === season.id)).toEqual([]);
     expect((await repository.listActiveWorkflowRuns()).map((r) => r.workflowRun.id)).toEqual(["run_replace_queued"]);
+  });
+
+  it("a replace_request reserved after the patrol's pre-filter still keeps the patrol out (skipped_active)", async () => {
+    const { repository, storage, season } = await completeShow();
+    const { title } = trackedFixture();
+    const reserve = repository.reserveWorkflowRun.bind(repository);
+    repository.reserveWorkflowRun = async (input) => {
+      if (input.workflowRun.kind === "type3_monitor") {
+        // "现在处理" lands between the sweep's busy-work check and this reservation.
+        await reserve({
+          title,
+          season,
+          workflowRun: { id: "run_replace_late", kind: "replace_request", status: "queued", trackedSeasonId: season.id, startedAt: fixedNow(), finishedAt: null, auditEvents: [] },
+          episodes: (await repository.getTrackedSeasonState(season.id))!.episodes,
+          resourceSnapshots: [],
+          decisions: [],
+          transferAttempts: [],
+          notifications: [],
+          blockIfTitleHasActiveRun: true,
+        });
+      }
+      return reserve(input);
+    };
+
+    const outcomes = await patrol(repository, storage);
+
+    expect(outcomes).toEqual([{ trackedSeasonId: season.id, status: "skipped_active" }]);
+    expect((await repository.listActiveWorkflowRuns()).map((r) => r.workflowRun.id)).toEqual(["run_replace_late"]);
   });
 
   it("one work whose replace request cannot be queued does not abort the sweep", async () => {

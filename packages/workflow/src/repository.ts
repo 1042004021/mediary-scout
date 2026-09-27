@@ -63,6 +63,17 @@ export function seasonScopeKey(seasonId: string, connectedStorageId: string | nu
   return `${seasonId}\u0000${connectedStorageId ?? UNSCOPED_STORAGE}`;
 }
 
+/** Which active runs of the same title refuse a reservation, or null when the
+ *  reservation is not title-exclusive at all (see ReserveWorkflowRunInput). */
+export function titleBlockFilter(
+  input: Pick<ReserveWorkflowRunInput, "blockIfTitleHasActiveRun" | "blockIfTitleHasActiveKinds">,
+): ((run: Pick<WorkflowRun, "kind">) => boolean) | null {
+  if (input.blockIfTitleHasActiveRun === true) return () => true;
+  const kinds = input.blockIfTitleHasActiveKinds;
+  if (kinds && kinds.length > 0) return (run) => kinds.includes(run.kind);
+  return null;
+}
+
 export interface PersistWorkflowRunSnapshotInput {
   /** Owning account. Optional at the call site (single-user = implicit
    *  acct_default); the repository stamps it onto the account_id column. */
@@ -117,6 +128,14 @@ export interface ReserveWorkflowRunInput extends PersistWorkflowRunSnapshotInput
    * spawn overlapping writers on the same title.
    */
   blockIfTitleHasActiveRun?: boolean;
+  /**
+   * Narrower title-level exclusion: refuse only if an active run of one of these
+   * kinds exists for the same (account, drive, title). The patrol sets
+   * ["replace_request"]: a replace run works every season's directory, so a patrol
+   * run beside it would race it, while patrol runs of other seasons must not block
+   * each other. Checked under the same lock as blockIfTitleHasActiveRun.
+   */
+  blockIfTitleHasActiveKinds?: WorkflowKind[];
   staleActiveRunStartedBefore?: string;
   staleFinishedAt?: string;
 }
@@ -875,7 +894,8 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     // constraint, so legacy/null stays null for backfill to pin later); the
     // episode bucket key collapses null→sentinel via seasonScopeKey.
     const storageValue = snapshot.connectedStorageId ?? null;
-    if (input.blockIfTitleHasActiveRun === true) {
+    const blocksTitle = titleBlockFilter(input);
+    if (blocksTitle) {
       const titleActive = Array.from(this.workflowRuns.values())
         .filter(
           (stored) =>
@@ -883,7 +903,8 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
             // different drives may each track the same title independently.
             scopeMatches(reservingScope, stored.accountId, stored.connectedStorageId) &&
             stored.season.mediaTitleId === snapshot.season.mediaTitleId &&
-            isActiveWorkflowStatus(stored.workflowRun.status),
+            isActiveWorkflowStatus(stored.workflowRun.status) &&
+            blocksTitle(stored.workflowRun),
         )
         .sort((a, b) => b.workflowRun.startedAt.localeCompare(a.workflowRun.startedAt))[0];
       if (titleActive) {

@@ -646,6 +646,39 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         }
       });
 
+      it("blockIfTitleHasActiveKinds refuses only while a run of those kinds is active for the title", async () => {
+        const repo = await fresh();
+        const base = workflowPersistenceFixture();
+        const forSeason = (id: string, seasonNumber: number, kind: "type3_monitor" | "replace_request", over: Record<string, unknown> = {}) =>
+          reIded(id, {
+            season: { ...base.season, id: `season_k${seasonNumber}`, seasonNumber },
+            workflowRun: { ...base.workflowRun, id, kind, status: "queued" as const, trackedSeasonId: `season_k${seasonNumber}`, finishedAt: null },
+            episodes: [],
+            connectedStorageId: "cs_kinds",
+            ...over,
+          });
+        // A type3 run on season 1 does not block type3 on season 2.
+        expect((await repo.reserveWorkflowRun(forSeason("run_k1", 1, "type3_monitor"))).status).toBe("reserved");
+        expect(
+          (await repo.reserveWorkflowRun(forSeason("run_k2", 2, "type3_monitor", { blockIfTitleHasActiveKinds: ["replace_request"] }))).status,
+        ).toBe("reserved");
+        // An active replace_request (on season 1) blocks type3 on season 3 with the option...
+        expect((await repo.reserveWorkflowRun(forSeason("run_rr", 1, "replace_request"))).status).toBe("reserved");
+        const blocked = await repo.reserveWorkflowRun(
+          forSeason("run_k3", 3, "type3_monitor", { blockIfTitleHasActiveKinds: ["replace_request"] }),
+        );
+        expect(blocked.status).toBe("already_active");
+        expect((blocked as { snapshot: { workflowRun: { id: string } } }).snapshot.workflowRun.id).toBe("run_rr");
+        // ...and not without it.
+        expect((await repo.reserveWorkflowRun(forSeason("run_k3", 3, "type3_monitor"))).status).toBe("reserved");
+        // Another drive's replace_request does not block.
+        expect(
+          (await repo.reserveWorkflowRun(
+            forSeason("run_k4", 4, "type3_monitor", { connectedStorageId: "cs_other", blockIfTitleHasActiveKinds: ["replace_request"] }),
+          )).status,
+        ).toBe("reserved");
+      });
+
       it("blockIfEpisodeStatesExist returns already_has_episode_state when the scoped bucket is non-empty", async () => {
         const repo = await fresh();
         // Seed episode states via a TERMINAL (succeeded) run so the active-run check

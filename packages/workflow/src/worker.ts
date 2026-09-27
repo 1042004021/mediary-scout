@@ -490,8 +490,9 @@ export async function runScheduledType3Monitoring(input: {
     }
   }
   // Also skip works whose replace run is already in flight: a type3 run beside it
-  // would work the same directories at the same time (the per-season reservation
-  // only blocks the same kind, not a title-level replace_request).
+  // would work the same directories at the same time. This filter is only the cheap
+  // path; a replace run queued after it is caught by the patrol reservation itself
+  // (blockIfTitleHasActiveKinds).
   const busyKeys = new Set((await input.repository.listWorksWithProcessingMessages()).map(workKey));
   for (const accountId of new Set(trackedStates.map((s) => s.accountId))) {
     for (const run of await input.repository.listActiveWorkflowRuns({ accountId, connectedStorageId: null })) {
@@ -625,6 +626,9 @@ async function patrolTrackedState(args: {
       decisions: [],
       transferAttempts: [],
       notifications: [],
+      // The sweep's busy-work filter is not atomic with this reservation: a replace
+      // run queued in between (现在处理) would otherwise work the same directories.
+      blockIfTitleHasActiveKinds: ["replace_request"],
       ...(staleActiveRunStartedBefore === null
         ? {}
         : { staleActiveRunStartedBefore, staleFinishedAt: startedAt }),
@@ -804,6 +808,8 @@ async function patrolMovie(args: {
     decisions: [],
     transferAttempts: [],
     notifications: [],
+    // Same race as the TV patrol: a replace run queued after the sweep's filter.
+    blockIfTitleHasActiveKinds: ["replace_request"],
     ...(staleActiveRunStartedBefore === null
       ? {}
       : { staleActiveRunStartedBefore, staleFinishedAt: startedAt }),

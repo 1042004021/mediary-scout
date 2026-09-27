@@ -68,6 +68,7 @@ import {
   tearsDownTrackingOnCancel,
   retriedWorkflowRun,
   seasonScopeKey,
+  titleBlockFilter,
   UNSCOPED_STORAGE,
   validateWorkflowRunSnapshot,
   withDerivedEpisodeSummaries,
@@ -320,16 +321,17 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
     const accountId = snapshot.accountId ?? DEFAULT_ACCOUNT_ID;
     const connectedStorageId = snapshot.connectedStorageId ?? UNSCOPED_STORAGE;
 
+    const blocksTitle = titleBlockFilter(input);
     return this.db.transaction((): WorkflowRunReservationResult => {
       this.expireStaleActiveWorkflowRuns(input);
 
-      if (input.blockIfTitleHasActiveRun === true) {
+      if (blocksTitle) {
         const titleActive = this.selectWorkflowRunsForTitle(
           snapshot.season.mediaTitleId,
           accountId,
           connectedStorageId,
         )
-          .filter((workflowRun) => isActiveWorkflowStatus(workflowRun.status))
+          .filter((workflowRun) => isActiveWorkflowStatus(workflowRun.status) && blocksTitle(workflowRun))
           .sort((a, b) => b.startedAt.localeCompare(a.startedAt))[0];
         if (titleActive) {
           const activeSnapshot = this.loadSnapshot(titleActive.id);
