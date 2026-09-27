@@ -124,6 +124,46 @@ describe("reflection digest — what became of the transferred files", () => {
     expect(sandbox.materializedFate("film")).toEqual({ kept: 2, thrownAway: 0 });
   });
 
+  it("keeps a wrapper whose film did not move, and does not count that film as thrown", async () => {
+    const removed: string[] = [];
+    const sandbox = await flattenMoveSandbox({
+      files: [
+        { id: "vid", path: "Wrapper/Film.mkv", sizeBytes: 10, isVideo: true, isSubtitle: false },
+        { id: "nfo", path: "Wrapper/extra.nfo", sizeBytes: 1, isVideo: false, isSubtitle: false },
+      ],
+      wrappers: [{ id: "wrap-dir", path: "Wrapper" }],
+      moved: [],
+      onRemove: (id) => removed.push(id),
+    });
+    await expect(sandbox.flattenMovie()).rejects.toThrow(
+      "FLATTEN_NOT_DONE: 1 file(s) did not move out of their wrapper (vid) — the wrapper holding them was kept; call flattenMovie again",
+    );
+    expect(removed).toEqual([]);
+    expect(sandbox.materializedFate("film")).toEqual({ kept: 2, thrownAway: 0 });
+  });
+
+  it("removes only wrappers whose videos and subtitles all moved, and counts the lifted file as kept", async () => {
+    const removed: string[] = [];
+    const sandbox = await flattenMoveSandbox({
+      files: [
+        { id: "vid", path: "Good/Film.mkv", sizeBytes: 10, isVideo: true, isSubtitle: false },
+        { id: "cover", path: "Good/cover.jpg", sizeBytes: 1, isVideo: false, isSubtitle: false },
+        { id: "stuck", path: "Stuck/Other.mkv", sizeBytes: 10, isVideo: true, isSubtitle: false },
+      ],
+      wrappers: [
+        { id: "good-dir", path: "Good" },
+        { id: "stuck-dir", path: "Stuck" },
+      ],
+      moved: ["vid"],
+      onRemove: (id) => removed.push(id),
+    });
+    await expect(sandbox.flattenMovie()).rejects.toThrow(
+      "FLATTEN_NOT_DONE: 1 file(s) did not move out of their wrapper (stuck) — the wrapper holding them was kept; call flattenMovie again",
+    );
+    expect(removed).toEqual(["good-dir"]);
+    expect(sandbox.materializedFate("film")).toEqual({ kept: 2, thrownAway: 1 });
+  });
+
   it("counts a file as kept only when moveFiles reports that it moved", async () => {
     expect((await moveFateSandbox([])).materializedFate("pack")).toEqual({ kept: 0, thrownAway: 2 });
     expect((await moveFateSandbox(["f1"])).materializedFate("pack")).toEqual({ kept: 1, thrownAway: 1 });
@@ -189,6 +229,53 @@ async function flattenFateSandbox(removed: string[]): Promise<TaskSandbox> {
     },
     async removeDirectory() {
       return { removed: [...removed] };
+    },
+    async transferSubtitleUrls() {
+      return [];
+    },
+  };
+  const sandbox = new TaskSandbox({
+    provider: new FakeResourceProviderV2({ results: { film: [{ id: "film", title: "Film" }] } }),
+    storage,
+    stagingDirectoryId: "movie",
+    targetMovieDirectoryId: "movie",
+    need: ["MOVIE"],
+  });
+  const snapshotId = (await sandbox.searchResources("film")).snapshot!.id;
+  await sandbox.transferCandidate({ snapshotId, candidateId: "film" });
+  return sandbox;
+}
+
+async function flattenMoveSandbox(options: {
+  files: SimTreeFile[];
+  wrappers: Array<{ id: string; path: string }>;
+  moved: string[];
+  onRemove: (directoryId: string) => void;
+}): Promise<TaskSandbox> {
+  const storage: StorageV2 = {
+    async createDirectory() {
+      return "movie";
+    },
+    async transferCandidate() {
+      return { status: "succeeded", materializedFileIds: options.files.map((file) => file.id) };
+    },
+    candidateLinkKind: () => "unknown",
+    async listTree() {
+      return options.files.map((file) => ({ ...file }));
+    },
+    async listSubdirectories() {
+      return options.wrappers.map((wrapper) => ({ ...wrapper }));
+    },
+    async moveFiles() {
+      return { moved: [...options.moved] };
+    },
+    async renameFile() {},
+    async deleteFiles() {
+      return { deleted: [] };
+    },
+    async removeDirectory(input) {
+      options.onRemove(input.directoryId);
+      return { removed: [input.directoryId] };
     },
     async transferSubtitleUrls() {
       return [];

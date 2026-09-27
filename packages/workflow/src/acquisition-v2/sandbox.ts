@@ -1153,24 +1153,33 @@ export class TaskSandbox {
     const nested = tree.filter(
       (file) => (file.isVideo || file.isSubtitle) && file.path.includes("/") && !this.protectedFiles.has(file.id),
     );
-    if (nested.length > 0) {
-      await this.storage.moveFiles({ fileIds: nested.map((file) => file.id), targetDirectoryId: root });
-    }
+    // 115 answers ok:false with { moved: [] }. Those files are still inside the
+    // wrapper; deleting the wrapper would delete the film.
+    const moved = nested.length === 0
+      ? []
+      : (await this.storage.moveFiles({ fileIds: nested.map((file) => file.id), targetDirectoryId: root })).moved;
+    const liftedIds = new Set(moved);
+    const unlifted = nested.filter((file) => !liftedIds.has(file.id));
     const protectedPaths = tree.filter((file) => this.protectedFiles.has(file.id)).map((file) => file.path);
-    const liftedIds = new Set(nested.map((file) => file.id));
     for (const wrapper of await this.storage.listSubdirectories({ directoryId: root })) {
       // 115 lists subdirectories recursively, parents before children. Removing a
       // wrapper deletes its subtree, so a nested path is already gone — removing it
       // next throws WRITE_SCOPE_VIOLATION on a movie dir that is already clean.
       if (wrapper.path.includes("/")) continue;
       if (protectedPaths.some((path) => path.startsWith(`${wrapper.path}/`))) continue;
+      const prefix = `${wrapper.path}/`;
+      if (unlifted.some((file) => file.path.startsWith(prefix))) continue;
       const removed = await this.storage.removeDirectory({ directoryId: wrapper.id });
       // Real drives return the directory id, not the file ids that went with it.
       // The pre-move tree already names them: everything still under this wrapper
-      // (nested subdirs included) except the video/subtitle just lifted.
+      // (nested subdirs included) except the video/subtitle that actually moved.
       if (removed.removed.length === 0) continue;
-      const prefix = `${wrapper.path}/`;
       this.markThrown(tree.filter((file) => file.path.startsWith(prefix) && !liftedIds.has(file.id)).map((file) => file.id));
+    }
+    if (unlifted.length > 0) {
+      throw new Error(
+        `FLATTEN_NOT_DONE: ${unlifted.length} file(s) did not move out of their wrapper (${unlifted.map((file) => file.id).join(",")}) — the wrapper holding them was kept; call flattenMovie again`,
+      );
     }
     return { movie: await this.storage.listTree({ directoryId: root }) };
   }
