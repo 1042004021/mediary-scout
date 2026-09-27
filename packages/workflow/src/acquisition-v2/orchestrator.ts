@@ -162,8 +162,10 @@ export interface RunAcquisitionV2Result extends AcquisitionAgentResult {
       sizeBytes?: number;
       note: string;
     }>;
-    /** linkKey: the link it was rejected by too — of the transfer that landed the file, else
-     *  the episode's recorded source (null = none known). */
+    /** The copies this run rejected that were not on the list yet (by episode, name and size) —
+     *  what counts as the user asking for an episode again. A listed copy that only gained its
+     *  link is recorded but not here. linkKey: the link it was rejected by too — of the transfer
+     *  that landed the file, else the episode's recorded source (null = none known). */
     rejected: Array<{ episode: string; label: string; sizeBytes: number | null; linkKey: string | null; reason: string }>;
     /** Paths (relative to the library dir) of the rejected files, still in place. */
     oldFiles: string[];
@@ -223,7 +225,9 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
   // they are rejected by, so they are honoured for the rest of the run even when the
   // store write failed (spec §7).
   const replaceResults = new Map<string, NonNullable<RunAcquisitionV2Result["replacement"]>["results"][number]>();
+  // Every row this run recorded (the filters read them); newlyRejected only the new copies.
   const replaceRejected: NonNullable<RunAcquisitionV2Result["replacement"]>["rejected"] = [];
+  const newlyRejected: NonNullable<RunAcquisitionV2Result["replacement"]>["rejected"] = [];
   const oldFiles = new Set<string>();
   let rejectedPersistFailed = false;
   // Concurrent callers share one in-flight read (the sandbox re-checks every cached
@@ -384,14 +388,21 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
               } catch (error) {
                 console.log(`[user-message] run ${request.workflowRunId} rejected list read failed (not deduping): ${errorText(error)}`);
               }
-              const fresh = rows.filter((r) => {
-                if (exact.has(exactKey(r)) || (r.linkKey === null && plain.has(plainKey(r)))) return false;
+              const fresh: typeof rows = [];
+              const newCopies: typeof rows = [];
+              for (const r of rows) {
+                if (exact.has(exactKey(r)) || (r.linkKey === null && plain.has(plainKey(r)))) continue;
+                // A copy already listed (same episode, name and size) that only gains a link is
+                // recorded, for the filters, but asks for nothing new: re-rejecting a listed copy
+                // never re-opens an episode the user let go.
+                if (!plain.has(plainKey(r))) newCopies.push(r);
                 note(r);
-                return true;
-              });
+                fresh.push(r);
+              }
               for (const i of items) oldFiles.add(i.path);
               if (fresh.length === 0) return;
               replaceRejected.push(...fresh);
+              newlyRejected.push(...newCopies);
               try {
                 await userRequest.rejectedStore.add(fresh);
               } catch (error) {
@@ -600,7 +611,7 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
       ? {
           replacement: {
             results: [...replaceResults.values()],
-            rejected: replaceRejected,
+            rejected: newlyRejected,
             oldFiles: [...oldFiles],
             identified: sandbox.identifiedThisRun(),
             ...(rejectedPersistFailed ? { rejectedPersistFailed: true } : {}),

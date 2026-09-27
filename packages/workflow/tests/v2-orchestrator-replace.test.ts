@@ -1009,7 +1009,7 @@ describe("runAcquisitionV2 — a rejection carries the link of the transfer that
       },
     });
 
-    await runAcquisitionV2(
+    const result = await runAcquisitionV2(
       odysseyRequest(model, odysseyExecutor([twin("twin_b", "b"), twin("twin_c", "c")]), rejectedRows, async () => ({
         odyssey_yts: YTS_KEY,
         twin_b: KEY_B,
@@ -1020,6 +1020,8 @@ describe("runAcquisitionV2 — a rejection carries the link of the transfer that
       [ODYSSEY_FILE, YTS_KEY],
       [ODYSSEY_FILE, KEY_B],
     ]);
+    // One copy by name and size: the run reports it once.
+    expect(result.replacement?.rejected.map((r) => r.linkKey)).toEqual([YTS_KEY]);
   });
 
   it("a rejection stored without a link gains one: rejecting the same file again, its landing link known, records the link", async () => {
@@ -1034,9 +1036,12 @@ describe("runAcquisitionV2 — a rejection carries the link of the transfer that
       },
     });
 
-    await runAcquisitionV2(odysseyRequest(model, odysseyExecutor(), rejectedRows, async () => ({ odyssey_yts: YTS_KEY })));
+    const result = await runAcquisitionV2(odysseyRequest(model, odysseyExecutor(), rejectedRows, async () => ({ odyssey_yts: YTS_KEY })));
 
     expect(rejectedRows.map((r) => r.linkKey)).toEqual([null, YTS_KEY]);
+    // The copy was already listed: gaining its link is no new request (re-rejecting a listed
+    // copy never re-opens an episode the user let go with 不换了).
+    expect(result.replacement?.rejected).toEqual([]);
   });
   it("on a share-only drive (夸克): the rejected share is hidden and refused by its share id, and a replacement's source is recorded by its share id", async () => {
     const FAKE_SHARE = "https://pan.quark.cn/s/1a2B3c4D?pwd=zzzz";
