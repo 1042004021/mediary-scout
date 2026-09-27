@@ -1341,8 +1341,9 @@ export class TaskSandbox {
     return undefined;
   }
 
-  /** Reject the current file(s) of the episodes the user complained about. Each group
-   *  names one episode and THAT episode's file ids (a TV call may carry every episode;
+  /** Reject the current file(s) of the episodes the user complained about. One group
+   *  per episode (a second group for the same episode is refused). Each group names
+   *  one episode and all of that episode's file ids (a TV call may carry every episode;
    *  a movie is one group, episode omitted or "MOVIE"). A file is recorded only under
    *  the episode it is grouped with. The caller adds the link and decides which items
    *  become rows. The files stay in place. The episodes join the need, so one the agent
@@ -1374,6 +1375,23 @@ export class TaskSandbox {
       }
       this.assertEpisodeTokens([named]);
       normalized.push({ episode: named, fileIds });
+    }
+    // One group per episode. Two groups for one episode disagree with the row
+    // builder, which collapses by episode (a subtitle group plus a video group
+    // would hide the subtitle, or a no-file group would contradict the files).
+    const duplicated: string[] = [];
+    const seenEpisode = new Set<string>();
+    for (const group of normalized) {
+      if (!seenEpisode.has(group.episode)) {
+        seenEpisode.add(group.episode);
+        continue;
+      }
+      if (!duplicated.includes(group.episode)) duplicated.push(group.episode);
+    }
+    if (duplicated.length > 0) {
+      throw new Error(
+        `SANDBOX_DUPLICATE_EPISODE: ${duplicated.join(",")} appears in more than one group — put all of that episode's file ids in one group`,
+      );
     }
     const withFiles = normalized.filter((group) => group.fileIds.length > 0);
     const noFile = normalized.filter((group) => group.fileIds.length === 0);

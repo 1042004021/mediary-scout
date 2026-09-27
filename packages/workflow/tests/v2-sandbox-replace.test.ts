@@ -97,6 +97,119 @@ describe("TaskSandbox — replace", () => {
     expect(sandbox.identifiedThisRun()).toBe(false);
   });
 
+  const DUPLICATE_E13 =
+    "SANDBOX_DUPLICATE_EPISODE: S01E13 appears in more than one group — put all of that episode's file ids in one group";
+
+  it("a subtitle group and a video group for the same episode are refused, and a later valid call still records", async () => {
+    const { sandbox, rejected, old13 } = await setup();
+    await expect(
+      sandbox.rejectCurrentSource({
+        rejections: [
+          { episode: "S01E13", fileIds: ["subtitle-id"] },
+          { episode: "S01E13", fileIds: [old13] },
+        ],
+        reason: "发蓝",
+      }),
+    ).rejects.toThrow(DUPLICATE_E13);
+    expect(rejected).toEqual([]);
+    expect(sandbox.identifiedThisRun()).toBe(false);
+    expect((await sandbox.finish()).missing).toEqual([]);
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E13", fileIds: [old13] }], reason: "发蓝" });
+    expect(rejected).toEqual([expect.objectContaining({ episode: "S01E13", fileId: old13 })]);
+    expect(sandbox.identifiedThisRun()).toBe(true);
+  });
+
+  it("a no-file group and a with-files group for the same episode are refused", async () => {
+    const { sandbox, rejected, old13 } = await setup();
+    await expect(
+      sandbox.rejectCurrentSource({
+        rejections: [
+          { episode: "S01E13", fileIds: [] },
+          { episode: "S01E13", fileIds: [old13] },
+        ],
+        reason: "发蓝",
+      }),
+    ).rejects.toThrow(DUPLICATE_E13);
+    expect(rejected).toEqual([]);
+    expect(sandbox.identifiedThisRun()).toBe(false);
+  });
+
+  it("two duplicated episodes are both named, in the order their second group appears", async () => {
+    const { sandbox, rejected, old13, old24 } = await setup();
+    await expect(
+      sandbox.rejectCurrentSource({
+        rejections: [
+          { episode: "S01E13", fileIds: [old13] },
+          { episode: "S01E24", fileIds: [old24] },
+          { episode: "S01E13", fileIds: [] },
+          { episode: "S01E24", fileIds: [old24] },
+        ],
+        reason: "发蓝",
+      }),
+    ).rejects.toThrow(
+      "SANDBOX_DUPLICATE_EPISODE: S01E13,S01E24 appears in more than one group — put all of that episode's file ids in one group",
+    );
+    expect(rejected).toEqual([]);
+  });
+
+  it("one group may hold a video and its subtitle, and another episode stays its own group", async () => {
+    const storage = new Storage115Simulator({
+      packs: {
+        old_pack: {
+          files: [
+            { path: "Show - 13.mkv", sizeBytes: 100 },
+            { path: "Show - 13.chs.srt", sizeBytes: 10 },
+            { path: "Show - 14.mkv", sizeBytes: 100 },
+          ],
+        },
+      },
+    });
+    const staging = await storage.createDirectory({ name: "staging", parentId: "root" });
+    const season = await storage.createDirectory({ name: "Season 01", parentId: "root" });
+    await storage.transferCandidate({ candidateId: "old_pack", intoDirectoryId: season });
+    const files = await storage.listTree({ directoryId: season });
+    const video = files.find((file) => file.path.endsWith("Show - 13.mkv"))!.id;
+    const sub = files.find((file) => file.isSubtitle)!.id;
+    const e14 = files.find((file) => file.path.endsWith("Show - 14.mkv"))!.id;
+    const rejected: Array<{ episode: string; fileId: string; isVideo: boolean }> = [];
+    const sandbox = new TaskSandbox({
+      provider: new FakeResourceProviderV2(),
+      storage, stagingDirectoryId: staging, targetSeasonDirectoryIds: { 1: season }, need: [],
+      replace: {
+        requestedEpisodes: ["S01E13", "S01E14"], hasMessages: true, untaggedMessages: 0,
+        onReject: async (items) => { rejected.push(...items); },
+        onReport: async () => {},
+      },
+    });
+    await sandbox.captureProtectedFiles();
+    await expect(
+      sandbox.rejectCurrentSource({
+        rejections: [
+          { episode: "S01E13", fileIds: [video, sub] },
+          { episode: "S01E14", fileIds: [e14] },
+        ],
+        reason: "发蓝",
+      }),
+    ).resolves.toMatchObject({ rejected: 3 });
+    expect(rejected.map((item) => [item.episode, item.fileId, item.isVideo])).toEqual([
+      ["S01E13", video, true],
+      ["S01E13", sub, false],
+      ["S01E14", e14, true],
+    ]);
+  });
+
+  it("the same fileId under two different episodes is still accepted", async () => {
+    const { sandbox, rejected, old13 } = await setup();
+    await sandbox.rejectCurrentSource({
+      rejections: [
+        { episode: "S01E13", fileIds: [old13] },
+        { episode: "S01E14", fileIds: [old13] },
+      ],
+      reason: "连播",
+    });
+    expect(rejected.map((item) => (item as { episode: string }).episode)).toEqual(["S01E13", "S01E14"]);
+  });
+
   it("the same file grouped under two episodes is recorded under both (only when the agent groups it so)", async () => {
     const { sandbox, rejected, old13 } = await setup();
     await sandbox.rejectCurrentSource({
@@ -1287,6 +1400,39 @@ describe("TaskSandbox — replace (movie: the movie dir is also staging)", () =>
       { candidateId: "good_share", status: "succeeded" },
     ]);
     expect(result.transferredCandidateId).toBe("good_share");
+  });
+
+  it("two movie groups are the same episode MOVIE, whether episode is omitted or named", async () => {
+    const storage = new Storage115Simulator({
+      packs: { old_film: { files: [{ path: "Film.mkv", sizeBytes: 4_000 }, { path: "Film.srt", sizeBytes: 10 }] } },
+    });
+    const movieDir = await storage.createDirectory({ name: "Film (2023)", parentId: "root" });
+    await storage.transferCandidate({ candidateId: "old_film", intoDirectoryId: movieDir });
+    const files = await storage.listTree({ directoryId: movieDir });
+    const video = files.find((file) => file.isVideo)!.id;
+    const sub = files.find((file) => file.isSubtitle)!.id;
+    const rejected: unknown[] = [];
+    const sandbox = new TaskSandbox({
+      provider: new FakeResourceProviderV2(),
+      storage, stagingDirectoryId: movieDir, targetMovieDirectoryId: movieDir, need: ["MOVIE"],
+      replace: {
+        requestedEpisodes: ["MOVIE"], hasMessages: true, untaggedMessages: 0,
+        onReject: async (items) => { rejected.push(...items); },
+        onReport: async () => {},
+      },
+    });
+    await sandbox.captureProtectedFiles();
+    const message = "SANDBOX_DUPLICATE_EPISODE: MOVIE appears in more than one group — put all of that episode's file ids in one group";
+    await expect(
+      sandbox.rejectCurrentSource({ rejections: [{ fileIds: [sub] }, { fileIds: [video] }], reason: "假片" }),
+    ).rejects.toThrow(message);
+    await expect(
+      sandbox.rejectCurrentSource({ rejections: [{ fileIds: [video] }, { episode: "MOVIE", fileIds: [sub] }], reason: "假片" }),
+    ).rejects.toThrow(message);
+    expect(rejected).toEqual([]);
+    expect(sandbox.identifiedThisRun()).toBe(false);
+    await sandbox.rejectCurrentSource({ rejections: [{ fileIds: [video, sub] }], reason: "假片" });
+    expect(rejected).toHaveLength(2);
   });
 
   it("a movie rejection with episode omitted is recorded as MOVIE", async () => {

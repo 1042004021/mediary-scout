@@ -179,9 +179,11 @@ export interface RunAcquisitionV2Result extends AcquisitionAgentResult {
   };
 }
 
-/** Which rejection items become rows. A video is a row; a subtitle (or anything else)
- *  beside one is not — it can never match a search candidate. A group that names no
- *  video still records every file, so a rejection is never empty. One place. */
+/** Which rejection items become rows, per episode. The sandbox guarantees one group
+ *  per episode, so per group and per episode are the same thing. A video is a row; a
+ *  subtitle (or anything else) beside one is not — it can never match a search
+ *  candidate. An episode that names no video still records every file, so a rejection
+ *  is never empty. One place. */
 function rejectionRowItems<T extends { episode: string; isVideo: boolean }>(items: T[]): T[] {
   const groups = new Map<string, T[]>();
   for (const item of items) {
