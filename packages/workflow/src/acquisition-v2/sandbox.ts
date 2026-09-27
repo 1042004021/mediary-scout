@@ -826,7 +826,8 @@ export class TaskSandbox {
     if (attempt.status === "succeeded" || attempt.materializedFileIds.length > 0) {
       this.succeededCandidates.add(input.candidateId);
       this.recordMaterialized(input.candidateId, attempt.materializedFileIds);
-      this.noteLandedLink(input.candidateId);
+      // "succeeded" with an empty id list landed nothing — do not occupy the link.
+      if (attempt.materializedFileIds.length > 0) this.noteLandedLink(input.candidateId);
     }
     const staging = await this.storage.listTree({ directoryId: this.stagingDirectoryId });
     // A systemic block ONLY when nothing actually landed — a provider can mark an
@@ -928,7 +929,8 @@ export class TaskSandbox {
       if (attempt.status === "succeeded" || attempt.materializedFileIds.length > 0) {
         this.succeededCandidates.add(candidateId);
         this.recordMaterialized(candidateId, attempt.materializedFileIds);
-        this.noteLandedLink(candidateId);
+        // "succeeded" with an empty id list landed nothing — do not occupy the link.
+        if (attempt.materializedFileIds.length > 0) this.noteLandedLink(candidateId);
       }
       if (attempt.status === "succeeded") {
         transferredCandidateId = candidateId;
@@ -1121,6 +1123,7 @@ export class TaskSandbox {
       await this.storage.moveFiles({ fileIds: nested.map((file) => file.id), targetDirectoryId: root });
     }
     const protectedPaths = tree.filter((file) => this.protectedFiles.has(file.id)).map((file) => file.path);
+    const liftedIds = new Set(nested.map((file) => file.id));
     for (const wrapper of await this.storage.listSubdirectories({ directoryId: root })) {
       // 115 lists subdirectories recursively, parents before children. Removing a
       // wrapper deletes its subtree, so a nested path is already gone — removing it
@@ -1128,8 +1131,12 @@ export class TaskSandbox {
       if (wrapper.path.includes("/")) continue;
       if (protectedPaths.some((path) => path.startsWith(`${wrapper.path}/`))) continue;
       const removed = await this.storage.removeDirectory({ directoryId: wrapper.id });
-      // Covers and nfo go with the wrapper. The files just lifted stay kept.
-      this.markThrown(removed.removed);
+      // Real drives return the directory id, not the file ids that went with it.
+      // The pre-move tree already names them: everything still under this wrapper
+      // (nested subdirs included) except the video/subtitle just lifted.
+      if (removed.removed.length === 0) continue;
+      const prefix = `${wrapper.path}/`;
+      this.markThrown(tree.filter((file) => file.path.startsWith(prefix) && !liftedIds.has(file.id)).map((file) => file.id));
     }
     return { movie: await this.storage.listTree({ directoryId: root }) };
   }

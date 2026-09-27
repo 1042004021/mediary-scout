@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { TaskSandbox } from "../src/acquisition-v2/sandbox.js";
 import { FakeResourceProviderV2 } from "../src/acquisition-v2/fake-provider.js";
-import { Storage115Simulator } from "../src/acquisition-v2/storage-115-simulator.js";
+import { Storage115Simulator, type StorageV2 } from "../src/acquisition-v2/storage-115-simulator.js";
 
 /**
  * One PanSou link shows up under two titles. The agent never sees the url, so
@@ -140,4 +140,74 @@ describe("TaskSandbox — same link is not transferred twice in one run", () => 
     expect(result.attempts[0]!.providerMessage).not.toMatch(/same link/);
     expect(result.transferredCandidateId).toBe("live");
   });
+
+  it("a succeeded transfer that materialized no file does not block transferCandidate", async () => {
+    const { sandbox, snapshotId, transferred } = await emptySuccessSandbox("tv");
+    const first = await sandbox.transferCandidate({ snapshotId, candidateId: "a" });
+    expect(first.attempt).toMatchObject({ status: "succeeded", materializedFileIds: [] });
+
+    const second = await sandbox.transferCandidate({ snapshotId, candidateId: "b" });
+    expect(second.attempt.status).toBe("succeeded");
+    expect(transferred).toEqual(["a", "b"]);
+  });
+
+  it("a succeeded transfer that materialized no file does not block transferUntilLanded", async () => {
+    const { sandbox, transferred } = await emptySuccessSandbox("movie");
+    const first = await sandbox.transferUntilLanded({ candidateIds: ["a"] });
+    expect(first.transferredCandidateId).toBe("a");
+    expect(first.attempts[0]).toMatchObject({ status: "succeeded" });
+
+    const second = await sandbox.transferUntilLanded({ candidateIds: ["b"] });
+    expect(second.attempts).toEqual([{ candidateId: "b", status: "succeeded" }]);
+    expect(second.transferredCandidateId).toBe("b");
+    expect(transferred).toEqual(["a", "b"]);
+  });
 });
+
+/** A returns succeeded with nothing materialized — the status flag without files. */
+async function emptySuccessSandbox(kind: "tv" | "movie"): Promise<{ sandbox: TaskSandbox; snapshotId: string; transferred: string[] }> {
+  const transferred: string[] = [];
+  const storage: StorageV2 = {
+    async createDirectory() {
+      return "dir";
+    },
+    async transferCandidate(input) {
+      transferred.push(input.candidateId);
+      if (input.candidateId === "a") return { status: "succeeded", materializedFileIds: [] };
+      return { status: "succeeded", materializedFileIds: ["b-file"] };
+    },
+    candidateLinkKind: () => "share",
+    async listTree() {
+      return [];
+    },
+    async listSubdirectories() {
+      return [];
+    },
+    async moveFiles() {
+      return { moved: [] };
+    },
+    async renameFile() {},
+    async deleteFiles() {
+      return { deleted: [] };
+    },
+    async removeDirectory() {
+      return { removed: [] };
+    },
+    async transferSubtitleUrls() {
+      return [];
+    },
+  };
+  const provider = new FakeResourceProviderV2({
+    results: { show: [{ id: "a", title: "A" }, { id: "b", title: "B" }] },
+  });
+  const sandbox = new TaskSandbox({
+    provider,
+    storage,
+    stagingDirectoryId: "staging",
+    ...(kind === "movie" ? { targetMovieDirectoryId: "staging" } : { targetSeasonDirectoryIds: { 1: "season" } }),
+    need: kind === "movie" ? ["MOVIE"] : ["S01E01"],
+    linkOf: () => SAME,
+  });
+  const snapshotId = (await sandbox.searchResources("show")).snapshot!.id;
+  return { sandbox, transferred, snapshotId };
+}

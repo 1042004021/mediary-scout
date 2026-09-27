@@ -3,7 +3,7 @@ import { MockLanguageModelV3 } from "ai/test";
 import { buildReflectionDigest } from "../src/acquisition-v2/agent-loop.js";
 import { TaskSandbox } from "../src/acquisition-v2/sandbox.js";
 import { FakeResourceProviderV2 } from "../src/acquisition-v2/fake-provider.js";
-import { Storage115Simulator } from "../src/acquisition-v2/storage-115-simulator.js";
+import { Storage115Simulator, type SimTreeFile, type StorageV2 } from "../src/acquisition-v2/storage-115-simulator.js";
 import { runAcquisitionV2 } from "../src/acquisition-v2/orchestrator.js";
 import { FakeStorageExecutor } from "../src/fakes.js";
 import { InMemoryWorkflowRepository } from "../src/repository.js";
@@ -112,6 +112,18 @@ describe("reflection digest — what became of the transferred files", () => {
     expect(sandbox.materializedFate("film")).toEqual({ kept: 1, thrownAway: 2 });
   });
 
+  it("counts a file that left with the wrapper when removeDirectory only returns the directory id", async () => {
+    const sandbox = await flattenFateSandbox(["wrap-dir"]);
+    await sandbox.flattenMovie();
+    expect(sandbox.materializedFate("film")).toEqual({ kept: 1, thrownAway: 1 });
+  });
+
+  it("does not mark wrapper files thrown when removeDirectory reports that nothing was removed", async () => {
+    const sandbox = await flattenFateSandbox([]);
+    await sandbox.flattenMovie();
+    expect(sandbox.materializedFate("film")).toEqual({ kept: 2, thrownAway: 0 });
+  });
+
   it("an attempt without a file fate keeps the plain file count", () => {
     const digest = buildReflectionDigest({
       searches: [],
@@ -141,6 +153,53 @@ const stop = (t: string) => ({
   usage: USAGE,
   warnings: [],
 });
+
+/** Real drives report only the wrapper directory id from removeDirectory. */
+const WRAPPER_TREE: SimTreeFile[] = [
+  { id: "vid", path: "Wrapper/Film.mkv", sizeBytes: 10, isVideo: true, isSubtitle: false },
+  { id: "nfo", path: "Wrapper/extra.nfo", sizeBytes: 1, isVideo: false, isSubtitle: false },
+];
+
+async function flattenFateSandbox(removed: string[]): Promise<TaskSandbox> {
+  const storage: StorageV2 = {
+    async createDirectory() {
+      return "movie";
+    },
+    async transferCandidate() {
+      return { status: "succeeded", materializedFileIds: WRAPPER_TREE.map((file) => file.id) };
+    },
+    candidateLinkKind: () => "unknown",
+    async listTree() {
+      return WRAPPER_TREE.map((file) => ({ ...file }));
+    },
+    async listSubdirectories() {
+      return [{ id: "wrap-dir", path: "Wrapper" }];
+    },
+    async moveFiles(input) {
+      return { moved: input.fileIds };
+    },
+    async renameFile() {},
+    async deleteFiles() {
+      return { deleted: [] };
+    },
+    async removeDirectory() {
+      return { removed: [...removed] };
+    },
+    async transferSubtitleUrls() {
+      return [];
+    },
+  };
+  const sandbox = new TaskSandbox({
+    provider: new FakeResourceProviderV2({ results: { film: [{ id: "film", title: "Film" }] } }),
+    storage,
+    stagingDirectoryId: "movie",
+    targetMovieDirectoryId: "movie",
+    need: ["MOVIE"],
+  });
+  const snapshotId = (await sandbox.searchResources("film")).snapshot!.id;
+  await sandbox.transferCandidate({ snapshotId, candidateId: "film" });
+  return sandbox;
+}
 
 describe("runAcquisitionV2 — reflection digest carries file fate", () => {
   it("tells the reflection that a TV transfer left in staging was thrown away", async () => {
