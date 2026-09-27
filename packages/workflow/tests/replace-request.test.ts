@@ -1760,3 +1760,43 @@ describe("replace_request failure — who retries, and how the failure is labell
     expect(await repository.listWorksWithPendingMessages({ urgentOnly: true })).toEqual([]);
   });
 });
+
+describe("replace_request retry — what a retried run claims", () => {
+  it("a message written during a failed attempt is claimed by the retry AND shown to its agent, so finishing it with the retry's reply is correct", async () => {
+    const { repository } = await trackedShow();
+    await repository.createUserMessage({ ...WORK, body: "A: 换第 1 集", episodeTags: ["S01E01"], now: NOW });
+    await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => "run_rr_retry" });
+
+    // Attempt 1: B arrives while A is processing, then a transient network error re-queues the run.
+    const first = new MockLanguageModelV3({
+      doGenerate: async () => {
+        await repository.createUserMessage({ ...WORK, body: "B: 还有第 2 集", episodeTags: ["S01E02"], now: "2026-09-26T08:00:01.000Z" });
+        throw Object.assign(new Error("fetch failed"), { cause: Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }) });
+      },
+    });
+    const attempt1 = await runQueuedReplaceRequest(baseRun(repository, new FakeStorageExecutor(), first));
+    expect(attempt1).toMatchObject({ workflowRunId: "run_rr_retry", workflowStatus: "queued" });
+
+    // Attempt 2 (after the backoff): the claim happens before the prompt is built, so the
+    // agent sees every message this attempt claimed — B included.
+    let seen = "";
+    const second = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        seen += JSON.stringify(options.prompt);
+        return text("done");
+      },
+    });
+    const attempt2 = await runQueuedReplaceRequest({
+      ...baseRun(repository, new FakeStorageExecutor(), second),
+      now: () => "2026-09-26T09:00:00.000Z",
+    });
+
+    expect(attempt2).toMatchObject({ workflowRunId: "run_rr_retry", workflowStatus: "succeeded" });
+    expect(seen).toContain("A: 换第 1 集");
+    expect(seen).toContain("B: 还有第 2 集");
+    expect((await repository.listUserMessages(WORK)).map((m) => [m.body, m.status, m.runId])).toEqual([
+      ["B: 还有第 2 集", "done", "run_rr_retry"],
+      ["A: 换第 1 集", "done", "run_rr_retry"],
+    ]);
+  });
+});
