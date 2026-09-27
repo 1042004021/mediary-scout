@@ -15,6 +15,9 @@ import type { MergedSourceHealth } from "../resource-source-health.js";
 export interface SimResourceCandidate {
   id: string;
   title: string;
+  /** PanSou post date (YYYY-MM-DD) when the provider actually has one. A share
+   *  posted before the missing episode aired almost certainly does not contain it. */
+  postedAt?: string;
 }
 
 export interface ResourceSnapshotV2 {

@@ -296,6 +296,9 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
   const sandbox = new TaskSandbox({
     provider,
     storage,
+    // The agent names aliases, never urls. Two PanSou titles of one share only
+    // meet here, via the registry the provider recorded them under.
+    linkOf: (id) => resourceLinkKey(String(registry.get(id)?.providerPayload?.["url"] ?? "")),
     // Movie-only 中文字幕软兜底: 8+2 budget + last-resort raw landing (the prompt's
     // soft floor authorizes it). TV/anime omit it → hard floor + hard 8-budget.
     ...(request.target.kind === "movie" ? { subtitleFallback: true } : {}),
@@ -587,7 +590,12 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
         searches: sandbox.searchHistory(),
         ...(memoryDrive ? { drive: memoryDrive } : {}),
         ...(request.storageProvider ? { driveBrand: request.storageProvider } : {}),
-        attempts: transferAttempts,
+        // Attempts store the provider's real candidate id; the sandbox tracked each
+        // file under the alias the agent passed. The file ids are the same on both.
+        attempts: transferAttempts.map((attempt) => {
+          const fate = sandbox.materializedFateOf(attempt.materializedFileIds);
+          return fate ? { ...attempt, kept: fate.kept, thrownAway: fate.thrownAway } : attempt;
+        }),
         candidateTitle: (id) => registry.get(id)?.title,
         coverage: result.coverage,
         auditEvents: sandbox.auditTrail(),

@@ -137,13 +137,13 @@ export function buildSandboxToolSet(
     },
     viewResourceSnapshot: {
       description:
-        "View the system's pre-warmed raw snapshot (活期文档). Read-only, free, repeatable — does NOT consume search budget. The system already searched the raw keyword (bare title) for you; this returns all those candidates (id + title). Use this FIRST to see what's available. Do NOT use searchResources to re-search the raw keyword — searchResources is ONLY for 繁体/英文 upgrades when the raw snapshot is insufficient.",
+        "View the system's pre-warmed raw snapshot (活期文档). Read-only, free, repeatable — does NOT consume search budget. The system already searched the raw keyword (bare title) for you; this returns all those candidates (id + title, and · 发布 YYYY-MM-DD when the post date is known). Use this FIRST to see what's available. Do NOT use searchResources to re-search the raw keyword — searchResources is ONLY for 繁体/英文 upgrades when the raw snapshot is insufficient.",
       inputSchema: z.object({}),
       execute: () => Promise.resolve(sandbox.viewResourceSnapshot()),
     },
     searchResources: {
       description:
-        "Search the resource provider with ONE keyword. Read-only. Returns the full snapshot of candidates (no slicing). Repeats are deduped; the search budget is capped — decide from gathered evidence when refused. NOTE: raw keyword already pre-searched (see viewResourceSnapshot). Use searchResources ONLY for 繁体/英文/原名 upgrades.",
+        "Search the resource provider with ONE keyword. Read-only. Returns the full snapshot of candidates (no slicing); each has id, title, and postedAt (YYYY-MM-DD) when the post date is known. Repeats are deduped; the search budget is capped — decide from gathered evidence when refused. NOTE: raw keyword already pre-searched (see viewResourceSnapshot). Use searchResources ONLY for 繁体/英文/原名 upgrades.",
       inputSchema: z.object({ keyword: z.string() }),
       execute: (args: { keyword: string }) => asEvidence(() => sandbox.searchResources(args.keyword)),
     },
@@ -504,6 +504,7 @@ DRIVES: the facts are from ONE drive (see "DRIVE OF THIS RUN"; a note tagged wit
 NEVER GIVE UP IN A NOTE. A run that found nothing proves only that nothing was found TODAY: episodes and seasons are released and uploaded over time, and the episode list itself comes from TMDB, which you must take as given even when it looks wrong. So never write that a season / episode / the whole title is not available, has no coverage on this drive, or should no longer be searched for — not "this drive only has season 1, no need to search season 2", not "S02E01 has no source here, skip it". Likewise a keyword that returned 0 while the wanted episodes may simply not be out yet (a new season, a just-aired episode) proves nothing about the keyword, and the bare title returning only older seasons today is expected, not a reason to stop using it. An "avoid" note must name a specific keyword that returned a DIFFERENT work (another show, a film, music), or a specific candidate / pack / link / release group that failed or was fake — the next run still searches for everything that is missing.
 Notes outlive today: no "今天/今日" conclusions, no drive quota or rate-limit state (it resets), no "wait for the next upload".
 NEVER tell the next run to avoid the bare title (the work's own name alone): it is always the first and widest search, even when it is noisy or returned nothing today. If the bare title pulls in another work, name THAT work ("混进《某某》，不是本作") so the next run can skip those candidates — the keyword itself stays.
+A transfer whose files were all thrown away brought nothing new — never record it as "works". If it is worth noting, record what it contained (e.g. "that share only holds episodes 1–12") as avoid.
 
 DO NOT write: episode / file state the database already records, counts of this run ("搜到 42 个候选", budget spent, ids), a plain record that something landed with nothing to learn from it, guesses without evidence, or restatements of your manual.
 FIX the existing notes shown below: overwrite (same name) one that the facts now contradict or refine; delete one that proved wrong. Prefer updating over adding near-duplicates.
@@ -527,7 +528,15 @@ export function buildReflectionDigest(input: {
   drive?: string;
   /** Its brand (pan115 / guangya / …), shown next to the opaque drive id. */
   driveBrand?: string;
-  attempts: Array<{ candidateId: string; status: string; providerMessage?: string; materializedFileIds?: string[] }>;
+  attempts: Array<{
+    candidateId: string;
+    status: string;
+    providerMessage?: string;
+    materializedFileIds?: string[];
+    /** What became of those files. Absent = the caller has no fate (plain file count). */
+    kept?: number;
+    thrownAway?: number;
+  }>;
   candidateTitle: (candidateId: string) => string | undefined;
   coverage: { coverageMet: boolean; obtained: string[]; missing: string[] };
   auditEvents: Array<{ type: string; message: string }>;
@@ -552,7 +561,14 @@ export function buildReflectionDigest(input: {
   for (const a of input.attempts) {
     const title = (input.candidateTitle(a.candidateId) ?? a.candidateId).slice(0, 80);
     const msg = a.providerMessage ? ` — ${a.providerMessage.slice(0, 120)}` : "";
-    lines.push(`- ${title} → ${a.status}${a.materializedFileIds?.length ? ` (${a.materializedFileIds.length} files)` : ""}${msg}`);
+    const count = a.materializedFileIds?.length ?? 0;
+    const files =
+      count > 0 && typeof a.kept === "number" && typeof a.thrownAway === "number"
+        ? ` (${count} files: ${a.kept} kept, ${a.thrownAway} thrown away)`
+        : count > 0
+          ? ` (${count} files)`
+          : "";
+    lines.push(`- ${title} → ${a.status}${files}${msg}`);
   }
   const noCoverage = input.auditEvents.find((e) => e.type === "no_coverage_reported");
   lines.push(

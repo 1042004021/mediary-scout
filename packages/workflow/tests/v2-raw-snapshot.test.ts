@@ -395,3 +395,58 @@ describe("prefilter → adapter → sandbox seam (real classes, no hand-stamped 
     expect(result.snapshot!.candidates[1]!.title).toBe("权利交锋 S01E08 ⚠ 相关度存疑(0.04)");
   });
 });
+
+describe("candidate post dates reach both agent read paths", () => {
+  it("prints · 发布 YYYY-MM-DD on the raw row and postedAt on searchResources candidates", async () => {
+    const inner: ResourceProvider = {
+      search: async ({ keyword }): Promise<ResourceSnapshot> => ({
+        id: "snap_dates",
+        provider: "pansou",
+        keyword,
+        createdAt: "2026-09-27T00:00:00.000Z",
+        candidates: [
+          {
+            id: "dated",
+            snapshotId: "snap_dates",
+            index: 0,
+            title: "黄泉的使者 (2026)",
+            type: "123",
+            source: "pansou",
+            providerPayload: { url: "https://www.123pan.com/s/Ab-cD_12", datetime: "2026-04-06T08:00:00Z" },
+          },
+          {
+            id: "unknown",
+            snapshotId: "snap_dates",
+            index: 1,
+            title: "未知日期",
+            type: "123",
+            source: "pansou",
+            providerPayload: { datetime: "0001-01-01T00:00:00Z" },
+          },
+        ],
+      }),
+    };
+    const provider = new RealResourceProviderV2({ provider: inner, registry: new CandidateRegistry(), workflowRunId: "run-dates" });
+    const storage = new Storage115Simulator({ packs: {} });
+    const stagingDirectoryId = await storage.createDirectory({ name: "staging", parentId: "root" });
+    const seasonDirectoryId = await storage.createDirectory({ name: "Season 1", parentId: "root" });
+    const sandbox = new TaskSandbox({
+      provider,
+      storage,
+      stagingDirectoryId,
+      targetSeasonDirectoryIds: { 1: seasonDirectoryId },
+      need: ["S01E01"],
+    });
+
+    await sandbox.primeRawSnapshot("黄泉的使者");
+    const doc = sandbox.viewResourceSnapshot().document;
+    expect(doc).toContain("[s1-1] 黄泉的使者 (2026) · 发布 2026-04-06\n");
+    expect(doc).toContain("[s1-2] 未知日期\n");
+    expect(doc).not.toMatch(/未知日期 · 发布/);
+
+    const again = await sandbox.searchResources("黄泉的使者");
+    expect(again.deduped).toBe(true);
+    expect(again.snapshot!.candidates[0]).toMatchObject({ id: "s1-1", postedAt: "2026-04-06" });
+    expect(again.snapshot!.candidates[1]).not.toHaveProperty("postedAt");
+  });
+});

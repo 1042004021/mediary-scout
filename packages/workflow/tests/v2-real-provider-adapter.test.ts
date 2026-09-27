@@ -344,4 +344,31 @@ describe("RealResourceProviderV2 — pansou → ResourceProviderV2 adapter", () 
     expect(view.prefilterScores).toBeUndefined();
     expect(view.prefilterDropped).toBeUndefined();
   });
+
+  it("sets postedAt only when providerPayload.datetime is a real date (year ≥ 2000)", async () => {
+    const base = realSnapshot().candidates[0]!;
+    const snapshot: ResourceSnapshot = {
+      ...realSnapshot(),
+      candidates: [
+        { ...base, id: "dated", providerPayload: { url: "https://www.123pan.com/s/Ab-cD_12", datetime: "2026-04-06T08:00:00Z" } },
+        { ...base, id: "unknown", index: 1, providerPayload: { url: "https://www.123pan.com/s/unknown", datetime: "0001-01-01T00:00:00Z" } },
+        { ...base, id: "garbage", index: 2, providerPayload: { url: "https://www.123pan.com/s/garbage", datetime: "not-a-date" } },
+        { ...base, id: "impossible", index: 3, providerPayload: { datetime: "2026-02-31T00:00:00Z" } },
+      ],
+    };
+    const adapter = new RealResourceProviderV2({
+      provider: { search: async () => snapshot },
+      registry: new CandidateRegistry(),
+      workflowRunId: "run-1",
+    });
+
+    const view = await adapter.search("莉可丽丝 全集");
+
+    expect(view.candidates.map((c) => ({ id: c.id, postedAt: c.postedAt }))).toEqual([
+      { id: "s1-1", postedAt: "2026-04-06" },
+      { id: "s1-2", postedAt: undefined },
+      { id: "s1-3", postedAt: undefined },
+      { id: "s1-4", postedAt: undefined },
+    ]);
+  });
 });
