@@ -24,7 +24,7 @@ export interface RealResourceProviderV2Options {
   workflowRunId: string;
   /** When set, candidates whose link is known-dead are dropped BEFORE the agent
    *  sees them (and never recorded/persisted), so it never re-transfers a dead
-   *  resource (#15). */
+   *  resource (#15). A failing read fails the search: it never fails open. */
   deadLinkStore?: DeadLinkStore;
   /** The work's rejected resources (user said "not this one"), re-read on every search
    *  so a rejection made earlier in THIS run applies at once. Matching candidates are
@@ -59,7 +59,10 @@ export class RealResourceProviderV2 implements ResourceProviderV2 {
 
   async search(keyword: string): Promise<ResourceSnapshotV2> {
     const snapshot = await this.provider.search({ keyword, workflowRunId: this.workflowRunId });
-    const deadKeys = await this.readDeadKeys();
+    // A dead-link read error fails the search. Filtering nothing instead would show
+    // every link already proven dead — and let the agent transfer it again. Only the
+    // rejected list below fails open (best effort by design).
+    const deadKeys = this.deadLinkStore ? new Set(await this.deadLinkStore.listDeadLinkKeys()) : new Set<string>();
     const rejected = await this.readRejected();
     const rejectedKeys = new Set(rejected.map((r) => r.linkKey).filter((k): k is string => k !== null));
     let deadDropped = 0;
@@ -136,16 +139,6 @@ export class RealResourceProviderV2 implements ResourceProviderV2 {
           }
         : {}),
     };
-  }
-
-  private async readDeadKeys(): Promise<Set<string>> {
-    if (!this.deadLinkStore) return new Set();
-    try {
-      return new Set(await this.deadLinkStore.listDeadLinkKeys());
-    } catch (error) {
-      console.log(`[dead-link] dead-link list read failed (not filtering): ${truncateErrorMessage(error)}`);
-      return new Set();
-    }
   }
 
   private async readRejected(): Promise<Array<{ linkKey: string | null; label: string; sizeBytes: number | null }>> {
