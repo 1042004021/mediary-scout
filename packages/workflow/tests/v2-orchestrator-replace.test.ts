@@ -821,7 +821,7 @@ function odysseyRequest(
   model: MockLanguageModelV3,
   exec: FakeStorageExecutor,
   rejectedRows: RejectedRow[],
-  landingLinkKeys: (fileIds: string[]) => Promise<Record<string, string>>,
+  landingLinkKeys: (fileIds: string[]) => Promise<Record<string, string | null>>,
 ): RunAcquisitionV2Request {
   return {
     provider: odysseyProvider(),
@@ -962,7 +962,7 @@ describe("runAcquisitionV2 — a rejection carries the link of the transfer that
     // An older copy whose transfer is no longer on record (finished runs are pruned).
     const OLD_FILE = "奥德赛.2026.HDRip.1080p.mkv";
     const SOURCE_KEY = `magnet:${"c".repeat(40)}`;
-    const rejectBoth = async (sourceLinkKeys?: Record<string, string>) => {
+    const rejectBoth = async (sourceLinkKeys?: Record<string, string>, landing: Record<string, string | null> = { odyssey_yts: YTS_KEY }) => {
       const rejectedRows: RejectedRow[] = [];
       let i = 0;
       const model = new MockLanguageModelV3({
@@ -975,7 +975,7 @@ describe("runAcquisitionV2 — a rejection carries the link of the transfer that
       const exec = odysseyExecutor([
         { id: "odyssey_old", storageDirectoryId: "film", name: OLD_FILE, sizeBytes: 2_000_000_000, episodeCode: null, providerFileId: "odyssey_old" },
       ]);
-      const req = odysseyRequest(model, exec, rejectedRows, async () => ({ odyssey_yts: YTS_KEY }));
+      const req = odysseyRequest(model, exec, rejectedRows, async () => landing);
       if (sourceLinkKeys) req.userRequest = { ...req.userRequest!, sourceLinkKeys };
       await runAcquisitionV2(req);
       return rejectedRows.map((r) => [r.label, r.linkKey]);
@@ -983,6 +983,9 @@ describe("runAcquisitionV2 — a rejection carries the link of the transfer that
 
     expect(await rejectBoth({ MOVIE: SOURCE_KEY })).toEqual([[ODYSSEY_FILE, YTS_KEY], [OLD_FILE, SOURCE_KEY]]);
     expect(await rejectBoth()).toEqual([[ODYSSEY_FILE, YTS_KEY], [OLD_FILE, null]]);
+    // A transfer on record whose link has no key (null) is still that file's own source: the
+    // episode's recorded source belongs to another copy and is not lent to it.
+    expect(await rejectBoth({ MOVIE: SOURCE_KEY }, { odyssey_yts: YTS_KEY, odyssey_old: null })).toEqual([[ODYSSEY_FILE, YTS_KEY], [OLD_FILE, null]]);
   });
   it("two different files with the same name and size keep their own links; a twin with no link adds nothing the linked one does not already cover", async () => {
     const KEY_B = `magnet:${"b".repeat(40)}`;

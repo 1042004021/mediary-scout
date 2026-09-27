@@ -2176,10 +2176,12 @@ describe("replace_request — a rejection carries the link of the transfer that 
     expect(await rejectTheFake(repository)).toEqual([expect.objectContaining({ label: FILE, linkKey: "quark:1a2B3c4D" })]);
   });
 
-  it("the oldest transfer decides, even when its link has no key: a later claim on the same file (a lagging listing) does not lend its link", async () => {
+  it("the oldest transfer decides, even when its link has no key: neither a later claim on the same file (a lagging listing) nor the episode's recorded source lends its link", async () => {
     const repository = new InMemoryWorkflowRepository();
     await repository.saveWorkflowRunSnapshot(landingRun("run_first", DRIVE, "2026-09-14T00:00:00.000Z", "https://example.com/The.Odyssey.2026.mp4"));
     await repository.saveWorkflowRunSnapshot(landingRun("run_later", DRIVE, "2026-09-15T00:00:00.000Z", YTS_URL));
+    // An earlier replacement's source: another copy's link, only for a file with no transfer on record.
+    await repository.upsertEpisodeSource({ ...work, episode: "MOVIE", linkKey: `magnet:${"c".repeat(40)}`, label: "奥德赛 HDTS", sizeBytes: 8_000_000_000, runId: "run_old_replace", recordedAt: NOW });
 
     expect(await rejectTheFake(repository)).toEqual([expect.objectContaining({ label: FILE, linkKey: null })]);
   });

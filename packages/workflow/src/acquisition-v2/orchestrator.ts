@@ -123,10 +123,10 @@ export interface RunAcquisitionV2Request {
      *  link for. */
     sourceLinkKeys?: Record<string, string>;
     /** File id → link key of the resource whose transfer landed that file (this account + drive's
-     *  transfer history; nothing for a file landed before the history was pruned). How a rejection of a
-     *  file an ordinary run landed carries its link: its name and size rarely match the search titles
-     *  (a magnet's title is not its file name). */
-    landingLinkKeys?: (fileIds: string[]) => Promise<Record<string, string>>;
+     *  transfer history), null when that link has no key; a file landed before the history was pruned
+     *  is absent. How a rejection of a file an ordinary run landed carries its link: its name and size
+     *  rarely match the search titles (a magnet's title is not its file name). */
+    landingLinkKeys?: (fileIds: string[]) => Promise<Record<string, string | null>>;
     rejectedStore: {
       /** `episode` lets a repeated rejection be skipped (see onReject). */
       list: () => Promise<Array<{ episode?: string; linkKey: string | null; label: string; sizeBytes: number | null }>>;
@@ -341,7 +341,7 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
               // name and size yet come from different resources. A rejection without its link
               // is the very hole this closes, so an unreadable history refuses the whole call
               // (fail closed, like the run's other strict reads) and the agent can call again.
-              let landed = new Map<string, string>();
+              let landed = new Map<string, string | null>();
               if (userRequest.landingLinkKeys) {
                 try {
                   landed = new Map(Object.entries(await userRequest.landingLinkKeys([...new Set(items.map((i) => i.fileId))])));
@@ -353,11 +353,12 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
               }
               // Reject by link too, not only name+size — here and in the store: the link of
               // the transfer that landed the file (an episode replaced once has two files,
-              // each with its own source), else the episode's recorded source (a file whose
-              // transfer is no longer on record).
+              // each with its own source; null when its link has no key — still that file's
+              // own source), else, for a file whose transfer is no longer on record, the
+              // episode's recorded source.
               const rows = items.map((i) => ({
                 episode: i.episode,
-                linkKey: landed.get(i.fileId) ?? userRequest.sourceLinkKeys?.[i.episode] ?? null,
+                linkKey: landed.has(i.fileId) ? (landed.get(i.fileId) ?? null) : (userRequest.sourceLinkKeys?.[i.episode] ?? null),
                 label: i.label,
                 sizeBytes: i.sizeBytes,
                 reason: i.reason,

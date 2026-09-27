@@ -281,20 +281,18 @@ export async function runQueuedReplaceRequest(
         pending,
         ...(movie ? { filmObtained } : {}),
       },
-      // An episode replaced once before has a known link: its rejection carries it.
+      // An episode replaced once before has a known link: a rejected file of it whose own
+      // transfer is no longer on record carries that one.
       sourceLinkKeys: Object.fromEntries(sources.flatMap((s): Array<[string, string]> => (s.linkKey ? [[s.episode, s.linkKey]] : []))),
       // A file's own link, from the transfer that landed it: the only link a file an
       // ordinary run landed has (no episode source is recorded for it).
       landingLinkKeys: async (fileIds) => {
-        const keys = new Map<string, string>();
-        const decided = new Set<string>();
+        const keys = new Map<string, string | null>();
         for (const s of await repository.listLandingSources({ accountId: work.accountId, drive: work.drive, fileIds })) {
           // The oldest transfer decides — a later one can only have claimed the file through
-          // a lagging listing — even when its link has no key.
-          if (decided.has(s.fileId)) continue;
-          decided.add(s.fileId);
-          const key = resourceLinkKey(s.url);
-          if (key) keys.set(s.fileId, key);
+          // a lagging listing — even when its link has no key (null, not left out: the file
+          // has a source of its own, so the episode's recorded one is not lent to it).
+          if (!keys.has(s.fileId)) keys.set(s.fileId, resourceLinkKey(s.url));
         }
         return Object.fromEntries(keys);
       },
