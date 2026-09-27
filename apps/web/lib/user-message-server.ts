@@ -12,7 +12,7 @@ import {
   type WorkflowRepository,
   type WorkflowScope,
 } from "@media-track/workflow";
-import type { ThreadMessage } from "./user-message-state";
+import type { PendingRow, ThreadMessage } from "./user-message-state";
 
 // The badge label is shared with the client card (which must not import this module).
 export { swapBadgeLabel } from "./user-message-state";
@@ -46,6 +46,9 @@ export interface MessageThreadView {
   messages: ThreadMessage[];
   /** Episode codes still 待换 (sorted); "MOVIE" for a film. */
   pendingReplacements: string[];
+  /** The same 待换 rows with the message that asked and when (same order): what 撤销
+   *  after 「不换了」 puts back. */
+  pendingRows: PendingRow[];
   /** A run holds one of the messages right now. */
   busy: boolean;
 }
@@ -55,6 +58,9 @@ export async function loadMessageThread(
   work: UserMessageScope,
 ): Promise<MessageThreadView> {
   const [messages, pending] = await Promise.all([repo.listUserMessages(work), repo.listPendingReplacements(work)]);
+  const pendingRows = pending
+    .map(({ episode, messageId, requestedAt }) => ({ episode, messageId, requestedAt }))
+    .sort((a, b) => (a.episode < b.episode ? -1 : a.episode > b.episode ? 1 : 0));
   return {
     messages: messages.map(({ id, body, episodeTags, status, urgent, createdAt, processedAt, reply }) => ({
       id,
@@ -66,7 +72,8 @@ export async function loadMessageThread(
       processedAt,
       reply,
     })),
-    pendingReplacements: pending.map((p) => p.episode).sort(),
+    pendingReplacements: pendingRows.map((p) => p.episode),
+    pendingRows,
     busy: messages.some((m) => m.status === "processing"),
   };
 }

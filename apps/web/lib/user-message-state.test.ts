@@ -5,12 +5,15 @@ import {
   appendChipText,
   composerPlaceholder,
   draftIsSendable,
+  editorAfterRefresh,
   episodeLabel,
   formatSize,
   groupEpisodesBySeason,
   isMultiSeason,
   keepToastText,
+  mergeIntoComposer,
   nowButtonMessageId,
+  replacedLaterByRun,
   replyView,
   showsMessageCard,
   statusLabel,
@@ -18,6 +21,7 @@ import {
   threadExchanges,
   toggleEpisode,
   visibleExchanges,
+  type EditingMessage,
   type ThreadMessage,
 } from "./user-message-state";
 
@@ -160,6 +164,13 @@ describe("replyView — the agent's reply as a track list", () => {
     expect(view.rows[1]!.state).toBe("stopped");
   });
 
+  it("one a later reply replaced says so; otherwise it is just no longer 待换", () => {
+    const later = replyView(mixed, { ...tv, pending: new Set(), replacedLater: new Set(["S01E24"]) });
+    expect(later.rows.map((r) => r.state)).toEqual(["replaced", "replacedLater"]);
+    // Still 待换 wins: a later reply replaced it, yet a newer request brought it back.
+    expect(replyView(mixed, { ...tv, pending: new Set(["S01E24"]), replacedLater: new Set(["S01E24"]) }).rows[1]!.state).toBe("looking");
+  });
+
   it("everything replaced: the old files can go once the new ones play", () => {
     const view = replyView(
       reply("r", {
@@ -223,6 +234,75 @@ describe("replyView — the agent's reply as a track list", () => {
       summary: "换好了",
       oldFilesLabel: "旧文件还在，确认新的能看再删：",
       foot: "新文件和旧文件放在一起，播放器里会看到两个版本。",
+    });
+  });
+});
+
+describe("replacedLaterByRun — which episodes a newer reply replaced", () => {
+  it("per answered run: the episodes replaced by any reply after it", () => {
+    const exchanges = threadExchanges([
+      msg({ id: "m3", status: "done", reply: reply("run_c", { results: [{ episode: "S01E05", outcome: "replaced", note: "" }] }), processedAt: "2026-09-27T01:00:00.000Z" }),
+      msg({ id: "m2", status: "done", reply: reply("run_b", { results: [{ episode: "S01E24", outcome: "replaced", note: "" }, { episode: "S01E03", outcome: "not_found", note: "" }] }), processedAt: "2026-09-26T01:00:00.000Z" }),
+      msg({ id: "m1", status: "done", reply: reply("run_a", { results: [{ episode: "S01E24", outcome: "not_found", note: "" }] }), processedAt: "2026-09-25T01:00:00.000Z" }),
+    ]);
+
+    const later = replacedLaterByRun(exchanges);
+
+    expect([...(later.get("run_a") ?? [])].sort()).toEqual(["S01E05", "S01E24"]);
+    expect([...(later.get("run_b") ?? [])]).toEqual(["S01E05"]);
+    expect([...(later.get("run_c") ?? [])]).toEqual([]);
+  });
+});
+
+describe("editorAfterRefresh — a message's editor when a fresh render arrives", () => {
+  const original = { body: "第 1 集发蓝", tags: ["S01E01"] };
+  const editing = (over: Partial<EditingMessage> = {}): EditingMessage => ({ id: "m1", body: "第 1 集发蓝，换个中字的", tags: ["S01E01"], original, saved: null, ...over });
+  const inView = (over: Partial<ThreadMessage> = {}) => msg({ id: "m1", body: original.body, episodeTags: original.tags, ...over });
+
+  it("still waiting: the editor stays", () => {
+    expect(editorAfterRefresh(editing(), inView())).toEqual({ kind: "keep" });
+  });
+
+  it("taken by a run while being edited: the notice, and the words typed go to the composer", () => {
+    expect(editorAfterRefresh(editing(), inView({ status: "processing" }))).toEqual({
+      kind: "taken",
+      typed: { body: "第 1 集发蓝，换个中字的", tags: ["S01E01"] },
+    });
+    // Nothing was changed: nothing to carry over, only the notice.
+    expect(editorAfterRefresh(editing({ body: original.body }), inView({ status: "done" }))).toEqual({ kind: "taken", typed: null });
+    // Blanks alone are no change (the store trims).
+    expect(editorAfterRefresh(editing({ body: ` ${original.body} ` }), inView({ status: "processing" }))).toEqual({ kind: "taken", typed: null });
+    // A changed tag is a change.
+    expect(editorAfterRefresh(editing({ body: original.body, tags: [] }), inView({ status: "processing" }))).toEqual({
+      kind: "taken",
+      typed: { body: original.body, tags: [] },
+    });
+  });
+
+  it("gone from the thread (withdrawn elsewhere): the editor closes; changed words go to the composer", () => {
+    expect(editorAfterRefresh(editing(), undefined)).toEqual({ kind: "gone", typed: { body: "第 1 集发蓝，换个中字的", tags: ["S01E01"] } });
+    expect(editorAfterRefresh(editing({ body: original.body }), undefined)).toEqual({ kind: "gone", typed: null });
+  });
+
+  it("saved: stays open until a render carries the new words, then closes", () => {
+    const saved = editing({ saved: { body: "第 1 集发蓝，换个中字的", tags: ["S01E01"] } });
+    // A render fetched before the save landed still has the old words.
+    expect(editorAfterRefresh(saved, inView())).toEqual({ kind: "keep" });
+    expect(editorAfterRefresh(saved, inView({ body: "第 1 集发蓝，换个中字的" }))).toEqual({ kind: "close" });
+    // Taken right after the save: the run has the new words — nothing was lost.
+    expect(editorAfterRefresh(saved, inView({ body: "第 1 集发蓝，换个中字的", status: "processing" }))).toEqual({ kind: "close" });
+    // Changed again elsewhere, or gone: nothing to wait for.
+    expect(editorAfterRefresh(saved, inView({ body: "别的话" }))).toEqual({ kind: "close" });
+    expect(editorAfterRefresh(saved, undefined)).toEqual({ kind: "close" });
+  });
+});
+
+describe("mergeIntoComposer — words from a closed editor join the composer", () => {
+  it("fills an empty draft, else goes on a new line; tags join without repeats, in order", () => {
+    expect(mergeIntoComposer({ draft: "", tags: [] }, { body: "第 1 集发蓝", tags: ["S01E01"] })).toEqual({ draft: "第 1 集发蓝", tags: ["S01E01"] });
+    expect(mergeIntoComposer({ draft: "还有第 3 集  ", tags: ["S01E03", "S01E01"] }, { body: "第 1 集发蓝", tags: ["S01E01", "S01E02"] })).toEqual({
+      draft: "还有第 3 集\n第 1 集发蓝",
+      tags: ["S01E01", "S01E02", "S01E03"],
     });
   });
 });

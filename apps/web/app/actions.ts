@@ -1142,7 +1142,8 @@ export async function processMessagesNowAction(
   }
 }
 
-/** 「不换了」: these episodes stay as they are; the patrol stops looking for them. */
+/** 「不换了」: these episodes stay as they are; the patrol stops looking for them. Saved at
+ *  once — the card's 撤销 calls restoreEpisodesToPendingAction. */
 export async function keepEpisodesAsIsAction(
   input: MessageWorkInput & { episodes: string[] },
 ): Promise<PushSettingsActionResult> {
@@ -1159,5 +1160,62 @@ export async function keepEpisodesAsIsAction(
     return { success: true };
   } catch (error) {
     return { success: false, message: `没能保存：${String(error)}` };
+  }
+}
+
+/** A 待换 row as the card got it (loadMessageThread): what 撤销 puts back. */
+export interface PendingEpisodeInput {
+  episode: string;
+  messageId: string;
+  requestedAt: string;
+}
+
+// The store's episode tag format (validateUserMessageInput): SxxEyy for a show, MOVIE for a film.
+const SHOW_EPISODE = /^S\d{2}E\d{2,4}$/;
+const MESSAGE_ID = /^msg_[\w-]{1,80}$/;
+
+/** The rows as they will be written back, or null when any is malformed or not this
+ *  work's kind of episode. Whatever the client sent: checked before any lookup. */
+function checkPendingRows(input: unknown, mediaType: "movie" | "tv", max: number): PendingEpisodeInput[] | null {
+  if (!Array.isArray(input) || input.length === 0 || input.length > max) return null;
+  const rows: PendingEpisodeInput[] = [];
+  for (const row of input as unknown[]) {
+    if (typeof row !== "object" || row === null) return null;
+    const { episode, messageId, requestedAt } = row as Record<string, unknown>;
+    if (typeof episode !== "string" || !(mediaType === "movie" ? episode === "MOVIE" : SHOW_EPISODE.test(episode))) return null;
+    if (typeof messageId !== "string" || !MESSAGE_ID.test(messageId)) return null;
+    if (typeof requestedAt !== "string" || !Number.isFinite(Date.parse(requestedAt))) return null;
+    rows.push({ episode, messageId, requestedAt: new Date(requestedAt).toISOString() });
+  }
+  return rows;
+}
+
+/** 撤销 after 「不换了」: the 待换 rows go back exactly as they were (the message that asked,
+ *  and when), so the patrol looks for these episodes again. A row that is somehow still
+ *  there is left alone. */
+export async function restoreEpisodesToPendingAction(
+  input: MessageWorkInput & { episodes: PendingEpisodeInput[] },
+): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const { USER_MESSAGE_LIMITS } = await import("@media-track/workflow");
+    const rows = checkPendingRows(input.episodes, input.mediaType, USER_MESSAGE_LIMITS.tagsMax);
+    if (!rows) return { success: false, message: "集数不对" };
+    const { repo, work } = await messageWorkFor(input);
+    if (!work) return { success: false, message: MESSAGE_NOT_TRACKED };
+    // addPendingReplacements takes one message and one time per call.
+    const groups = new Map<string, { messageId: string; requestedAt: string; episodes: string[] }>();
+    for (const row of rows) {
+      const key = `${row.messageId} ${row.requestedAt}`;
+      const group = groups.get(key) ?? { messageId: row.messageId, requestedAt: row.requestedAt, episodes: [] };
+      group.episodes.push(row.episode);
+      groups.set(key, group);
+    }
+    for (const group of groups.values()) {
+      await repo.addPendingReplacements({ ...work, episodes: group.episodes, messageId: group.messageId, now: group.requestedAt });
+    }
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: `没能撤销：${String(error)}` };
   }
 }

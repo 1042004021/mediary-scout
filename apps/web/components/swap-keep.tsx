@@ -4,15 +4,16 @@ import { createContext, useCallback, useContext, useMemo, useState, type ReactNo
 import { swapBadgeLabel } from "../lib/user-message-state";
 
 /**
- * 「不换了」 is deferred — six seconds to undo, the way deleting a note works — yet the
- * page must look kept at once: the red 待换 cell back to its own state, the badge gone.
- * The season grid and the badge are server-rendered, so the episodes waiting on a 不换了
- * are shared through this context: the message card adds and removes them, the two
- * small client pieces below read them. Design: docs/superpowers/specs/2026-09-26-user-message-replace-design.md §6.
+ * 「不换了」 is saved at once and can be undone for six seconds (components/user-message-thread.tsx,
+ * lib/keep-undo.ts); the page must look kept at once: the red 待换 cell back to its own
+ * state, the badge gone. The season grid and the badge are server-rendered, so the
+ * episodes a 不换了 took are shared through this context: the message card adds and
+ * removes them, the two small client pieces below read them.
+ * Design: docs/superpowers/specs/2026-09-26-user-message-replace-design.md §6.
  */
 interface SwapKeepState {
-  /** Episodes whose 不换了 is waiting out the undo window, or sent and not yet reflected
-   *  by a fresh server render. */
+  /** Episodes a 不换了 took, drawn kept until the server's own render has taken over
+   *  (while 撤销 is possible, and until the next fresh render after that). */
   kept: ReadonlySet<string>;
   add: (episodes: readonly string[]) => void;
   remove: (episodes: readonly string[]) => void;
@@ -46,20 +47,20 @@ export function useSwapKeep(): SwapKeepState {
 
 const NONE: ReadonlySet<string> = new Set();
 
-/** Read-only: the episodes a 不换了 is waiting on (none outside the provider). */
+/** Read-only: the episodes a 不换了 took (none outside the provider). */
 function useKept(): ReadonlySet<string> {
   return useContext(SwapKeepContext)?.kept ?? NONE;
 }
 
-/** 「N 集待换」/「待换资源」 beside the title, less the episodes a 不换了 is waiting on. */
+/** 「N 集待换」/「待换资源」 beside the title, less the episodes a 不换了 took. */
 export function SwapBadgeLive({ mediaType, pending }: { mediaType: "movie" | "tv"; pending: readonly string[] }) {
   const kept = useKept();
   const label = swapBadgeLabel(mediaType, kept.size > 0 ? pending.filter((e) => !kept.has(e)) : pending);
   return label ? <span className="hub-badge tone-red">{label}</span> : null;
 }
 
-/** A 待换 cell of the season grid. While a 不换了 on it is waiting it is drawn in its
- *  own state again (the file was never touched, so that state is what it is). */
+/** A 待换 cell of the season grid. Once 不换了 took it, it is drawn in its own state
+ *  again (the file was never touched, so that state is what it is). */
 export function SwapEpisodeCell({ code, stateClass, stateLabel }: { code: string; stateClass: string; stateLabel: string }) {
   const kept = useKept();
   const swapping = !kept.has(code);

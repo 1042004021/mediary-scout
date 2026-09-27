@@ -5,11 +5,15 @@
  * Design: docs/superpowers/specs/2026-09-26-user-message-replace-design.md · pixel standard:
  * docs/superpowers/design/2026-09-26-user-message-mockup.html.
  */
-import type { UserMessage, UserMessageReply } from "@media-track/workflow";
+import type { PendingReplacement, UserMessage, UserMessageReply } from "@media-track/workflow";
 import { relativeDayLabel } from "./relative-day";
 
 /** What the card gets of each message. */
 export type ThreadMessage = Pick<UserMessage, "id" | "body" | "episodeTags" | "status" | "urgent" | "createdAt" | "processedAt" | "reply">;
+
+/** A 待换 row as the card gets it: what 撤销 after 「不换了」 puts back (same message,
+ *  same time — the episode is not re-requested). */
+export type PendingRow = Pick<PendingReplacement, "episode" | "messageId" | "requestedAt">;
 
 const EPISODE_CODE = /^S(\d+)E(\d+)$/;
 
@@ -117,15 +121,16 @@ export function visibleExchanges(exchanges: readonly Exchange[]): { earlier: Exc
 }
 
 /** One row of the reply's track list. `looking`: not replaced and still 待换 (the patrol
- *  keeps looking, 「不换了」 is offered); `stopped`: no longer 待换 (the user kept it, or a
- *  later run replaced it). */
+ *  keeps looking, 「不换了」 is offered); `replacedLater`: no longer 待换 because a newer
+ *  reply replaced it; `stopped`: no longer 待换 otherwise (the user kept it, or a run
+ *  without a message replaced it). */
 export interface ReplyRow {
   episode: string;
   label: string;
   resource: string;
   note: string;
   size: string;
-  state: "replaced" | "looking" | "stopped";
+  state: "replaced" | "looking" | "replacedLater" | "stopped";
 }
 
 export interface ReplyView {
@@ -142,7 +147,7 @@ export interface ReplyView {
 
 export function replyView(
   reply: UserMessageReply,
-  ctx: { mediaType: "movie" | "tv"; multiSeason: boolean; pending: ReadonlySet<string> },
+  ctx: { mediaType: "movie" | "tv"; multiSeason: boolean; pending: ReadonlySet<string>; replacedLater?: ReadonlySet<string> | undefined },
 ): ReplyView {
   const rows = [...reply.results]
     .sort((a, b) => compareEpisodeCodes(a.episode, b.episode))
@@ -154,7 +159,13 @@ export function replyView(
         resource: replaced ? r.label?.trim() || "没记下资源名" : "没有找到别的版本",
         note: r.note,
         size: replaced && typeof r.sizeBytes === "number" && r.sizeBytes > 0 ? formatSize(r.sizeBytes) : "—",
-        state: replaced ? "replaced" : ctx.pending.has(r.episode) ? "looking" : "stopped",
+        state: replaced
+          ? "replaced"
+          : ctx.pending.has(r.episode)
+            ? "looking"
+            : ctx.replacedLater?.has(r.episode)
+              ? "replacedLater"
+              : "stopped",
       };
     });
   const replaced = rows.filter((r) => r.state === "replaced");
@@ -192,6 +203,68 @@ export function replyView(
     unidentified: reply.unidentified === true,
     rejectedNotSaved: reply.rejectedNotSaved === true,
   };
+}
+
+/** Per answered run (by runId): the episodes some newer reply replaced — an older row
+ *  about one of them reads 「后来换好了」, not just 「不再待换」. */
+export function replacedLaterByRun(oldestFirst: readonly Exchange[]): Map<string, Set<string>> {
+  const out = new Map<string, Set<string>>();
+  const later = new Set<string>();
+  for (const exchange of [...oldestFirst].reverse()) {
+    if (exchange.kind !== "answered" || !exchange.reply) continue;
+    out.set(exchange.reply.runId, new Set(later));
+    for (const r of exchange.reply.results) if (r.outcome === "replaced") later.add(r.episode);
+  }
+  return out;
+}
+
+/** One waiting message edited in place. `original`: its words when the editor opened;
+ *  `saved`: set once 保存 went through (the body as stored, trimmed) — the editor then
+ *  stays open, disabled, until a fresh render carries the new words (no flash of the old). */
+export interface EditingMessage {
+  id: string;
+  body: string;
+  tags: string[];
+  original: { body: string; tags: string[] };
+  saved: { body: string; tags: string[] } | null;
+}
+
+/** What a fresh render means for an open editor: keep it; close it; or it can no longer
+ *  be edited — a run took the message ("taken": the card says so) or it left the thread
+ *  ("gone") — and whatever was typed, if it changed anything, goes to the composer. */
+export type EditorVerdict =
+  | { kind: "keep" }
+  | { kind: "close" }
+  | { kind: "taken" | "gone"; typed: { body: string; tags: string[] } | null };
+
+const sameWords = (a: { body: string; tags: readonly string[] }, b: { body: string; tags: readonly string[] }) =>
+  a.body === b.body && a.tags.length === b.tags.length && a.tags.every((t, i) => t === b.tags[i]);
+
+export function editorAfterRefresh(
+  editing: EditingMessage,
+  message: Pick<ThreadMessage, "body" | "episodeTags" | "status"> | undefined,
+): EditorVerdict {
+  const shown = message ? { body: message.body, tags: message.episodeTags } : null;
+  if (editing.saved) {
+    // Still the old words: a render fetched before the save landed.
+    return shown && sameWords(shown, editing.original) && !sameWords(editing.saved, editing.original) ? { kind: "keep" } : { kind: "close" };
+  }
+  if (message?.status === "pending") return { kind: "keep" };
+  const typed = { body: editing.body.trim(), tags: editing.tags };
+  const changed = !sameWords(typed, editing.original);
+  return { kind: message ? "taken" : "gone", typed: changed ? { body: editing.body, tags: editing.tags } : null };
+}
+
+/** Words from an editor that closed on its own join the composer: they fill an empty
+ *  draft or go on a new line; the tags join in episode order, without repeats. */
+export function mergeIntoComposer(
+  composer: { draft: string; tags: string[] },
+  typed: { body: string; tags: string[] },
+): { draft: string; tags: string[] } {
+  const body = typed.body.trim();
+  const draft = composer.draft.trim() === "" ? body : `${composer.draft.trimEnd()}\n${body}`;
+  const tags = [...new Set([...composer.tags, ...typed.tags])].sort(compareEpisodeCodes);
+  return { draft, tags };
 }
 
 /** Byte size the way the rest of the app writes it (notifications, the activity page):

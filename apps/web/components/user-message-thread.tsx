@@ -7,15 +7,17 @@
  * · copy path) · film 待换 bar · unidentified · rejected list not saved · error */
 
 import { useEffect, useId, useRef, useState, useTransition, type FocusEvent, type KeyboardEvent, type MouseEvent } from "react";
-import { flushSync } from "react-dom";
+import { createPortal, flushSync } from "react-dom";
 import { useRouter } from "next/navigation";
 import {
   editUserMessageAction,
   keepEpisodesAsIsAction,
   postUserMessageAction,
   processMessagesNowAction,
+  restoreEpisodesToPendingAction,
   withdrawUserMessageAction,
 } from "../app/actions";
+import { KEEP_SAVE_FAILED, KEEP_UNDO_FAILED, createKeepUndo, type KeepToast } from "../lib/keep-undo";
 import { relativeDayLabel } from "../lib/relative-day";
 import { runAction } from "../lib/run-action";
 import type { MessageRunView, MessageThreadView } from "../lib/user-message-server";
@@ -24,28 +26,37 @@ import {
   appendChipText,
   composerPlaceholder,
   draftIsSendable,
+  editorAfterRefresh,
   episodeLabel,
   groupEpisodesBySeason,
   isMultiSeason,
   keepToastText,
+  mergeIntoComposer,
   nowButtonMessageId,
+  replacedLaterByRun,
   replyView,
   statusLabel,
   threadExchanges,
   toggleEpisode,
   visibleExchanges,
+  type EditingMessage,
   type Exchange,
   type ReplyRow,
   type ThreadMessage,
 } from "../lib/user-message-state";
 import { useSwapKeep } from "./swap-keep";
 
-/** 「不换了」 waits this long for 撤销 before it is sent (as deleting a note does). */
+/** How long 撤销 stays on screen after 「不换了」 (saved at once; 撤销 puts it back). */
 const UNDO_MS = 6000;
 const COPIED_MS = 2500;
 /** USER_MESSAGE_LIMITS.bodyMax — the card cannot import the workflow package; the
  *  server validates the same limit. */
 const BODY_MAX = 500;
+/** Why 「不换了」 waits while a replace run of the work is processing: the run's end-of-run
+ *  bookkeeping would put the episode back as 待换 and silently undo the choice. */
+const KEEP_BUSY_HINT = "处理中，完了再操作";
+const EDIT_TAKEN = "agent 已经开始处理这条留言了";
+const EDIT_TAKEN_MOVED = "agent 已经开始处理这条留言了。改过的内容挪到了输入框里，可以再发一条";
 
 /** The common ways to say what is wrong (mockup ②): the chip, and what it adds to the draft. */
 const CHIPS = [
@@ -56,7 +67,7 @@ const CHIPS = [
   { label: "音画不同步", fill: "音画不同步" },
 ] as const;
 
-const OUT_TONE = { replaced: "is-ok", looking: "is-bad", stopped: "is-off" } as const;
+const OUT_TONE = { replaced: "is-ok", looking: "is-bad", replacedLater: "is-off", stopped: "is-off" } as const;
 
 interface Work {
   tmdbId: number;
@@ -85,17 +96,23 @@ export interface UserMessageThreadProps {
  */
 export function UserMessageThread(props: UserMessageThreadProps) {
   // One instance per work: the App Router reuses components across /show pages, and no
-  // draft or waiting 不换了 may carry to the next work (the old instance's unmount sends
-  // its waiting 不换了 against its own work).
+  // draft, editor or undo toast may carry to the next work.
   const { work } = props;
   return <ThreadForOneWork key={`${work.mediaType}:${work.tmdbId}:${work.storageId ?? ""}`} {...props} />;
+}
+
+/** A message action's answer for the keep/undo module: null when it went through, else
+ *  the card's error line. */
+async function savedOr(action: () => Promise<{ success: boolean; message?: string }>, fallback: string): Promise<string | null> {
+  const r = await runAction(action, () => undefined);
+  if (r.ok && r.value.success) return null;
+  return (r.ok && r.value.message) || fallback;
 }
 
 function ThreadForOneWork({ work, view, run, nextPatrol, episodes, now }: UserMessageThreadProps) {
   const router = useRouter();
   const [sending, startSend] = useTransition();
   const [acting, startAct] = useTransition();
-  const [, startKeep] = useTransition();
   const [error, setError] = useState<string | null>(null);
   // The composer.
   const [draft, setDraft] = useState("");
@@ -108,22 +125,40 @@ function ThreadForOneWork({ work, view, run, nextPatrol, episodes, now }: UserMe
   const [holdOpen, setHoldOpen] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // One waiting message edited in place.
-  const [editing, setEditing] = useState<{ id: string; body: string; tags: string[] } | null>(null);
+  const [editing, setEditing] = useState<EditingMessage | null>(null);
   // 不换了 and its undo. The episodes are shared with the page (the 待换 cells, the badge).
   const { kept, add: keepOnPage, remove: unkeepOnPage } = useSwapKeep();
-  const [toast, setToast] = useState<{ episodes: string[]; text: string } | null>(null);
-  const waitingKeep = useRef<{ episodes: string[]; work: Work; timer: ReturnType<typeof setTimeout> } | null>(null);
-  /** Sent and saved; still overridden on the page until a fresh render reflects them. */
-  const settledKeeps = useRef(new Set<string>());
+  const [toast, setToast] = useState<KeepToast | null>(null);
+  // Saved at once; 撤销 puts the rows back (lib/keep-undo.ts). Nothing waits for the page
+  // to go away: a send from an unmounting page posted to the next route and was lost.
+  const [keeper] = useState(() =>
+    createKeepUndo({
+      commit: (list) => savedOr(() => keepEpisodesAsIsAction({ ...work, episodes: list }), KEEP_SAVE_FAILED),
+      restore: (rows) => savedOr(() => restoreEpisodesToPendingAction({ ...work, episodes: rows }), KEEP_UNDO_FAILED),
+      hide: keepOnPage,
+      show: unkeepOnPage,
+      toast: setToast,
+      error: setError,
+      refresh: () => router.refresh(),
+      undoMs: UNDO_MS,
+      setTimer: (fn, ms) => setTimeout(fn, ms),
+      clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+    }),
+  );
   const focusUndo = useRef(false);
   const undoRef = useRef<HTMLButtonElement>(null);
+  /** The toast lives in <body> (above every card on the page); only once mounted. */
+  const [mounted, setMounted] = useState(false);
+  const lastView = useRef(view);
   const pickerId = useId();
+  const keepHintId = useId();
 
   const movie = work.mediaType === "movie";
   const exchanges = threadExchanges(view.messages);
   const { earlier, recent, earlierCount } = visibleExchanges(exchanges);
   const last = exchanges.at(-1);
   const latestAnswered = [...recent].reverse().find((e) => e.kind === "answered");
+  const replacedLater = replacedLaterByRun(exchanges);
   const pending = new Set(view.pendingReplacements.filter((e) => !kept.has(e)));
   const multiSeason = isMultiSeason([
     ...episodes,
@@ -133,6 +168,8 @@ function ThreadForOneWork({ work, view, run, nextPatrol, episodes, now }: UserMe
   const obtained = new Set(episodes);
   // An urgent message waits for the run in flight rather than going with a queued one.
   const busy = view.busy || run.waitsForRun;
+  // A replace run of this work is processing: 「不换了」 waits (its bookkeeping would undo it).
+  const keepBusy = view.busy || run.running;
   const nowId = nowButtonMessageId([...view.messages].reverse());
   const active = view.messages.some((m) => m.status === "pending" || m.status === "processing");
   const open = focused || draft !== "" || tags.length > 0 || picking;
@@ -141,32 +178,30 @@ function ThreadForOneWork({ work, view, run, nextPatrol, episodes, now }: UserMe
   const canPick = !movie && episodes.length > 0;
   const editingId = editing && view.messages.some((m) => m.id === editing.id && m.status === "pending") ? editing.id : null;
 
-  // A fresh server render: what a 不换了 saved is in the server's list now; an editor
-  // whose message a run took is dropped (so it cannot pop back if the run hands it back).
-  useEffect(() => {
-    setHoldOpen(false);
-    setEditing((cur) => (cur && view.messages.some((m) => m.id === cur.id && m.status === "pending") ? cur : null));
-    if (settledKeeps.current.size === 0) return;
-    const settled = [...settledKeeps.current];
-    settledKeeps.current.clear();
-    unkeepOnPage(settled);
-  }, [view, unkeepOnPage]);
+  useEffect(() => setMounted(true), []);
 
-  // A 不换了 the user asked for is never dropped: leaving the page (or this work) sends it now.
+  // A fresh server render. Not when the page merely shows again (the router keeps a
+  // page it left hidden, and effects run anew when it comes back): same props, no news.
   useEffect(() => {
-    const flush = () => {
-      const waiting = waitingKeep.current;
-      if (!waiting) return;
-      clearTimeout(waiting.timer);
-      waitingKeep.current = null;
-      void keepEpisodesAsIsAction({ ...waiting.work, episodes: waiting.episodes }).catch(() => undefined);
-    };
-    window.addEventListener("pagehide", flush);
-    return () => {
-      window.removeEventListener("pagehide", flush);
-      flush();
-    };
-  }, []);
+    if (lastView.current === view) return;
+    lastView.current = view;
+    keeper.viewChanged();
+    setHoldOpen(false);
+    if (!editing) return;
+    const verdict = editorAfterRefresh(editing, view.messages.find((m) => m.id === editing.id));
+    if (verdict.kind === "keep") return;
+    setEditing(null);
+    if (verdict.kind === "close") return;
+    // A run took the message (or it left the thread) while its editor was open: what was
+    // typed is not dropped — it moves into the composer.
+    const typed = verdict.typed;
+    if (typed) {
+      setDraft((cur) => mergeIntoComposer({ draft: cur, tags: [] }, typed).draft);
+      setTags((cur) => mergeIntoComposer({ draft: "", tags: cur }, typed).tags);
+    }
+    if (verdict.kind === "taken") setError(typed ? EDIT_TAKEN_MOVED : EDIT_TAKEN);
+    // `editing` is read as of the render that brought this view: only a new view re-runs this.
+  }, [view, keeper]);
 
   // The 不换了 button just went away with its row state: 撤销 takes the focus.
   useEffect(() => {
@@ -230,15 +265,21 @@ function ThreadForOneWork({ work, view, run, nextPatrol, episodes, now }: UserMe
   };
 
   const saveEdit = () => {
-    if (!editing || !draftIsSendable(editing.body) || acting) return;
-    const input = { id: editing.id, body: editing.body, episodeTags: editing.tags };
+    if (!editing || editing.saved || !draftIsSendable(editing.body) || acting) return;
+    const { id } = editing;
+    const input = { id, body: editing.body, episodeTags: editing.tags };
+    // What the store keeps (it trims).
+    const saved = { body: editing.body.trim(), tags: editing.tags };
     setError(null);
     startAct(async () => {
       const r = await runAction(() => editUserMessageAction(input), setError);
       if (!r.ok) return;
-      if (r.value.success) setEditing(null);
+      // Saved: the editor stays, disabled, with the new words until the refreshed render
+      // carries them — closing now would flash the old text first.
+      if (r.value.success) setEditing((cur) => (cur?.id === id ? { ...cur, body: saved.body, saved } : cur));
       else setError(r.value.message ?? "修改没成功，再试一次");
-      // Either way: a message a run took meanwhile then shows locked, and its editor closes.
+      // Either way: a message a run took meanwhile then shows locked, and what was typed
+      // moves into the composer.
       router.refresh();
     });
   };
@@ -266,64 +307,31 @@ function ThreadForOneWork({ work, view, run, nextPatrol, episodes, now }: UserMe
     });
   };
 
-  const commitKeep = (target: { episodes: string[]; work: Work }) => {
-    startKeep(async () => {
-      const r = await runAction(() => keepEpisodesAsIsAction({ ...target.work, episodes: target.episodes }), setError);
-      if (r.ok && r.value.success) {
-        for (const e of target.episodes) settledKeeps.current.add(e);
-      } else {
-        // Still 待换 on the server: show it again.
-        if (r.ok) setError(r.value.message ?? "没能保存，再试一次");
-        unkeepOnPage(target.episodes);
-      }
-      router.refresh();
-    });
-  };
-
   const keep = (episodesToKeep: string[]) => {
-    setError(null);
-    // One undo at a time: a second 不换了 sends the first right away.
-    const waiting = waitingKeep.current;
-    if (waiting) {
-      clearTimeout(waiting.timer);
-      waitingKeep.current = null;
-      commitKeep(waiting);
-    }
-    const target = { episodes: episodesToKeep, work };
-    keepOnPage(episodesToKeep);
-    focusUndo.current = true;
-    setToast({ episodes: episodesToKeep, text: keepToastText(episodesToKeep, { mediaType: work.mediaType, multiSeason, obtained }) });
-    waitingKeep.current = {
-      ...target,
-      timer: setTimeout(() => {
-        waitingKeep.current = null;
-        setToast((shown) => (shown?.episodes === episodesToKeep ? null : shown));
-        commitKeep(target);
-      }, UNDO_MS),
-    };
+    const rows = view.pendingRows.filter((r) => episodesToKeep.includes(r.episode));
+    const text = keepToastText(episodesToKeep, { mediaType: work.mediaType, multiSeason, obtained });
+    if (keeper.keep({ rows, text, busy: keepBusy })) focusUndo.current = true;
   };
 
   const undo = () => {
-    const waiting = waitingKeep.current;
-    if (!waiting) return;
-    clearTimeout(waiting.timer);
-    waitingKeep.current = null;
-    unkeepOnPage(waiting.episodes);
-    setToast(null);
+    void keeper.undo();
   };
 
-  const tagChip = (code: string, remove: () => void) => {
+  const tagChip = (code: string, remove: (() => void) | null) => {
     const label = episodeLabel(code, multiSeason);
     return (
-      <button type="button" key={code} className="um-chip um-ep-tag" aria-label={`去掉 ${label}`} onClick={remove}>
+      <button type="button" key={code} className="um-chip um-ep-tag" aria-label={`去掉 ${label}`} onClick={remove ?? undefined} disabled={remove === null}>
         {label}
         <b aria-hidden="true">×</b>
       </button>
     );
   };
 
-  const renderEditor = () =>
-    editing ? (
+  const renderEditor = () => {
+    if (!editing) return null;
+    // Saved and waiting for the refreshed render: shown, not editable.
+    const settled = editing.saved !== null;
+    return (
       <div className="um-edit">
         <div className="um-composer is-open">
           <textarea
@@ -331,6 +339,7 @@ function ThreadForOneWork({ work, view, run, nextPatrol, episodes, now }: UserMe
             rows={1}
             maxLength={BODY_MAX}
             value={editing.body}
+            disabled={settled}
             autoFocus
             onChange={(event) => {
               const body = event.target.value;
@@ -346,20 +355,23 @@ function ThreadForOneWork({ work, view, run, nextPatrol, episodes, now }: UserMe
           />
           {editing.tags.length > 0 ? (
             <div className="um-tools">
-              {editing.tags.map((code) => tagChip(code, () => setEditing((cur) => (cur ? { ...cur, tags: cur.tags.filter((t) => t !== code) } : cur))))}
+              {editing.tags.map((code) =>
+                tagChip(code, settled ? null : () => setEditing((cur) => (cur ? { ...cur, tags: cur.tags.filter((t) => t !== code) } : cur))),
+              )}
             </div>
           ) : null}
         </div>
         <div className="um-msg-actions">
-          <button type="button" className="um-btn is-ghost" onClick={() => setEditing(null)}>
+          <button type="button" className="um-btn is-ghost" onClick={() => setEditing(null)} disabled={settled}>
             取消
           </button>
-          <button type="button" className="um-btn is-go" onClick={saveEdit} disabled={acting || !draftIsSendable(editing.body)}>
+          <button type="button" className="um-btn is-go" onClick={saveEdit} disabled={settled || acting || !draftIsSendable(editing.body)}>
             保存
           </button>
         </div>
       </div>
-    ) : null;
+    );
+  };
 
   const renderUserMessage = (m: ThreadMessage) => {
     const label = statusLabel(m, nextPatrol, busy);
@@ -396,7 +408,7 @@ function ThreadForOneWork({ work, view, run, nextPatrol, episodes, now }: UserMe
                     className="um-btn is-ghost"
                     onClick={() => {
                       setError(null);
-                      setEditing({ id: m.id, body: m.body, tags: m.episodeTags });
+                      setEditing({ id: m.id, body: m.body, tags: m.episodeTags, original: { body: m.body, tags: m.episodeTags }, saved: null });
                     }}
                     disabled={acting}
                     aria-label={`修改这条留言：${snippet}`}
@@ -447,7 +459,7 @@ function ThreadForOneWork({ work, view, run, nextPatrol, episodes, now }: UserMe
 
   const renderReply = (exchange: Extract<Exchange, { kind: "answered" }>) => {
     if (!exchange.reply) return null;
-    const reply = replyView(exchange.reply, { mediaType: work.mediaType, multiSeason, pending });
+    const reply = replyView(exchange.reply, { mediaType: work.mediaType, multiSeason, pending, replacedLater: replacedLater.get(exchange.reply.runId) });
     const latest = exchange === latestAnswered;
     const foot = latest ? reply.foot : null;
     const another = latest && !composerShown;
@@ -461,7 +473,7 @@ function ThreadForOneWork({ work, view, run, nextPatrol, episodes, now }: UserMe
             <b>agent</b>
             {reply.summary ? <span>{reply.summary}</span> : null}
           </div>
-          {reply.rows.length > 0 ? <Tracks rows={reply.rows} movie={movie} onKeep={keep} /> : null}
+          {reply.rows.length > 0 ? <Tracks rows={reply.rows} movie={movie} onKeep={keep} keepBlockedBy={keepBusy ? keepHintId : null} /> : null}
           {reply.unidentified ? <p className="um-note">没看出是哪几集——用「选集数」标出来，再发一次</p> : null}
           {reply.rejectedNotSaved ? <p className="um-note is-faint">这次拒掉的版本没能记下来，之后搜索时可能还会看到它</p> : null}
           {reply.oldFilesLabel ? <OldFiles label={reply.oldFilesLabel} paths={reply.oldFiles} /> : null}
@@ -497,10 +509,23 @@ function ThreadForOneWork({ work, view, run, nextPatrol, episodes, now }: UserMe
           <span>
             <b>还在找别的版本。</b>现在这份先留着，之后每次巡检都会接着找。
           </span>
-          <button type="button" className="um-btn is-outline" onClick={() => keep(["MOVIE"])}>
+          <button
+            type="button"
+            className="um-btn is-outline"
+            onClick={() => keep(["MOVIE"])}
+            disabled={keepBusy}
+            title={keepBusy ? KEEP_BUSY_HINT : undefined}
+            aria-describedby={keepBusy ? keepHintId : undefined}
+          >
             不换了
           </button>
         </div>
+      ) : null}
+      {/* The reason a disabled 不换了 gives (title for the pointer, this for screen readers). */}
+      {keepBusy ? (
+        <span id={keepHintId} hidden>
+          {KEEP_BUSY_HINT}
+        </span>
       ) : null}
       <section className="um-thread" aria-label="给 agent 的留言">
         {view.messages.length > 0 ? (
@@ -607,22 +632,40 @@ function ThreadForOneWork({ work, view, run, nextPatrol, episodes, now }: UserMe
           </details>
         ) : null}
       </section>
-      <div className="um-toast-row" role="status" aria-live="polite">
-        {toast ? (
-          <div className="um-toast">
-            <span>{toast.text}</span>
-            <button type="button" ref={undoRef} onClick={undo}>
-              撤销
-            </button>
-          </div>
-        ) : null}
-      </div>
+      {/* In <body>: inside the page it painted under the agent-notes card that follows (the
+          card is its own stacking context). Hidden with the page when the router keeps it. */}
+      {mounted
+        ? createPortal(
+            <div className="um-toast-row" role="status" aria-live="polite">
+              {toast ? (
+                <div className="um-toast" key={toast.id}>
+                  <span>{toast.text}</span>
+                  <button type="button" ref={undoRef} onClick={undo}>
+                    撤销
+                  </button>
+                </div>
+              ) : null}
+            </div>,
+            document.body,
+          )
+        : null}
     </>
   );
 }
 
-/** The reply as a track list (集 / 这次用的资源 / 大小 / 结果). */
-function Tracks({ rows, movie, onKeep }: { rows: ReplyRow[]; movie: boolean; onKeep: (episodes: string[]) => void }) {
+/** The reply as a track list (集 / 这次用的资源 / 大小 / 结果). `keepBlockedBy`: the id of the
+ *  reason 不换了 is disabled (a replace run of the work is processing), else null. */
+function Tracks({
+  rows,
+  movie,
+  onKeep,
+  keepBlockedBy,
+}: {
+  rows: ReplyRow[];
+  movie: boolean;
+  onKeep: (episodes: string[]) => void;
+  keepBlockedBy: string | null;
+}) {
   return (
     <div className={`um-tracks${movie ? " is-movie" : ""}`} role="table" aria-label="这次的处理结果">
       {movie ? null : (
@@ -661,13 +704,23 @@ function Tracks({ rows, movie, onKeep }: { rows: ReplyRow[]; movie: boolean; onK
                 </span>
                 {/* A film's 不换了 is on the red bar above the card. */}
                 {movie ? null : (
-                  <button type="button" className="um-keep" onClick={() => onKeep([row.episode])} aria-label={`${row.label} 不换了`}>
+                  <button
+                    type="button"
+                    className="um-keep"
+                    onClick={() => onKeep([row.episode])}
+                    aria-label={`${row.label} 不换了`}
+                    disabled={keepBlockedBy !== null}
+                    title={keepBlockedBy !== null ? KEEP_BUSY_HINT : undefined}
+                    aria-describedby={keepBlockedBy ?? undefined}
+                  >
                     不换了
                   </button>
                 )}
               </>
+            ) : row.state === "replacedLater" ? (
+              "后来换好了"
             ) : (
-              "不找了"
+              "不再待换"
             )}
           </span>
         </div>

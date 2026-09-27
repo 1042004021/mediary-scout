@@ -177,6 +177,19 @@ describe("loadMessageThread", () => {
     expect(view.busy).toBe(true);
     expect(view.messages[0]).toMatchObject({ status: "processing" });
   });
+
+  it("each 待换 row carries the message that asked and when — what 撤销 after 不换了 puts back", async () => {
+    const repo = new InMemoryWorkflowRepository();
+    await repo.addPendingReplacements({ ...work, episodes: ["S01E24"], messageId: "msg_b", now: "2026-09-26T02:00:00.000Z" });
+    await repo.addPendingReplacements({ ...work, episodes: ["S01E03"], messageId: "msg_a", now: "2026-09-25T01:00:00.000Z" });
+
+    const view = await loadMessageThread(repo, work);
+
+    expect(view.pendingRows).toEqual([
+      { episode: "S01E03", messageId: "msg_a", requestedAt: "2026-09-25T01:00:00.000Z" },
+      { episode: "S01E24", messageId: "msg_b", requestedAt: "2026-09-26T02:00:00.000Z" },
+    ]);
+  });
 });
 
 describe("messageRunView — what the work's active run means for its messages", () => {

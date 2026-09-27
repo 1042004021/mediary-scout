@@ -13,6 +13,7 @@ vi.mock("../app/actions", () => ({
   withdrawUserMessageAction: vi.fn(),
   processMessagesNowAction: vi.fn(),
   keepEpisodesAsIsAction: vi.fn(),
+  restoreEpisodesToPendingAction: vi.fn(),
 }));
 
 const { UserMessageThread } = await import("./user-message-thread");
@@ -40,9 +41,11 @@ function render(input: {
   episodes?: string[];
 }) {
   const messages = input.messages ?? [];
+  const pending = input.pending ?? [];
   const view: MessageThreadView = {
     messages,
-    pendingReplacements: input.pending ?? [],
+    pendingReplacements: pending,
+    pendingRows: pending.map((episode) => ({ episode, messageId: "msg_1", requestedAt: NOW })),
     busy: messages.some((m) => m.status === "processing"),
   };
   const mediaType = input.mediaType ?? "tv";
@@ -201,5 +204,58 @@ describe("UserMessageThread — the states of the mockup", () => {
     const html = render({ pending: ["S01E24"], run: { running: true, activity: "正在搜索资源：第 24 集", waitsForRun: true } });
     expect(html).toContain("正在处理");
     expect(html).toContain("正在搜索资源：第 24 集");
+  });
+
+  it("while a replace run of the work is processing, 不换了 is disabled and says why (its bookkeeping would undo the choice)", () => {
+    const answered = done(
+      "run_c",
+      { results: [{ episode: "S01E24", outcome: "not_found", note: "没找到" }], oldFiles: [] },
+      { id: "m1", episodeTags: ["S01E24"] },
+    );
+    const idle = render({ messages: [answered], pending: ["S01E24"] });
+    expect(idle).toMatch(/<button type="button" class="um-keep" aria-label="E24 不换了">不换了<\/button>/);
+
+    const html = render({ messages: [answered], pending: ["S01E24"], run: { running: true, activity: "正在搜索资源：第 24 集", waitsForRun: true } });
+    const button = /<button[^>]*class="um-keep"[^>]*>不换了<\/button>/.exec(html)?.[0] ?? "";
+    expect(button).toContain('disabled=""');
+    expect(button).toContain('title="处理中，完了再操作"');
+    const describedBy = /aria-describedby="([^"]+)"/.exec(button)?.[1];
+    expect(describedBy).toBeTruthy();
+    expect(html).toContain(`<span id="${describedBy}" hidden="">处理中，完了再操作</span>`);
+  });
+
+  it("a film's 不换了 on the red bar is disabled the same way while its run holds the message", () => {
+    const html = render({
+      mediaType: "movie",
+      messages: [msg({ id: "m2", status: "processing", episodeTags: [] })],
+      pending: ["MOVIE"],
+      run: { running: true, activity: null, waitsForRun: true },
+    });
+    const button = /<div class="um-movie-state">[\s\S]*?<button[^>]*>不换了<\/button>/.exec(html)?.[0] ?? "";
+    expect(button).toContain('disabled=""');
+    expect(button).toContain('title="处理中，完了再操作"');
+  });
+
+  it("the undo toast is not in the server markup: it portals into <body> once mounted, above every card", () => {
+    const html = render({ messages: [done("run_c", { results: [{ episode: "S01E24", outcome: "not_found", note: "" }], oldFiles: [] }, { id: "m1" })], pending: ["S01E24"] });
+    expect(html).not.toContain("um-toast");
+  });
+
+  it("an older reply's episode that a newer reply replaced reads 后来换好了; one no longer 待换 otherwise reads 不再待换", () => {
+    const html = render({
+      messages: [
+        done("run_b", { results: [{ episode: "S01E24", outcome: "replaced", label: "[x] 24", note: "" }], oldFiles: [] }, { id: "m2", processedAt: "2026-09-27T07:00:00.000Z" }),
+        done(
+          "run_a",
+          { results: [{ episode: "S01E24", outcome: "not_found", note: "" }, { episode: "S01E13", outcome: "not_found", note: "" }], oldFiles: [] },
+          { id: "m1", createdAt: "2026-09-25T06:00:00.000Z", processedAt: "2026-09-25T06:30:00.000Z" },
+        ),
+      ],
+      pending: [],
+    });
+    const earlier = html.slice(html.indexOf('class="um-earlier"'));
+    expect(earlier).toMatch(/E24<\/span>[\s\S]*?<span class="um-out is-off" role="cell">后来换好了<\/span>/);
+    expect(earlier).toMatch(/E13<\/span>[\s\S]*?<span class="um-out is-off" role="cell">不再待换<\/span>/);
+    expect(html).not.toContain("不找了");
   });
 });

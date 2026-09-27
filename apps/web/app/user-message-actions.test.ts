@@ -3,6 +3,7 @@ import {
   createEpisodeStates,
   InMemoryWorkflowRepository,
   isRegisteredStorageProvider,
+  movieAnchorSeason,
   pickWorkspaceStorageId,
   type MediaTitle,
   type TrackedSeason,
@@ -123,7 +124,11 @@ describe("user message actions", () => {
     expect(await actions.postUserMessageAction({ ...onPrimary, body: "换", episodeTags: [] })).toEqual(notTracked);
     expect(await actions.processMessagesNowAction(onPrimary)).toEqual(notTracked);
     expect(await actions.keepEpisodesAsIsAction({ ...onPrimary, episodes: ["S01E01"] })).toEqual(notTracked);
+    expect(
+      await actions.restoreEpisodesToPendingAction({ ...onPrimary, episodes: [{ episode: "S01E01", messageId: "msg_1", requestedAt: NOW }] }),
+    ).toEqual(notTracked);
     expect(await repo.listUserMessages(primaryWork)).toHaveLength(0);
+    expect(await repo.listPendingReplacements(primaryWork)).toHaveLength(0);
     expect(await repo.listWorksWithPendingMessages({ urgentOnly: false })).toEqual([]);
   });
 
@@ -231,6 +236,82 @@ describe("user message actions", () => {
     expect((await repo.listPendingReplacements(primaryWork)).map((p) => p.episode)).toEqual(["S01E01"]);
   });
 
+  it("撤销 after 不换了 puts the 待换 rows back as they were: same message, same time", async () => {
+    await track(repo, "acct_default", "cs_primary");
+    await repo.addPendingReplacements({ ...primaryWork, episodes: ["S01E01"], messageId: "msg_1", now: "2026-09-25T01:00:00.000Z" });
+    await repo.addPendingReplacements({ ...primaryWork, episodes: ["S01E02"], messageId: "msg_2", now: "2026-09-26T02:00:00.000Z" });
+    const before = await repo.listPendingReplacements(primaryWork);
+    const rows = before.map(({ episode, messageId, requestedAt }) => ({ episode, messageId, requestedAt }));
+    expect(await actions.keepEpisodesAsIsAction({ ...onPrimary, episodes: ["S01E01", "S01E02"] })).toEqual({ success: true });
+    expect(await repo.listPendingReplacements(primaryWork)).toEqual([]);
+
+    expect(await actions.restoreEpisodesToPendingAction({ ...onPrimary, episodes: rows })).toEqual({ success: true });
+
+    expect(await repo.listPendingReplacements(primaryWork)).toEqual(before);
+  });
+
+  it("撤销 leaves a row that is somehow still there as it was", async () => {
+    await track(repo, "acct_default", "cs_primary");
+    await repo.addPendingReplacements({ ...primaryWork, episodes: ["S01E01"], messageId: "msg_1", now: NOW });
+
+    // Already 待换 (a refresh raced the undo): left as it was.
+    expect(
+      await actions.restoreEpisodesToPendingAction({ ...onPrimary, episodes: [{ episode: "S01E01", messageId: "msg_9", requestedAt: "2026-01-01T00:00:00.000Z" }] }),
+    ).toEqual({ success: true });
+    expect(await repo.listPendingReplacements(primaryWork)).toMatchObject([{ episode: "S01E01", messageId: "msg_1", requestedAt: NOW }]);
+  });
+
+  it("a film's 撤销 puts back its MOVIE row", async () => {
+    const film: MediaTitle = { id: "tmdb_movie_42", tmdbId: 42, type: "movie", title: "Film", originalTitle: "Film", year: 2026, aliases: [] };
+    const anchor = movieAnchorSeason({ titleId: film.id, qualityPreference: "4K", storageDirectoryId: "dir_film" });
+    await repo.saveWorkflowRunSnapshot({
+      accountId: "acct_default",
+      connectedStorageId: "cs_primary",
+      title: film,
+      season: anchor,
+      workflowRun: { id: "seed_film", kind: "movie_init", status: "succeeded", trackedSeasonId: anchor.id, startedAt: NOW, finishedAt: NOW, auditEvents: [] },
+      episodes: createEpisodeStates({ trackedSeasonId: anchor.id, seasonNumber: anchor.seasonNumber, totalEpisodes: 1, latestAiredEpisode: 1 }).map((e) => ({ ...e, obtained: true })),
+      resourceSnapshots: [],
+      decisions: [],
+      transferAttempts: [],
+      notifications: [],
+    });
+    const filmWork = { ...primaryWork, titleKey: film.id };
+    const onFilm = { ...onPrimary, mediaType: "movie" as const };
+    await repo.addPendingReplacements({ ...filmWork, episodes: ["MOVIE"], messageId: "msg_f", now: NOW });
+    expect(await actions.keepEpisodesAsIsAction({ ...onFilm, episodes: ["MOVIE"] })).toEqual({ success: true });
+
+    expect(await actions.restoreEpisodesToPendingAction({ ...onFilm, episodes: [{ episode: "MOVIE", messageId: "msg_f", requestedAt: NOW }] })).toEqual({
+      success: true,
+    });
+    expect(await repo.listPendingReplacements(filmWork)).toMatchObject([{ episode: "MOVIE", messageId: "msg_f", requestedAt: NOW }]);
+  });
+
+  it("撤销's rows are checked before any lookup: a malformed one is refused and nothing is written", async () => {
+    await track(repo, "acct_default", "cs_primary");
+    const ok = { episode: "S01E01", messageId: "msg_1", requestedAt: NOW };
+    const refused = { success: false, message: "集数不对" };
+    const bad: unknown[] = [
+      [],
+      "S01E01",
+      [{ ...ok, episode: "E13" }],
+      [{ ...ok, episode: "MOVIE" }],
+      [{ ...ok, messageId: "" }],
+      [{ ...ok, messageId: "x".repeat(200) }],
+      [{ ...ok, requestedAt: "昨天" }],
+      [{ episode: "S01E01" }],
+      [null],
+      Array.from({ length: 201 }, (_, i) => ({ ...ok, episode: `S01E${String(i + 1).padStart(3, "0")}` })),
+    ];
+
+    for (const episodes of bad) {
+      expect(await actions.restoreEpisodesToPendingAction({ ...onPrimary, episodes: episodes as never })).toEqual(refused);
+    }
+    // A film only has its MOVIE row.
+    expect(await actions.restoreEpisodesToPendingAction({ ...onPrimary, mediaType: "movie", episodes: [ok] })).toEqual(refused);
+    expect(await repo.listPendingReplacements(primaryWork)).toEqual([]);
+  });
+
   it("the unauthenticated sentinel is refused by every action and nothing is written", async () => {
     const { UNAUTHENTICATED_ACCOUNT_ID } = await vi.importActual<typeof import("../lib/workflow-runtime")>("../lib/workflow-runtime");
     await track(repo, "acct_default", "cs_primary");
@@ -243,9 +324,12 @@ describe("user message actions", () => {
     expect(await actions.withdrawUserMessageAction({ id: m.id })).toMatchObject({ success: false });
     expect(await actions.processMessagesNowAction(onPrimary)).toMatchObject({ success: false });
     expect(await actions.keepEpisodesAsIsAction({ ...onPrimary, episodes: ["S01E01"] })).toMatchObject({ success: false });
+    expect(
+      await actions.restoreEpisodesToPendingAction({ ...onPrimary, episodes: [{ episode: "S01E02", messageId: m.id, requestedAt: NOW }] }),
+    ).toMatchObject({ success: false });
 
     expect(await repo.listUserMessages(primaryWork)).toMatchObject([{ body: "原话", status: "pending", urgent: false }]);
-    expect(await repo.listPendingReplacements(primaryWork)).toHaveLength(1);
+    expect(await repo.listPendingReplacements(primaryWork)).toMatchObject([{ episode: "S01E01" }]);
     expect(await repo.listWorksWithPendingMessages({ urgentOnly: false })).toEqual([primaryWork]);
   });
 });
