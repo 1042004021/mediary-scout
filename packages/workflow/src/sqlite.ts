@@ -1977,7 +1977,10 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
     // The json_type guards matter: json_each over a scalar yields it as one element.
     const rows = this.db
       .prepare(
-        "SELECT f.value AS file_id, json_extract(c.value, '$.providerPayload.url') AS url, json_extract(c.value, '$.title') AS title " +
+        "SELECT f.value AS file_id, " +
+          "CASE WHEN json_type(c.value, '$.providerPayload.url') = 'text' AND json_extract(c.value, '$.providerPayload.url') <> '' " +
+          "THEN json_extract(c.value, '$.providerPayload.url') END AS url, " +
+          "json_extract(c.value, '$.title') AS title " +
           "FROM transfer_attempts t " +
           "JOIN workflow_runs r ON r.id = t.workflow_run_id " +
           "JOIN json_each(t.payload, '$.materializedFileIds') f " +
@@ -1987,11 +1990,10 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
           "AND json_type(t.payload, '$.materializedFileIds') = 'array' AND json_type(s.payload, '$.candidates') = 'array' " +
           "AND f.value IN (SELECT value FROM json_each(?)) " +
           "AND json_extract(c.value, '$.id') = t.candidate_id " +
-          "AND json_type(c.value, '$.providerPayload.url') = 'text' AND json_extract(c.value, '$.providerPayload.url') <> '' " +
           "ORDER BY json_extract(r.payload, '$.startedAt'), r.id, t.ordinal, f.key, s.ordinal",
       )
-      .all(input.accountId, storage, JSON.stringify(input.fileIds)) as Array<{ file_id: string; url: string; title: string | null }>;
-    return rows.map((r) => ({ fileId: String(r.file_id), url: String(r.url), title: String(r.title ?? "") }));
+      .all(input.accountId, storage, JSON.stringify(input.fileIds)) as Array<{ file_id: string; url: string | null; title: string | null }>;
+    return rows.map((r) => ({ fileId: String(r.file_id), url: r.url === null ? null : String(r.url), title: String(r.title ?? "") }));
   }
 
   async listDeadLinkKeys(options?: { now?: string }): Promise<string[]> {

@@ -290,9 +290,9 @@ export async function runQueuedReplaceRequest(
         const keys = new Map<string, string | null>();
         for (const s of await repository.listLandingSources({ accountId: work.accountId, drive: work.drive, fileIds })) {
           // The oldest transfer decides — a later one can only have claimed the file through
-          // a lagging listing — even when its link has no key (null, not left out: the file
-          // has a source of its own, so the episode's recorded one is not lent to it).
-          if (!keys.has(s.fileId)) keys.set(s.fileId, resourceLinkKey(s.url));
+          // a lagging listing — even when its link is unusable or has no key (null, not left
+          // out: the file has a source of its own, so the episode's recorded one is not lent).
+          if (!keys.has(s.fileId)) keys.set(s.fileId, s.url === null ? null : resourceLinkKey(s.url));
         }
         return Object.fromEntries(keys);
       },

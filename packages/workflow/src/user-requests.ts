@@ -88,7 +88,8 @@ export interface EpisodeSource extends UserMessageScope {
 /** A file on a drive and the resource whose transfer put it there. */
 export interface LandingSource {
   fileId: string;
-  url: string;
+  /** Null when the candidate's link is unusable (missing, empty, not a string). */
+  url: string | null;
   title: string;
 }
 
@@ -142,9 +143,9 @@ export interface UserRequestStore {
   listEpisodeSources(scope: UserMessageScope): Promise<EpisodeSource[]>;
 
   /** For each of `fileIds`: the candidate whose transfer — in a run of this account on this drive that is
-   *  still on record (finished runs are pruned after 30 days) — materialized that file, with its link and
-   *  title. Oldest transfer first (a file several transfers landed is listed once per transfer); an id no
-   *  transfer on record materialized is simply absent. */
+   *  still on record (finished runs are pruned after 30 days) — materialized that file, with its link (null
+   *  when unusable: the file still has a source of its own) and title. Oldest transfer first (a file several
+   *  transfers landed is listed once per transfer); an id no transfer on record materialized is absent. */
   listLandingSources(input: { accountId: string; drive: string; fileIds: string[] }): Promise<LandingSource[]>;
 }
 

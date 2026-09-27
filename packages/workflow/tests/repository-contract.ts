@@ -440,7 +440,7 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
           ]);
         });
 
-        it("skips a transfer whose candidate has no usable url: missing, empty or not a string", async () => {
+        it("lists a transfer whose candidate has no usable url — missing, empty or not a string — with url null: the file still has a source of its own", async () => {
           const repo = await fresh();
           await repo.saveWorkflowRunSnapshot(landingRun({
             id: "run_urls", drive: "cs_1", startedAt: t0,
@@ -453,6 +453,9 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
             ],
           }));
           expect(await repo.listLandingSources({ accountId: "acct_a", drive: "cs_1", fileIds: ["f1", "f2", "f3", "f4"] })).toEqual([
+            { fileId: "f1", url: null, title: titleOf("run_urls", "missing") },
+            { fileId: "f2", url: null, title: titleOf("run_urls", "empty") },
+            { fileId: "f3", url: null, title: titleOf("run_urls", "number") },
             { fileId: "f4", url: magnet("a"), title: titleOf("run_urls", "good") },
           ]);
         });

@@ -929,8 +929,9 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
         const landed = Array.isArray(attempt.materializedFileIds) ? attempt.materializedFileIds : [];
         for (const fileId of landed.filter((id) => wanted.has(id))) {
           for (const c of candidates) {
+            if (c.id !== attempt.candidateId) continue;
             const url = c.providerPayload?.["url"];
-            if (c.id === attempt.candidateId && typeof url === "string" && url !== "") out.push({ fileId, url, title: c.title });
+            out.push({ fileId, url: typeof url === "string" && url !== "" ? url : null, title: c.title });
           }
         }
       }

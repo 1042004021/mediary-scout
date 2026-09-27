@@ -1802,8 +1802,11 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
     // An unbound work ("") is stored under the sentinel, never NULL (see storageFromColumn).
     const storage = input.drive === "" ? UNSCOPED_STORAGE : input.drive;
     // jsonb_array_elements* throws on a non-array: the CASE guards read one as [].
-    const result = await this.pool.query<{ file_id: string; url: string; title: string | null }>(
-      "SELECT f.id AS file_id, c->'providerPayload'->>'url' AS url, c->>'title' AS title " +
+    const result = await this.pool.query<{ file_id: string; url: string | null; title: string | null }>(
+      "SELECT f.id AS file_id, " +
+        "CASE WHEN jsonb_typeof(c->'providerPayload'->'url') = 'string' AND c->'providerPayload'->>'url' <> '' " +
+        "THEN c->'providerPayload'->>'url' END AS url, " +
+        "c->>'title' AS title " +
         "FROM transfer_attempts t " +
         "JOIN workflow_runs r ON r.id = t.workflow_run_id " +
         "CROSS JOIN LATERAL jsonb_array_elements_text(" +
@@ -1815,11 +1818,10 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
         ") AS c " +
         "WHERE r.account_id = $1 AND r.connected_storage_id = $2 AND f.id = ANY($3::text[]) " +
         "AND c->>'id' = t.candidate_id " +
-        "AND jsonb_typeof(c->'providerPayload'->'url') = 'string' AND c->'providerPayload'->>'url' <> '' " +
         "ORDER BY r.payload->>'startedAt', r.id, t.ordinal, f.ord, s.ordinal",
       [input.accountId, storage, input.fileIds],
     );
-    return result.rows.map((r) => ({ fileId: String(r.file_id), url: String(r.url), title: String(r.title ?? "") }));
+    return result.rows.map((r) => ({ fileId: String(r.file_id), url: r.url === null ? null : String(r.url), title: String(r.title ?? "") }));
   }
 
   // ---- private ----
