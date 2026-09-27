@@ -58,6 +58,8 @@ export interface RunTvAcquisitionV2Request {
   protectExisting?: RunAcquisitionV2WorkflowRequest["protectExisting"];
   /** See orchestrator.rejectedLookup. */
   rejectedLookup?: RunAcquisitionV2WorkflowRequest["rejectedLookup"];
+  /** See orchestrator.linkHistory. */
+  linkHistory?: RunAcquisitionV2WorkflowRequest["linkHistory"];
   onProgress?: (event: AgentToolEvent) => void;
   now?: () => string;
 }
@@ -106,6 +108,7 @@ export async function runTvAcquisitionV2(request: RunTvAcquisitionV2Request): Pr
     ...(request.userRequest ? { userRequest: request.userRequest } : {}),
     ...(request.protectExisting ? { protectExisting: request.protectExisting } : {}),
     ...(request.rejectedLookup ? { rejectedLookup: request.rejectedLookup } : {}),
+    ...(request.linkHistory ? { linkHistory: request.linkHistory } : {}),
     ...(request.onProgress ? { onProgress: request.onProgress } : {}),
   });
 

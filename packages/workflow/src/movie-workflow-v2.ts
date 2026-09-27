@@ -67,6 +67,8 @@ export interface RunMovieAcquisitionV2Request {
   protectExisting?: RunAcquisitionV2Request["protectExisting"];
   /** See orchestrator.rejectedLookup. */
   rejectedLookup?: RunAcquisitionV2Request["rejectedLookup"];
+  /** See orchestrator.linkHistory. */
+  linkHistory?: RunAcquisitionV2Request["linkHistory"];
   onProgress?: (event: AgentToolEvent) => void;
   now?: () => string;
 }
@@ -125,6 +127,7 @@ export async function runMovieAcquisitionV2(
     ...(request.userRequest ? { userRequest: request.userRequest } : {}),
     ...(request.protectExisting ? { protectExisting: request.protectExisting } : {}),
     ...(request.rejectedLookup ? { rejectedLookup: request.rejectedLookup } : {}),
+    ...(request.linkHistory ? { linkHistory: request.linkHistory } : {}),
     ...(request.onProgress ? { onProgress: request.onProgress } : {}),
   });
 

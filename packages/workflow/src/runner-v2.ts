@@ -140,6 +140,43 @@ async function protectExistingOption(input: {
   }
 }
 
+const LINK_HISTORY_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** This work's transfers from the last 30 days, excluding the run in progress.
+ *  Read lazily once the orchestrator starts; a failing read is logged and treated
+ *  as an empty list (fail open — it must never fail a run). */
+function linkHistoryOption(input: {
+  repository: WorkflowRepository;
+  accountId?: string;
+  connectedStorageId?: string | null;
+  title: MediaTitle;
+  workflowRunId: string;
+  now: () => string;
+}): { linkHistory: NonNullable<RunTvAcquisitionV2Request["linkHistory"]> } {
+  const accountId = input.accountId ?? DEFAULT_ACCOUNT_ID;
+  const drive = userMessageDrive(input.connectedStorageId);
+  const titleKey = input.title.id;
+  return {
+    linkHistory: {
+      list: async () => {
+        try {
+          const since = new Date(Date.parse(input.now()) - LINK_HISTORY_WINDOW_MS).toISOString();
+          return await input.repository.listLinkHistory({
+            accountId,
+            drive,
+            titleKey,
+            since,
+            excludeRunId: input.workflowRunId,
+          });
+        } catch (error) {
+          console.error(`[link-history] could not read link history of ${titleKey}: ${String(error).slice(0, 300)}`);
+          return [];
+        }
+      },
+    },
+  };
+}
+
 /** This work's rejected resources (account + work scoped), for every run of it: the
  *  search filter and the transfer-time guard keep a patrol from landing what the
  *  user rejected. Read lazily on every search/transfer; a failing read is logged and
@@ -257,6 +294,7 @@ export async function runType2InitializationV2AndPersist(
     ...passthrough(input),
     ...(await protectExistingOption(input)),
     ...rejectedLookupOption(input),
+    ...linkHistoryOption({ ...input, workflowRunId: input.workflowRun.id, now }),
   });
 
   await persistSingleSeason({
@@ -307,6 +345,7 @@ export async function runType3MonitoringV2AndPersist(
     ...passthrough(input),
     ...(await protectExistingOption(input)),
     ...rejectedLookupOption(input),
+    ...linkHistoryOption({ ...input, workflowRunId: input.workflowRun.id, now }),
   });
 
   await persistSingleSeason({
@@ -358,6 +397,7 @@ export async function runSeriesInitializationV2AndPersist(
     ...passthrough(input),
     ...(await protectExistingOption(input)),
     ...rejectedLookupOption(input),
+    ...linkHistoryOption({ ...input, workflowRunId: input.workflowRun.id, now }),
   });
 
   // Stamp completion AFTER the run; one finishedAt shared across all season
@@ -464,6 +504,7 @@ export async function runReplaceRequestV2AndPersist(
     ...passthrough(input),
     ...(await protectExistingOption(input)),
     ...rejectedLookupOption(input),
+    ...linkHistoryOption({ ...input, workflowRunId: input.workflowRun.id, now }),
   });
 
   const lock = bridged.seasons.find((entry) => entry.season.seasonNumber === input.lockSeasonNumber);
@@ -655,6 +696,7 @@ export async function runMovieAcquisitionV2AndPersist(input: {
     ...(input.priorObtained === undefined ? {} : { priorObtained: input.priorObtained }),
     ...(await protectExistingOption(input)),
     ...rejectedLookupOption(input),
+    ...linkHistoryOption({ ...input, workflowRunId: input.workflowRun.id, now }),
     ...memoryOption(input),
   });
 

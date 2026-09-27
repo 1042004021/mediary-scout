@@ -472,6 +472,285 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
           ]);
         });
       });
+
+      describe("listLinkHistory", () => {
+        const share = "https://www.123pan.com/s/Ab-cD_12";
+        const otherShare = "https://www.123pan.com/s/OtherKey1";
+        /** A finished run of one work. Snapshot and attempt ids are per run (SQL primary keys). */
+        function historyRun(input: {
+          id: string;
+          startedAt: string;
+          accountId?: string;
+          /** Omitted: saved with no connected storage. */
+          drive?: string;
+          titleKey?: string;
+          candidates: Array<{ key: string; url?: unknown }>;
+          /** Further snapshots in this run, after the first. Same candidate shape. */
+          laterSnapshots?: Array<Array<{ key: string; url?: unknown }>>;
+          transfers: Array<{ key: string; fileIds: unknown; fate?: unknown }>;
+        }) {
+          const base = workflowPersistenceFixture();
+          const titleKey = input.titleKey ?? "title_1";
+          const seasonId = `season_${input.id}`;
+          const snapshots = [input.candidates, ...(input.laterSnapshots ?? [])];
+          return {
+            ...base,
+            accountId: input.accountId ?? "acct_a",
+            ...(input.drive === undefined ? {} : { connectedStorageId: input.drive }),
+            title: { ...base.title, id: titleKey },
+            season: { ...base.season, id: seasonId, mediaTitleId: titleKey },
+            workflowRun: { ...base.workflowRun, id: input.id, trackedSeasonId: seasonId, startedAt: input.startedAt, finishedAt: input.startedAt },
+            episodes: [],
+            resourceSnapshots: snapshots.map((candidates, ordinal) => {
+              const snapshotId = `snap_${input.id}_${ordinal}`;
+              return {
+                id: snapshotId,
+                provider: "pansou",
+                keyword: "黄泉",
+                createdAt: input.startedAt,
+                candidates: candidates.map((c, index) => ({
+                  id: `${input.id}_${c.key}`,
+                  snapshotId,
+                  index,
+                  title: `${input.id} ${c.key}`,
+                  type: "123" as const,
+                  source: "pansou",
+                  providerPayload: c.url === undefined ? {} : { url: c.url },
+                })),
+              };
+            }),
+            decisions: [],
+            transferAttempts: input.transfers.map((t, ordinal) => {
+              const attempt: TransferAttempt = {
+                id: `ta_${input.id}_${ordinal}`,
+                workflowRunId: input.id,
+                candidateId: `${input.id}_${t.key}`,
+                status: "succeeded",
+                providerMessage: "",
+                materializedFileIds: t.fileIds as string[],
+              };
+              // Malformed values are stored on purpose; the cast only satisfies the field type.
+              if (t.fate !== undefined) attempt.fate = t.fate as NonNullable<TransferAttempt["fate"]>;
+              return attempt;
+            }),
+            notifications: [],
+          };
+        }
+
+        const query = {
+          accountId: "acct_a",
+          drive: "cs_1",
+          titleKey: "title_1",
+          since: "2026-08-28T00:00:00.000Z",
+        };
+
+        it("returns this work's transfers only: same account, drive and title, including another season of that title", async () => {
+          const repo = await fresh();
+          await repo.saveWorkflowRunSnapshot(historyRun({
+            id: "run_other_account", accountId: "acct_b", drive: "cs_1", startedAt: "2026-09-10T00:00:00.000Z",
+            candidates: [{ key: "x", url: otherShare }], transfers: [{ key: "x", fileIds: ["f1", "f2"] }],
+          }));
+          await repo.saveWorkflowRunSnapshot(historyRun({
+            id: "run_other_drive", drive: "cs_2", startedAt: "2026-09-10T00:00:00.000Z",
+            candidates: [{ key: "x", url: otherShare }], transfers: [{ key: "x", fileIds: ["f1"] }],
+          }));
+          await repo.saveWorkflowRunSnapshot(historyRun({
+            id: "run_other_title", drive: "cs_1", titleKey: "tmdb_movie_9", startedAt: "2026-09-10T00:00:00.000Z",
+            candidates: [{ key: "x", url: otherShare }], transfers: [{ key: "x", fileIds: ["f1"] }],
+          }));
+          await repo.saveWorkflowRunSnapshot(historyRun({
+            id: "run_s1", drive: "cs_1", startedAt: "2026-09-10T00:00:00.000Z",
+            candidates: [{ key: "a", url: share }], transfers: [{ key: "a", fileIds: ["f1", "f2", "f3"] }],
+          }));
+          // Another season of the same title is the same work.
+          await repo.saveWorkflowRunSnapshot(historyRun({
+            id: "run_s2", drive: "cs_1", titleKey: "title_1", startedAt: "2026-09-11T00:00:00.000Z",
+            candidates: [{ key: "b", url: otherShare }], transfers: [{ key: "b", fileIds: ["g1"] }],
+          }));
+
+          expect(await repo.listLinkHistory(query)).toEqual([
+            { url: share, startedAt: "2026-09-10T00:00:00.000Z", materializedCount: 3 },
+            { url: otherShare, startedAt: "2026-09-11T00:00:00.000Z", materializedCount: 1 },
+          ]);
+        });
+
+        it("since is inclusive on the run's startedAt; an earlier run is absent", async () => {
+          const repo = await fresh();
+          await repo.saveWorkflowRunSnapshot(historyRun({
+            id: "run_before", drive: "cs_1", startedAt: "2026-08-27T23:59:59.000Z",
+            candidates: [{ key: "a", url: share }], transfers: [{ key: "a", fileIds: ["f1"] }],
+          }));
+          await repo.saveWorkflowRunSnapshot(historyRun({
+            id: "run_on", drive: "cs_1", startedAt: "2026-08-28T00:00:00.000Z",
+            candidates: [{ key: "b", url: share }], transfers: [{ key: "b", fileIds: ["f1", "f2"] }],
+          }));
+          expect(await repo.listLinkHistory(query)).toEqual([
+            { url: share, startedAt: "2026-08-28T00:00:00.000Z", materializedCount: 2 },
+          ]);
+        });
+
+        it("excludeRunId drops that run and no other", async () => {
+          const repo = await fresh();
+          await repo.saveWorkflowRunSnapshot(historyRun({
+            id: "run_keep", drive: "cs_1", startedAt: "2026-09-01T00:00:00.000Z",
+            candidates: [{ key: "a", url: share }], transfers: [{ key: "a", fileIds: ["f1"] }],
+          }));
+          await repo.saveWorkflowRunSnapshot(historyRun({
+            id: "run_skip", drive: "cs_1", startedAt: "2026-09-02T00:00:00.000Z",
+            candidates: [{ key: "b", url: otherShare }], transfers: [{ key: "b", fileIds: ["f2"] }],
+          }));
+          expect(await repo.listLinkHistory({ ...query, excludeRunId: "run_skip" })).toEqual([
+            { url: share, startedAt: "2026-09-01T00:00:00.000Z", materializedCount: 1 },
+          ]);
+          expect(await repo.listLinkHistory(query)).toHaveLength(2);
+        });
+
+        it("drive '' is the run saved with no connected storage", async () => {
+          const repo = await fresh();
+          await repo.saveWorkflowRunSnapshot(historyRun({
+            id: "run_unbound", startedAt: "2026-09-01T00:00:00.000Z",
+            candidates: [{ key: "u", url: share }], transfers: [{ key: "u", fileIds: ["f1"] }],
+          }));
+          await repo.saveWorkflowRunSnapshot(historyRun({
+            id: "run_bound", drive: "cs_1", startedAt: "2026-09-01T00:00:00.000Z",
+            candidates: [{ key: "b", url: otherShare }], transfers: [{ key: "b", fileIds: ["f1"] }],
+          }));
+          expect(await repo.listLinkHistory({ ...query, drive: "" })).toEqual([
+            { url: share, startedAt: "2026-09-01T00:00:00.000Z", materializedCount: 1 },
+          ]);
+        });
+
+        it("looks the url up in that run's own snapshots: unusable urls are null, and the earliest snapshot wins", async () => {
+          const repo = await fresh();
+          await repo.saveWorkflowRunSnapshot(historyRun({
+            id: "run_urls", drive: "cs_1", startedAt: "2026-09-01T00:00:00.000Z",
+            candidates: [
+              { key: "missing" },
+              { key: "empty", url: "" },
+              { key: "number", url: 42 },
+              { key: "good", url: share },
+            ],
+            transfers: [
+              { key: "missing", fileIds: ["f1"] },
+              { key: "empty", fileIds: ["f2"] },
+              { key: "number", fileIds: ["f3"] },
+              { key: "good", fileIds: ["f4"] },
+            ],
+          }));
+          // The candidate is in two snapshots. The earliest one's url is the one recorded.
+          await repo.saveWorkflowRunSnapshot(historyRun({
+            id: "run_two", drive: "cs_1", startedAt: "2026-09-02T00:00:00.000Z",
+            candidates: [{ key: "a", url: "" }],
+            laterSnapshots: [[{ key: "a", url: share }]],
+            transfers: [{ key: "a", fileIds: ["f9"] }],
+          }));
+          // Not in the first snapshot: the later one is used.
+          await repo.saveWorkflowRunSnapshot(historyRun({
+            id: "run_later", drive: "cs_1", startedAt: "2026-09-03T00:00:00.000Z",
+            candidates: [{ key: "other", url: otherShare }],
+            laterSnapshots: [[{ key: "a", url: share }]],
+            transfers: [{ key: "a", fileIds: ["f8"] }],
+          }));
+
+          expect(await repo.listLinkHistory(query)).toEqual([
+            { url: null, startedAt: "2026-09-01T00:00:00.000Z", materializedCount: 1 },
+            { url: null, startedAt: "2026-09-01T00:00:00.000Z", materializedCount: 1 },
+            { url: null, startedAt: "2026-09-01T00:00:00.000Z", materializedCount: 1 },
+            { url: share, startedAt: "2026-09-01T00:00:00.000Z", materializedCount: 1 },
+            { url: null, startedAt: "2026-09-02T00:00:00.000Z", materializedCount: 1 },
+            { url: share, startedAt: "2026-09-03T00:00:00.000Z", materializedCount: 1 },
+          ]);
+        });
+
+        it("materializedCount is the landed-file list length; a non-list counts as 0 and does not break the read", async () => {
+          const repo = await fresh();
+          await repo.saveWorkflowRunSnapshot(historyRun({
+            id: "run_count", drive: "cs_1", startedAt: "2026-09-05T00:00:00.000Z",
+            candidates: [{ key: "a", url: share }],
+            transfers: [
+              { key: "a", fileIds: ["f1", "f2"] },
+              { key: "a", fileIds: "f1" },
+              { key: "a", fileIds: undefined },
+              { key: "a", fileIds: [] },
+            ],
+          }));
+          expect(await repo.listLinkHistory(query)).toEqual([
+            { url: share, startedAt: "2026-09-05T00:00:00.000Z", materializedCount: 2 },
+            { url: share, startedAt: "2026-09-05T00:00:00.000Z", materializedCount: 0 },
+            { url: share, startedAt: "2026-09-05T00:00:00.000Z", materializedCount: 0 },
+            { url: share, startedAt: "2026-09-05T00:00:00.000Z", materializedCount: 0 },
+          ]);
+        });
+
+        it("round-trips fate, and a missing, non-object or incomplete fate is absent", async () => {
+          const repo = await fresh();
+          await repo.saveWorkflowRunSnapshot(historyRun({
+            id: "run_fate", drive: "cs_1", startedAt: "2026-09-06T00:00:00.000Z",
+            candidates: [{ key: "a", url: share }],
+            transfers: [
+              { key: "a", fileIds: ["f1"], fate: { kept: 2, thrownAway: 10 } },
+              { key: "a", fileIds: ["f2"] },
+              { key: "a", fileIds: ["f3"], fate: "nope" },
+              { key: "a", fileIds: ["f4"], fate: { kept: 1 } },
+              { key: "a", fileIds: ["f5"], fate: { kept: "1", thrownAway: 0 } },
+              { key: "a", fileIds: ["f6"], fate: null },
+            ],
+          }));
+          expect(await repo.listLinkHistory(query)).toEqual([
+            { url: share, startedAt: "2026-09-06T00:00:00.000Z", materializedCount: 1, fate: { kept: 2, thrownAway: 10 } },
+            { url: share, startedAt: "2026-09-06T00:00:00.000Z", materializedCount: 1 },
+            { url: share, startedAt: "2026-09-06T00:00:00.000Z", materializedCount: 1 },
+            { url: share, startedAt: "2026-09-06T00:00:00.000Z", materializedCount: 1 },
+            { url: share, startedAt: "2026-09-06T00:00:00.000Z", materializedCount: 1 },
+            { url: share, startedAt: "2026-09-06T00:00:00.000Z", materializedCount: 1 },
+          ]);
+        });
+
+        it("a stored fate that is not two non-negative integers counting at least one file comes back without fate", async () => {
+          const repo = await fresh();
+          await repo.saveWorkflowRunSnapshot(historyRun({
+            id: "run_bad_fate", drive: "cs_1", startedAt: "2026-09-07T00:00:00.000Z",
+            candidates: [{ key: "a", url: share }],
+            transfers: [
+              { key: "a", fileIds: ["f1"], fate: { kept: 0, thrownAway: -1 } },
+              { key: "a", fileIds: ["f2"], fate: { kept: 0.5, thrownAway: 2 } },
+              { key: "a", fileIds: ["f3"], fate: { kept: 0, thrownAway: 0 } },
+              { key: "a", fileIds: ["f4"], fate: { kept: 0, thrownAway: 12 } },
+            ],
+          }));
+          expect(await repo.listLinkHistory(query)).toEqual([
+            { url: share, startedAt: "2026-09-07T00:00:00.000Z", materializedCount: 1 },
+            { url: share, startedAt: "2026-09-07T00:00:00.000Z", materializedCount: 1 },
+            { url: share, startedAt: "2026-09-07T00:00:00.000Z", materializedCount: 1 },
+            { url: share, startedAt: "2026-09-07T00:00:00.000Z", materializedCount: 1, fate: { kept: 0, thrownAway: 12 } },
+          ]);
+        });
+
+        it("orders by startedAt, then run id, then the run's transfer order", async () => {
+          const repo = await fresh();
+          await repo.saveWorkflowRunSnapshot(historyRun({
+            id: "run_b", drive: "cs_1", startedAt: "2026-09-02T00:00:00.000Z",
+            candidates: [{ key: "a", url: share }, { key: "b", url: otherShare }],
+            transfers: [{ key: "b", fileIds: ["f2"] }, { key: "a", fileIds: ["f1"] }],
+          }));
+          await repo.saveWorkflowRunSnapshot(historyRun({
+            id: "run_a", drive: "cs_1", startedAt: "2026-09-02T00:00:00.000Z",
+            candidates: [{ key: "a", url: share }],
+            transfers: [{ key: "a", fileIds: ["f3"] }],
+          }));
+          await repo.saveWorkflowRunSnapshot(historyRun({
+            id: "run_early", drive: "cs_1", startedAt: "2026-09-01T00:00:00.000Z",
+            candidates: [{ key: "a", url: otherShare }],
+            transfers: [{ key: "a", fileIds: ["f0"] }],
+          }));
+          expect((await repo.listLinkHistory(query)).map((row) => `${row.startedAt} ${row.url} ${row.materializedCount}`)).toEqual([
+            `2026-09-01T00:00:00.000Z ${otherShare} 1`,
+            `2026-09-02T00:00:00.000Z ${share} 1`,
+            `2026-09-02T00:00:00.000Z ${otherShare} 1`,
+            `2026-09-02T00:00:00.000Z ${share} 1`,
+          ]);
+        });
+      });
     });
 
     describe("agent memories", () => {

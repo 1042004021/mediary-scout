@@ -240,6 +240,13 @@ export interface TransferAttempt {
   status: TransferStatus;
   providerMessage: string;
   materializedFileIds: string[];
+  /**
+   * What became of the files this transfer materialized, counted at the end of
+   * its run: kept = moved into a target dir (or landed in the movie dir) and
+   * still there; thrownAway = deleted, discarded with staging, or left in
+   * staging. Absent = not recorded (older runs, or nothing materialized).
+   */
+  fate?: { kept: number; thrownAway: number };
   /** The names those files actually landed under, parallel to materializedFileIds —
    *  set only by an executor that knows them and whose landing name can differ from
    *  the requested one (123 lands a taken name as `name(1).ext`). Absent = the

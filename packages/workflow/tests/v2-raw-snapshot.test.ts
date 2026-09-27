@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { buildSandboxToolSet } from "../src/acquisition-v2/agent-loop.js";
 import { TaskSandbox } from "../src/acquisition-v2/sandbox.js";
 import { FakeResourceProviderV2 } from "../src/acquisition-v2/fake-provider.js";
 import type { ResourceProviderV2, ResourceSnapshotV2 } from "../src/acquisition-v2/fake-provider.js";
@@ -7,6 +8,7 @@ import { buildTvAnimeSystemPrompt, buildMovieSystemPrompt } from "../src/acquisi
 import { JEV_UNCERTAIN_LEGEND } from "../src/jev-judge.js";
 import type { JevJudgeTarget } from "../src/jev-judge.js";
 import { JevPrefilterProvider } from "../src/jev-prefilter-provider.js";
+import { resourceLinkKey } from "../src/acquisition-v2/resource-link.js";
 import { RealResourceProviderV2 } from "../src/acquisition-v2/real-provider-adapter.js";
 import { CandidateRegistry } from "../src/acquisition-v2/candidate-registry.js";
 import type { ResourceProvider } from "../src/ports.js";
@@ -160,6 +162,35 @@ describe("system prompt carries raw snapshot pointer", () => {
     // 用一个启发式检查:不应该有多个 [cN] 格式的 id
     const idMatches = prompt.match(/\[c\d+\]/g);
     expect(idMatches).toBeNull(); // 完全没有候选 id,或最多有示例性的 1-2 个
+  });
+
+  it("tells the agent what the 近 30 天 note means, on both the raw pointer and the search tools", () => {
+    const fact = "none of the files those transfers landed ended up in the library";
+    for (const prompt of [
+      buildTvAnimeSystemPrompt({ prefetchedCandidateCount: 12 }),
+      buildMovieSystemPrompt({ prefetchedCandidateCount: 12 }),
+      buildTvAnimeSystemPrompt({
+        prefetchedCandidateCount: 12,
+        userRequests: { messages: [{ body: "换一版", episodeTags: ["S01E01"], createdAt: "2026-09-27T00:00:00.000Z" }], rejected: [], pending: [] },
+      }),
+    ]) {
+      expect(prompt).toContain("近 30 天转过");
+      expect(prompt).toContain("文件每次都被丢掉");
+      expect(prompt).toContain(fact);
+      expect(prompt).not.toContain("held only files the library already had");
+    }
+    const sandbox = new TaskSandbox({
+      provider: new FakeResourceProviderV2({ results: {} }),
+      need: ["S01E01"],
+    });
+    const tools = buildSandboxToolSet(sandbox);
+    for (const name of ["viewResourceSnapshot", "searchResources"] as const) {
+      const description = tools[name]!.description ?? "";
+      expect(description).toContain("近 30 天转过");
+      expect(description).toContain("文件每次都被丢掉");
+      expect(description).toContain(fact);
+      expect(description).not.toContain("held only files the library already had");
+    }
   });
 
   it("prompt without prefetchedCandidateCount does NOT mention raw snapshot", () => {
@@ -448,5 +479,104 @@ describe("candidate post dates reach both agent read paths", () => {
     expect(again.deduped).toBe(true);
     expect(again.snapshot!.candidates[0]).toMatchObject({ id: "s1-1", postedAt: "2026-04-06" });
     expect(again.snapshot!.candidates[1]).not.toHaveProperty("postedAt");
+    expect(doc).not.toContain("近 30 天");
+  });
+
+  it("prints a link-history note after the post date, and omits it when the candidate has none", async () => {
+    const note = "近 30 天转过 2 次（最近 09-25），最近一次留下 12 个文件";
+    const provider = new FakeResourceProviderV2({
+      results: {
+        show: [
+          { id: "a", title: "有记录", postedAt: "2026-09-01", linkHistory: note },
+          { id: "b", title: "没有记录", postedAt: "2026-09-02" },
+        ],
+      },
+    });
+    const storage = new Storage115Simulator({ packs: {} });
+    const stagingDirectoryId = await storage.createDirectory({ name: "staging", parentId: "root" });
+    const seasonDirectoryId = await storage.createDirectory({ name: "Season 1", parentId: "root" });
+    const sandbox = new TaskSandbox({
+      provider,
+      storage,
+      stagingDirectoryId,
+      targetSeasonDirectoryIds: { 1: seasonDirectoryId },
+      need: ["S01E01"],
+    });
+    await sandbox.primeRawSnapshot("show");
+    const doc = sandbox.viewResourceSnapshot().document;
+    expect(doc).toContain(`[a] 有记录 · 发布 2026-09-01 · ${note}\n`);
+    expect(doc).toContain("[b] 没有记录 · 发布 2026-09-02\n");
+    expect(doc).not.toContain("没有记录 · 发布 2026-09-02 ·");
+  });
+
+  it("annotates both titles of one link from the candidate url, and searchResources returns the field", async () => {
+    const share = "https://www.123pan.com/s/Ab-cD_12";
+    const note = "近 30 天转过 31 次（最近 09-26），文件每次都被丢掉";
+    const inner: ResourceProvider = {
+      search: async ({ keyword }): Promise<ResourceSnapshot> => ({
+        id: "snap_hist",
+        provider: "pansou",
+        keyword,
+        createdAt: "2026-09-27T00:00:00.000Z",
+        candidates: [
+          {
+            id: "a",
+            snapshotId: "snap_hist",
+            index: 0,
+            title: "黄泉的使者 (2026)",
+            type: "123",
+            source: "pansou",
+            providerPayload: { url: share, datetime: "2026-09-01T00:00:00Z" },
+          },
+          {
+            id: "b",
+            snapshotId: "snap_hist",
+            index: 1,
+            title: "🎬 黄泉的使者 (2026) 已更新",
+            type: "123",
+            source: "pansou",
+            providerPayload: { url: share, datetime: "2026-09-01T00:00:00Z" },
+          },
+          {
+            id: "c",
+            snapshotId: "snap_hist",
+            index: 2,
+            title: "别的链接",
+            type: "123",
+            source: "pansou",
+            providerPayload: { url: "https://www.123pan.com/s/OtherKey1", datetime: "2026-09-02T00:00:00Z" },
+          },
+        ],
+      }),
+    };
+    const provider = new RealResourceProviderV2({
+      provider: inner,
+      registry: new CandidateRegistry(),
+      workflowRunId: "run-hist",
+      linkHistory: new Map([[resourceLinkKey(share)!, note]]),
+    });
+    const storage = new Storage115Simulator({ packs: {} });
+    const stagingDirectoryId = await storage.createDirectory({ name: "staging", parentId: "root" });
+    const seasonDirectoryId = await storage.createDirectory({ name: "Season 1", parentId: "root" });
+    const sandbox = new TaskSandbox({
+      provider,
+      storage,
+      stagingDirectoryId,
+      targetSeasonDirectoryIds: { 1: seasonDirectoryId },
+      need: ["S01E01"],
+    });
+
+    await sandbox.primeRawSnapshot("黄泉的使者");
+    const doc = sandbox.viewResourceSnapshot().document;
+    expect(doc).toContain(`[s1-1] 黄泉的使者 (2026) · 发布 2026-09-01 · ${note}\n`);
+    expect(doc).toContain(`[s1-2] 🎬 黄泉的使者 (2026) 已更新 · 发布 2026-09-01 · ${note}\n`);
+    expect(doc).toContain("[s1-3] 别的链接 · 发布 2026-09-02\n");
+    expect(doc).not.toContain("别的链接 · 发布 2026-09-02 ·");
+
+    const again = await sandbox.searchResources("黄泉的使者");
+    expect(again.snapshot!.candidates[0]).toMatchObject({ id: "s1-1", postedAt: "2026-09-01", linkHistory: note });
+    expect(again.snapshot!.candidates[1]).toMatchObject({ id: "s1-2", linkHistory: note });
+    expect(again.snapshot!.candidates[0]!.linkHistory).toBe(again.snapshot!.candidates[1]!.linkHistory);
+    expect(again.snapshot!.candidates[2]).not.toHaveProperty("linkHistory");
   });
 });

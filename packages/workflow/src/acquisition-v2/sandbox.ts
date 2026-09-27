@@ -1958,7 +1958,8 @@ export class TaskSandbox {
 
   /** Read-only tool: view the pre-warmed raw snapshot as a structured document.
    *  Free, repeatable, does NOT consume search budget. Each row is id + title,
-   *  plus · 发布 YYYY-MM-DD when postedAt is known (truncated at 120 if excessive). */
+   *  plus · 发布 YYYY-MM-DD when postedAt is known, then · 近 30 天转过… when
+   *  linkHistory is set (truncated at 120 if excessive). */
   viewResourceSnapshot(): { document: string; candidateCount: number } {
     if (!this.rawSnapshot) {
       return {
@@ -1981,7 +1982,8 @@ export class TaskSandbox {
 
     for (const candidate of truncated) {
       const posted = candidate.postedAt ? ` · 发布 ${candidate.postedAt}` : "";
-      document += `[${candidate.id}] ${candidate.title}${posted}\n`;
+      const history = candidate.linkHistory ? ` · ${candidate.linkHistory}` : "";
+      document += `[${candidate.id}] ${candidate.title}${posted}${history}\n`;
     }
 
     if (remaining > 0) {

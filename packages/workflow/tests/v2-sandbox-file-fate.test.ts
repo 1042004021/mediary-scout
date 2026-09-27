@@ -406,4 +406,76 @@ describe("runAcquisitionV2 — reflection digest carries file fate", () => {
 
     expect(reflectionPrompt).toContain("黄泉的使者 (2026) → succeeded (2 files: 0 kept, 2 thrown away)");
   });
+
+  it("writes fate onto outcome attempts that materialized files, and leaves it off one that landed nothing", async () => {
+    const provider: ResourceProvider = {
+      search: async ({ keyword }) => ({
+        id: "snap_mix",
+        provider: "pansou",
+        keyword,
+        createdAt: "2026-09-27T00:00:00.000Z",
+        candidates: [
+          {
+            id: "cand_mix",
+            snapshotId: "snap_mix",
+            index: 0,
+            title: "黄泉的使者 (2026)",
+            type: "123",
+            source: "pansou",
+            providerPayload: { url: "https://www.123pan.com/s/Ab-cD_12" },
+          },
+          {
+            id: "cand_empty",
+            snapshotId: "snap_mix",
+            index: 1,
+            title: "空包",
+            type: "123",
+            source: "pansou",
+            providerPayload: { url: "https://www.123pan.com/s/OtherKey1" },
+          },
+        ],
+      }),
+    };
+    const files: VerifiedFile[] = ["e1", "e2"].map((id) => ({
+      id,
+      storageDirectoryId: "staging",
+      name: `${id}.mkv`,
+      sizeBytes: 10,
+      episodeCode: "S01E01",
+      providerFileId: id,
+    }));
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => {
+        i += 1;
+        if (i === 1) return tool("viewResourceSnapshot", {}, i);
+        if (i === 2) return tool("transferCandidate", { snapshotId: "s1", candidateId: "s1-1" }, i);
+        if (i === 3) return tool("moveToSeason", { moves: [{ season: 1, fileIds: ["e1"] }] }, i);
+        if (i === 4) return tool("transferCandidate", { snapshotId: "s1", candidateId: "s1-2" }, i);
+        if (i === 5) return tool("reportNoCoverage", { reason: "mix" }, i);
+        return stop("done");
+      },
+    });
+
+    const result = await runAcquisitionV2({
+      provider,
+      executor: new FakeStorageExecutor({
+        directories: { staging: [], season: [] },
+        transferOutcomes: {
+          cand_mix: { status: "succeeded", providerMessage: "ok", files },
+          cand_empty: { status: "failed", providerMessage: "nothing", files: [] },
+        },
+      }),
+      model,
+      workflowRunId: "run-fate-outcome",
+      target: { kind: "tv", title: "黄泉的使者", aliases: [], seasons: [1], missingEpisodes: ["S01E01"], qualityPreference: "1080p", tmdbId: 1 },
+      stagingDirectoryId: "staging",
+      targetSeasonDirectoryIds: { 1: "season" },
+    });
+
+    const [kept, empty] = result.outcome.transferAttempts;
+    expect(kept).toMatchObject({ candidateId: "cand_mix", fate: { kept: 1, thrownAway: 1 } });
+    expect(empty).toMatchObject({ candidateId: "cand_empty", materializedFileIds: [] });
+    expect(empty).not.toHaveProperty("fate");
+  });
 });

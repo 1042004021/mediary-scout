@@ -36,6 +36,8 @@ import {
   type EpisodeSource,
   type EpisodeSourceRow,
   type LandingSource,
+  type LinkHistoryRow,
+  linkHistoryFromStored,
   type PendingReplacement,
   type PendingReplacementRow,
   type RejectedResource,
@@ -1994,6 +1996,52 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
       )
       .all(input.accountId, storage, JSON.stringify(input.fileIds)) as Array<{ file_id: string; url: string | null; title: string | null }>;
     return rows.map((r) => ({ fileId: String(r.file_id), url: r.url === null ? null : String(r.url), title: String(r.title ?? "") }));
+  }
+
+  async listLinkHistory(input: Parameters<UserRequestStore["listLinkHistory"]>[0]): Promise<LinkHistoryRow[]> {
+    // An unbound work ("") is stored under the sentinel.
+    const storage = input.drive === "" ? UNSCOPED_STORAGE : input.drive;
+    // One row per attempt. The url is the candidate's in the earliest snapshot of
+    // that run (json_each over a non-array is replaced with [] so a bad payload
+    // reads as no url, not an error). fate is parsed in JS, same as the other engines.
+    const exclude = input.excludeRunId !== undefined;
+    const rows = this.db
+      .prepare(
+        "SELECT (" +
+          "SELECT CASE WHEN json_type(c.value, '$.providerPayload.url') = 'text' AND json_extract(c.value, '$.providerPayload.url') <> '' " +
+          "THEN json_extract(c.value, '$.providerPayload.url') END " +
+          "FROM resource_snapshots s " +
+          "JOIN json_each(CASE WHEN json_type(s.payload, '$.candidates') = 'array' THEN json_extract(s.payload, '$.candidates') ELSE '[]' END) c " +
+          "WHERE s.workflow_run_id = t.workflow_run_id AND json_extract(c.value, '$.id') = t.candidate_id " +
+          "ORDER BY s.ordinal, CAST(c.key AS INTEGER) LIMIT 1" +
+          ") AS url, " +
+          "json_extract(r.payload, '$.startedAt') AS started_at, " +
+          "CASE WHEN json_type(t.payload, '$.materializedFileIds') = 'array' THEN json_array_length(t.payload, '$.materializedFileIds') ELSE 0 END AS materialized_count, " +
+          "json_extract(t.payload, '$.fate') AS fate " +
+          "FROM transfer_attempts t " +
+          "JOIN workflow_runs r ON r.id = t.workflow_run_id " +
+          "JOIN tracked_seasons ts ON ts.id = r.tracked_season_id AND ts.connected_storage_id = r.connected_storage_id " +
+          "WHERE r.account_id = ? AND r.connected_storage_id = ? AND ts.media_title_id = ? " +
+          "AND json_extract(r.payload, '$.startedAt') >= ?" +
+          (exclude ? " AND r.id <> ?" : "") +
+          " ORDER BY json_extract(r.payload, '$.startedAt'), r.id, t.ordinal",
+      )
+      .all(
+        ...(exclude
+          ? [input.accountId, storage, input.titleKey, input.since, input.excludeRunId]
+          : [input.accountId, storage, input.titleKey, input.since]),
+      ) as Array<{ url: string | null; started_at: string | null; materialized_count: number | null; fate: unknown }>;
+    const out: LinkHistoryRow[] = [];
+    for (const row of rows) {
+      const mapped = linkHistoryFromStored({
+        url: row.url,
+        startedAt: row.started_at,
+        materializedCount: row.materialized_count,
+        fate: row.fate,
+      });
+      if (mapped) out.push(mapped);
+    }
+    return out;
   }
 
   async listDeadLinkKeys(options?: { now?: string }): Promise<string[]> {

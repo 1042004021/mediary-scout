@@ -69,6 +69,8 @@ import {
   type EpisodeSource,
   type EpisodeSourceRow,
   type LandingSource,
+  type LinkHistoryRow,
+  linkHistoryFromStored,
   type PendingReplacement,
   type PendingReplacementRow,
   type RejectedResource,
@@ -1822,6 +1824,52 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       [input.accountId, storage, input.fileIds],
     );
     return result.rows.map((r) => ({ fileId: String(r.file_id), url: r.url === null ? null : String(r.url), title: String(r.title ?? "") }));
+  }
+
+  async listLinkHistory(input: Parameters<UserRequestStore["listLinkHistory"]>[0]): Promise<LinkHistoryRow[]> {
+    await this.ensureSchema();
+    // An unbound work ("") is stored under the sentinel, never NULL (see storageFromColumn).
+    const storage = input.drive === "" ? UNSCOPED_STORAGE : input.drive;
+    // One row per attempt. jsonb_array_elements throws on a non-array, so a bad
+    // candidates payload reads as [] (no url) instead of failing the read. fate is
+    // parsed in JS, same as the other engines.
+    const exclude = input.excludeRunId !== undefined;
+    const params: unknown[] = [input.accountId, storage, input.titleKey, input.since];
+    if (exclude) params.push(input.excludeRunId);
+    const result = await this.pool.query<{ url: string | null; started_at: string | null; materialized_count: number | null; fate: unknown }>(
+      "SELECT (" +
+        "SELECT CASE WHEN jsonb_typeof(c.elem->'providerPayload'->'url') = 'string' AND c.elem->'providerPayload'->>'url' <> '' " +
+        "THEN c.elem->'providerPayload'->>'url' END " +
+        "FROM resource_snapshots s " +
+        "CROSS JOIN LATERAL jsonb_array_elements(" +
+        "CASE WHEN jsonb_typeof(s.payload->'candidates') = 'array' THEN s.payload->'candidates' ELSE '[]'::jsonb END" +
+        ") WITH ORDINALITY AS c(elem, ord) " +
+        "WHERE s.workflow_run_id = t.workflow_run_id AND c.elem->>'id' = t.candidate_id " +
+        "ORDER BY s.ordinal, c.ord LIMIT 1" +
+        ") AS url, " +
+        "r.payload->>'startedAt' AS started_at, " +
+        "CASE WHEN jsonb_typeof(t.payload->'materializedFileIds') = 'array' THEN jsonb_array_length(t.payload->'materializedFileIds') ELSE 0 END AS materialized_count, " +
+        "t.payload->'fate' AS fate " +
+        "FROM transfer_attempts t " +
+        "JOIN workflow_runs r ON r.id = t.workflow_run_id " +
+        "JOIN tracked_seasons ts ON ts.id = r.tracked_season_id AND ts.connected_storage_id = r.connected_storage_id " +
+        "WHERE r.account_id = $1 AND r.connected_storage_id = $2 AND ts.media_title_id = $3 " +
+        "AND r.payload->>'startedAt' >= $4" +
+        (exclude ? " AND r.id <> $5" : "") +
+        " ORDER BY r.payload->>'startedAt', r.id, t.ordinal",
+      params,
+    );
+    const out: LinkHistoryRow[] = [];
+    for (const row of result.rows) {
+      const mapped = linkHistoryFromStored({
+        url: row.url,
+        startedAt: row.started_at,
+        materializedCount: row.materialized_count,
+        fate: row.fate,
+      });
+      if (mapped) out.push(mapped);
+    }
+    return out;
   }
 
   // ---- private ----

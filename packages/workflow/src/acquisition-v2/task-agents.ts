@@ -5,6 +5,7 @@ import type { TaskSandbox } from "./sandbox.js";
 import { skillIndexForAgent } from "./skill.js";
 import { getStorageBrand } from "../storage-brands.js";
 import { stripMemoryFence, type AgentMemory } from "../agent-memory.js";
+import { LINK_HISTORY_PROMPT } from "./link-history.js";
 import { hasUserRequests, userRequestBlock, type UserRequestPromptInput } from "./user-request-block.js";
 
 export { userRequestBlock, type UserRequestPromptInput } from "./user-request-block.js";
@@ -262,9 +263,9 @@ function rawSnapshotPointer(options: TaskAgentPromptOptions): string {
   // A user request run has one first step, and it is not this: the copies it rejects are
   // hidden from the snapshot afterwards anyway.
   if (hasUserRequests(options)) {
-    return `\n📋 RAW SNAPSHOT (活期文档): The system has already pre-searched the raw keyword (bare title) for you and found ${options.prefetchedCandidateCount} candidates. Right after the FIRST STEP in USER REQUESTS (inspectTargetDir, then rejectCurrentSource), call viewResourceSnapshot() to view this live document — it's free, read-only, contains all the raw candidates (id + title, and · 发布 YYYY-MM-DD when the post date is known), and no longer shows the copies you rejected. Do NOT use searchResources to re-search the raw keyword; searchResources is ONLY for 繁体/英文/原名 upgrades when the raw snapshot is insufficient.\n`;
+    return `\n📋 RAW SNAPSHOT (活期文档): The system has already pre-searched the raw keyword (bare title) for you and found ${options.prefetchedCandidateCount} candidates. Right after the FIRST STEP in USER REQUESTS (inspectTargetDir, then rejectCurrentSource), call viewResourceSnapshot() to view this live document — it's free, read-only, contains all the raw candidates (id + title, and · 发布 YYYY-MM-DD when the post date is known), and no longer shows the copies you rejected. Do NOT use searchResources to re-search the raw keyword; searchResources is ONLY for 繁体/英文/原名 upgrades when the raw snapshot is insufficient. ${LINK_HISTORY_PROMPT}\n`;
   }
-  return `\n📋 RAW SNAPSHOT (活期文档): The system has already pre-searched the raw keyword (bare title) for you and found ${options.prefetchedCandidateCount} candidates. Your FIRST step: call viewResourceSnapshot() to view this live document — it's free, read-only, and contains all the raw candidates (id + title, and · 发布 YYYY-MM-DD when the post date is known). Do NOT use searchResources to re-search the raw keyword; searchResources is ONLY for 繁体/英文/原名 upgrades when the raw snapshot is insufficient.\n`;
+  return `\n📋 RAW SNAPSHOT (活期文档): The system has already pre-searched the raw keyword (bare title) for you and found ${options.prefetchedCandidateCount} candidates. Your FIRST step: call viewResourceSnapshot() to view this live document — it's free, read-only, and contains all the raw candidates (id + title, and · 发布 YYYY-MM-DD when the post date is known). Do NOT use searchResources to re-search the raw keyword; searchResources is ONLY for 繁体/英文/原名 upgrades when the raw snapshot is insufficient. ${LINK_HISTORY_PROMPT}\n`;
 }
 
 /** The subtitle twin of rawSnapshotPointer — rendered only when the subtitle flow
