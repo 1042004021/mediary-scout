@@ -203,10 +203,11 @@ export async function runAcquisitionV2Workflow(
   // not a claimed quality). Reads AFTER the acquisition succeeded; on the heavy
   // run where the 115 call budget is spent this returns undefined rather than
   // throwing, so the size is simply omitted — never failing a good run.
-  const landed = await readLandedSize(
-    request.executor,
-    Object.values(directories.seasonDirectoryIds),
-  );
+  // A replace run skips it (like the movie path): its season dirs hold the old
+  // AND the new copies, and the replace notification drops the size anyway.
+  const landed = request.userRequest
+    ? undefined
+    : await readLandedSize(request.executor, Object.values(directories.seasonDirectoryIds));
 
   return {
     directories,

@@ -417,6 +417,27 @@ describe("runAcquisitionV2Workflow — user request (replace_request run)", () =
     expect(result.stillMissing).toEqual(["S01E24"]);
   });
 
+  it("a replace run skips the landed-size read: old + new files would add up to a meaningless size, and the notification drops it anyway", async () => {
+    const { executor } = await seededExecutor();
+    const { model } = rejectThenNotFoundModel();
+    const result = await runAcquisitionV2Workflow({
+      provider: emptyProvider(),
+      executor,
+      model,
+      workflowRunId: "run-ur-size",
+      title: { name: "Show", year: 2024, aliases: [], tmdbId: 42 },
+      categoryParentId: "tv_root",
+      seasons: [{ seasonNumber: 1, latestAiredEpisode: 13 }],
+      qualityPreference: "1080p",
+      priorObtained: ALL_13,
+      userRequest,
+    });
+
+    // The season dir holds the old E13 video, so an unconditional read would report it.
+    expect(result.landedFileCount).toBeUndefined();
+    expect(result.landedBytes).toBeUndefined();
+  });
+
   it("no user request on a fully obtained show: the no-op short-circuit still skips the agent", async () => {
     const { executor } = await seededExecutor();
     let calls = 0;
