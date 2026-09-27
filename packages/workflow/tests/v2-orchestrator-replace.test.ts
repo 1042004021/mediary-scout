@@ -124,9 +124,9 @@ describe("runAcquisitionV2 — user replace request", () => {
         systems.push(JSON.stringify(options.prompt.find((m) => m.role === "system") ?? ""));
         i += 1;
         if (i === 1) return tool("inspectTargetDir", { season: 1 }, i);
-        if (i === 2) return tool("rejectCurrentSource", { episodes: ["S01E13"], fileIds: ["old13"], reason: "发蓝" }, i);
+        if (i === 2) return tool("rejectCurrentSource", { rejections: [{ episode: "S01E13", fileIds: ["old13"] }], reason: "发蓝" }, i);
         // Every requested episode must be rejected before anything transfers.
-        if (i === 3) return tool("rejectCurrentSource", { episodes: ["S01E24"], fileIds: ["old24"], reason: "发蓝" }, i);
+        if (i === 3) return tool("rejectCurrentSource", { rejections: [{ episode: "S01E24", fileIds: ["old24"] }], reason: "发蓝" }, i);
         if (i === 4) return tool("searchResources", { keyword: "Show 13" }, i);
         if (i === 5) {
           const search = lastToolOutput(options.prompt, "searchResources");
@@ -186,9 +186,9 @@ describe("runAcquisitionV2 — user replace request", () => {
       doGenerate: async (options) => {
         i += 1;
         if (i === 1) return tool("viewResourceSnapshot", {}, i);
-        if (i === 2) return tool("rejectCurrentSource", { episodes: ["S01E13"], fileIds: ["old13"], reason: "发蓝" }, i);
+        if (i === 2) return tool("rejectCurrentSource", { rejections: [{ episode: "S01E13", fileIds: ["old13"] }], reason: "发蓝" }, i);
         // Every requested episode must be rejected before anything transfers.
-        if (i === 3) return tool("rejectCurrentSource", { episodes: ["S01E24"], fileIds: ["old24"], reason: "发蓝" }, i);
+        if (i === 3) return tool("rejectCurrentSource", { rejections: [{ episode: "S01E24", fileIds: ["old24"] }], reason: "发蓝" }, i);
         if (i === 4) {
           // The raw snapshot document lists "[s1-1] <title>" rows.
           const doc = String(lastToolOutput(options.prompt, "viewResourceSnapshot").document);
@@ -222,9 +222,9 @@ describe("runAcquisitionV2 — user replace request", () => {
     const model = new MockLanguageModelV3({
       doGenerate: async (options) => {
         i += 1;
-        if (i === 1) return tool("rejectCurrentSource", { episodes: ["S01E13"], fileIds: ["old13"], reason: "发蓝" }, i);
+        if (i === 1) return tool("rejectCurrentSource", { rejections: [{ episode: "S01E13", fileIds: ["old13"] }], reason: "发蓝" }, i);
         // Every requested episode must be rejected before anything transfers.
-        if (i === 2) return tool("rejectCurrentSource", { episodes: ["S01E24"], fileIds: ["old24"], reason: "发蓝" }, i);
+        if (i === 2) return tool("rejectCurrentSource", { rejections: [{ episode: "S01E24", fileIds: ["old24"] }], reason: "发蓝" }, i);
         if (i === 3) return tool("reportReplacement", { results: [{ episode: "S01E13", outcome: "not_found", note: "先没找到" }] }, i);
         if (i === 4) return tool("searchResources", { keyword: "Show 13" }, i);
         if (i === 5) {
@@ -254,9 +254,9 @@ describe("runAcquisitionV2 — user replace request", () => {
     const model = new MockLanguageModelV3({
       doGenerate: async (options) => {
         i += 1;
-        if (i === 1) return tool("rejectCurrentSource", { episodes: ["S01E13"], fileIds: ["old13"], reason: "发蓝" }, i);
+        if (i === 1) return tool("rejectCurrentSource", { rejections: [{ episode: "S01E13", fileIds: ["old13"] }], reason: "发蓝" }, i);
         // Every requested episode must be rejected before anything transfers.
-        if (i === 2) return tool("rejectCurrentSource", { episodes: ["S01E24"], fileIds: ["old24"], reason: "发蓝" }, i);
+        if (i === 2) return tool("rejectCurrentSource", { rejections: [{ episode: "S01E24", fileIds: ["old24"] }], reason: "发蓝" }, i);
         if (i === 3) return tool("searchResources", { keyword: "Show 13" }, i);
         if (i === 4) {
           const search = lastToolOutput(options.prompt, "searchResources");
@@ -308,7 +308,7 @@ describe("runAcquisitionV2 — user replace request", () => {
     const model = new MockLanguageModelV3({
       doGenerate: async (options) => {
         i += 1;
-        if (i === 1) return tool("rejectCurrentSource", { episodes: ["S01E13"], fileIds: ["old13"], reason: "发蓝" }, i);
+        if (i === 1) return tool("rejectCurrentSource", { rejections: [{ episode: "S01E13", fileIds: ["old13"] }], reason: "发蓝" }, i);
         if (i === 2) return tool("searchResources", { keyword: "Show 13" }, i);
         if (i === 3) {
           seen = (lastToolOutput(options.prompt, "searchResources").snapshot.candidates as Array<{ title: string }>).map((c) => c.title);
@@ -346,9 +346,9 @@ describe("runAcquisitionV2 — user replace request", () => {
         if (i === 1) return tool("viewResourceSnapshot", {}, i);
         if (i === 2) {
           rawRow = /\[(s(\d+)-\d+)\] \[Nekomoe/.exec(String(lastToolOutput(options.prompt, "viewResourceSnapshot").document));
-          return tool("rejectCurrentSource", { episodes: ["S01E13"], fileIds: ["old13"], reason: "发蓝" }, i);
+          return tool("rejectCurrentSource", { rejections: [{ episode: "S01E13", fileIds: ["old13"] }], reason: "发蓝" }, i);
         }
-        if (i === 3) return tool("rejectCurrentSource", { episodes: ["S01E24"], fileIds: ["old24"], reason: "发蓝" }, i);
+        if (i === 3) return tool("rejectCurrentSource", { rejections: [{ episode: "S01E24", fileIds: ["old24"] }], reason: "发蓝" }, i);
         if (i === 4) {
           dbDown = true; // the database blips after the rejections are recorded
           return tool("searchResources", { keyword: "Show 13" }, i);
@@ -421,9 +421,9 @@ describe("runAcquisitionV2 — user replace request", () => {
         if (i === 2) {
           // Remembered from the pre-search, before the rejection hides it.
           rawRow = /\[(s(\d+)-\d+)\] Show\.13\.WEB-DL\.Another\.Group/.exec(String(lastToolOutput(options.prompt, "viewResourceSnapshot").document));
-          return tool("rejectCurrentSource", { episodes: ["S01E13"], fileIds: ["old13"], reason: "发蓝" }, i);
+          return tool("rejectCurrentSource", { rejections: [{ episode: "S01E13", fileIds: ["old13"] }], reason: "发蓝" }, i);
         }
-        if (i === 3) return tool("rejectCurrentSource", { episodes: ["S01E24"], fileIds: ["old24"], reason: "发蓝" }, i);
+        if (i === 3) return tool("rejectCurrentSource", { rejections: [{ episode: "S01E24", fileIds: ["old24"] }], reason: "发蓝" }, i);
         if (i === 4) return tool("transferCandidate", { snapshotId: `s${rawRow![2]}`, candidateId: rawRow![1] }, i);
         if (i === 5) {
           transferOutput = lastToolOutput(options.prompt, "transferCandidate");
@@ -515,23 +515,20 @@ describe("runAcquisitionV2 — user replace request", () => {
     const model = new MockLanguageModelV3({
       doGenerate: async () => {
         i += 1;
-        if (i === 1) return tool("rejectCurrentSource", { episodes: ["S01E13"], fileIds: ["old13"], reason: "发蓝" }, i);
-        if (i === 2) return tool("rejectCurrentSource", { episodes: ["S01E13", "S01E24"], fileIds: ["old13", "old24"], reason: "发蓝" }, i);
+        if (i === 1) return tool("rejectCurrentSource", { rejections: [{ episode: "S01E13", fileIds: ["old13"] }], reason: "发蓝" }, i);
+        if (i === 2) return tool("rejectCurrentSource", { rejections: [{ episode: "S01E13", fileIds: ["old13"] }, { episode: "S01E24", fileIds: ["old24"] }], reason: "发蓝" }, i);
         return text("done");
       },
     });
     const result = await runAcquisitionV2(baseRequest(model, executor(), rejectedRows));
-    // old13 once for E13; old24 for E24 is already stored; old13×E24 and old24×E13 are new pairs.
+    // First call records old13 under E13. The second call groups each file with its own
+    // episode: E13's file is the same copy again, and E24's file is already stored.
     expect(result.replacement?.rejected.map((r) => [r.episode, r.label])).toEqual([
       ["S01E13", "Show - 13 [CR 1080p].mkv"],
-      ["S01E24", "Show - 13 [CR 1080p].mkv"],
-      ["S01E13", "Show - 24 [CR 1080p].mkv"],
     ]);
     expect(rejectedRows.map((r) => [r.episode, r.label])).toEqual([
       ["S01E24", "Show - 24 [CR 1080p].mkv"],
       ["S01E13", "Show - 13 [CR 1080p].mkv"],
-      ["S01E24", "Show - 13 [CR 1080p].mkv"],
-      ["S01E13", "Show - 24 [CR 1080p].mkv"],
     ]);
     // Every rejected file is still listed as an old file.
     expect(result.replacement?.oldFiles.sort()).toEqual(["Season 01/Show - 13 [CR 1080p].mkv", "Season 01/Show - 24 [CR 1080p].mkv"]);
@@ -680,7 +677,7 @@ describe("runAcquisitionV2 — user replace request", () => {
     const declares = new MockLanguageModelV3({
       doGenerate: async () => {
         i += 1;
-        if (i === 1) return tool("rejectCurrentSource", { episodes: ["S01E05"], fileIds: [], reason: "第 5 集也要换" }, i);
+        if (i === 1) return tool("rejectCurrentSource", { rejections: [{ episode: "S01E05", fileIds: [] }], reason: "第 5 集也要换" }, i);
         return text("done");
       },
     });
@@ -862,7 +859,7 @@ describe("runAcquisitionV2 — a rejection carries the link of the transfer that
         if (i === 2) {
           // Remembered from the pre-search, before the rejection hides it.
           ytsRow = YTS_ROW.exec(String(lastToolOutput(options.prompt, "viewResourceSnapshot").document));
-          return tool("rejectCurrentSource", { episodes: [], fileIds: ["odyssey_yts"], reason: "假片" }, i);
+          return tool("rejectCurrentSource", { rejections: [{ fileIds: ["odyssey_yts"] }], reason: "假片" }, i);
         }
         if (i === 3) return tool("viewResourceSnapshot", {}, i);
         if (i === 4) {
@@ -908,7 +905,7 @@ describe("runAcquisitionV2 — a rejection carries the link of the transfer that
         if (i === 1) return tool("viewResourceSnapshot", {}, i);
         if (i === 2) {
           ytsRow = YTS_ROW.exec(String(lastToolOutput(options.prompt, "viewResourceSnapshot").document));
-          return tool("rejectCurrentSource", { episodes: [], fileIds: ["odyssey_yts"], reason: "假片" }, i);
+          return tool("rejectCurrentSource", { rejections: [{ fileIds: ["odyssey_yts"] }], reason: "假片" }, i);
         }
         if (i === 3) {
           firstReject = lastToolOutput(options.prompt, "rejectCurrentSource");
@@ -919,19 +916,19 @@ describe("runAcquisitionV2 — a rejection carries the link of the transfer that
         if (i === 4) {
           gatedTransfer = lastToolOutput(options.prompt, "transferCandidate");
           historyDown = false;
-          return tool("rejectCurrentSource", { episodes: [], fileIds: ["odyssey_yts"], reason: "假片" }, i);
+          return tool("rejectCurrentSource", { rejections: [{ fileIds: ["odyssey_yts"] }], reason: "假片" }, i);
         }
         if (i === 5) {
           retryReject = lastToolOutput(options.prompt, "rejectCurrentSource");
           // Down again: every rejection reads its files' history — a repeat too, whose link
           // decides whether it adds anything.
           historyDown = true;
-          return tool("rejectCurrentSource", { episodes: [], fileIds: ["odyssey_yts"], reason: "假片" }, i);
+          return tool("rejectCurrentSource", { rejections: [{ fileIds: ["odyssey_yts"] }], reason: "假片" }, i);
         }
         if (i === 6) {
           repeatWhileDown = lastToolOutput(options.prompt, "rejectCurrentSource");
           historyDown = false;
-          return tool("rejectCurrentSource", { episodes: [], fileIds: ["odyssey_yts"], reason: "假片" }, i);
+          return tool("rejectCurrentSource", { rejections: [{ fileIds: ["odyssey_yts"] }], reason: "假片" }, i);
         }
         if (i === 7) repeatWhileUp = lastToolOutput(options.prompt, "rejectCurrentSource");
         return text("done");
@@ -968,7 +965,7 @@ describe("runAcquisitionV2 — a rejection carries the link of the transfer that
       const model = new MockLanguageModelV3({
         doGenerate: async () => {
           i += 1;
-          if (i === 1) return tool("rejectCurrentSource", { episodes: [], fileIds: ["odyssey_yts", "odyssey_old"], reason: "假片" }, i);
+          if (i === 1) return tool("rejectCurrentSource", { rejections: [{ fileIds: ["odyssey_yts", "odyssey_old"] }], reason: "假片" }, i);
           return text("done");
         },
       });
@@ -1004,7 +1001,7 @@ describe("runAcquisitionV2 — a rejection carries the link of the transfer that
     const model = new MockLanguageModelV3({
       doGenerate: async () => {
         i += 1;
-        if (i === 1) return tool("rejectCurrentSource", { episodes: [], fileIds: ["odyssey_yts", "twin_b", "twin_c"], reason: "假片" }, i);
+        if (i === 1) return tool("rejectCurrentSource", { rejections: [{ fileIds: ["odyssey_yts", "twin_b", "twin_c"] }], reason: "假片" }, i);
         return text("done");
       },
     });
@@ -1031,7 +1028,7 @@ describe("runAcquisitionV2 — a rejection carries the link of the transfer that
     const model = new MockLanguageModelV3({
       doGenerate: async () => {
         i += 1;
-        if (i === 1) return tool("rejectCurrentSource", { episodes: [], fileIds: ["odyssey_yts"], reason: "假片" }, i);
+        if (i === 1) return tool("rejectCurrentSource", { rejections: [{ fileIds: ["odyssey_yts"] }], reason: "假片" }, i);
         return text("done");
       },
     });
@@ -1060,7 +1057,7 @@ describe("runAcquisitionV2 — a rejection carries the link of the transfer that
           const doc = String(lastToolOutput(options.prompt, "viewResourceSnapshot").document);
           ytsRow = YTS_ROW.exec(doc);
           realAlias = /\[(s\d+-\d+)\] 奥德赛 The\.Odyssey\.2026\.2160p/.exec(doc)![1]!;
-          return tool("rejectCurrentSource", { episodes: [], fileIds: ["odyssey_yts"], reason: "假片" }, i);
+          return tool("rejectCurrentSource", { rejections: [{ fileIds: ["odyssey_yts"] }], reason: "假片" }, i);
         }
         if (i === 3) return tool("viewResourceSnapshot", {}, i);
         if (i === 4) {
@@ -1087,5 +1084,49 @@ describe("runAcquisitionV2 — a rejection carries the link of the transfer that
     expect(docAfter).not.toContain(YTS_TITLE);
     expect(String(refused?.error)).toMatch(/SANDBOX_CANDIDATE_REJECTED/);
     expect(result.replacement?.results).toEqual([expect.objectContaining({ episode: "MOVIE", outcome: "replaced", linkKey: "quark:9z8Y7x6W" })]);
+  });
+
+  it("rejecting a movie's mp4 and its subtitle writes one row (the mp4) and lists both as old files", async () => {
+    const SRT = "The.Odyssey.2026.chs.srt";
+    const rejectedRows: RejectedRow[] = [];
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => {
+        i += 1;
+        if (i === 1) {
+          return tool("rejectCurrentSource", { rejections: [{ fileIds: ["odyssey_yts", "odyssey_srt"] }], reason: "假片" }, i);
+        }
+        return text("done");
+      },
+    });
+    const exec = odysseyExecutor([
+      { id: "odyssey_srt", storageDirectoryId: "film", name: SRT, sizeBytes: 40_000, episodeCode: null, providerFileId: "odyssey_srt" },
+    ]);
+
+    const result = await runAcquisitionV2(odysseyRequest(model, exec, rejectedRows, async () => ({ odyssey_yts: YTS_KEY })));
+
+    expect(rejectedRows).toEqual([{ episode: "MOVIE", linkKey: YTS_KEY, label: ODYSSEY_FILE, sizeBytes: ODYSSEY_SIZE, reason: "假片" }]);
+    expect(result.replacement?.oldFiles).toEqual([ODYSSEY_FILE, SRT]);
+  });
+
+  it("a group that names no video still writes a row for its subtitle", async () => {
+    const SRT = "The.Odyssey.2026.chs.srt";
+    const rejectedRows: RejectedRow[] = [];
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => {
+        i += 1;
+        if (i === 1) return tool("rejectCurrentSource", { rejections: [{ fileIds: ["odyssey_srt"] }], reason: "字幕不对" }, i);
+        return text("done");
+      },
+    });
+    const exec = odysseyExecutor([
+      { id: "odyssey_srt", storageDirectoryId: "film", name: SRT, sizeBytes: 40_000, episodeCode: null, providerFileId: "odyssey_srt" },
+    ]);
+
+    const result = await runAcquisitionV2(odysseyRequest(model, exec, rejectedRows, async () => ({})));
+
+    expect(rejectedRows).toEqual([{ episode: "MOVIE", linkKey: null, label: SRT, sizeBytes: 40_000, reason: "字幕不对" }]);
+    expect(result.replacement?.oldFiles).toEqual([SRT]);
   });
 });

@@ -319,7 +319,7 @@ describe("runMovieAcquisitionV2 — user request (replace_request run)", () => {
         if (calls === 1) {
           system = JSON.stringify(options.prompt.find((m) => m.role === "system") ?? "");
           tools = (options.tools ?? []).map((t) => t.name);
-          return tool("rejectCurrentSource", { episodes: [], fileIds: ["oldfilm"], reason: "假片" });
+          return tool("rejectCurrentSource", { rejections: [{ fileIds: ["oldfilm"] }], reason: "假片" });
         }
         if (calls === 2) return tool("reportReplacement", { results: [{ episode: "MOVIE", outcome: "not_found", note: "没有正版" }] });
         return { content: [{ type: "text" as const, text: "done" }], finishReason: { unified: "stop" as const, raw: "stop" as const }, usage: USAGE, warnings: [] };
