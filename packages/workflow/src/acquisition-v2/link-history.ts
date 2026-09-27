@@ -2,11 +2,11 @@ import { resourceLinkKey } from "./resource-link.js";
 import { readTransferFate, type LinkHistoryRow } from "../user-requests.js";
 
 /**
- * One sentence, wherever a prompt explains `· 发布 YYYY-MM-DD`. Information for
- * the agent, not a block: transferring the link again is still the agent's call.
+ * Shown wherever a prompt explains `· 发布 YYYY-MM-DD`. States where the files
+ * went, and the usual reason, without turning the note into a block.
  */
 export const LINK_HISTORY_PROMPT =
-  "The 「近 30 天转过…」 note is this work's own transfer history of that same link (any title); 「文件每次都被丢掉」 means every earlier transfer held only files the library already had, so transferring it again needs a concrete reason (e.g. a post date after those transfers).";
+  "The 「近 30 天转过…」 note is this work's own transfer history of that same link (any title). 「文件每次都被丢掉」 means none of the files those transfers landed ended up in the library — usually because they were episodes the library already had, so transferring it again needs a concrete reason (e.g. a post date after those transfers, or a size/version that differs from what you have).";
 
 /** resourceLinkKey → the one-line note. A row whose url has no key, or that landed nothing, is skipped. */
 export function linkHistoryByKey(rows: readonly LinkHistoryRow[]): Map<string, string> {

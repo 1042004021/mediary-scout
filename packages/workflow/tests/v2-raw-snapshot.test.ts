@@ -165,7 +165,7 @@ describe("system prompt carries raw snapshot pointer", () => {
   });
 
   it("tells the agent what the 近 30 天 note means, on both the raw pointer and the search tools", () => {
-    const sentence = "文件每次都被丢掉";
+    const fact = "none of the files those transfers landed ended up in the library";
     for (const prompt of [
       buildTvAnimeSystemPrompt({ prefetchedCandidateCount: 12 }),
       buildMovieSystemPrompt({ prefetchedCandidateCount: 12 }),
@@ -175,7 +175,9 @@ describe("system prompt carries raw snapshot pointer", () => {
       }),
     ]) {
       expect(prompt).toContain("近 30 天转过");
-      expect(prompt).toContain(sentence);
+      expect(prompt).toContain("文件每次都被丢掉");
+      expect(prompt).toContain(fact);
+      expect(prompt).not.toContain("held only files the library already had");
     }
     const sandbox = new TaskSandbox({
       provider: new FakeResourceProviderV2({ results: {} }),
@@ -183,8 +185,11 @@ describe("system prompt carries raw snapshot pointer", () => {
     });
     const tools = buildSandboxToolSet(sandbox);
     for (const name of ["viewResourceSnapshot", "searchResources"] as const) {
-      expect(tools[name]!.description).toContain("近 30 天转过");
-      expect(tools[name]!.description).toContain(sentence);
+      const description = tools[name]!.description ?? "";
+      expect(description).toContain("近 30 天转过");
+      expect(description).toContain("文件每次都被丢掉");
+      expect(description).toContain(fact);
+      expect(description).not.toContain("held only files the library already had");
     }
   });
 
