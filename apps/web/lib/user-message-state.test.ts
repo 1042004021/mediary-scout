@@ -12,6 +12,7 @@ import {
   isMultiSeason,
   keepToastText,
   mergeIntoComposer,
+  missedEpisodes,
   nowButtonMessageId,
   replacedLaterByRun,
   replyView,
@@ -215,8 +216,8 @@ describe("replyView — the agent's reply as a track list", () => {
     expect(view.rows[0]!.resource).toBe("没记下资源名");
   });
 
-  it("carries the two flags the reply can raise", () => {
-    expect(replyView(reply("r", { unidentified: true }), { ...tv, pending: new Set() })).toMatchObject({ unidentified: true, rejectedNotSaved: false, summary: "", rows: [] });
+  it("carries the rejected-list flag; an unidentified reply has no rows (its hint goes under the message: missedEpisodes)", () => {
+    expect(replyView(reply("r", { unidentified: true }), { ...tv, pending: new Set() })).toMatchObject({ rejectedNotSaved: false, summary: "", rows: [] });
     expect(replyView(reply("r", { rejectedNotSaved: true }), { ...tv, pending: new Set() }).rejectedNotSaved).toBe(true);
   });
 
@@ -294,6 +295,21 @@ describe("editorAfterRefresh — a message's editor when a fresh render arrives"
     // Changed again elsewhere, or gone: nothing to wait for.
     expect(editorAfterRefresh(saved, inView({ body: "别的话" }))).toEqual({ kind: "close" });
     expect(editorAfterRefresh(saved, undefined)).toEqual({ kind: "close" });
+  });
+});
+
+describe("missedEpisodes — the 「没看出是哪几集」 hint goes under the message it is about", () => {
+  const unidentified = reply("run_u", { unidentified: true, results: [{ episode: "S01E04", outcome: "not_found", note: "" }] });
+
+  it("the flag is one per run: only a message that named no episode gets the hint", () => {
+    expect(missedEpisodes({ episodeTags: [], reply: unidentified }, "tv")).toBe(true);
+    expect(missedEpisodes({ episodeTags: ["S01E04"], reply: unidentified }, "tv")).toBe(false);
+  });
+
+  it("no hint without the flag, without a reply, or for a film (it always has its one file)", () => {
+    expect(missedEpisodes({ episodeTags: [], reply: reply("run_ok") }, "tv")).toBe(false);
+    expect(missedEpisodes({ episodeTags: [], reply: null }, "tv")).toBe(false);
+    expect(missedEpisodes({ episodeTags: [], reply: unidentified }, "movie")).toBe(false);
   });
 });
 

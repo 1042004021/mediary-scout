@@ -32,6 +32,7 @@ import {
   isMultiSeason,
   keepToastText,
   mergeIntoComposer,
+  missedEpisodes,
   nowButtonMessageId,
   replacedLaterByRun,
   replyView,
@@ -55,6 +56,7 @@ const BODY_MAX = 500;
 /** Why 「不换了」 waits while a replace run of the work is processing: the run's end-of-run
  *  bookkeeping would put the episode back as 待换 and silently undo the choice. */
 const KEEP_BUSY_HINT = "处理中，完了再操作";
+const MISSED_EPISODES_HINT = "没看出是哪几集——用「选集数」标出来，再发一次";
 const EDIT_TAKEN = "agent 已经开始处理这条留言了";
 const EDIT_TAKEN_MOVED = "agent 已经开始处理这条留言了。改过的内容挪到了输入框里，可以再发一条";
 
@@ -401,6 +403,8 @@ function ThreadForOneWork({ work, view, run, nextPatrol, episodes, now }: UserMe
                 {inline.length > 0 ? " " : null}
                 {m.body}
               </div>
+              {/* The run could not tell which episodes this one meant (it named none). */}
+              {missedEpisodes(m, work.mediaType) ? <p className="um-note">{MISSED_EPISODES_HINT}</p> : null}
               {m.status === "pending" ? (
                 <div className="um-msg-actions">
                   <button
@@ -474,7 +478,6 @@ function ThreadForOneWork({ work, view, run, nextPatrol, episodes, now }: UserMe
             {reply.summary ? <span>{reply.summary}</span> : null}
           </div>
           {reply.rows.length > 0 ? <Tracks rows={reply.rows} movie={movie} onKeep={keep} keepBlockedBy={keepBusy ? keepHintId : null} /> : null}
-          {reply.unidentified ? <p className="um-note">没看出是哪几集——用「选集数」标出来，再发一次</p> : null}
           {reply.rejectedNotSaved ? <p className="um-note is-faint">这次拒掉的版本没能记下来，之后搜索时可能还会看到它</p> : null}
           {reply.oldFilesLabel ? <OldFiles label={reply.oldFilesLabel} paths={reply.oldFiles} /> : null}
           {foot || another ? (

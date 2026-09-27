@@ -3,7 +3,7 @@
 // component without dragging the server runtime (and transitively the `pg`
 // Postgres driver) into the browser bundle. `activity-view.ts` re-exports these
 // for server-side callers; the activity-feed client component imports them here.
-import type { EpisodeState, MediaType } from "@media-track/workflow";
+import type { EpisodeState, MediaType, WorkflowKind } from "@media-track/workflow";
 
 /**
  * Distinct, sorted (numeric) season numbers present in an episode set, derived
@@ -41,4 +41,19 @@ export function seasonLabelText(
     return "";
   }
   return `第 ${seasons.join("/")} 季`;
+}
+
+/**
+ * The sub-label beside an active run's title. A replace run (a user's 「换一个」, or the
+ * patrol looking for 待换 episodes) is about the title: it covers every tracked season,
+ * whichever one its title lock sits on, so it reads 「换源」 rather than a season. Any
+ * other run reads its seasons (seasonLabelText). Pure.
+ */
+export function activeRunLabel(run: {
+  kind: WorkflowKind;
+  type: MediaType;
+  seasonNumbers: readonly number[];
+  seasonNumber: number | null;
+}): string {
+  return run.kind === "replace_request" ? "换源" : seasonLabelText(run.type, run.seasonNumbers, run.seasonNumber);
 }

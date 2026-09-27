@@ -11,7 +11,7 @@ import type {
   ActivityView,
   RetryRefusalReason,
 } from "../lib/activity-view";
-import { seasonLabelText } from "../lib/activity-season-label";
+import { activeRunLabel } from "../lib/activity-season-label";
 import { isDemoModeClient } from "../lib/demo-mode";
 import { demoCompletedItems, demoInProgressActivityItems } from "../lib/demo-session";
 import { useDemoAcquisitions, useDemoInProgress } from "../lib/use-demo-session";
@@ -111,8 +111,9 @@ function poster(posterPath: string | null, title: string, tone: string) {
   );
 }
 
+/** 「第 1/2 季」, or 「换源」 for a replace run (title-level). */
 function seasonLabel(run: ActivityActiveRun): string {
-  return seasonLabelText(run.type, run.seasonNumbers ?? [], run.seasonNumber);
+  return activeRunLabel({ ...run, seasonNumbers: run.seasonNumbers ?? [] });
 }
 
 function RunningRow({ run, storageId }: { run: ActivityActiveRun; storageId?: string | undefined }) {

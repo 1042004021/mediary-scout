@@ -141,7 +141,6 @@ export interface ReplyView {
   oldFilesLabel: string | null;
   /** The note under the latest reply: where the new files went. */
   foot: string | null;
-  unidentified: boolean;
   rejectedNotSaved: boolean;
 }
 
@@ -200,9 +199,16 @@ export function replyView(
     oldFiles: reply.oldFiles,
     oldFilesLabel,
     foot,
-    unidentified: reply.unidentified === true,
     rejectedNotSaved: reply.rejectedNotSaved === true,
   };
+}
+
+/** Whether a message gets the 「没看出是哪几集」 hint: the agent could not tell which
+ *  episodes were meant. `reply.unidentified` is one flag per run, shared by every message
+ *  the run answered, so it belongs only under a message that named no episode (a tagged
+ *  one said which). A film always has its one file, so never for a film. */
+export function missedEpisodes(message: Pick<ThreadMessage, "episodeTags" | "reply">, mediaType: "movie" | "tv"): boolean {
+  return mediaType === "tv" && message.reply?.unidentified === true && message.episodeTags.length === 0;
 }
 
 /** Per answered run (by runId): the episodes some newer reply replaced — an older row

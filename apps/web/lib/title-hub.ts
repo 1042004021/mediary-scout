@@ -498,12 +498,17 @@ export interface InProgressTitle {
 /**
  * Titles with an acquisition run still queued/running — they surface in the
  * library as non-clickable "获取中" poster placeholders until the run finishes
- * and the title materializes as a real card.
+ * and the title materializes as a real card. A replace_request run is not one:
+ * its title is already in the library, and those runs queue last and pile up
+ * after each sweep — the card must still open the page, where the user edits or
+ * withdraws the message (design §1 G2).
  */
 export async function getInProgressTitles(storageId?: string): Promise<InProgressTitle[]> {
   const repository = getWorkflowRepository();
   const scope = await getActiveWorkspaceScope(storageId);
-  const active = await repository.listActiveWorkflowRuns(scope);
+  const active = (await repository.listActiveWorkflowRuns(scope)).filter(
+    (snapshot) => snapshot.workflowRun.kind !== "replace_request",
+  );
   const byTmdb = new Map<number, InProgressTitle>();
   for (const snapshot of active) {
     const title = snapshot.title;

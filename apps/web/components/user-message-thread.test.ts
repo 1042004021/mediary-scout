@@ -181,6 +181,23 @@ describe("UserMessageThread — the states of the mockup", () => {
     expect(html).toContain('class="um-tracks is-movie"');
   });
 
+  it("one run, two messages: the 「没看出是哪几集」 hint sits only under the one without episode tags", () => {
+    const reply = { results: [{ episode: "S01E04", outcome: "not_found" as const, note: "还是没找到" }], oldFiles: [], unidentified: true };
+    const html = render({
+      messages: [
+        done("run_u", reply, { id: "m2", body: "有几集声音对不上", episodeTags: [], createdAt: "2026-09-27T06:10:00.000Z" }),
+        done("run_u", reply, { id: "m1", body: "第 4 集偏色", episodeTags: ["S01E04"], createdAt: "2026-09-27T06:00:00.000Z" }),
+      ],
+      pending: ["S01E04"],
+    });
+    const hint = "没看出是哪几集——用「选集数」标出来，再发一次";
+    expect(html.split(hint)).toHaveLength(2);
+    // After the untagged message, before the agent's reply; not after the tagged one.
+    expect(html.indexOf("第 4 集偏色")).toBeLessThan(html.indexOf("有几集声音对不上"));
+    expect(html.indexOf("有几集声音对不上")).toBeLessThan(html.indexOf(hint));
+    expect(html.indexOf(hint)).toBeLessThan(html.indexOf("还是没找到"));
+  });
+
   it("the agent could not tell which episodes: asks for them", () => {
     const html = render({ messages: [done("run_u", { results: [], oldFiles: [], unidentified: true }, { id: "m1", episodeTags: [] })] });
     expect(html).toContain("没看出是哪几集——用「选集数」标出来，再发一次");

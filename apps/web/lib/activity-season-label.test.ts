@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { EpisodeState } from "@media-track/workflow";
 // Import from the PURE module (not activity-view) — this is the client-safe home
 // for these helpers, kept free of the Postgres-backed runtime.
-import { distinctSeasons, seasonLabelText } from "./activity-season-label";
+import { activeRunLabel, distinctSeasons, seasonLabelText } from "./activity-season-label";
 
 function episode(seasonNumber: number, episodeNumber: number): EpisodeState {
   return {
@@ -49,5 +49,16 @@ describe("seasonLabelText", () => {
   });
   it("falls back to the single seasonNumber when the list is empty", () => {
     expect(seasonLabelText("tv", [], 3)).toBe("第 3 季");
+  });
+});
+
+describe("activeRunLabel — beside an active run's title on the activity page", () => {
+  it("a replace run is about the title: 「换源」, never a season (it covers every tracked season)", () => {
+    expect(activeRunLabel({ kind: "replace_request", type: "tv", seasonNumbers: [1], seasonNumber: 1 })).toBe("换源");
+    expect(activeRunLabel({ kind: "replace_request", type: "movie", seasonNumbers: [], seasonNumber: null })).toBe("换源");
+  });
+  it("any other run keeps its seasons (a film none)", () => {
+    expect(activeRunLabel({ kind: "type2_init", type: "tv", seasonNumbers: [1, 2], seasonNumber: 1 })).toBe("第 1/2 季");
+    expect(activeRunLabel({ kind: "movie_init", type: "movie", seasonNumbers: [], seasonNumber: null })).toBe("");
   });
 });

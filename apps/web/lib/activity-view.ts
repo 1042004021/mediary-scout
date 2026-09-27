@@ -6,13 +6,13 @@ import {
   type WorkflowRepository,
   type WorkflowRunProgress,
 } from "@media-track/workflow";
-import { distinctSeasons, seasonLabelText } from "./activity-season-label";
+import { activeRunLabel, distinctSeasons, seasonLabelText } from "./activity-season-label";
 
 // Re-export the pure season-label helpers so existing server-side imports from
 // this module keep working. The CANONICAL home is the runtime-free
 // `activity-season-label.ts` — the "use client" activity-feed must import from
 // there (not here), since this module pulls the Postgres-backed runtime.
-export { distinctSeasons, seasonLabelText };
+export { activeRunLabel, distinctSeasons, seasonLabelText };
 
 /** One title currently in the pipeline (queued or running). */
 export interface ActivityActiveRun {
@@ -27,17 +27,21 @@ export interface ActivityActiveRun {
   posterPath: string | null;
   /** The snapshot's primary/placeholder season number (`snapshot.season`). May
    *  be a real number even for a whole-show ("全季") run, where it's just the
-   *  scope's anchor season — NOT the full set of covered seasons. null only for
-   *  movies / season-less snapshots. For display, prefer `seasonNumbers`. */
+   *  scope's anchor season — NOT the full set of covered seasons. null for
+   *  movies / season-less snapshots, and for a replace_request run (title-level:
+   *  its snapshot season is only where the title lock sits). For display, prefer
+   *  `seasonNumbers` (activeRunLabel). */
   seasonNumber: number | null;
   /** The distinct, sorted seasons the run actually covers, derived from its
    *  episode set. This is what the UI labels (e.g. "第 1/2/3/4 季"); a 全季 run
-   *  spans many seasons even though `seasonNumber` is a single anchor value. */
+   *  spans many seasons even though `seasonNumber` is a single anchor value.
+   *  [] for a replace_request run, which reads 「换源」 instead. */
   seasonNumbers: number[];
   status: "queued" | "running";
   /** 1-based position among queued items; null for the running one. */
   queuePosition: number | null;
-  /** Aired-but-not-obtained episodes still needed. */
+  /** Aired-but-not-obtained episodes still needed. 0 for a replace_request run:
+   *  its snapshot holds only the lock season's episodes, not what it looks for. */
   missingCount: number;
   /** Live agent progress (running only). */
   progress: WorkflowRunProgress | null;
@@ -107,9 +111,12 @@ export async function getActivityView(input: {
 
   const active: ActivityActiveRun[] = activeRuns.map((snapshot) => {
     const status = snapshot.workflowRun.status === "running" ? "running" : "queued";
-    const missingCount = snapshot.episodes.filter(
-      (episode) => episode.airStatus === "aired" && !episode.obtained,
-    ).length;
+    // A replace run covers the whole title; its snapshot is only the lock season's
+    // (an S02E01 request would read 「第 1 季」 with S01's missing count).
+    const titleLevel = snapshot.workflowRun.kind === "replace_request";
+    const missingCount = titleLevel
+      ? 0
+      : snapshot.episodes.filter((episode) => episode.airStatus === "aired" && !episode.obtained).length;
     const queueIndex = queuedOrder.indexOf(snapshot.workflowRun.id);
     return {
       runId: snapshot.workflowRun.id,
@@ -119,8 +126,8 @@ export async function getActivityView(input: {
       year: snapshot.title.year ?? null,
       type: snapshot.title.type,
       posterPath: snapshot.title.posterPath ?? null,
-      seasonNumber: snapshot.season.seasonNumber ?? null,
-      seasonNumbers: distinctSeasons(snapshot.episodes),
+      seasonNumber: titleLevel ? null : snapshot.season.seasonNumber ?? null,
+      seasonNumbers: titleLevel ? [] : distinctSeasons(snapshot.episodes),
       status,
       queuePosition: status === "queued" && queueIndex >= 0 ? queueIndex + 1 : null,
       missingCount,

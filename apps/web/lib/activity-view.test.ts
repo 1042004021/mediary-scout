@@ -147,6 +147,28 @@ describe("getActivityView", () => {
     );
   });
 
+  it("a replace run reads at the title level: its lock season's episodes say nothing about what it covers", async () => {
+    // A request for S02E01 locks the title on its first tracked season; the snapshot
+    // holds S01's episodes (two of them missing) — neither the season nor the count is
+    // what the run is about.
+    const repo = new InMemoryWorkflowRepository();
+    await repo.saveWorkflowRunSnapshot(
+      run({
+        id: "r_swap",
+        tmdbId: 2,
+        name: "Owned",
+        status: "queued",
+        startedAt: "2026-06-17T00:00:01Z",
+        kind: "replace_request",
+        episodes: [episode(1, 1, "t2_s1"), episode(1, 2, "t2_s1")],
+      }),
+    );
+
+    const [swap] = (await getActivityView({ repository: repo })).active;
+
+    expect(swap).toMatchObject({ kind: "replace_request", seasonNumber: null, seasonNumbers: [], missingCount: 0 });
+  });
+
   it("recentCompleted carries finished runs with runId + size, excluding no-op patrol checks (client scopes by observed runs)", async () => {
     const repo = new InMemoryWorkflowRepository();
     await repo.saveWorkflowRunSnapshot(run({ id: "r_done", tmdbId: 2, name: "Done", status: "succeeded", startedAt: "2026-06-17T00:01:00Z", finishedAt: "2026-06-17T00:01:30Z" }));
