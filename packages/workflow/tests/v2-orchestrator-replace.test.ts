@@ -148,8 +148,9 @@ describe("runAcquisitionV2 — user replace request", () => {
     expect(systems[0]).toContain("13、24 发蓝");
     expect(result.replacement?.results).toEqual([
       // candidateId is mapped back from the agent's short alias to the provider's real id,
-      // with the resource title and link identity the episode_sources row needs.
-      { episode: "S01E13", outcome: "replaced", candidateId: "cand_nekomoe", label: NEKOMOE_TITLE, linkKey: `magnet:${"b".repeat(40)}`, note: "喵萌版" },
+      // with the resource title and link identity the episode_sources row needs, and the
+      // named new file's real size (read from the season dir when reporting).
+      { episode: "S01E13", outcome: "replaced", candidateId: "cand_nekomoe", label: NEKOMOE_TITLE, linkKey: `magnet:${"b".repeat(40)}`, sizeBytes: 1_000_000_000, note: "喵萌版" },
       { episode: "S01E24", outcome: "not_found", note: "" },
     ]);
     expect(result.replacement?.rejected).toEqual([

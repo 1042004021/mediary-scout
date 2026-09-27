@@ -527,7 +527,7 @@ describe("replace tools registration", () => {
     expect(plain.finish?.description).not.toContain("names no episode");
   });
 
-  it("the reportReplacement description asks for the new video (subtitles may ride along) and says the directories are read when reporting", () => {
+  it("the reportReplacement description asks for the new video (subtitles optional, never checked) and says the directories are read when reporting", () => {
     type DescribedTool = { description?: string };
     const tools = buildSandboxToolSet(
       new TaskSandbox({
@@ -537,10 +537,13 @@ describe("replace tools registration", () => {
         replace: { requestedEpisodes: ["S01E13"], hasMessages: true, untaggedMessages: 0, onReject: async () => undefined, onReport: async () => undefined },
       }),
     ) as Record<string, DescribedTool>;
-    expect(tools.reportReplacement?.description).toContain("its subtitles may be included, but at least one must be the video (a subtitle alone is refused)");
+    expect(tools.reportReplacement?.description).toContain("Subtitles are optional and not checked — name the video (a subtitle alone is refused)");
+    expect(tools.reportReplacement?.description).toContain("every named video was downloaded THIS run by that candidateId");
+    expect(tools.reportReplacement?.description).not.toContain("its subtitles may be included");
     expect(tools.reportReplacement?.description).toContain(
       "It then lists the season/movie directories: a named file that is not there now (still in staging, or deleted since) records that episode not_found",
     );
+    expect(tools.reportReplacement?.description).toContain("A video reported replaced stays: it can no longer be deleted this run.");
   });
 
   it("the finish tool of a replace run returns the report requirement as evidence, not a crash", async () => {

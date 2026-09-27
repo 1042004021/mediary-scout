@@ -866,6 +866,9 @@ describe("TaskSandbox — replace: a replaced names that episode's own new file(
         pack: { files: [{ path: "[Pack] Show S01/Show - 13.mkv", sizeBytes: 1_000_000_000 }, { path: "[Pack] Show S01/Show - 24.mkv", sizeBytes: 1_000_000_000 }] },
         // A release that ships its own subtitle beside the video.
         c13sub: { files: [{ path: "[SubGroup] Show - 13.mkv", sizeBytes: 1_200_000_000 }, { path: "[SubGroup] Show - 13.chs.ass", sizeBytes: 60_000 }] },
+        // An external subtitle landed outside the video transfers (assrt): real drives
+        // never record a subtitle as a file the transfer downloaded.
+        assrt13: { files: [{ path: "Show - 13.chs.ass", sizeBytes: 50_000 }] },
       },
     });
     const staging = await storage.createDirectory({ name: "staging", parentId: "root" });
@@ -896,7 +899,14 @@ describe("TaskSandbox — replace: a replaced names that episode's own new file(
     /** Transfer one candidate into staging; the ids it materialized. */
     const land = async (candidateId: string) => (await sandbox.transferCandidate({ snapshotId: snap.id, candidateId })).attempt.materializedFileIds;
     const moveIn = (fileIds: string[]) => sandbox.moveToSeason({ moves: [{ season: 1, fileIds }] });
-    return { sandbox, storage, results, old13, land, moveIn };
+    /** Land a subtitle into staging the way assrt does: not through the sandbox's
+     *  video transfers, so it is never among the files a transfer downloaded. */
+    const landExternalSubtitle = async (candidateId: string) => {
+      const before = new Set((await storage.listTree({ directoryId: staging })).map((f) => f.id));
+      await storage.transferCandidate({ candidateId, intoDirectoryId: staging });
+      return (await storage.listTree({ directoryId: staging })).filter((f) => !before.has(f.id)).map((f) => f.id);
+    };
+    return { sandbox, storage, results, old13, land, moveIn, landExternalSubtitle };
   }
 
   it("E24 cannot ride on E13's new file: once E13 is reported with it, E24 naming it is REUSED; a made-up id is UNKNOWN", async () => {
@@ -1085,6 +1095,68 @@ describe("TaskSandbox — replace: a replaced names that episode's own new file(
     // One season dir, listed once for both episodes.
     expect(listed).toHaveLength(1);
   });
+
+  it("a file reported as an episode's replacement cannot be deleted later in the run", async () => {
+    const { sandbox, results, land, moveIn } = await fileSetup();
+    const [new13] = await land("c13");
+    await moveIn([new13!]);
+    await sandbox.markObtained({ codes: ["S01E13"] });
+    await sandbox.reportReplacement({ results: [{ episode: "S01E13", outcome: "replaced", candidateId: "c13", fileIds: [new13!], note: "喵萌版" }] });
+    // A keep-larger dedup gone wrong: the smaller NEW file is what the report stands on.
+    await expect(sandbox.deleteFiles({ directory: "season", season: 1, fileIds: [new13!] })).rejects.toThrow(
+      `SANDBOX_FILE_BACKS_REPLACEMENT: ${new13} backs S01E13`,
+    );
+    expect((await sandbox.inspectTargetDir({ season: 1 })).map((f) => f.id)).toContain(new13);
+    expect(results).toMatchObject([{ episode: "S01E13", outcome: "replaced" }]);
+  });
+
+  it("a subtitle no transfer recorded (assrt) is optional: named beside the new video it is not checked, and it backs nothing", async () => {
+    const { sandbox, results, land, moveIn, landExternalSubtitle } = await fileSetup();
+    const [video] = await land("c13");
+    const [sub] = await landExternalSubtitle("assrt13");
+    await moveIn([video!, sub!]);
+    await sandbox.markObtained({ codes: ["S01E13"] });
+    // Alone it is still no replacement.
+    await expect(
+      sandbox.reportReplacement({ results: [{ episode: "S01E13", outcome: "replaced", candidateId: "c13", fileIds: [sub!], note: "x" }] }),
+    ).rejects.toThrow("SANDBOX_REPLACEMENT_NO_VIDEO: S01E13");
+    await expect(
+      sandbox.reportReplacement({ results: [{ episode: "S01E13", outcome: "replaced", candidateId: "c13", fileIds: [video!, sub!], note: "带中字" }] }),
+    ).resolves.toEqual({ recorded: 1, ignored: [] });
+    expect(results).toMatchObject([{ episode: "S01E13", outcome: "replaced", candidateId: "c13" }]);
+    // The video backs the episode; the subtitle does not (it can go, the video cannot).
+    await expect(sandbox.deleteFiles({ directory: "season", season: 1, fileIds: [video!] })).rejects.toThrow(/SANDBOX_FILE_BACKS_REPLACEMENT/);
+    await expect(sandbox.deleteFiles({ directory: "season", season: 1, fileIds: [sub!] })).resolves.toMatchObject({ deleted: [sub] });
+  });
+
+  it("each replaced result carries the real size of that episode's named video file(s) — not the whole pack", async () => {
+    const { sandbox, results, land, moveIn } = await fileSetup();
+    await land("pack");
+    const staged = await sandbox.inspectStaging();
+    const a = staged.find((f) => f.path.endsWith("Show - 13.mkv"))!.id;
+    await moveIn([a]);
+    await sandbox.markObtained({ codes: ["S01E13"] });
+    await sandbox.reportReplacement({
+      results: [
+        { episode: "S01E13", outcome: "replaced", candidateId: "pack", fileIds: [a], note: "整季包里的这一集" },
+        { episode: "S01E24", outcome: "not_found", note: "没有" },
+      ],
+    });
+    expect(results).toMatchObject([
+      { episode: "S01E13", outcome: "replaced", sizeBytes: 1_000_000_000 },
+      { episode: "S01E24", outcome: "not_found" },
+    ]);
+    expect(results[1]).not.toHaveProperty("sizeBytes");
+  });
+
+  it("the size of a video + its subtitle is the video's alone", async () => {
+    const { sandbox, results, land, moveIn } = await fileSetup();
+    const [video, sub] = await land("c13sub");
+    await moveIn([video!, sub!]);
+    await sandbox.markObtained({ codes: ["S01E13"] });
+    await sandbox.reportReplacement({ results: [{ episode: "S01E13", outcome: "replaced", candidateId: "c13sub", fileIds: [video!, sub!], note: "带中字" }] });
+    expect(results).toMatchObject([{ episode: "S01E13", outcome: "replaced", sizeBytes: 1_200_000_000 }]);
+  });
 });
 
 describe("TaskSandbox — replace (movie: the movie dir is also staging)", () => {
@@ -1243,6 +1315,45 @@ describe("TaskSandbox — replace (movie: the movie dir is also staging)", () =>
     // A movie has no staging of its own to move from: no moveToSeason hint.
     expect(out.notInTarget![0]!.reason).not.toContain("moveToSeason");
     expect(results).toEqual([{ episode: "MOVIE", outcome: "not_found", note: expect.any(String) }]);
+  });
+
+  it("the new film reported as the replacement cannot be deleted afterwards (the movie dir is also staging)", async () => {
+    const { sandbox, old } = await movieSetup();
+    await sandbox.rejectCurrentSource({ episodes: [], fileIds: [old.find((f) => f.isVideo)!.id], reason: "假片" });
+    const snap = (await sandbox.searchResources("film")).snapshot!;
+    const [newFilm] = (await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "good_share" })).attempt.materializedFileIds;
+    await sandbox.markObtained({ codes: ["MOVIE"] });
+    await sandbox.reportReplacement({ results: [{ episode: "MOVIE", outcome: "replaced", candidateId: "good_share", fileIds: [newFilm!], note: "4K REMUX" }] });
+    await expect(sandbox.deleteFiles({ directory: "staging", fileIds: [newFilm!] })).rejects.toThrow(
+      `SANDBOX_FILE_BACKS_REPLACEMENT: ${newFilm} backs MOVIE`,
+    );
+  });
+
+  it("the old (rejected) film sitting in the movie dir is no transfer evidence for the content-filter recovery; an attempted transfer is", async () => {
+    const { sandbox, old } = await movieSetup();
+    expect(await sandbox.hasTransferEvidence()).toBe(false);
+    await sandbox.rejectCurrentSource({ episodes: [], fileIds: [old.find((f) => f.isVideo)!.id], reason: "假片" });
+    const snap = (await sandbox.searchResources("film")).snapshot!;
+    await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "good_share" });
+    expect(await sandbox.hasTransferEvidence()).toBe(true);
+  });
+
+  it("outside a replace run a film already in the movie dir still counts as evidence (a crashed run's landing can be finished), protected or not", async () => {
+    for (const protectExistingFiles of [false, true]) {
+      const storage = new Storage115Simulator({ packs: { film: { files: [{ path: "Wrapper/Film.2023.mkv", sizeBytes: 4_000 }] } } });
+      const movieDir = await storage.createDirectory({ name: "Film (2023)", parentId: "root" });
+      await storage.transferCandidate({ candidateId: "film", intoDirectoryId: movieDir });
+      const sandbox = new TaskSandbox({
+        provider: new FakeResourceProviderV2(),
+        storage,
+        stagingDirectoryId: movieDir,
+        targetMovieDirectoryId: movieDir,
+        need: ["MOVIE"],
+        protectExistingFiles,
+      });
+      await sandbox.captureProtectedFiles();
+      expect(await sandbox.hasTransferEvidence()).toBe(true);
+    }
   });
 });
 

@@ -364,7 +364,12 @@ export async function runQueuedReplaceRequest(
 
   // The run itself succeeded and is saved. What follows is bookkeeping: a failure
   // here is logged, never turned into a failed run.
-  const results = (replacement?.results ?? []).map((r) => ({ ...r, sizeBytes: r.label ? parseSizeFromTitle(r.label) : null }));
+  // A replaced episode's size is its new video file(s) as they lie in the target dir
+  // (a season pack's title carries the whole pack); the title is only a fallback.
+  const results = (replacement?.results ?? []).map((r) => ({
+    ...r,
+    sizeBytes: r.sizeBytes ?? (r.label ? parseSizeFromTitle(r.label) : null),
+  }));
   const outcome = { repository, work, runId, results, messages, pendingRows, now };
   try {
     await recordReplacementOutcome(outcome);

@@ -138,8 +138,18 @@ export interface RunAcquisitionV2Result extends AcquisitionAgentResult {
   replacement?: {
     /** One entry per episode (the last report wins). candidateId here is the
      *  PROVIDER's real id (mapped back from the agent's alias), with the title and
-     *  link identity of the resource that landed. */
-    results: Array<{ episode: string; outcome: "replaced" | "not_found"; candidateId?: string; label?: string; linkKey?: string | null; note: string }>;
+     *  link identity of the resource that landed. sizeBytes (replaced only) is the real
+     *  total size of the episode's named video file(s) in its target dir — the title of
+     *  a season pack would carry the whole pack's size. */
+    results: Array<{
+      episode: string;
+      outcome: "replaced" | "not_found";
+      candidateId?: string;
+      label?: string;
+      linkKey?: string | null;
+      sizeBytes?: number;
+      note: string;
+    }>;
     rejected: Array<{ episode: string; label: string; sizeBytes: number | null; reason: string }>;
     /** Paths (relative to the library dir) of the rejected files, still in place. */
     oldFiles: string[];
@@ -351,6 +361,7 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
                         linkKey: deadLinkKey(String(candidate.providerPayload?.["url"] ?? ""))?.key ?? null,
                       }
                     : {}),
+                  ...(r.outcome === "replaced" && r.sizeBytes !== undefined ? { sizeBytes: r.sizeBytes } : {}),
                 });
               }
             },

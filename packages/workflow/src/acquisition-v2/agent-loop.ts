@@ -241,7 +241,7 @@ export function buildSandboxToolSet(
     };
     tools["reportReplacement"] = {
       description:
-        'User request run only. Report, per requested episode, whether you replaced it: {episode, outcome:"replaced", candidateId, fileIds, note} — ONLY after the new file has been MOVED into that episode\'s season directory with moveToSeason (movie: it already lands in the movie directory) AND marked obtained; a file still sitting in staging is NOT replaced. fileIds = the id(s) of THAT episode\'s own NEW video file(s) (from the transfer\'s materializedFileIds / the moved files; movie: the new film) — its subtitles may be included, but at least one must be the video (a subtitle alone is refused). Otherwise {episode, outcome:"not_found", note} with one 中文 sentence on why. For a "replaced" the system checks that the episode was marked, and that every named file was downloaded THIS run by that candidateId (never the old file) and backs only this one episode (E24 can never be "replaced" by E13\'s file) — a refused check refuses the whole call. It then lists the season/movie directories: a named file that is not there now (still in staging, or deleted since) records that episode not_found (listed in notInTarget: if it is still in staging, move it in, then report it again).',
+        'User request run only. Report, per requested episode, whether you replaced it: {episode, outcome:"replaced", candidateId, fileIds, note} — ONLY after the new file has been MOVED into that episode\'s season directory with moveToSeason (movie: it already lands in the movie directory) AND marked obtained; a file still sitting in staging is NOT replaced. fileIds = the id(s) of THAT episode\'s own NEW video file(s) (from the transfer\'s materializedFileIds / the moved files; movie: the new film). Subtitles are optional and not checked — name the video (a subtitle alone is refused). Otherwise {episode, outcome:"not_found", note} with one 中文 sentence on why. For a "replaced" the system checks that the episode was marked, and that every named video was downloaded THIS run by that candidateId (never the old file) and backs only this one episode (E24 can never be "replaced" by E13\'s file) — a refused check refuses the whole call. It then lists the season/movie directories: a named file that is not there now (still in staging, or deleted since) records that episode not_found (listed in notInTarget: if it is still in staging, move it in, then report it again). A video reported replaced stays: it can no longer be deleted this run.',
       inputSchema: z.object({
         results: z.array(
           z.object({
@@ -423,8 +423,14 @@ export async function runAcquisitionAgent(
         "reportNoCoverage",
       ]);
       if (!request.movie) recoveryToolNames.add("discardStaging");
-      // A user request run must still be able to report its per-episode outcome.
-      if (request.sandbox.hasReplace()) recoveryToolNames.add("reportReplacement");
+      // A user request run must still be able to report its per-episode outcome — and to
+      // identify an untagged message's episodes (finish is refused until it has). Neither
+      // transfers anything: rejectCurrentSource only records the current file (or
+      // declares there is none).
+      if (request.sandbox.hasReplace?.()) {
+        recoveryToolNames.add("reportReplacement");
+        recoveryToolNames.add("rejectCurrentSource");
+      }
       const recoveryTools = Object.fromEntries(
         Object.entries(tools).filter(([name]) => recoveryToolNames.has(name)),
       ) as ToolSet;

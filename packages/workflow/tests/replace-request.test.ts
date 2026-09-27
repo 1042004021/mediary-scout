@@ -38,6 +38,13 @@ const text = (t: string) => ({
   usage: USAGE,
   warnings: [],
 });
+/** A model response the provider's content filter cut off. */
+const contentFiltered = () => ({
+  content: [],
+  finishReason: { unified: "content-filter" as const, raw: "content_filter" },
+  usage: USAGE,
+  warnings: [],
+});
 
 function throwingModel() {
   return new MockLanguageModelV3({
@@ -336,9 +343,10 @@ describe("runQueuedReplaceRequest", () => {
 
     const [done] = await repository.listUserMessages(WORK);
     expect(done).toMatchObject({ id: message.id, status: "done", runId: "run_rr" });
+    // The size is the new file's real size (from the target dir), not the "[1.9G]" in its title.
     expect(done!.reply).toEqual({
       results: [
-        { episode: "S01E01", outcome: "replaced", label: NEW_TITLE, sizeBytes: Math.round(1.9 * 1024 ** 3), note: "新版" },
+        { episode: "S01E01", outcome: "replaced", label: NEW_TITLE, sizeBytes: 2_000_000_000, note: "新版" },
         { episode: "S01E02", outcome: "not_found", note: "没找到别的版本" },
       ],
       oldFiles: ["Season 01/Show.S01E01.mkv", "Season 01/Show.S01E02.mkv"],
@@ -348,7 +356,7 @@ describe("runQueuedReplaceRequest", () => {
     expect((await repository.listPendingReplacements(WORK)).map((p) => [p.episode, p.messageId])).toEqual([["S01E02", message.id]]);
     const sources = await repository.listEpisodeSources(WORK);
     expect(sources).toEqual([
-      expect.objectContaining({ episode: "S01E01", label: NEW_TITLE, linkKey: `magnet:${"b".repeat(40)}`, runId: "run_rr", sizeBytes: Math.round(1.9 * 1024 ** 3) }),
+      expect.objectContaining({ episode: "S01E01", label: NEW_TITLE, linkKey: `magnet:${"b".repeat(40)}`, runId: "run_rr", sizeBytes: 2_000_000_000 }),
     ]);
     const rejected = await repository.listRejectedResources({ accountId: "acct_1", titleKey: "tmdb_tv_42" });
     expect(rejected).toHaveLength(2);
@@ -378,6 +386,64 @@ describe("runQueuedReplaceRequest", () => {
     expect(notification.report?.fileCount).toBeUndefined();
     expect(notification.body).not.toMatch(/入库|获取完成/);
     expect(await repository.listActiveWorkflowRuns({ accountId: "acct_1", connectedStorageId: DRIVE })).toEqual([]);
+  });
+
+  it("an episode replaced from a season pack replies with its own file's size, not the pack size in the title", async () => {
+    const { repository, title, season } = await trackedShow();
+    const PACK_TITLE = "[NewGroup] Show S01 全集 1080p [20.5G]";
+    const storage = new FakeStorageExecutor({
+      transferOutcomes: {
+        cand_pack: {
+          status: "succeeded",
+          providerMessage: "ok",
+          files: [
+            { id: "pack01", storageDirectoryId: "staging", name: "[NewGroup] Show 01.mkv", sizeBytes: 1_300_000_000, episodeCode: "S01E01", providerFileId: "pack01" },
+            { id: "pack02", storageDirectoryId: "staging", name: "[NewGroup] Show 02.mkv", sizeBytes: 1_400_000_000, episodeCode: "S01E02", providerFileId: "pack02" },
+          ],
+        },
+      },
+    });
+    await seedV2Season(storage, title, season, ["S01E01", "S01E02"]);
+    const packProvider: ResourceProvider = {
+      search: async ({ keyword }) => ({
+        id: `snap_${keyword}`,
+        provider: "pansou",
+        keyword,
+        candidates: [
+          { id: "cand_pack", snapshotId: `snap_${keyword}`, index: 0, title: PACK_TITLE, type: "magnet", source: "pansou", providerPayload: { url: `magnet:?xt=urn:btih:${"d".repeat(40)}` } },
+        ],
+        createdAt: NOW,
+      }),
+    };
+    await repository.createUserMessage({ ...WORK, body: "第 1 集发蓝", episodeTags: ["S01E01"], now: NOW });
+    await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => "run_rr_pack" });
+    let alias = "";
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        i += 1;
+        if (i === 1) return tool("rejectCurrentSource", { episodes: ["S01E01"], fileIds: ["present_S01E01"], reason: "发蓝" }, i);
+        if (i === 2) return tool("searchResources", { keyword: "Show S01" }, i);
+        if (i === 3) {
+          const search = lastToolOutput(options.prompt, "searchResources");
+          alias = search.snapshot.candidates[0].id;
+          return tool("transferCandidate", { snapshotId: search.snapshot.id, candidateId: alias }, i);
+        }
+        if (i === 4) return tool("moveToSeason", { moves: [{ season: 1, fileIds: ["pack01"] }] }, i);
+        if (i === 5) return tool("markObtained", { codes: ["S01E01"] }, i);
+        if (i === 6) return tool("reportReplacement", { results: [{ episode: "S01E01", outcome: "replaced", candidateId: alias, fileIds: ["pack01"], note: "整季包里的第 1 集" }] }, i);
+        if (i === 7) return tool("finish", {}, i);
+        return text("done");
+      },
+    });
+
+    await runQueuedReplaceRequest({ ...baseRun(repository, storage, model), resourceProvider: packProvider });
+
+    const [done] = await repository.listUserMessages(WORK);
+    expect(done?.reply?.results).toEqual([
+      { episode: "S01E01", outcome: "replaced", label: PACK_TITLE, sizeBytes: 1_300_000_000, note: "整季包里的第 1 集" },
+    ]);
+    expect(await repository.listEpisodeSources(WORK)).toEqual([expect.objectContaining({ episode: "S01E01", sizeBytes: 1_300_000_000 })]);
   });
 
   it("covers every tracked season: the lock season record carries the evidence, the other season a bare _sN record", async () => {
@@ -570,12 +636,62 @@ describe("runQueuedReplaceRequest", () => {
     expect(run?.notifications[0]?.report?.totalBytes).toBeUndefined();
     const [message] = await repository.listUserMessages(work);
     expect(message?.status).toBe("done");
-    const filmSize = Math.round(8.4 * 1024 ** 3);
+    // The new film's real size, not the "[8.4G]" in the candidate title.
+    const filmSize = 9_000_000_000;
     expect(message?.reply?.results).toEqual([{ episode: "MOVIE", outcome: "replaced", label: "Film 2010 Real [8.4G]", sizeBytes: filmSize, note: "正版" }]);
     expect(await repository.listEpisodeSources(work)).toEqual([
       expect.objectContaining({ episode: "MOVIE", label: "Film 2010 Real [8.4G]", sizeBytes: filmSize }),
     ]);
     expect(await repository.listPendingReplacements(work)).toEqual([]);
+  });
+
+  it("a movie replace run cut off by the content filter before any transfer fails loud like TV: no reply, no 还没找到 push, no 待换", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    const title: MediaTitle = { id: "tmdb_movie_7", tmdbId: 7, type: "movie", title: "Film", originalTitle: "Film", year: 2020, aliases: [] };
+    const season = movieAnchorSeason({ titleId: title.id, qualityPreference: "4K", storageDirectoryId: "dir_movie" });
+    await repository.saveWorkflowRunSnapshot({
+      accountId: "acct_1",
+      connectedStorageId: DRIVE,
+      title,
+      season,
+      workflowRun: { id: "seed_movie7", kind: "movie_init", status: "succeeded", trackedSeasonId: season.id, startedAt: "2026-09-01T00:00:00.000Z", finishedAt: "2026-09-01T00:00:00.000Z", auditEvents: [] },
+      episodes: createEpisodeStates({ trackedSeasonId: season.id, seasonNumber: 1, totalEpisodes: 1, latestAiredEpisode: 1 }).map((e) => ({ ...e, obtained: true })),
+      resourceSnapshots: [],
+      decisions: [],
+      transferAttempts: [],
+      notifications: [],
+    });
+    const work = { accountId: "acct_1", drive: DRIVE, titleKey: title.id };
+    const storage = new FakeStorageExecutor();
+    // The film the user calls fake: it sits in the movie dir, which is also the run's staging.
+    const movieDir = await storage.createDirectory({ name: "Film (2020) {tmdb-7}", parentId: "movies_root" });
+    storage.seedDirectoryFiles(movieDir, [
+      { id: "old_film", storageDirectoryId: movieDir, name: "Film.2020.mkv", sizeBytes: 5_000_000_000, episodeCode: null, providerFileId: "old_film" },
+    ]);
+    await repository.createUserMessage({ ...work, body: "这是假片", episodeTags: [], now: NOW });
+    await queueReplaceRequest({ repository, work, now: fixedNow, createWorkflowRunId: () => "run_rr_movie_cf" });
+    let calls = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => {
+        calls += 1;
+        return calls === 1 ? contentFiltered() : text("恢复轮：没有新文件");
+      },
+    });
+
+    const result = await runQueuedReplaceRequest(baseRun(repository, storage, model));
+
+    expect(result).toMatchObject({ status: "failed", workflowRunId: "run_rr_movie_cf" });
+    // No finish-only recovery turn: the old film is not something it could finish.
+    expect(calls).toBe(1);
+    const [message] = await repository.listUserMessages(work);
+    expect(message).toMatchObject({ status: "pending", runId: null });
+    expect(message?.reply).toBeFalsy();
+    expect(await repository.listPendingReplacements(work)).toEqual([]);
+    const run = await repository.getWorkflowRunSnapshot("run_rr_movie_cf", { accountId: "acct_1", connectedStorageId: DRIVE });
+    expect(run?.workflowRun.status).toBe("failed");
+    expect(run?.notifications.map((n) => n.report?.status)).toEqual(["failed"]);
+    expect(JSON.stringify(run?.notifications)).not.toContain("还没找到");
+    expect(run?.episodes[0]?.obtained).toBe(true);
   });
 
   it("a rejected list that could not be saved is flagged in the reply", async () => {
