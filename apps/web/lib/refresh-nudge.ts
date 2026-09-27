@@ -1,13 +1,10 @@
-/** One active nudge schedule. A new schedule cancels the previous one. */
-let activeCancel: (() => void) | null = null;
-
 type TimerId = ReturnType<typeof setTimeout>;
 
 /**
  * Call `bump` every `intervalMs` (default 200) until `durationMs` (default
  * 5000) has elapsed, including a bump on the deadline when it lands on an
- * interval. Returns a cancel function. Starting another schedule cancels this
- * one first.
+ * interval. Returns a cancel function. Each call is its own schedule: cancelling
+ * one does not stop another.
  */
 export function scheduleRefreshNudges(
   bump: () => void,
@@ -18,7 +15,6 @@ export function scheduleRefreshNudges(
     clearTimer?: (id: TimerId) => void;
   },
 ): () => void {
-  activeCancel?.();
   const intervalMs = opts?.intervalMs ?? 200;
   const durationMs = opts?.durationMs ?? 5_000;
   const setTimer = opts?.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
@@ -31,7 +27,6 @@ export function scheduleRefreshNudges(
     stopped = true;
     if (timer !== null) clearTimer(timer);
     timer = null;
-    if (activeCancel === cancel) activeCancel = null;
   };
   const tick = () => {
     timer = null;
@@ -49,6 +44,5 @@ export function scheduleRefreshNudges(
     timer = setTimer(tick, intervalMs);
   };
   timer = setTimer(tick, intervalMs);
-  activeCancel = cancel;
   return cancel;
 }

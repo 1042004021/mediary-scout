@@ -110,21 +110,39 @@ function getDurableTargetCache(): DurableJsonCache {
   return durableTargetCache;
 }
 
-async function loadSeriesTarget(tmdbId: number): Promise<PreparedSeriesTarget | null> {
-  const durable = getDurableTargetCache();
+/** Live TMDB read, then a best-effort durable write. A write failure is logged
+ *  and the prepared target is still returned, so the in-process memo can keep it. */
+export async function loadSeriesTargetWithCache(
+  tmdbId: number,
+  durable: DurableJsonCache,
+  fetchTarget: (tmdbId: number) => Promise<PreparedSeriesTarget | null>,
+): Promise<PreparedSeriesTarget | null> {
   const fromDb = await durable.getJson<PreparedSeriesTarget>(`series-target:${tmdbId}`);
   if (fromDb) return fromDb;
+  let value: PreparedSeriesTarget | null;
   try {
-    const value = await prepareSeriesTarget({
-      tmdbId,
-      qualityPreference: process.env.MEDIA_TRACK_DEFAULT_QUALITY ?? "4K",
-      metadataProvider: createTmdbMetadataProvider(await getTmdbAccesses(getAccountScopedSettings(await getCurrentAccountId()))),
-    });
-    await durable.setJson(`series-target:${tmdbId}`, value, SERIES_TARGET_TTL_MS);
-    return value;
+    value = await fetchTarget(tmdbId);
   } catch {
     return null;
   }
+  try {
+    await durable.setJson(`series-target:${tmdbId}`, value, SERIES_TARGET_TTL_MS);
+  } catch (error) {
+    console.error(
+      `[media-track] series-target cache write failed for ${tmdbId}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  return value;
+}
+
+async function loadSeriesTarget(tmdbId: number): Promise<PreparedSeriesTarget | null> {
+  return loadSeriesTargetWithCache(tmdbId, getDurableTargetCache(), async (id) =>
+    prepareSeriesTarget({
+      tmdbId: id,
+      qualityPreference: process.env.MEDIA_TRACK_DEFAULT_QUALITY ?? "4K",
+      metadataProvider: createTmdbMetadataProvider(await getTmdbAccesses(getAccountScopedSettings(await getCurrentAccountId()))),
+    }),
+  );
 }
 
 const seriesTargetMemo = createTtlMemo<PreparedSeriesTarget>({
@@ -137,8 +155,9 @@ const seriesTargetMemo = createTtlMemo<PreparedSeriesTarget>({
  * Season metadata + artwork for a title, independent of tracking state.
  * Live TMDB when configured (cached 6h per title). A miss is remembered for a
  * minute so refresh does not wait on it again. A refetch that fails keeps the
- * last successful payload instead of blanking the season list. Demo candidates
- * otherwise; null when the title was never known.
+ * last successful payload instead of blanking the season list. A durable-cache
+ * write failure does not discard a live result. Demo candidates otherwise;
+ * null when the title was never known.
  */
 async function seriesTargetFor(tmdbId: number): Promise<PreparedSeriesTarget | null> {
   if (process.env.MEDIA_TRACK_SEARCH_PROVIDER === "tmdb") {

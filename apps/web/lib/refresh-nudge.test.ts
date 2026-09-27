@@ -32,22 +32,23 @@ describe("scheduleRefreshNudges", () => {
     expect(bumps).toBe(1);
   });
 
-  it("a second schedule replaces the first", () => {
+  it("two schedules run independently — cancelling one does not stop the other", () => {
     let first = 0;
     let second = 0;
-    scheduleRefreshNudges(() => {
+    const cancelFirst = scheduleRefreshNudges(() => {
       first += 1;
-    }, { intervalMs: 200, durationMs: 5_000 });
-    vi.advanceTimersByTime(200);
-    expect(first).toBe(1);
+    }, { intervalMs: 200, durationMs: 1_000 });
     scheduleRefreshNudges(() => {
       second += 1;
-    }, { intervalMs: 200, durationMs: 600 });
-    vi.advanceTimersByTime(600);
+    }, { intervalMs: 200, durationMs: 1_000 });
+    vi.advanceTimersByTime(200);
     expect(first).toBe(1);
-    expect(second).toBe(3);
-    vi.advanceTimersByTime(5_000);
+    expect(second).toBe(1);
+    cancelFirst();
+    vi.advanceTimersByTime(800);
     expect(first).toBe(1);
-    expect(second).toBe(3);
+    expect(second).toBe(5);
+    vi.advanceTimersByTime(2_000);
+    expect(second).toBe(5);
   });
 });
