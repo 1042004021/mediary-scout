@@ -1048,6 +1048,11 @@ export class TaskSandbox {
     }
     // A movie's staging IS its movie dir, so the old film sits "in staging" too.
     this.assertNotProtected(resolved.flatMap((move) => move.fileIds));
+    // Hold every validated id before the first move. A throw on season 1 must not
+    // leave season 2's files unmarked — the loop never reaches them.
+    for (const fileId of resolved.flatMap((move) => move.fileIds)) {
+      this.unmovedFileIds.add(fileId);
+    }
     // Execute each move (the system does the per-file moves under the hood).
     // A failure — a 115 budget refusal in particular — must come back saying the
     // files did not move. The agent otherwise marks the episodes obtained and the

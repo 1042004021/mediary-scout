@@ -690,6 +690,58 @@ describe("sweepOrphanStagingDirs", () => {
     expect(reads).toBeGreaterThanOrEqual(2);
   });
 
+  it("does not report a non-empty leftover whose run becomes active during the listing", async () => {
+    const inner = new InMemoryWorkflowRepository();
+    await saveRun(inner, {
+      id: "run-report",
+      status: "failed",
+      startedAt: "2026-09-27T00:30:00.000Z",
+      finishedAt: "2026-09-27T01:00:00.000Z",
+    });
+    let reads = 0;
+    const repo = {
+      getWorkflowRunSnapshot: async (id: string, scope?: string) => {
+        const snapshot = await inner.getWorkflowRunSnapshot(id, scope);
+        if (id !== "run-report" || !snapshot) return snapshot;
+        reads += 1;
+        if (reads < 2) return snapshot;
+        return { ...snapshot, workflowRun: { ...snapshot.workflowRun, status: "running" as const } };
+      },
+      getAccountSetting: (accountId: string, key: string) => inner.getAccountSetting(accountId, key),
+      setAccountSetting: (accountId: string, key: string, value: string) =>
+        inner.setAccountSetting(accountId, key, value),
+      saveWorkflowRunSnapshot: (input: Parameters<InMemoryWorkflowRepository["saveWorkflowRunSnapshot"]>[0]) =>
+        inner.saveWorkflowRunSnapshot(input),
+    };
+    await sweepOrphanStagingDirs({
+      repository: repo,
+      now: NOW,
+      drives: [
+        drive({
+          storageId: "drive-report",
+          executor: {
+            async listChildDirectories(parentId: string) {
+              if (parentId === "tv") return [{ id: "show", name: "Show" }];
+              if (parentId === "show") return [{ id: "stg-report", name: "staging-run-report" }];
+              return [];
+            },
+            async listTree() {
+              return [{ path: "a.mkv", providerFileId: "f1", sizeBytes: 1024 * 1024 }];
+            },
+            async removeDirectory() {
+              return { removed: true };
+            },
+          },
+        }),
+      ],
+    });
+    const notes = (await inner.listNotifications({ accountId: "acct" })).filter(
+      (note) => note.kind === "staging_leftover",
+    );
+    expect(notes).toHaveLength(0);
+    expect(reads).toBeGreaterThanOrEqual(2);
+  });
+
   it("does not touch a drive whose executor cannot list and remove", async () => {
     const repo = new InMemoryWorkflowRepository();
     let listed = false;

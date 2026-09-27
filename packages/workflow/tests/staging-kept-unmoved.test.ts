@@ -241,6 +241,58 @@ describe("moveToSeason preflight listing failure", () => {
   });
 });
 
+async function twoSeasonSandbox() {
+  const provider = new FakeResourceProviderV2({
+    results: { show: [{ id: "pack", title: "Show" }] },
+  });
+  const storage = new Storage115Simulator({
+    packs: { pack: { files: [{ path: "Show/E01.mkv", sizeBytes: 9 }, { path: "Show/E02.mkv", sizeBytes: 8 }] } },
+  });
+  const stagingDirectoryId = await storage.createDirectory({ name: "staging", parentId: "root" });
+  const season1 = await storage.createDirectory({ name: "Season 1", parentId: "root" });
+  const season2 = await storage.createDirectory({ name: "Season 2", parentId: "root" });
+  const sandbox = new TaskSandbox({
+    provider,
+    storage,
+    stagingDirectoryId,
+    targetSeasonDirectoryIds: { 1: season1, 2: season2 },
+    need: ["S01E01", "S02E01"],
+  });
+  const search = await sandbox.searchResources("show");
+  const transfer = await sandbox.transferCandidate({ snapshotId: search.snapshot!.id, candidateId: "pack" });
+  const [first, second] = transfer.staging;
+  return { sandbox, storage, first: first!.id, second: second!.id };
+}
+
+describe("a multi-season move holds every requested id", () => {
+  it("keeps the later season's ids when an earlier move throws", async () => {
+    const { sandbox, storage, first, second } = await twoSeasonSandbox();
+    storage.moveFiles = async () => {
+      throw new Error("PAN115_RATE_LIMIT: API call budget exhausted before moveItems");
+    };
+    await expect(
+      sandbox.moveToSeason({
+        moves: [
+          { season: 1, fileIds: [first] },
+          { season: 2, fileIds: [second] },
+        ],
+      }),
+    ).rejects.toThrow(/MOVE_NOT_DONE/);
+    expect(sandbox.unmovedStagingFileIds().sort()).toEqual([first, second].sort());
+  });
+
+  it("clears every id after each season move succeeds", async () => {
+    const { sandbox, first, second } = await twoSeasonSandbox();
+    await sandbox.moveToSeason({
+      moves: [
+        { season: 1, fileIds: [first] },
+        { season: 2, fileIds: [second] },
+      ],
+    });
+    expect(sandbox.unmovedStagingFileIds()).toEqual([]);
+  });
+});
+
 describe("a partial move tracks only the ids that stayed behind", () => {
   it("moveFiles returning moved: [f1] for [f1, f2] leaves only f2 unmoved, and moving f2 then allows discardStaging", async () => {
     const { sandbox, storage, stagingDirectoryId, first, second } = await stagedSandbox();
@@ -437,6 +489,45 @@ describe("runAcquisitionV2Workflow does not delete files whose move failed", () 
     const kept = result.auditEvents.filter((event) => event.type === "staging_kept_unmoved_files");
     expect(kept).toHaveLength(1);
     expect(kept[0]?.data).toMatchObject({ fileCount: 1 });
+    expect(executor.removed).not.toContain(result.directories.stagingDirectoryId);
+  });
+
+  it("keeps staging when the first of two season moves throws before the second runs", async () => {
+    const executor = new StuckFileExecutor();
+    executor.failMoves = 1;
+    executor.listTree = async () => [
+      { path: "E01.mkv", providerFileId: "f1", sizeBytes: 10 },
+      { path: "E02.mkv", providerFileId: "f2", sizeBytes: 10 },
+    ];
+    let step = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => {
+        step += 1;
+        if (step === 1) {
+          return tool(
+            "moveToSeason",
+            {
+              moves: [
+                { season: 1, fileIds: ["f1"] },
+                { season: 2, fileIds: ["f2"] },
+              ],
+            },
+            step,
+          );
+        }
+        return tool("finish", {}, step);
+      },
+    });
+    const result = await runAcquisitionV2Workflow({
+      ...workflowRequest(executor, model),
+      seasons: [
+        { seasonNumber: 1, latestAiredEpisode: 1 },
+        { seasonNumber: 2, latestAiredEpisode: 1 },
+      ],
+    });
+    const kept = result.auditEvents.filter((event) => event.type === "staging_kept_unmoved_files");
+    expect(kept).toHaveLength(1);
+    expect(kept[0]?.data).toMatchObject({ fileCount: 2 });
     expect(executor.removed).not.toContain(result.directories.stagingDirectoryId);
   });
 

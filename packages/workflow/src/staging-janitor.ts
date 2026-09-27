@@ -77,6 +77,14 @@ type SweepRepository = Pick<
   "getWorkflowRunSnapshot" | "getAccountSetting" | "setAccountSetting" | "saveWorkflowRunSnapshot"
 >;
 
+/** The run was claimed again, or a missing run gained a snapshot, since the first read. */
+function runCameBack(
+  first: Awaited<ReturnType<SweepRepository["getWorkflowRunSnapshot"]>>,
+  again: Awaited<ReturnType<SweepRepository["getWorkflowRunSnapshot"]>>,
+): boolean {
+  return Boolean((again && isActiveWorkflowStatus(again.workflowRun.status)) || (!first && again));
+}
+
 function settledForSweep(
   snapshot: Awaited<ReturnType<SweepRepository["getWorkflowRunSnapshot"]>>,
   now: string,
@@ -300,7 +308,7 @@ async function sweepDrive(
         const subdirs = tree.length === 0 ? await pace(() => executor.listChildDirectories(child.id)) : [];
         if (tree.length === 0 && subdirs.length === 0) {
           const again = await repository.getWorkflowRunSnapshot(runId, drive.accountId);
-          if ((again && isActiveWorkflowStatus(again.workflowRun.status)) || (!snapshot && again)) {
+          if (runCameBack(snapshot, again)) {
             continue;
           }
           const result = await pace(() => executor.removeDirectory(child.id));
@@ -312,6 +320,10 @@ async function sweepDrive(
           continue;
         }
         if (reported.has(reportedToken(drive.storageId, child.id))) {
+          continue;
+        }
+        const again = await repository.getWorkflowRunSnapshot(runId, drive.accountId);
+        if (runCameBack(snapshot, again)) {
           continue;
         }
         const unknownContents = tree.length === 0;
