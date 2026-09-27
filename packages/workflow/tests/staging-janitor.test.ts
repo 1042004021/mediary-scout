@@ -314,7 +314,8 @@ describe("sweepOrphanStagingDirs", () => {
           async listChildDirectories(parentId: string) {
             times.push(now);
             if (parentId === "tv") return [{ id: "show", name: label }];
-            return [{ id: "stg", name: "staging-old" }];
+            if (parentId === "show") return [{ id: "stg", name: "staging-old" }];
+            return [];
           },
           async listTree() {
             times.push(now);
@@ -339,10 +340,10 @@ describe("sweepOrphanStagingDirs", () => {
         drive({ storageId: "d115", provider: "pan115", executor: pan115.executor }),
       ],
     });
-    // category list, show list, listTree, removeDirectory — three gaps.
-    expect(pan123.times.slice(1).map((time, index) => time - pan123.times[index]!)).toEqual([1500, 1500, 1500]);
+    // category, show, listTree, subdirectory check, removeDirectory — four gaps.
+    expect(pan123.times.slice(1).map((time, index) => time - pan123.times[index]!)).toEqual([1500, 1500, 1500, 1500]);
     expect(pan115.times.every((time) => time === pan115.times[0])).toBe(true);
-    expect(sleeps).toEqual([1500, 1500, 1500]);
+    expect(sleeps).toEqual([1500, 1500, 1500, 1500]);
   });
 
   it("resumes a cut-short walk at the show that threw, and clears the cursor after a full walk", async () => {
@@ -396,7 +397,8 @@ describe("sweepOrphanStagingDirs", () => {
     const executor = {
       async listChildDirectories(parentId: string) {
         if (parentId === "tv") return [{ id: "show", name: "Show" }];
-        return [{ id: "stg", name: "staging-old" }];
+        if (parentId === "show") return [{ id: "stg", name: "staging-old" }];
+        return [];
       },
       async listTree() {
         trees += 1;
@@ -437,7 +439,8 @@ describe("sweepOrphanStagingDirs", () => {
     const executor = {
       async listChildDirectories(parentId: string) {
         if (parentId === "tv") return [{ id: "show", name: "Show" }];
-        return [{ id: "stg", name: "staging-old" }];
+        if (parentId === "show") return [{ id: "stg", name: "staging-old" }];
+        return [];
       },
       async listTree() {
         trees += 1;
@@ -475,7 +478,8 @@ describe("sweepOrphanStagingDirs", () => {
           executor: {
             async listChildDirectories(parentId: string) {
               if (parentId === "tv") return [{ id: "show", name: "Show" }];
-              return [{ id: "stg", name: "staging-old" }];
+              if (parentId === "show") return [{ id: "stg", name: "staging-old" }];
+              return [];
             },
             async listTree() {
               return [];
@@ -490,6 +494,74 @@ describe("sweepOrphanStagingDirs", () => {
     expect(logs).toContain(
       "[patrol] staging janitor drive-stuck: removed 0 empty (1 could not be removed), reported 0 non-empty",
     );
+  });
+
+  it("does not delete a staging dir whose files are below listTree depth, and reports it", async () => {
+    const removed: string[] = [];
+    const repo = new InMemoryWorkflowRepository();
+    await sweepOrphanStagingDirs({
+      repository: repo,
+      now: NOW,
+      drives: [
+        drive({
+          storageId: "drive-deep",
+          executor: {
+            async listChildDirectories(parentId: string) {
+              if (parentId === "tv") return [{ id: "show", name: "Deep Show" }];
+              if (parentId === "show") return [{ id: "stg-deep", name: "staging-run-deep" }];
+              if (parentId === "stg-deep") return [{ id: "nested", name: "pack" }];
+              return [];
+            },
+            async listTree() {
+              return [];
+            },
+            async removeDirectory(id: string) {
+              removed.push(id);
+              return { removed: true };
+            },
+          },
+        }),
+      ],
+    });
+    expect(removed).toEqual([]);
+    const notes = (await repo.listNotifications({ accountId: "acct" })).filter(
+      (note) => note.kind === "staging_leftover",
+    );
+    expect(notes).toHaveLength(1);
+    expect(notes[0]?.body).toContain("Deep Show / staging-run-deep：0 个文件");
+  });
+
+  it("removes a staging dir that has no files and no subdirectories", async () => {
+    const removed: string[] = [];
+    const repo = new InMemoryWorkflowRepository();
+    await sweepOrphanStagingDirs({
+      repository: repo,
+      now: NOW,
+      drives: [
+        drive({
+          storageId: "drive-bare",
+          executor: {
+            async listChildDirectories(parentId: string) {
+              if (parentId === "tv") return [{ id: "show", name: "Bare Show" }];
+              if (parentId === "show") return [{ id: "stg-bare", name: "staging-run-bare" }];
+              return [];
+            },
+            async listTree() {
+              return [];
+            },
+            async removeDirectory(id: string) {
+              removed.push(id);
+              return { removed: true };
+            },
+          },
+        }),
+      ],
+    });
+    expect(removed).toEqual(["stg-bare"]);
+    const notes = (await repo.listNotifications({ accountId: "acct" })).filter(
+      (note) => note.kind === "staging_leftover",
+    );
+    expect(notes).toHaveLength(0);
   });
 
   it("does not touch a drive whose executor cannot list and remove", async () => {

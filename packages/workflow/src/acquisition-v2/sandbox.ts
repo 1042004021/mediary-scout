@@ -1064,8 +1064,9 @@ export class TaskSandbox {
           else this.unmovedFileIds.add(fileId);
         }
         const reason = error instanceof Error ? error.message : String(error);
+        const missed = landed === null ? move.fileIds : move.fileIds.filter((fileId) => !landedIds.has(fileId));
         throw new Error(
-          `MOVE_NOT_DONE: these files did NOT move (${move.fileIds.join(", ")}). Do not markObtained their episodes this run — they are still only in staging. ${reason}`,
+          `MOVE_NOT_DONE: these files did NOT move (${missed.join(", ")}). Do not markObtained their episodes this run — they are still only in staging. ${reason}`,
         );
       }
     }

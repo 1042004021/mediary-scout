@@ -232,7 +232,9 @@ describe("a partial move tracks only the ids that stayed behind", () => {
       }
       return realMove(input);
     };
-    await expect(sandbox.moveToSeason({ moves: [{ season: 1, fileIds: [first, second] }] })).rejects.toThrow(/MOVE_NOT_DONE/);
+    await expect(sandbox.moveToSeason({ moves: [{ season: 1, fileIds: [first, second] }] })).rejects.toThrow(
+      new RegExp(`MOVE_NOT_DONE: these files did NOT move \\(${second}\\)\\.`),
+    );
     expect(sandbox.unmovedStagingFileIds()).toEqual([second]);
     partial = false;
     await sandbox.moveToSeason({ moves: [{ season: 1, fileIds: [second] }] });
@@ -276,15 +278,11 @@ describe("withStagingCleanup keeps staging when unmoved files remain", () => {
     expect(result).toBe("ok");
     expect(removed).toEqual([]);
     expect(kept).toEqual([{ stagingDirectoryId: "stg", showDirectoryId: "show", fileCount: 14 }]);
-    const event = stagingFailureAuditEvents.length
-      ? null
-      : null;
     const { stagingKeptAuditEvent } = await import("../src/acquisition-v2/directory-lifecycle.js");
     expect(stagingKeptAuditEvent(kept[0]!).type).toBe("staging_kept_unmoved_files");
     expect(stagingKeptAuditEvent(kept[0]!).message).toBe(
       "staging 目录里还有 14 个移动失败、没进季目录的文件，已保留不删：stg",
     );
-    expect(event).toBeNull();
   });
 
   it("still removes staging when keep returns null", async () => {
@@ -324,9 +322,11 @@ describe("runAcquisitionV2Workflow does not delete files whose move failed", () 
       },
     });
     const result = await runAcquisitionV2Workflow(workflowRequest(executor, model));
-    const kept = result.auditEvents.find((event) => event.type === "staging_kept_unmoved_files");
-    expect(kept?.message).toContain("1 个移动失败");
-    expect(kept?.data).toMatchObject({
+    const kept = result.auditEvents.filter((event) => event.type === "staging_kept_unmoved_files");
+    expect(kept).toHaveLength(1);
+    expect(result.auditEvents.some((event) => event.type === "staging_leaked" || event.type === "staging_cleanup_unverified")).toBe(false);
+    expect(kept[0]?.message).toContain("1 个移动失败");
+    expect(kept[0]?.data).toMatchObject({
       fileCount: 1,
       stagingDirectoryId: result.directories.stagingDirectoryId,
       showDirectoryId: result.directories.showDirectoryId,
@@ -357,6 +357,8 @@ describe("runAcquisitionV2Workflow does not delete files whose move failed", () 
     const kept = stagingKeptUnmovedOf(caught);
     expect(kept).toHaveLength(1);
     expect(kept[0]?.fileCount).toBe(1);
+    const failureEvents = stagingFailureAuditEvents(caught);
+    expect(failureEvents.map((event) => event.type)).toEqual(["staging_kept_unmoved_files"]);
     expect(executor.removed).toEqual([]);
   });
 

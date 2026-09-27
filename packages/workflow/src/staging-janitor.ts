@@ -269,7 +269,10 @@ async function sweepDrive(
           continue;
         }
         const tree = await pace(() => executor.listTree({ directoryId: child.id }));
-        if (tree.length === 0) {
+        // listTree stops at its depth, so a dir with only deeper files looks empty.
+        // A subdirectory means the orphan is not empty; leave it and report it.
+        const subdirs = tree.length === 0 ? await pace(() => executor.listChildDirectories(child.id)) : [];
+        if (tree.length === 0 && subdirs.length === 0) {
           const result = await pace(() => executor.removeDirectory(child.id));
           if (result.removed) {
             removed += 1;
