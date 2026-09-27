@@ -6,7 +6,8 @@ import type { ResourceProvider, StorageExecutor } from "../ports.js";
 import type { AcquisitionAgentResult } from "./agent-loop.js";
 import type { AgentToolEvent } from "./activity.js";
 import { CandidateRegistry } from "./candidate-registry.js";
-import { deadLinkKey, type DeadLinkStore } from "./dead-links.js";
+import type { DeadLinkStore } from "./dead-links.js";
+import { resourceLinkKey } from "./resource-link.js";
 import { resourceFingerprintMatches } from "../user-requests.js";
 import type { UserRequestPromptInput } from "./user-request-block.js";
 import { RealResourceProviderV2 } from "./real-provider-adapter.js";
@@ -118,8 +119,14 @@ export interface RunAcquisitionV2Request {
     /** Episode → link key of the copy an earlier replace run put in place (the
      *  episode_sources rows). A rejection of that episode carries the link, so the same
      *  resource is refused under any name: in the store, and for the rest of this run
-     *  even when the store write fails. */
+     *  even when the store write fails. The fallback for a file landingLinkKeys has no
+     *  link for. */
     sourceLinkKeys?: Record<string, string>;
+    /** File id → link key of the resource whose transfer landed that file (this account + drive's
+     *  transfer history), null when that link has no key; a file landed before the history was pruned
+     *  is absent. How a rejection of a file an ordinary run landed carries its link: its name and size
+     *  rarely match the search titles (a magnet's title is not its file name). */
+    landingLinkKeys?: (fileIds: string[]) => Promise<Record<string, string | null>>;
     rejectedStore: {
       /** `episode` lets a repeated rejection be skipped (see onReject). */
       list: () => Promise<Array<{ episode?: string; linkKey: string | null; label: string; sizeBytes: number | null }>>;
@@ -155,7 +162,10 @@ export interface RunAcquisitionV2Result extends AcquisitionAgentResult {
       sizeBytes?: number;
       note: string;
     }>;
-    /** linkKey: the episode's recorded source link it was rejected by too (null = none known). */
+    /** The copies this run rejected that were not on the list yet (by episode, name and size) —
+     *  what counts as the user asking for an episode again. A listed copy that only gained its
+     *  link is recorded but not here. linkKey: the link it was rejected by too — of the transfer
+     *  that landed the file, else the episode's recorded source (null = none known). */
     rejected: Array<{ episode: string; label: string; sizeBytes: number | null; linkKey: string | null; reason: string }>;
     /** Paths (relative to the library dir) of the rejected files, still in place. */
     oldFiles: string[];
@@ -215,7 +225,9 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
   // they are rejected by, so they are honoured for the rest of the run even when the
   // store write failed (spec §7).
   const replaceResults = new Map<string, NonNullable<RunAcquisitionV2Result["replacement"]>["results"][number]>();
+  // Every row this run recorded (the filters read them); newlyRejected only the new copies.
   const replaceRejected: NonNullable<RunAcquisitionV2Result["replacement"]>["rejected"] = [];
+  const newlyRejected: NonNullable<RunAcquisitionV2Result["replacement"]>["rejected"] = [];
   const oldFiles = new Set<string>();
   let rejectedPersistFailed = false;
   // Concurrent callers share one in-flight read (the sandbox re-checks every cached
@@ -289,9 +301,9 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
             // pre-search may predate a rejection; a repeated keyword is cached).
             try {
               const rows = await listRejected();
-              const key = deadLinkKey(String(registry.get(candidate.id)?.providerPayload?.["url"] ?? ""))?.key;
+              const key = resourceLinkKey(String(registry.get(candidate.id)?.providerPayload?.["url"] ?? ""));
               return rows.some(
-                (r) => (key !== undefined && r.linkKey === key) || resourceFingerprintMatches(candidate.title, r),
+                (r) => (key !== null && r.linkKey === key) || resourceFingerprintMatches(candidate.title, r),
               );
             } catch (error) {
               // Replace run: fail closed — refuse the transfer (the agent sees why and can
@@ -329,39 +341,70 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
                 ? [...new Set(userRequest.prompt.rejected.map((r) => r.episode))]
                 : [],
             onReject: async (items) => {
-              // Skip what is already rejected (same episode + label + size), in the
-              // store or earlier this run — the agent may reject the same file twice.
-              const seen = new Set<string>();
-              const key = (r: { episode: string; label: string; sizeBytes: number | null }) =>
-                JSON.stringify([r.episode, r.label, r.sizeBytes]);
-              for (const r of replaceRejected) seen.add(key(r));
-              try {
-                for (const r of await userRequest.rejectedStore.list()) {
-                  if (r.episode !== undefined) seen.add(key({ episode: r.episode, label: r.label, sizeBytes: r.sizeBytes }));
+              // Every file's link first, before anything is recorded: two files can share a
+              // name and size yet come from different resources. A rejection without its link
+              // is the very hole this closes, so an unreadable history refuses the whole call
+              // (fail closed, like the run's other strict reads) and the agent can call again.
+              let landed = new Map<string, string | null>();
+              if (userRequest.landingLinkKeys) {
+                try {
+                  landed = new Map(Object.entries(await userRequest.landingLinkKeys([...new Set(items.map((i) => i.fileId))])));
+                } catch (error) {
+                  throw new Error(
+                    `SANDBOX_REJECT_SOURCE_UNAVAILABLE: could not read which transfer landed these files (${errorText(error)}) — try again in a moment`,
+                  );
                 }
-              } catch (error) {
-                console.log(`[user-message] run ${request.workflowRunId} rejected list read failed (not deduping): ${errorText(error)}`);
               }
-              const fresh = items.filter((i) => {
-                const k = key(i);
-                if (seen.has(k)) return false;
-                seen.add(k);
-                return true;
-              });
-              for (const i of items) oldFiles.add(i.path);
-              if (fresh.length === 0) return;
-              // An episode replaced once before has a known link: reject it by link too,
-              // not only name+size — here and in the store.
-              const rows = fresh.map((i) => ({
+              // Reject by link too, not only name+size — here and in the store: the link of
+              // the transfer that landed the file (an episode replaced once has two files,
+              // each with its own source; null when its link has no key — still that file's
+              // own source), else, for a file whose transfer is no longer on record, the
+              // episode's recorded source.
+              const rows = items.map((i) => ({
                 episode: i.episode,
-                linkKey: userRequest.sourceLinkKeys?.[i.episode] ?? null,
+                linkKey: landed.has(i.fileId) ? (landed.get(i.fileId) ?? null) : (userRequest.sourceLinkKeys?.[i.episode] ?? null),
                 label: i.label,
                 sizeBytes: i.sizeBytes,
                 reason: i.reason,
               }));
-              replaceRejected.push(...rows);
+              // Skip what adds nothing, in the store or earlier this run (the agent may reject
+              // the same file twice): a row of the same episode, name and size that already
+              // carries this link — or, for a row without a link, any such row. A row stored
+              // without a link still gains one.
+              type Seen = { episode: string; label: string; sizeBytes: number | null; linkKey: string | null };
+              const plainKey = (r: Seen) => JSON.stringify([r.episode, r.label, r.sizeBytes]);
+              const exactKey = (r: Seen) => JSON.stringify([r.episode, r.label, r.sizeBytes, r.linkKey]);
+              const plain = new Set<string>();
+              const exact = new Set<string>();
+              const note = (r: Seen) => {
+                plain.add(plainKey(r));
+                exact.add(exactKey(r));
+              };
+              for (const r of replaceRejected) note(r);
               try {
-                await userRequest.rejectedStore.add(rows);
+                for (const r of await userRequest.rejectedStore.list()) {
+                  if (r.episode !== undefined) note({ episode: r.episode, label: r.label, sizeBytes: r.sizeBytes, linkKey: r.linkKey });
+                }
+              } catch (error) {
+                console.log(`[user-message] run ${request.workflowRunId} rejected list read failed (not deduping): ${errorText(error)}`);
+              }
+              const fresh: typeof rows = [];
+              const newCopies: typeof rows = [];
+              for (const r of rows) {
+                if (exact.has(exactKey(r)) || (r.linkKey === null && plain.has(plainKey(r)))) continue;
+                // A copy already listed (same episode, name and size) that only gains a link is
+                // recorded, for the filters, but asks for nothing new: re-rejecting a listed copy
+                // never re-opens an episode the user let go.
+                if (!plain.has(plainKey(r))) newCopies.push(r);
+                note(r);
+                fresh.push(r);
+              }
+              for (const i of items) oldFiles.add(i.path);
+              if (fresh.length === 0) return;
+              replaceRejected.push(...fresh);
+              newlyRejected.push(...newCopies);
+              try {
+                await userRequest.rejectedStore.add(fresh);
               } catch (error) {
                 // Best-effort (spec §7): the run goes on and the reply says the list was not saved.
                 rejectedPersistFailed = true;
@@ -384,7 +427,7 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
                     ? {
                         candidateId: candidate.id,
                         label: candidate.title,
-                        linkKey: deadLinkKey(String(candidate.providerPayload?.["url"] ?? ""))?.key ?? null,
+                        linkKey: resourceLinkKey(String(candidate.providerPayload?.["url"] ?? "")),
                       }
                     : {}),
                   ...(r.outcome === "replaced" && r.sizeBytes !== undefined ? { sizeBytes: r.sizeBytes } : {}),
@@ -568,7 +611,7 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
       ? {
           replacement: {
             results: [...replaceResults.values()],
-            rejected: replaceRejected,
+            rejected: newlyRejected,
             oldFiles: [...oldFiles],
             identified: sandbox.identifiedThisRun(),
             ...(rejectedPersistFailed ? { rejectedPersistFailed: true } : {}),

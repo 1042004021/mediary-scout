@@ -66,6 +66,7 @@ export interface RejectedResource {
   accountId: string;
   titleKey: string;
   episode: string;
+  /** resourceLinkKey of the rejected copy's link; null when none is known. */
   linkKey: string | null;
   label: string;
   sizeBytes: number | null;
@@ -76,11 +77,20 @@ export interface RejectedResource {
 
 export interface EpisodeSource extends UserMessageScope {
   episode: string;
+  /** resourceLinkKey of the link the episode's copy was transferred by. */
   linkKey: string | null;
   label: string;
   sizeBytes: number | null;
   runId: string;
   recordedAt: string;
+}
+
+/** A file on a drive and the resource whose transfer put it there. */
+export interface LandingSource {
+  fileId: string;
+  /** Null when the candidate's link is unusable (missing, empty, not a string). */
+  url: string | null;
+  title: string;
 }
 
 /** Persistence port, implemented by all three repositories. Every state transition
@@ -131,6 +141,12 @@ export interface UserRequestStore {
 
   upsertEpisodeSource(input: EpisodeSource): Promise<void>;
   listEpisodeSources(scope: UserMessageScope): Promise<EpisodeSource[]>;
+
+  /** For each of `fileIds`: the candidate whose transfer — in a run of this account on this drive that is
+   *  still on record (finished runs are pruned after 30 days) — materialized that file, with its link (null
+   *  when unusable: the file still has a source of its own) and title. Oldest transfer first (a file several
+   *  transfers landed is listed once per transfer); an id no transfer on record materialized is absent. */
+  listLandingSources(input: { accountId: string; drive: string; fileIds: string[] }): Promise<LandingSource[]>;
 }
 
 export const USER_MESSAGE_LIMITS = {

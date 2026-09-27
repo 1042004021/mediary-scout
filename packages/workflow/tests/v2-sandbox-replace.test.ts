@@ -61,7 +61,7 @@ describe("TaskSandbox — replace", () => {
     const { sandbox, rejected, old13, oldPaths } = await setup();
     await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
     const path13 = oldPaths.find((p) => p.includes("13"))!; // the pack may nest files in a wrapper dir
-    expect(rejected).toEqual([{ episode: "S01E13", label: "Show - 13 [CR 1080p].mkv", sizeBytes: 1_400_000_000, reason: "发蓝", path: `Season 01/${path13}` }]);
+    expect(rejected).toEqual([{ episode: "S01E13", label: "Show - 13 [CR 1080p].mkv", sizeBytes: 1_400_000_000, reason: "发蓝", path: `Season 01/${path13}`, fileId: old13 }]);
     expect((await sandbox.finish()).missing).toContain("S01E13");
     await expect(sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: ["nope"], reason: "x" })).rejects.toThrow(/NOT_IN_TARGET/);
   });

@@ -237,7 +237,10 @@ export interface TaskSandboxOptions {
      *  stored list). When every requested episode is in here the agent may transfer
      *  without calling rejectCurrentSource again — see assertRejectedFirst. */
     alreadyRejectedEpisodes?: string[];
-    onReject: (items: Array<{ episode: string; label: string; sizeBytes: number; reason: string; path: string }>) => Promise<void>;
+    /** One item per (file, episode) rejected: the file's name, size and place, and its id —
+     *  by which the caller finds the link of the transfer that landed it. A throw refuses the
+     *  whole rejection before the sandbox records any of it (the agent may call again). */
+    onReject: (items: Array<{ episode: string; label: string; sizeBytes: number; reason: string; path: string; fileId: string }>) => Promise<void>;
     /** A recorded "replaced" also carries the agent-named fileIds it was verified by, and
      *  the real total size of that episode's named video file(s), read from its target
      *  dir when reporting (a pack's title would give the whole pack's size). */
@@ -1332,7 +1335,8 @@ export class TaskSandbox {
   }
 
   /** Reject the current file(s) of the episodes the user complained about: the system
-   *  records name + size (the caller adds the link when known) so every copy is hidden
+   *  records name + size (the caller adds the link of the transfer that landed the file,
+   *  or of the episode's recorded source, when known) so every copy is hidden
    *  from later searches and refused at transfer. The files stay in place. The episodes
    *  join the need, so one the agent read from the user's words (no tag) can still pass
    *  the transfer gate. Movie: episodes [] = the film ("MOVIE"); a TV run must list
@@ -1370,7 +1374,7 @@ export class TaskSandbox {
       const { file, dirLabel: dir } = this.protectedFiles.get(id)!;
       const path = dir ? `${dir}/${file.path}` : file.path;
       const label = file.path.split("/").pop()!;
-      return episodes.map((episode) => ({ episode, label, sizeBytes: file.sizeBytes, reason, path }));
+      return episodes.map((episode) => ({ episode, label, sizeBytes: file.sizeBytes, reason, path, fileId: id }));
     });
     await this.replace.onReject(items);
     for (const episode of episodes) {
