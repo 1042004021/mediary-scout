@@ -11,6 +11,7 @@ import type { ActivityActiveRun } from "./activity-view";
 function run(over: Partial<ActivityActiveRun>): ActivityActiveRun {
   return {
     runId: "r",
+    kind: "type2_init",
     tmdbId: 1,
     title: "T",
     year: 2026,

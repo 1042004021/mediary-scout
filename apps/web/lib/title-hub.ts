@@ -80,6 +80,10 @@ export interface MovieHubView {
   /** acquired=已入库, reserved=未上映已预定, acquiring=获取中, missing=已上映未获取, untracked=未追踪. */
   state: "acquired" | "reserved" | "acquiring" | "missing" | "untracked";
   acquiring: boolean;
+  /** The film's file is in the library. Not the same as state "acquired": while a run
+   *  of the film is queued or running (a user's replace request keeps the old file)
+   *  the state reads 获取中. */
+  obtained: boolean;
 }
 
 export type DetailView = TitleHubView | MovieHubView;
@@ -286,7 +290,7 @@ export async function getDetailView(
     const obtained = movieState.episodes.some((episode) => episode.obtained);
     const reserved = isMovieUnreleased(movieState.title.releaseDate, now);
     const state = acquiring ? "acquiring" : reserved ? "reserved" : obtained ? "acquired" : "missing";
-    return movieHubViewFromTitle(movieState.title, state, acquiring);
+    return movieHubViewFromTitle(movieState.title, state, acquiring, obtained);
   }
 
   // Untracked title: TMDB's movie/tv id namespaces collide (movie 278 ≠ tv 278).
@@ -299,7 +303,7 @@ export async function getDetailView(
       return null;
     }
     // Untracked stays untracked even if unreleased — `reserved` means tracked + waiting.
-    return movieHubViewFromTitle(movieTarget.title, "untracked", false);
+    return movieHubViewFromTitle(movieTarget.title, "untracked", false, false);
   };
 
   if (typeHint === "movie") {
@@ -323,6 +327,7 @@ function movieHubViewFromTitle(
   title: MediaTitle,
   state: MovieHubView["state"],
   acquiring: boolean,
+  obtained: boolean,
 ): MovieHubView {
   return {
     kind: "movie",
@@ -336,6 +341,7 @@ function movieHubViewFromTitle(
     releaseDate: title.releaseDate ?? null,
     state,
     acquiring,
+    obtained,
   };
 }
 
@@ -492,12 +498,17 @@ export interface InProgressTitle {
 /**
  * Titles with an acquisition run still queued/running — they surface in the
  * library as non-clickable "获取中" poster placeholders until the run finishes
- * and the title materializes as a real card.
+ * and the title materializes as a real card. A replace_request run is not one:
+ * its title is already in the library, and those runs queue last and pile up
+ * after each sweep — the card must still open the page, where the user edits or
+ * withdraws the message (design §1 G2).
  */
 export async function getInProgressTitles(storageId?: string): Promise<InProgressTitle[]> {
   const repository = getWorkflowRepository();
   const scope = await getActiveWorkspaceScope(storageId);
-  const active = await repository.listActiveWorkflowRuns(scope);
+  const active = (await repository.listActiveWorkflowRuns(scope)).filter(
+    (snapshot) => snapshot.workflowRun.kind !== "replace_request",
+  );
   const byTmdb = new Map<number, InProgressTitle>();
   for (const snapshot of active) {
     const title = snapshot.title;

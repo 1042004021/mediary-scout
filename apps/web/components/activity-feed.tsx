@@ -10,7 +10,11 @@ import type {
   ActivityView,
   RetryRefusalReason,
 } from "../lib/activity-view";
-import { seasonLabelText } from "../lib/activity-season-label";
+// The run kind via the view type, NOT the workflow root barrel: the barrel `export *`s
+// ./postgres.js (pg), and a type-only barrel import can drag pg into this client bundle
+// (see request-track-button.tsx).
+type RunKind = ActivityActiveRun["kind"];
+import { activeRunLabel } from "../lib/activity-season-label";
 import { isDemoModeClient } from "../lib/demo-mode";
 import { demoCompletedItems, demoInProgressActivityItems } from "../lib/demo-session";
 import { useDemoAcquisitions, useDemoInProgress } from "../lib/use-demo-session";
@@ -110,8 +114,9 @@ function poster(posterPath: string | null, title: string, tone: string) {
   );
 }
 
+/** 「第 1/2 季」, or 「换源」 for a replace run (title-level). */
 function seasonLabel(run: ActivityActiveRun): string {
-  return seasonLabelText(run.type, run.seasonNumbers ?? [], run.seasonNumber);
+  return activeRunLabel({ ...run, seasonNumbers: run.seasonNumbers ?? [] });
 }
 
 function RunningRow({ run, storageId }: { run: ActivityActiveRun; storageId?: string | undefined }) {
@@ -214,7 +219,7 @@ function QueuedRow({ run }: { run: ActivityActiveRun }) {
         <span className="act-pill">
           <Clock3 size={12} aria-hidden />第 {run.queuePosition} 位{run.missingCount > 0 ? ` · 缺 ${run.missingCount} 集` : ""}
         </span>
-        <CancelButton runId={run.runId} title={run.title} />
+        <CancelButton runId={run.runId} title={run.title} kind={run.kind} />
       </div>
     </div>
   );
@@ -307,9 +312,20 @@ function RetryButton({ runId, title }: { runId: string; title: string }) {
   );
 }
 
-function CancelButton({ runId, title }: { runId: string; title: string }) {
+/** What the cancel control says. A queued acquisition takes its title out of the
+ *  library with it; a replace run only drops this attempt — the library stays, and the
+ *  swap waits for the next patrol (a patrol-queued replace run may carry only 待换
+ *  episodes and no message, so the note speaks of the swap). */
+export function cancelCopy(kind: RunKind): { action: string; confirm: string; note: string | null } {
+  return kind === "replace_request"
+    ? { action: "取消这次换源", confirm: "取消这次换源", note: "等下次巡检再换" }
+    : { action: "取消获取", confirm: "取消并移出", note: null };
+}
+
+function CancelButton({ runId, title, kind }: { runId: string; title: string; kind: RunKind }) {
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
+  const copy = cancelCopy(kind);
 
   const cancel = async () => {
     setBusy(true);
@@ -335,13 +351,16 @@ function CancelButton({ runId, title }: { runId: string; title: string }) {
   if (confirming) {
     return (
       <span className="act-confirm">
-        <button type="button" className="act-confirm-yes" onClick={cancel}>取消并移出</button>
-        <button type="button" className="act-confirm-no" onClick={() => setConfirming(false)}>留着</button>
+        {copy.note ? <span className="act-confirm-note">{copy.note}</span> : null}
+        <span className="act-confirm-buttons">
+          <button type="button" className="act-confirm-yes" onClick={cancel}>{copy.confirm}</button>
+          <button type="button" className="act-confirm-no" onClick={() => setConfirming(false)}>留着</button>
+        </span>
       </span>
     );
   }
   return (
-    <button type="button" className="act-cancel" aria-label={`取消获取 ${title}`} onClick={() => setConfirming(true)}>
+    <button type="button" className="act-cancel" aria-label={`${copy.action} ${title}`} onClick={() => setConfirming(true)}>
       <X size={15} aria-hidden />
     </button>
   );

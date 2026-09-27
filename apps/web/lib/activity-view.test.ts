@@ -5,6 +5,7 @@ import {
   type MediaTitle,
   type PersistWorkflowRunSnapshotInput,
   type TrackedSeason,
+  type WorkflowKind,
   type WorkflowStatus,
 } from "@media-track/workflow";
 import { getActivityView } from "./activity-view";
@@ -45,6 +46,7 @@ function run(input: {
   startedAt: string;
   finishedAt?: string;
   episodes?: EpisodeState[];
+  kind?: WorkflowKind;
 }): PersistWorkflowRunSnapshotInput {
   const t = title(input.tmdbId, input.name);
   const s = season(t.id, 1);
@@ -53,7 +55,7 @@ function run(input: {
     season: s,
     workflowRun: {
       id: input.id,
-      kind: "type2_init",
+      kind: input.kind ?? "type2_init",
       status: input.status,
       trackedSeasonId: s.id,
       startedAt: input.startedAt,
@@ -126,6 +128,45 @@ describe("getActivityView", () => {
     const q2 = view.active.find((r) => r.runId === "r_q2")!;
     expect(q1.queuePosition).toBe(1);
     expect(q2.queuePosition).toBe(2);
+  });
+
+  it("each active run carries its kind: cancelling a replace run is not cancelling an acquisition", async () => {
+    const repo = new InMemoryWorkflowRepository();
+    await repo.saveWorkflowRunSnapshot(run({ id: "r_acq", tmdbId: 1, name: "New", status: "queued", startedAt: "2026-06-17T00:00:00Z" }));
+    await repo.saveWorkflowRunSnapshot(
+      run({ id: "r_swap", tmdbId: 2, name: "Owned", status: "queued", startedAt: "2026-06-17T00:00:01Z", kind: "replace_request" }),
+    );
+
+    const view = await getActivityView({ repository: repo });
+
+    expect(view.active.map((r) => [r.runId, r.kind])).toEqual(
+      expect.arrayContaining([
+        ["r_acq", "type2_init"],
+        ["r_swap", "replace_request"],
+      ]),
+    );
+  });
+
+  it("a replace run reads at the title level: its lock season's episodes say nothing about what it covers", async () => {
+    // A request for S02E01 locks the title on its first tracked season; the snapshot
+    // holds S01's episodes (two of them missing) — neither the season nor the count is
+    // what the run is about.
+    const repo = new InMemoryWorkflowRepository();
+    await repo.saveWorkflowRunSnapshot(
+      run({
+        id: "r_swap",
+        tmdbId: 2,
+        name: "Owned",
+        status: "queued",
+        startedAt: "2026-06-17T00:00:01Z",
+        kind: "replace_request",
+        episodes: [episode(1, 1, "t2_s1"), episode(1, 2, "t2_s1")],
+      }),
+    );
+
+    const [swap] = (await getActivityView({ repository: repo })).active;
+
+    expect(swap).toMatchObject({ kind: "replace_request", seasonNumber: null, seasonNumbers: [], missingCount: 0 });
   });
 
   it("recentCompleted carries finished runs with runId + size, excluding no-op patrol checks (client scopes by observed runs)", async () => {

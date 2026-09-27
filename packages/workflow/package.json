@@ -16,6 +16,10 @@
     "./search-view": {
       "types": "./dist/search-view.d.ts",
       "default": "./dist/search-view.js"
+    },
+    "./user-requests": {
+      "types": "./dist/user-requests.d.ts",
+      "default": "./dist/user-requests.js"
     }
   },
   "dependencies": {
