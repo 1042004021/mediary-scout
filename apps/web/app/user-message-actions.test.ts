@@ -404,11 +404,12 @@ describe("user message actions", () => {
     expect(await repo.listPendingReplacements(primaryWork)).toEqual([]);
   });
 
-  it("撤销 only puts back episodes of a season tracked here", async () => {
+  it("撤销 only puts back episodes that exist in a season tracked here", async () => {
     await track(repo, "acct_default", "cs_primary");
     const m = await repo.createUserMessage({ ...primaryWork, body: "换", episodeTags: [], now: NOW });
 
-    for (const episode of ["S02E01", "S99E9999", "S00E01"]) {
+    // Untracked seasons, and an episode past the end of the tracked two-episode season.
+    for (const episode of ["S02E01", "S99E9999", "S00E01", "S01E03", "S01E9999"]) {
       expect(await actions.restoreEpisodesToPendingAction({ ...onPrimary, episodes: [{ episode, messageId: m.id, requestedAt: NOW }] })).toEqual(mismatch);
     }
     expect(await repo.listPendingReplacements(primaryWork)).toEqual([]);
@@ -447,7 +448,19 @@ describe("user message actions", () => {
   });
 
   it("撤销 takes every episode code the engine writes: SxxEyy with two or more digits in each part", async () => {
-    await track(repo, "acct_default", "cs_primary");
+    // Season 1 runs to 120 episodes here, so its three-digit codes exist.
+    await repo.saveWorkflowRunSnapshot({
+      accountId: "acct_default",
+      connectedStorageId: "cs_primary",
+      title: show,
+      season: { ...s1, totalEpisodes: 120, latestAiredEpisode: 120 },
+      workflowRun: { id: "seed_s1_long", kind: "type2_init", status: "succeeded", trackedSeasonId: s1.id, startedAt: NOW, finishedAt: NOW, auditEvents: [] },
+      episodes: createEpisodeStates({ trackedSeasonId: s1.id, seasonNumber: 1, totalEpisodes: 120, latestAiredEpisode: 120 }),
+      resourceSnapshots: [],
+      decisions: [],
+      transferAttempts: [],
+      notifications: [],
+    });
     await repo.saveWorkflowRunSnapshot({
       accountId: "acct_default",
       connectedStorageId: "cs_primary",
@@ -461,10 +474,10 @@ describe("user message actions", () => {
       notifications: [],
     });
     const m = await repo.createUserMessage({ ...primaryWork, body: "换", episodeTags: [], now: NOW });
-    const rows = ["S01E100", "S01E12345", "S100E01"].map((episode) => ({ episode, messageId: m.id, requestedAt: NOW }));
+    const rows = ["S01E100", "S01E120", "S100E01"].map((episode) => ({ episode, messageId: m.id, requestedAt: NOW }));
 
     expect(await actions.restoreEpisodesToPendingAction({ ...onPrimary, episodes: rows })).toEqual({ success: true });
-    expect((await repo.listPendingReplacements(primaryWork)).map((p) => p.episode).sort()).toEqual(["S01E100", "S01E12345", "S100E01"]);
+    expect((await repo.listPendingReplacements(primaryWork)).map((p) => p.episode).sort()).toEqual(["S01E100", "S01E120", "S100E01"]);
   });
 
   it("the unauthenticated sentinel is refused by every action and nothing is written", async () => {

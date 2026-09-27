@@ -168,17 +168,17 @@ export async function pendingRowsFitWork(input: {
   const { work } = input;
   const [messages, states] = await Promise.all([input.repo.listUserMessages(work), input.repo.listTrackedSeasonStates(input.scope)]);
   const messageIds = new Set(messages.map((m) => m.id));
-  const seasons = new Set(
-    states.filter((s) => s.title.id === work.titleKey && userMessageDrive(s.connectedStorageId) === work.drive).map((s) => s.season.seasonNumber),
+  // The episodes that exist in this work's seasons tracked on this drive — a season number
+  // alone would let a forged code (S01E9999 in a two-episode season) through.
+  const episodes = new Set(
+    states
+      .filter((s) => s.title.id === work.titleKey && userMessageDrive(s.connectedStorageId) === work.drive)
+      .flatMap((s) => s.episodes.map((e) => e.episodeCode)),
   );
   // The rows come back from this same server (web and worker share its clock), written
   // in the past — a time later than now is forged.
   const latest = input.now.getTime();
-  const isEpisode = (episode: string) => {
-    if (input.mediaType === "movie") return episode === "MOVIE";
-    const code = SHOW_EPISODE_CODE.exec(episode);
-    return code !== null && seasons.has(Number(code[1]));
-  };
+  const isEpisode = (episode: string) => (input.mediaType === "movie" ? episode === "MOVIE" : episodes.has(episode));
   return input.rows.every((row) => messageIds.has(row.messageId) && isEpisode(row.episode) && Date.parse(row.requestedAt) <= latest);
 }
 
