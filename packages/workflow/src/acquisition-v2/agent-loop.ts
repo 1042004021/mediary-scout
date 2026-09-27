@@ -239,7 +239,7 @@ export function buildSandboxToolSet(
     };
     tools["reportReplacement"] = {
       description:
-        'User request run only. Report, per requested episode, whether you replaced it: {episode, outcome:"replaced", candidateId, note} after the new file is moved and marked obtained, or {episode, outcome:"not_found", note} with one 中文 sentence on why. The system checks that a "replaced" episode was marked and its candidate really landed.',
+        'User request run only. Report, per requested episode, whether you replaced it: {episode, outcome:"replaced", candidateId, note} — ONLY after the new file has been MOVED into that episode\'s season directory with moveToSeason (movie: it already lands in the movie directory) AND marked obtained; a file still sitting in staging is NOT replaced. Otherwise {episode, outcome:"not_found", note} with one 中文 sentence on why. The system checks that a "replaced" episode was marked, its candidate really landed, AND a file this run actually reached the target directory — if it only reached staging the report is recorded not_found and the episode stays 待换.',
       inputSchema: z.object({
         results: z.array(
           z.object({
