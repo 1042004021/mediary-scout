@@ -52,9 +52,10 @@ const STRIP_NOTICE =
 /** Threshold for large snapshot digestion hint (病3). */
 const LARGE_SNAPSHOT_DIGEST_THRESHOLD = 10;
 
-/** Recorded (in place of "replaced") when the agent reports an episode replaced but no
- *  file it materialized this run reached a target dir — it only reached staging, so the
- *  new copy is not beside the old one. The episode stays 待换 for the next patrol. */
+/** Recorded (in place of "replaced") when the agent reports an episode replaced but a
+ *  file it named for that episode only reached staging, not a target dir — so the new
+ *  copy is not beside the old one. The episode stays 待换 (moved in and reported again,
+ *  it is upgraded). */
 const REPLACEMENT_NOT_IN_TARGET_NOTE =
   "新文件只落到暂存,没有移进目标目录(季目录/电影目录),不算完成替换——本轮记为未找到,留待下次巡检。";
 
@@ -226,7 +227,10 @@ export interface TaskSandboxOptions {
      *  without calling rejectCurrentSource again — see assertRejectedFirst. */
     alreadyRejectedEpisodes?: string[];
     onReject: (items: Array<{ episode: string; label: string; sizeBytes: number; reason: string; path: string }>) => Promise<void>;
-    onReport: (results: Array<{ episode: string; outcome: "replaced" | "not_found"; candidateId?: string; note: string }>) => Promise<void>;
+    /** A recorded "replaced" also carries the agent-named fileIds it was verified by. */
+    onReport: (
+      results: Array<{ episode: string; outcome: "replaced" | "not_found"; candidateId?: string; fileIds?: string[]; note: string }>,
+    ) => Promise<void>;
   };
   /** Whether a search candidate is a copy of a resource the user rejected for this
    *  work (any run — the rejected list is account + work scoped, not replace-only).
@@ -366,15 +370,19 @@ export class TaskSandbox {
    *  attempt, or a failed one that still materialized files (quark marks some
    *  landings failed — the landing point is the truth, not the status flag). */
   private readonly succeededCandidates = new Set<string>();
-  /** Files a successful transfer materialized this run (transferCandidate /
-   *  transferUntilLanded). A "replaced" outcome needs one of these to reach a TARGET
-   *  dir — reaching staging alone is not landing (for TV the season dir is separate). */
-  private readonly materializedThisRun = new Set<string>();
+  /** Every file a landed transfer materialized this run → the candidate that landed it
+   *  (transferCandidate / each landed attempt of transferUntilLanded). A "replaced"
+   *  names its episode's new files; each must be in here, under the reported candidate —
+   *  so the old file (pre-run) or a made-up id never counts. */
+  private readonly materializedBy = new Map<string, string>();
   /** This-run-materialized files now confirmed IN a target dir: carried into a season
    *  dir by moveToSeason (TV), or materialized straight into the movie dir (movie —
-   *  staging IS that dir). reportReplacement gates a "replaced" on this being non-empty;
-   *  without it the new copy never landed beside the old one. */
+   *  staging IS that dir). A "replaced" needs every file it names in here; a named file
+   *  still in staging records that episode not_found. */
   private readonly landedInTargetThisRun = new Set<string>();
+  /** File → the episode it backs, for every "replaced" recorded this run. One new file
+   *  backs one episode: E24 can never be reported replaced by E13's file. */
+  private readonly fileBackedEpisode = new Map<string, string>();
 
   constructor(options: TaskSandboxOptions) {
     this.provider = options.provider;
@@ -424,13 +432,13 @@ export class TaskSandbox {
     return this.movieDir !== undefined && this.seasonDirs.size === 0;
   }
 
-  /** Remember the files a successful transfer materialized this run. On a movie run the
+  /** Remember which candidate materialized which files this run. On a movie run the
    *  staging IS the movie dir, so they are already in the target; on a TV run they sit
    *  in staging until moveToSeason carries them into a season dir. reportReplacement
-   *  reads this to tell "reached the target" from "only reached staging". */
-  private recordMaterialized(fileIds: string[]): void {
+   *  reads both to check the files an agent names for an episode. */
+  private recordMaterialized(candidateId: string, fileIds: string[]): void {
     for (const id of fileIds) {
-      this.materializedThisRun.add(id);
+      this.materializedBy.set(id, candidateId);
       if (this.isMovieRun()) this.landedInTargetThisRun.add(id);
     }
   }
@@ -460,10 +468,11 @@ export class TaskSandbox {
   }
 
   /** Whether a need token counts toward coverage. A replace-guarded episode counts
-   *  only once reportReplacement recorded it replaced (which checks its mark and a
-   *  landed candidate). A mark alone is not enough: it may predate the rejection, or
-   *  be unlocked by a transfer that carried a different episode — either way the old
-   *  file would close the transfer gate before this episode was ever replaced. */
+   *  only once reportReplacement recorded it replaced (which checks its mark, a landed
+   *  candidate and the episode's own new files in the target). A mark alone is not
+   *  enough: it may predate the rejection, or be unlocked by a transfer that carried a
+   *  different episode — either way the old file would close the transfer gate before
+   *  this episode was ever replaced. */
   private countsAsObtained(token: string): boolean {
     if (!this.obtainedCodes.has(token)) return false;
     return !this.replaceGuardedEpisodes().has(token) || this.reportedEpisodes.get(token) === "replaced";
@@ -726,7 +735,7 @@ export class TaskSandbox {
     });
     if (attempt.status === "succeeded" || attempt.materializedFileIds.length > 0) {
       this.succeededCandidates.add(input.candidateId);
-      this.recordMaterialized(attempt.materializedFileIds);
+      this.recordMaterialized(input.candidateId, attempt.materializedFileIds);
     }
     const staging = await this.storage.listTree({ directoryId: this.stagingDirectoryId });
     // A systemic block ONLY when nothing actually landed — a provider can mark an
@@ -814,7 +823,7 @@ export class TaskSandbox {
       });
       if (attempt.status === "succeeded") {
         this.succeededCandidates.add(candidateId);
-        this.recordMaterialized(attempt.materializedFileIds);
+        this.recordMaterialized(candidateId, attempt.materializedFileIds);
         transferredCandidateId = candidateId;
         break;
       }
@@ -822,7 +831,7 @@ export class TaskSandbox {
       // loop itself is unchanged — it still decides on the status as before.
       if (attempt.materializedFileIds.length > 0) {
         this.succeededCandidates.add(candidateId);
-        this.recordMaterialized(attempt.materializedFileIds);
+        this.recordMaterialized(candidateId, attempt.materializedFileIds);
       }
       // Layer-1: stop on the first failure that is a SYSTEMIC block (quota / auth /
       // VIP) — it may come after one or more dead-link failures, but once we see a
@@ -894,10 +903,10 @@ export class TaskSandbox {
     }
     // Replace-run evidence: a file this run materialized that now reaches a scoped target
     // dir (resolveTargetDir already rejected anything else) is truly landed — reaching
-    // staging alone was not. reportReplacement needs this before it accepts a "replaced".
+    // staging alone was not. reportReplacement checks every file a "replaced" names here.
     for (const move of resolved) {
       for (const fileId of move.fileIds) {
-        if (this.materializedThisRun.has(fileId)) this.landedInTargetThisRun.add(fileId);
+        if (this.materializedBy.has(fileId)) this.landedInTargetThisRun.add(fileId);
       }
     }
     // Force-reread every touched target season + staging for one-shot verification.
@@ -1030,7 +1039,7 @@ export class TaskSandbox {
       const unreported = this.unreportedReplaceEpisodes();
       if (unreported.length > 0) {
         throw new Error(
-          `SANDBOX_REPORT_REQUIRED: ${unreported.join(",")} — call reportReplacement for these (replaced with the candidateId that landed, or not_found with a note), then finish`,
+          `SANDBOX_REPORT_REQUIRED: ${unreported.join(",")} — call reportReplacement for these (replaced with the candidateId that landed and the episode's new fileIds, or not_found with a note), then finish`,
         );
       }
     }
@@ -1322,13 +1331,22 @@ export class TaskSandbox {
   }
 
   /** Per-episode outcome of the request. Every episode must be requested or rejected
-   *  this run. "replaced" is accepted only when the episode was marked obtained this
-   *  run AND its candidate really landed this run; the whole call is refused otherwise
-   *  (nothing recorded). An episode is recorded once — except that an earlier
-   *  not_found may be upgraded to replaced; other repeats come back as `ignored`. */
+   *  this run. A "replaced" names that episode's own NEW file(s) in fileIds — which file
+   *  is which episode stays the agent's call (the system never reads names); the system
+   *  only checks facts about the claim: the episode was marked obtained this run, its
+   *  candidate landed this run, every named file was downloaded THIS run BY that
+   *  candidate (never the old copy, never a made-up id), and one file backs one episode
+   *  per run (E24 can never ride on E13's file). Any failed check refuses the whole call
+   *  (nothing recorded). An episode is recorded once — except that an earlier not_found
+   *  may be upgraded to replaced; other repeats come back as `ignored`. */
   async reportReplacement(input: {
-    results: Array<{ episode: string; outcome: "replaced" | "not_found"; candidateId?: string; note: string }>;
-  }): Promise<{ recorded: number; ignored: Array<{ episode: string; reason: string }> }> {
+    results: Array<{ episode: string; outcome: "replaced" | "not_found"; candidateId?: string; fileIds?: string[]; note: string }>;
+  }): Promise<{
+    recorded: number;
+    ignored: Array<{ episode: string; reason: string }>;
+    /** "replaced" episodes recorded not_found because a named file is still in staging. */
+    notInTarget?: Array<{ episode: string; reason: string }>;
+  }> {
     if (!this.replace) throw new Error("SANDBOX_NO_REPLACE: this run has no user request");
     this.assertEpisodeTokens(input.results.map((r) => r.episode));
     const allowed = new Set(this.replaceEpisodes());
@@ -1350,30 +1368,69 @@ export class TaskSandbox {
       if (earlier === undefined || (earlier === "not_found" && r.outcome === "replaced")) fresh.push(r);
       else ignored.push({ episode: r.episode, reason: `already reported ${earlier}` });
     }
-    for (const r of fresh) {
-      if (r.outcome !== "replaced") continue;
+    // Validate every "replaced" before recording any. `claimed` spans this call, so one
+    // file named for two episodes in the same call is caught too.
+    const claimed = new Map<string, string>();
+    const toRecord = fresh.map((r) => {
+      if (r.outcome !== "replaced") return r;
       if (!this.obtainedCodes.has(r.episode)) {
         throw new Error(`SANDBOX_REPLACEMENT_NOT_MARKED: ${r.episode} was not marked obtained this run`);
       }
       if (!r.candidateId || !this.succeededCandidates.has(r.candidateId)) {
         throw new Error(`SANDBOX_REPLACEMENT_NO_TRANSFER: ${r.candidateId ?? "(none)"} did not land in this run`);
       }
+      const fileIds = [...new Set(r.fileIds ?? [])];
+      if (fileIds.length === 0) {
+        throw new Error(
+          `SANDBOX_REPLACEMENT_FILES_REQUIRED: ${r.episode} — a "replaced" result must name fileIds: the NEW video file(s) of that episode`,
+        );
+      }
+      const unknown = fileIds.filter((id) => !this.materializedBy.has(id));
+      if (unknown.length > 0) {
+        throw new Error(
+          `SANDBOX_REPLACEMENT_FILE_UNKNOWN: ${unknown.join(",")} were not downloaded this run — name the NEW video file(s) of ${r.episode} that a transfer landed this run (not the old copy)`,
+        );
+      }
+      const foreign = fileIds.filter((id) => this.materializedBy.get(id) !== r.candidateId);
+      if (foreign.length > 0) {
+        const from = foreign.map((id) => `${id} was downloaded by ${this.materializedBy.get(id)}`).join(", ");
+        throw new Error(
+          `SANDBOX_REPLACEMENT_FILE_CANDIDATE_MISMATCH: ${from}, not ${r.candidateId} — report ${r.episode} with the candidateId that landed its file`,
+        );
+      }
+      for (const id of fileIds) {
+        const owner = this.fileBackedEpisode.get(id) ?? claimed.get(id);
+        if (owner !== undefined && owner !== r.episode) {
+          throw new Error(
+            `SANDBOX_REPLACEMENT_FILE_REUSED: ${id} already backs ${owner} — one new file backs one episode; name ${r.episode}'s own new file`,
+          );
+        }
+        claimed.set(id, r.episode);
+      }
+      return { ...r, fileIds };
+    });
+    // Every named file must also have reached a TARGET dir this run, not merely staging:
+    // for TV the season dir is separate, so without moveToSeason the new copy never lands
+    // beside the old one, yet the old file already closed the mark/transfer gates above.
+    // A named file still in staging records THAT episode not_found (it stays 待换) instead
+    // of throwing the whole batch away — moved in and reported again, it is upgraded,
+    // exactly like an earlier not_found; its files back no episode until then.
+    const notInTarget: Array<{ episode: string; reason: string }> = [];
+    const recorded = toRecord.map((r) => {
+      const staged = r.outcome === "replaced" ? (r.fileIds ?? []).filter((id) => !this.landedInTargetThisRun.has(id)) : [];
+      if (staged.length === 0) return r;
+      notInTarget.push({
+        episode: r.episode,
+        reason: `still in staging: ${staged.join(",")} — recorded not_found; moveToSeason it into the season directory, then report ${r.episode} again`,
+      });
+      return { episode: r.episode, outcome: "not_found" as const, note: REPLACEMENT_NOT_IN_TARGET_NOTE };
+    });
+    for (const r of recorded) {
+      this.reportedEpisodes.set(r.episode, r.outcome);
+      if (r.outcome === "replaced") for (const id of r.fileIds ?? []) this.fileBackedEpisode.set(id, r.episode);
     }
-    // A "replaced" also needs the NEW file to have reached a TARGET dir this run, not
-    // merely staging: for TV the season dir is separate, so without moveToSeason the new
-    // copy never lands beside the old one, yet the old file already closed the mark/
-    // transfer gates above. Missing that evidence, record the episode not_found (it stays
-    // 待换 for the next patrol) instead of throwing the whole batch away — a later
-    // moveToSeason + re-report upgrades it, exactly like an earlier not_found does.
-    const landedInTarget = this.landedInTargetThisRun.size > 0;
-    const toRecord = fresh.map((r) =>
-      r.outcome === "replaced" && !landedInTarget
-        ? { episode: r.episode, outcome: "not_found" as const, note: REPLACEMENT_NOT_IN_TARGET_NOTE }
-        : r,
-    );
-    for (const r of toRecord) this.reportedEpisodes.set(r.episode, r.outcome);
-    if (toRecord.length > 0) await this.replace.onReport(toRecord.map((r) => ({ ...r, note: r.note.slice(0, 200) })));
-    return { recorded: toRecord.length, ignored };
+    if (recorded.length > 0) await this.replace.onReport(recorded.map((r) => ({ ...r, note: r.note.slice(0, 200) })));
+    return { recorded: recorded.length, ignored, ...(notInTarget.length > 0 ? { notInTarget } : {}) };
   }
 
   /** End of run: every episode the user asked about (tags / pending) or the agent

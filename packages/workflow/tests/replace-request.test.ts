@@ -318,7 +318,7 @@ describe("runQueuedReplaceRequest", () => {
           const alias = (search.snapshot.candidates as Array<{ id: string; title: string }>)[0]!.id;
           return tool(
             "reportReplacement",
-            { results: [{ episode: "S01E01", outcome: "replaced", candidateId: alias, note: "新版" }, { episode: "S01E02", outcome: "not_found", note: "没找到别的版本" }] },
+            { results: [{ episode: "S01E01", outcome: "replaced", candidateId: alias, fileIds: ["new01"], note: "新版" }, { episode: "S01E02", outcome: "not_found", note: "没找到别的版本" }] },
             i,
           );
         }
@@ -536,7 +536,7 @@ describe("runQueuedReplaceRequest", () => {
         if (i === 4) return tool("markObtained", { codes: ["MOVIE"] }, i);
         if (i === 5) {
           const search = lastToolOutput(options.prompt, "searchResources");
-          return tool("reportReplacement", { results: [{ episode: "MOVIE", outcome: "replaced", candidateId: search.snapshot.candidates[0].id, note: "正版" }] }, i);
+          return tool("reportReplacement", { results: [{ episode: "MOVIE", outcome: "replaced", candidateId: search.snapshot.candidates[0].id, fileIds: ["newfilm"], note: "正版" }] }, i);
         }
         return text("done");
       },
@@ -764,7 +764,7 @@ describe("runQueuedReplaceRequest — scope, metadata and bookkeeping", () => {
         if (i === 6) {
           const search = lastToolOutput(options.prompt, "searchResources");
           const alias = (search.snapshot.candidates as Array<{ id: string; title: string }>)[0]!.id;
-          return tool("reportReplacement", { results: [{ episode: "S01E01", outcome: "replaced", candidateId: alias, note: "新版" }] }, i);
+          return tool("reportReplacement", { results: [{ episode: "S01E01", outcome: "replaced", candidateId: alias, fileIds: ["new01"], note: "新版" }] }, i);
         }
         if (i === 7) return tool("finish", {}, i);
         return text("done");

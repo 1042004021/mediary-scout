@@ -239,19 +239,20 @@ export function buildSandboxToolSet(
     };
     tools["reportReplacement"] = {
       description:
-        'User request run only. Report, per requested episode, whether you replaced it: {episode, outcome:"replaced", candidateId, note} — ONLY after the new file has been MOVED into that episode\'s season directory with moveToSeason (movie: it already lands in the movie directory) AND marked obtained; a file still sitting in staging is NOT replaced. Otherwise {episode, outcome:"not_found", note} with one 中文 sentence on why. The system checks that a "replaced" episode was marked, its candidate really landed, AND a file this run actually reached the target directory — if it only reached staging the report is recorded not_found and the episode stays 待换.',
+        'User request run only. Report, per requested episode, whether you replaced it: {episode, outcome:"replaced", candidateId, fileIds, note} — ONLY after the new file has been MOVED into that episode\'s season directory with moveToSeason (movie: it already lands in the movie directory) AND marked obtained; a file still sitting in staging is NOT replaced. fileIds = the id(s) of THAT episode\'s own NEW video file(s) (from the transfer\'s materializedFileIds / the moved files; movie: the new film). Otherwise {episode, outcome:"not_found", note} with one 中文 sentence on why. For a "replaced" the system checks that the episode was marked, and that every named file was downloaded THIS run by that candidateId (never the old file), is in the library, and backs only this one episode (E24 can never be "replaced" by E13\'s file) — a refused check refuses the whole call; a named file still in staging records that episode not_found (listed in notInTarget: move it, then report it again).',
       inputSchema: z.object({
         results: z.array(
           z.object({
             episode: z.string(),
             outcome: z.enum(["replaced", "not_found"]),
             candidateId: z.string().optional(),
+            fileIds: z.array(z.string()).optional(),
             note: z.string(),
           }),
         ),
       }),
       execute: (args: {
-        results: Array<{ episode: string; outcome: "replaced" | "not_found"; candidateId?: string; note: string }>;
+        results: Array<{ episode: string; outcome: "replaced" | "not_found"; candidateId?: string; fileIds?: string[]; note: string }>;
       }) => asEvidence(() => sandbox.reportReplacement(args)),
     };
   }

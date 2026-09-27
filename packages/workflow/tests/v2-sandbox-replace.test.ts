@@ -145,7 +145,7 @@ describe("TaskSandbox — replace", () => {
     await sandbox.moveToSeason({ moves: [{ season: 1, fileIds: out.attempt.materializedFileIds }] });
     await sandbox.markObtained({ codes: ["S01E13"] });
     const up = await sandbox.reportReplacement({
-      results: [{ episode: "S01E13", outcome: "replaced", candidateId: "cand_new13", note: "喵萌版" }],
+      results: [{ episode: "S01E13", outcome: "replaced", candidateId: "cand_new13", fileIds: out.attempt.materializedFileIds, note: "喵萌版" }],
     });
     expect(up).toEqual({ recorded: 1, ignored: [] });
     const again = await sandbox.reportReplacement({ results: [{ episode: "S01E13", outcome: "not_found", note: "x" }] });
@@ -194,7 +194,9 @@ describe("TaskSandbox — replace", () => {
     // reported replaced. The requested S01E13/S01E24 still need their own marks.
     expect(sandbox.isCoverageMet()).toBe(false);
     expect((await sandbox.finish()).missing).toEqual(["S01E25", "S01E13", "S01E24"]);
-    await sandbox.reportReplacement({ results: [{ episode: "S01E25", outcome: "replaced", candidateId: "cand_new13", note: "x" }] });
+    await sandbox.reportReplacement({
+      results: [{ episode: "S01E25", outcome: "replaced", candidateId: "cand_new13", fileIds: out.attempt.materializedFileIds, note: "x" }],
+    });
     expect((await sandbox.finish()).missing).toEqual(["S01E13", "S01E24"]);
   });
 
@@ -232,7 +234,9 @@ describe("TaskSandbox — replace", () => {
     expect(out13.attempt.status).toBe("succeeded");
     await sandbox.moveToSeason({ moves: [{ season: 1, fileIds: out13.attempt.materializedFileIds }] });
     expect(sandbox.isCoverageMet()).toBe(false);
-    await sandbox.reportReplacement({ results: [{ episode: "S01E13", outcome: "replaced", candidateId: "cand_new13", note: "喵萌版" }] });
+    await sandbox.reportReplacement({
+      results: [{ episode: "S01E13", outcome: "replaced", candidateId: "cand_new13", fileIds: out13.attempt.materializedFileIds, note: "喵萌版" }],
+    });
     expect(sandbox.isCoverageMet()).toBe(true);
     expect((await sandbox.finish()).missing).toEqual([]);
   });
@@ -263,12 +267,12 @@ describe("TaskSandbox — replace", () => {
     await sandbox.markObtained({ codes: ["S01E13"] });
     await sandbox.reportReplacement({
       results: [
-        { episode: "S01E13", outcome: "replaced", candidateId: "cand_new13", note: "喵萌版" },
+        { episode: "S01E13", outcome: "replaced", candidateId: "cand_new13", fileIds: out.attempt.materializedFileIds, note: "喵萌版" },
         { episode: "S01E24", outcome: "not_found", note: "只有同一份 CR" },
       ],
     });
     expect(results).toMatchObject([
-      { episode: "S01E13", outcome: "replaced", candidateId: "cand_new13", note: "喵萌版" },
+      { episode: "S01E13", outcome: "replaced", candidateId: "cand_new13", fileIds: out.attempt.materializedFileIds, note: "喵萌版" },
       { episode: "S01E24", outcome: "not_found", note: "只有同一份 CR" },
     ]);
   });
@@ -279,10 +283,13 @@ describe("TaskSandbox — replace", () => {
     await rejectE24();
     // Another candidate landed (so the mark is allowed), but not the one reported.
     const snap = (await sandbox.searchResources("Show")).snapshot!;
-    await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_cr13" });
+    const out = await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_cr13" });
+    await sandbox.moveToSeason({ moves: [{ season: 1, fileIds: out.attempt.materializedFileIds }] });
     await sandbox.markObtained({ codes: ["S01E13"] });
     await expect(
-      sandbox.reportReplacement({ results: [{ episode: "S01E13", outcome: "replaced", candidateId: "cand_new13", note: "x" }] }),
+      sandbox.reportReplacement({
+        results: [{ episode: "S01E13", outcome: "replaced", candidateId: "cand_new13", fileIds: out.attempt.materializedFileIds, note: "x" }],
+      }),
     ).rejects.toThrow(/NO_TRANSFER/);
   });
 
@@ -557,7 +564,9 @@ describe("TaskSandbox — replace: a failed attempt that still landed files", ()
     expect(out.attempt.materializedFileIds.length).toBeGreaterThan(0);
     await sandbox.moveToSeason({ moves: [{ season: 1, fileIds: out.attempt.materializedFileIds }] });
     await expect(sandbox.markObtained({ codes: ["S01E13"] })).resolves.toEqual({ confirmed: ["S01E13"] });
-    await sandbox.reportReplacement({ results: [{ episode: "S01E13", outcome: "replaced", candidateId: "cand_new13", note: "x" }] });
+    await sandbox.reportReplacement({
+      results: [{ episode: "S01E13", outcome: "replaced", candidateId: "cand_new13", fileIds: out.attempt.materializedFileIds, note: "x" }],
+    });
     expect(results).toMatchObject([{ episode: "S01E13", outcome: "replaced", candidateId: "cand_new13" }]);
   });
 
@@ -590,10 +599,12 @@ describe("TaskSandbox — replace: a failed attempt that still landed files", ()
     const transfer = storage.transferCandidate.bind(storage);
     storage.transferCandidate = async (input) => ({ ...(await transfer(input)), status: "failed" as const, providerMessage: "partial" });
     await sandbox.searchResources("film");
-    await sandbox.transferUntilLanded({ candidateIds: ["good_share"] });
+    const { landed } = await sandbox.transferUntilLanded({ candidateIds: ["good_share"] });
+    // The agent tells the new film from the old one in the landed listing.
+    const newFilm = landed.find((f) => f.id !== old.id)!.id;
     await sandbox.markObtained({ codes: ["MOVIE"] });
-    await sandbox.reportReplacement({ results: [{ episode: "MOVIE", outcome: "replaced", candidateId: "good_share", note: "4K" }] });
-    expect(results).toMatchObject([{ episode: "MOVIE", outcome: "replaced", candidateId: "good_share" }]);
+    await sandbox.reportReplacement({ results: [{ episode: "MOVIE", outcome: "replaced", candidateId: "good_share", fileIds: [newFilm], note: "4K" }] });
+    expect(results).toMatchObject([{ episode: "MOVIE", outcome: "replaced", candidateId: "good_share", fileIds: [newFilm] }]);
   });
 });
 
@@ -604,13 +615,15 @@ describe("TaskSandbox — replace: a replaced needs the NEW file in a target dir
     await rejectE24();
     const snap = (await sandbox.searchResources("Show")).snapshot!;
     // The new file lands in STAGING only — the agent never moves it into the season dir.
-    await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_new13" });
+    const landed = await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_new13" });
+    const [new13] = landed.attempt.materializedFileIds;
     await sandbox.markObtained({ codes: ["S01E13"] });
     const out = await sandbox.reportReplacement({
-      results: [{ episode: "S01E13", outcome: "replaced", candidateId: "cand_new13", note: "喵萌版" }],
+      results: [{ episode: "S01E13", outcome: "replaced", candidateId: "cand_new13", fileIds: [new13!], note: "喵萌版" }],
     });
-    // Recorded, but as not_found (nothing reached the season dir) — never replaced.
+    // Recorded, but as not_found (its file never reached the season dir) — never replaced.
     expect(out.recorded).toBe(1);
+    expect(out.notInTarget).toEqual([{ episode: "S01E13", reason: expect.stringContaining(`still in staging: ${new13}`) }]);
     expect(results).toMatchObject([{ episode: "S01E13", outcome: "not_found" }]);
     expect(results).not.toContainEqual(expect.objectContaining({ outcome: "replaced" }));
     // Stays 待换: the episode is still missing and coverage is not met.
@@ -628,7 +641,7 @@ describe("TaskSandbox — replace: a replaced needs the NEW file in a target dir
     await sandbox.moveToSeason({ moves: [{ season: 1, fileIds: out.attempt.materializedFileIds }] });
     await sandbox.markObtained({ codes: ["S01E13"] });
     const res = await sandbox.reportReplacement({
-      results: [{ episode: "S01E13", outcome: "replaced", candidateId: "cand_new13", note: "喵萌版" }],
+      results: [{ episode: "S01E13", outcome: "replaced", candidateId: "cand_new13", fileIds: out.attempt.materializedFileIds, note: "喵萌版" }],
     });
     expect(res).toEqual({ recorded: 1, ignored: [] });
     expect(results).toMatchObject([{ episode: "S01E13", outcome: "replaced", candidateId: "cand_new13", note: "喵萌版" }]);
@@ -649,6 +662,171 @@ describe("TaskSandbox — replace: a replaced needs the NEW file in a target dir
     expect(sandbox.isCoverageMet()).toBe(true);
     expect(sandbox.hasReplace()).toBe(false);
     await expect(sandbox.reportReplacement({ results: [] })).rejects.toThrow(/NO_REPLACE/);
+  });
+});
+
+describe("TaskSandbox — replace: a replaced names that episode's own new file(s), checked per episode", () => {
+  /** E13 + E24 requested, both current files already rejected (so transfers are open).
+   *  c13 carries only an E13, c24 only an E24, pack a season pack with both. Which file
+   *  is which episode is the agent's call — the system never reads the names. */
+  async function fileSetup() {
+    const storage = new Storage115Simulator({
+      packs: {
+        old_pack: { files: [{ path: "Show - 13 [CR 1080p].mkv", sizeBytes: 1_400_000_000 }, { path: "Show - 24 [CR 1080p].mkv", sizeBytes: 1_400_000_000 }] },
+        c13: { files: [{ path: "[Nekomoe] Show - 13 [1080p].mkv", sizeBytes: 1_100_000_000 }] },
+        c24: { files: [{ path: "[Nekomoe] Show - 24 [1080p].mkv", sizeBytes: 1_100_000_000 }] },
+        pack: { files: [{ path: "[Pack] Show S01/Show - 13.mkv", sizeBytes: 1_000_000_000 }, { path: "[Pack] Show S01/Show - 24.mkv", sizeBytes: 1_000_000_000 }] },
+      },
+    });
+    const staging = await storage.createDirectory({ name: "staging", parentId: "root" });
+    const season = await storage.createDirectory({ name: "Season 01", parentId: "root" });
+    await storage.transferCandidate({ candidateId: "old_pack", intoDirectoryId: season });
+    const oldFiles = await storage.listTree({ directoryId: season });
+    const old13 = oldFiles.find((f) => f.path.includes("13"))!.id;
+    const old24 = oldFiles.find((f) => f.path.includes("24"))!.id;
+    const results: Array<Record<string, unknown>> = [];
+    const sandbox = new TaskSandbox({
+      provider: new FakeResourceProviderV2({
+        results: { Show: [{ id: "c13", title: "[Nekomoe] Show 13" }, { id: "c24", title: "[Nekomoe] Show 24" }, { id: "pack", title: "[Pack] Show S01" }] },
+      }),
+      storage, stagingDirectoryId: staging, targetSeasonDirectoryIds: { 1: season }, need: [],
+      replace: { requestedEpisodes: ["S01E13", "S01E24"], onReject: async () => {}, onReport: async (r) => { results.push(...r); } },
+    });
+    await sandbox.captureProtectedFiles();
+    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
+    await sandbox.rejectCurrentSource({ episodes: ["S01E24"], fileIds: [old24], reason: "发蓝" });
+    const snap = (await sandbox.searchResources("Show")).snapshot!;
+    /** Transfer one candidate into staging; the ids it materialized. */
+    const land = async (candidateId: string) => (await sandbox.transferCandidate({ snapshotId: snap.id, candidateId })).attempt.materializedFileIds;
+    const moveIn = (fileIds: string[]) => sandbox.moveToSeason({ moves: [{ season: 1, fileIds }] });
+    return { sandbox, results, old13, land, moveIn };
+  }
+
+  it("E24 cannot ride on E13's new file: once E13 is reported with it, E24 naming it is REUSED; a made-up id is UNKNOWN", async () => {
+    const { sandbox, results, land, moveIn } = await fileSetup();
+    const [new13] = await land("c13");
+    await moveIn([new13!]);
+    // Something landed, so both marks are accepted — E24's is still its old file.
+    await sandbox.markObtained({ codes: ["S01E13", "S01E24"] });
+    await sandbox.reportReplacement({ results: [{ episode: "S01E13", outcome: "replaced", candidateId: "c13", fileIds: [new13!], note: "喵萌版" }] });
+    await expect(
+      sandbox.reportReplacement({ results: [{ episode: "S01E24", outcome: "replaced", candidateId: "c13", fileIds: [new13!], note: "x" }] }),
+    ).rejects.toThrow(`SANDBOX_REPLACEMENT_FILE_REUSED: ${new13} already backs S01E13`);
+    // No E24 file exists: whatever id the agent makes up was not downloaded this run.
+    await expect(
+      sandbox.reportReplacement({ results: [{ episode: "S01E24", outcome: "replaced", candidateId: "c13", fileIds: ["made_up"], note: "x" }] }),
+    ).rejects.toThrow("SANDBOX_REPLACEMENT_FILE_UNKNOWN: made_up were not downloaded this run");
+    expect(results).toEqual([expect.objectContaining({ episode: "S01E13", outcome: "replaced", candidateId: "c13" })]);
+    // E24 stays 待换: still missing, and its 待换 row is left for the next patrol.
+    expect((await sandbox.finish()).missing).toEqual(["S01E24"]);
+  });
+
+  it("one file named for two episodes in the same call is refused and nothing is recorded", async () => {
+    const { sandbox, results, land, moveIn } = await fileSetup();
+    const [new13] = await land("c13");
+    await moveIn([new13!]);
+    await sandbox.markObtained({ codes: ["S01E13", "S01E24"] });
+    await expect(
+      sandbox.reportReplacement({
+        results: [
+          { episode: "S01E13", outcome: "replaced", candidateId: "c13", fileIds: [new13!], note: "a" },
+          { episode: "S01E24", outcome: "replaced", candidateId: "c13", fileIds: [new13!], note: "b" },
+        ],
+      }),
+    ).rejects.toThrow(`SANDBOX_REPLACEMENT_FILE_REUSED: ${new13} already backs S01E13`);
+    expect(results).toEqual([]);
+  });
+
+  it("a replaced with no fileIds is refused", async () => {
+    const { sandbox, results, land, moveIn } = await fileSetup();
+    const [new13] = await land("c13");
+    await moveIn([new13!]);
+    await sandbox.markObtained({ codes: ["S01E13"] });
+    for (const fileIds of [undefined, []]) {
+      await expect(
+        sandbox.reportReplacement({ results: [{ episode: "S01E13", outcome: "replaced", candidateId: "c13", ...(fileIds ? { fileIds } : {}), note: "x" }] }),
+      ).rejects.toThrow(/SANDBOX_REPLACEMENT_FILES_REQUIRED: S01E13/);
+    }
+    expect(results).toEqual([]);
+  });
+
+  it("naming the OLD (pre-run) file is UNKNOWN — it was not downloaded this run", async () => {
+    const { sandbox, results, old13, land, moveIn } = await fileSetup();
+    const [new13] = await land("c13");
+    await moveIn([new13!]);
+    await sandbox.markObtained({ codes: ["S01E13"] });
+    await expect(
+      sandbox.reportReplacement({ results: [{ episode: "S01E13", outcome: "replaced", candidateId: "c13", fileIds: [old13], note: "x" }] }),
+    ).rejects.toThrow(`SANDBOX_REPLACEMENT_FILE_UNKNOWN: ${old13} were not downloaded this run`);
+    expect(results).toEqual([]);
+  });
+
+  it("a file downloaded by c24 reported under c13 is a CANDIDATE_MISMATCH", async () => {
+    const { sandbox, results, land, moveIn } = await fileSetup();
+    const [new13] = await land("c13");
+    const [new24] = await land("c24");
+    await moveIn([new13!, new24!]);
+    await sandbox.markObtained({ codes: ["S01E24"] });
+    await expect(
+      sandbox.reportReplacement({ results: [{ episode: "S01E24", outcome: "replaced", candidateId: "c13", fileIds: [new24!], note: "x" }] }),
+    ).rejects.toThrow(`SANDBOX_REPLACEMENT_FILE_CANDIDATE_MISMATCH: ${new24} was downloaded by c24, not c13`);
+    expect(results).toEqual([]);
+  });
+
+  it("a season pack that carries both episodes: each named with its own file, both are replaced", async () => {
+    const { sandbox, results, land, moveIn } = await fileSetup();
+    await land("pack");
+    // The agent tells the two files apart from the staging tree.
+    const staged = await sandbox.inspectStaging();
+    const a = staged.find((f) => f.path.endsWith("Show - 13.mkv"))!.id;
+    const b = staged.find((f) => f.path.endsWith("Show - 24.mkv"))!.id;
+    await moveIn([a, b]);
+    await sandbox.markObtained({ codes: ["S01E13", "S01E24"] });
+    await expect(
+      sandbox.reportReplacement({
+        results: [
+          { episode: "S01E13", outcome: "replaced", candidateId: "pack", fileIds: [a], note: "整季包" },
+          { episode: "S01E24", outcome: "replaced", candidateId: "pack", fileIds: [b], note: "整季包" },
+        ],
+      }),
+    ).resolves.toEqual({ recorded: 2, ignored: [] });
+    expect(results).toMatchObject([
+      { episode: "S01E13", outcome: "replaced", candidateId: "pack", fileIds: [a] },
+      { episode: "S01E24", outcome: "replaced", candidateId: "pack", fileIds: [b] },
+    ]);
+    expect((await sandbox.finish()).missing).toEqual([]);
+  });
+
+  it("an episode whose named file is still in staging is recorded not_found; moved in and re-reported, it is upgraded", async () => {
+    const { sandbox, results, land, moveIn } = await fileSetup();
+    const [new13] = await land("c13");
+    const [new24] = await land("c24");
+    // Only E13's new file reaches the season; E24's stays in staging.
+    await moveIn([new13!]);
+    await sandbox.markObtained({ codes: ["S01E13", "S01E24"] });
+    await expect(
+      sandbox.reportReplacement({
+        results: [
+          { episode: "S01E13", outcome: "replaced", candidateId: "c13", fileIds: [new13!], note: "a" },
+          { episode: "S01E24", outcome: "replaced", candidateId: "c24", fileIds: [new24!], note: "b" },
+        ],
+      }),
+    ).resolves.toEqual({
+      recorded: 2,
+      ignored: [],
+      // Told back, so the agent can move it in and report again this run.
+      notInTarget: [{ episode: "S01E24", reason: expect.stringContaining(`still in staging: ${new24}`) }],
+    });
+    expect(results).toMatchObject([
+      { episode: "S01E13", outcome: "replaced", candidateId: "c13" },
+      { episode: "S01E24", outcome: "not_found", note: expect.stringContaining("暂存") },
+    ]);
+    expect(results[1]).not.toHaveProperty("candidateId");
+    expect((await sandbox.finish()).missing).toEqual(["S01E24"]);
+    await moveIn([new24!]);
+    await sandbox.reportReplacement({ results: [{ episode: "S01E24", outcome: "replaced", candidateId: "c24", fileIds: [new24!], note: "b" }] });
+    expect(results[2]).toMatchObject({ episode: "S01E24", outcome: "replaced", candidateId: "c24", fileIds: [new24!] });
+    expect((await sandbox.finish()).missing).toEqual([]);
   });
 });
 
@@ -742,9 +920,12 @@ describe("TaskSandbox — replace (movie: the movie dir is also staging)", () =>
     const { sandbox, results, old } = await movieSetup();
     await sandbox.rejectCurrentSource({ episodes: [], fileIds: [old.find((f) => f.isVideo)!.id], reason: "x" });
     await sandbox.searchResources("film");
-    await sandbox.transferUntilLanded({ candidateIds: ["good_share"] });
+    const { landed } = await sandbox.transferUntilLanded({ candidateIds: ["good_share"] });
+    const newFilm = landed.find((f) => f.path.endsWith("Film.2023.2160p.REMUX.mkv"))!.id;
     await sandbox.markObtained({ codes: ["MOVIE"] });
-    await sandbox.reportReplacement({ results: [{ episode: "MOVIE", outcome: "replaced", candidateId: "good_share", note: "4K REMUX" }] });
+    await sandbox.reportReplacement({
+      results: [{ episode: "MOVIE", outcome: "replaced", candidateId: "good_share", fileIds: [newFilm], note: "4K REMUX" }],
+    });
     expect(results).toMatchObject([{ episode: "MOVIE", outcome: "replaced", candidateId: "good_share" }]);
   });
 
@@ -753,10 +934,28 @@ describe("TaskSandbox — replace (movie: the movie dir is also staging)", () =>
     await sandbox.rejectCurrentSource({ episodes: [], fileIds: [old.find((f) => f.isVideo)!.id], reason: "假片" });
     const snap = (await sandbox.searchResources("film")).snapshot!;
     // A movie's staging IS the movie dir, so the materialized file is already in-target.
-    await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "good_share" });
+    const out = await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "good_share" });
     await sandbox.markObtained({ codes: ["MOVIE"] });
-    await sandbox.reportReplacement({ results: [{ episode: "MOVIE", outcome: "replaced", candidateId: "good_share", note: "4K REMUX" }] });
+    await sandbox.reportReplacement({
+      results: [{ episode: "MOVIE", outcome: "replaced", candidateId: "good_share", fileIds: out.attempt.materializedFileIds, note: "4K REMUX" }],
+    });
     expect(results).toMatchObject([{ episode: "MOVIE", outcome: "replaced", candidateId: "good_share" }]);
+  });
+
+  it("a movie replaced must name the NEW film: the old film's id is UNKNOWN (it sits in the same dir)", async () => {
+    const { sandbox, results, old } = await movieSetup();
+    const oldVideo = old.find((f) => f.isVideo)!.id;
+    await sandbox.rejectCurrentSource({ episodes: [], fileIds: [oldVideo], reason: "假片" });
+    const snap = (await sandbox.searchResources("film")).snapshot!;
+    const out = await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "good_share" });
+    const [newFilm] = out.attempt.materializedFileIds;
+    await sandbox.markObtained({ codes: ["MOVIE"] });
+    await expect(
+      sandbox.reportReplacement({ results: [{ episode: "MOVIE", outcome: "replaced", candidateId: "good_share", fileIds: [oldVideo], note: "x" }] }),
+    ).rejects.toThrow(`SANDBOX_REPLACEMENT_FILE_UNKNOWN: ${oldVideo} were not downloaded this run`);
+    expect(results).toEqual([]);
+    await sandbox.reportReplacement({ results: [{ episode: "MOVIE", outcome: "replaced", candidateId: "good_share", fileIds: [newFilm!], note: "4K REMUX" }] });
+    expect(results).toMatchObject([{ episode: "MOVIE", outcome: "replaced", candidateId: "good_share", fileIds: [newFilm] }]);
   });
 });
 

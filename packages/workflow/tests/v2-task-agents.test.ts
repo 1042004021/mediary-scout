@@ -487,7 +487,7 @@ describe("replace tools registration", () => {
     expect(calls).toEqual([["reject", { episodes: ["S01E13"], fileIds: ["f1"], reason: "发蓝" }]]);
     // A guard refusal comes back as evidence, not a crash.
     await expect(
-      tools.reportReplacement!.execute({ results: [{ episode: "S01E13", outcome: "replaced", candidateId: "c", note: "" }] }, {}),
+      tools.reportReplacement!.execute({ results: [{ episode: "S01E13", outcome: "replaced", candidateId: "c", fileIds: ["f2"], note: "" }] }, {}),
     ).resolves.toEqual({ error: "SANDBOX_REPLACEMENT_NOT_MARKED: S01E13" });
   });
 

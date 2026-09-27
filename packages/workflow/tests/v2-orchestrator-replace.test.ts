@@ -135,7 +135,7 @@ describe("runAcquisitionV2 — user replace request", () => {
         }
         if (i === 6) return tool("moveToSeason", { moves: [{ season: 1, fileIds: ["new13"] }] }, i);
         if (i === 7) return tool("markObtained", { codes: ["S01E13"] }, i);
-        if (i === 8) return tool("reportReplacement", { results: [{ episode: "S01E13", outcome: "replaced", candidateId: alias, note: "喵萌版" }] }, i);
+        if (i === 8) return tool("reportReplacement", { results: [{ episode: "S01E13", outcome: "replaced", candidateId: alias, fileIds: ["new13"], note: "喵萌版" }] }, i);
         if (i === 9) return tool("finish", {}, i);
         return text("done");
       },
@@ -230,7 +230,7 @@ describe("runAcquisitionV2 — user replace request", () => {
         }
         if (i === 6) return tool("moveToSeason", { moves: [{ season: 1, fileIds: ["new13"] }] }, i);
         if (i === 7) return tool("markObtained", { codes: ["S01E13"] }, i);
-        if (i === 8) return tool("reportReplacement", { results: [{ episode: "S01E13", outcome: "replaced", candidateId: alias, note: "喵萌版" }] }, i);
+        if (i === 8) return tool("reportReplacement", { results: [{ episode: "S01E13", outcome: "replaced", candidateId: alias, fileIds: ["new13"], note: "喵萌版" }] }, i);
         return text("done");
       },
     });
@@ -263,7 +263,7 @@ describe("runAcquisitionV2 — user replace request", () => {
         // Recovery turn.
         if (i === 6) return tool("moveToSeason", { moves: [{ season: 1, fileIds: ["new13"] }] }, i);
         if (i === 7) return tool("markObtained", { codes: ["S01E13"] }, i);
-        if (i === 8) return tool("reportReplacement", { results: [{ episode: "S01E13", outcome: "replaced", candidateId: alias, note: "喵萌版" }] }, i);
+        if (i === 8) return tool("reportReplacement", { results: [{ episode: "S01E13", outcome: "replaced", candidateId: alias, fileIds: ["new13"], note: "喵萌版" }] }, i);
         return text("done");
       },
     });
