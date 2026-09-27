@@ -896,7 +896,8 @@ describe("runAcquisitionV2 — a rejection carries the link of the transfer that
     let rowsAfterFailure = -1;
     let gatedTransfer: any;
     let retryReject: any;
-    let repeatReject: any;
+    let repeatWhileDown: any;
+    let repeatWhileUp: any;
     let i = 0;
     const model = new MockLanguageModelV3({
       doGenerate: async (options) => {
@@ -919,11 +920,17 @@ describe("runAcquisitionV2 — a rejection carries the link of the transfer that
         }
         if (i === 5) {
           retryReject = lastToolOutput(options.prompt, "rejectCurrentSource");
-          // Down again: a repeat has nothing new to record, so it needs no read.
+          // Down again: every rejection reads its files' history — a repeat too, whose link
+          // decides whether it adds anything.
           historyDown = true;
           return tool("rejectCurrentSource", { episodes: [], fileIds: ["odyssey_yts"], reason: "假片" }, i);
         }
-        if (i === 6) repeatReject = lastToolOutput(options.prompt, "rejectCurrentSource");
+        if (i === 6) {
+          repeatWhileDown = lastToolOutput(options.prompt, "rejectCurrentSource");
+          historyDown = false;
+          return tool("rejectCurrentSource", { episodes: [], fileIds: ["odyssey_yts"], reason: "假片" }, i);
+        }
+        if (i === 7) repeatWhileUp = lastToolOutput(options.prompt, "rejectCurrentSource");
         return text("done");
       },
     });
@@ -939,7 +946,9 @@ describe("runAcquisitionV2 — a rejection carries the link of the transfer that
     expect(rowsAfterFailure).toBe(0);
     expect(String(gatedTransfer?.error)).toMatch(/SANDBOX_REJECT_FIRST/);
     expect(retryReject).toEqual({ rejected: 1 });
-    expect(repeatReject).toEqual({ rejected: 1 });
+    expect(String(repeatWhileDown?.error)).toMatch(/^SANDBOX_REJECT_SOURCE_UNAVAILABLE/);
+    expect(repeatWhileUp).toEqual({ rejected: 1 });
+    // The repeat, same file and same link, recorded nothing new.
     expect(rejectedRows).toEqual([expect.objectContaining({ episode: "MOVIE", linkKey: YTS_KEY, label: ODYSSEY_FILE })]);
     expect(result.replacement?.rejected).toEqual([expect.objectContaining({ linkKey: YTS_KEY })]);
     expect(result.replacement?.oldFiles).toEqual([ODYSSEY_FILE]);
@@ -971,5 +980,56 @@ describe("runAcquisitionV2 — a rejection carries the link of the transfer that
 
     expect(await rejectBoth({ MOVIE: SOURCE_KEY })).toEqual([[ODYSSEY_FILE, YTS_KEY], [OLD_FILE, SOURCE_KEY]]);
     expect(await rejectBoth()).toEqual([[ODYSSEY_FILE, YTS_KEY], [OLD_FILE, null]]);
+  });
+  it("two different files with the same name and size keep their own links; a twin with no link adds nothing the linked one does not already cover", async () => {
+    const KEY_B = `magnet:${"b".repeat(40)}`;
+    // The fake's name and size, in folders of their own: one landed from another resource,
+    // one whose transfer is no longer on record.
+    const twin = (id: string, dir: string): VerifiedFile => ({
+      id,
+      storageDirectoryId: "film",
+      name: `${dir}/${ODYSSEY_FILE}`,
+      sizeBytes: ODYSSEY_SIZE,
+      episodeCode: null,
+      providerFileId: id,
+    });
+    const rejectedRows: RejectedRow[] = [];
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => {
+        i += 1;
+        if (i === 1) return tool("rejectCurrentSource", { episodes: [], fileIds: ["odyssey_yts", "twin_b", "twin_c"], reason: "假片" }, i);
+        return text("done");
+      },
+    });
+
+    await runAcquisitionV2(
+      odysseyRequest(model, odysseyExecutor([twin("twin_b", "b"), twin("twin_c", "c")]), rejectedRows, async () => ({
+        odyssey_yts: YTS_KEY,
+        twin_b: KEY_B,
+      })),
+    );
+
+    expect(rejectedRows.map((r) => [r.label, r.linkKey])).toEqual([
+      [ODYSSEY_FILE, YTS_KEY],
+      [ODYSSEY_FILE, KEY_B],
+    ]);
+  });
+
+  it("a rejection stored without a link gains one: rejecting the same file again, its landing link known, records the link", async () => {
+    // Written before rejections carried landing links (production has such rows).
+    const rejectedRows: RejectedRow[] = [{ episode: "MOVIE", linkKey: null, label: ODYSSEY_FILE, sizeBytes: ODYSSEY_SIZE }];
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => {
+        i += 1;
+        if (i === 1) return tool("rejectCurrentSource", { episodes: [], fileIds: ["odyssey_yts"], reason: "假片" }, i);
+        return text("done");
+      },
+    });
+
+    await runAcquisitionV2(odysseyRequest(model, odysseyExecutor(), rejectedRows, async () => ({ odyssey_yts: YTS_KEY })));
+
+    expect(rejectedRows.map((r) => r.linkKey)).toEqual([null, YTS_KEY]);
   });
 });
