@@ -7,8 +7,9 @@ import type { AcquisitionAgentResult } from "./agent-loop.js";
 import type { AgentToolEvent } from "./activity.js";
 import { CandidateRegistry } from "./candidate-registry.js";
 import type { DeadLinkStore } from "./dead-links.js";
+import { linkHistoryByKey } from "./link-history.js";
 import { resourceLinkKey } from "./resource-link.js";
-import { resourceFingerprintMatches } from "../user-requests.js";
+import { resourceFingerprintMatches, type LinkHistoryRow } from "../user-requests.js";
 import type { UserRequestPromptInput } from "./user-request-block.js";
 import { RealResourceProviderV2 } from "./real-provider-adapter.js";
 import { RealStorageV2 } from "./real-storage-adapter.js";
@@ -111,6 +112,9 @@ export interface RunAcquisitionV2Request {
   rejectedLookup?: {
     list: () => Promise<Array<{ episode?: string; linkKey: string | null; label: string; sizeBytes: number | null }>>;
   };
+  /** This work's recent transfers, read once at run start and shown on candidates.
+   *  A failing read fails open (logged, no notes). */
+  linkHistory?: { list: () => Promise<LinkHistoryRow[]> };
   /** A replace_request run (user message). See docs/superpowers/specs/2026-09-26-user-message-replace-design.md. */
   userRequest?: {
     /** Episodes the user named or that are still pending (movie: ["MOVIE"]). Added to the need. */
@@ -200,6 +204,8 @@ function rejectionRowItems<T extends { episode: string; isVideo: boolean }>(item
 }
 
 export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promise<RunAcquisitionV2Result> {
+  // Before the provider exists, so the pre-warmed snapshot is annotated too.
+  const linkNotes = await loadLinkHistory(request);
   const registry = new CandidateRegistry();
   // Where the stored rejected list comes from (see rejectedLookup). Absent = no
   // rejection filtering at all (callers that do not know the work).
@@ -220,6 +226,7 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
     // Re-read on every search (closure over the collectors declared below; first
     // called only once the agent searches).
     ...(rejectedSource ? { rejectedResources: { list: () => listRejected(), ...(strictRejected ? { strict: true } : {}) } } : {}),
+    ...(linkNotes.size > 0 ? { linkHistory: linkNotes } : {}),
   });
   const storage = new RealStorageV2({
     executor: request.executor,
@@ -576,7 +583,10 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
   // same AcquisitionOutcome shape the old serial path persisted. No episode
   // mapping (§1.13): the decision records what was selected/observed, not a
   // fileId↔episode map.
-  const transferAttempts = storage.attempts();
+  const transferAttempts = storage.attempts().map((attempt) => {
+    const fate = sandbox.materializedFateOf(attempt.materializedFileIds);
+    return fate ? { ...attempt, fate } : attempt;
+  });
   const resourceSnapshots = provider.snapshots();
 
   // Post-run reflection: best-effort, never changes the outcome.
@@ -592,10 +602,9 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
         ...(request.storageProvider ? { driveBrand: request.storageProvider } : {}),
         // Attempts store the provider's real candidate id; the sandbox tracked each
         // file under the alias the agent passed. The file ids are the same on both.
-        attempts: transferAttempts.map((attempt) => {
-          const fate = sandbox.materializedFateOf(attempt.materializedFileIds);
-          return fate ? { ...attempt, kept: fate.kept, thrownAway: fate.thrownAway } : attempt;
-        }),
+        attempts: transferAttempts.map((attempt) =>
+          attempt.fate ? { ...attempt, kept: attempt.fate.kept, thrownAway: attempt.fate.thrownAway } : attempt,
+        ),
         candidateTitle: (id) => registry.get(id)?.title,
         coverage: result.coverage,
         auditEvents: sandbox.auditTrail(),
@@ -723,6 +732,17 @@ function jevTargetOf(target: AcquisitionV2Target): JevJudgeTarget {
       const never: never = target;
       throw new Error(`unknown target kind: ${String((never as { kind?: unknown }).kind)}`);
     }
+  }
+}
+
+/** This work's link notes, or an empty map. A failing read never fails the run. */
+async function loadLinkHistory(request: RunAcquisitionV2Request): Promise<Map<string, string>> {
+  if (!request.linkHistory) return new Map();
+  try {
+    return linkHistoryByKey(await request.linkHistory.list());
+  } catch (error) {
+    console.log(`[link-history] run ${request.workflowRunId} read failed (no history this run): ${errorText(error)}`);
+    return new Map();
   }
 }
 

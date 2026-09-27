@@ -93,6 +93,52 @@ export interface LandingSource {
   title: string;
 }
 
+/** One transfer attempt of a work, for the note the agent sees on that link. */
+export interface LinkHistoryRow {
+  /** Null when the candidate's link is unusable (missing, empty, not a string). */
+  url: string | null;
+  startedAt: string;
+  materializedCount: number;
+  /** Absent when the attempt recorded none, or the stored value is malformed. */
+  fate?: { kept: number; thrownAway: number };
+}
+
+/** A stored fate, or undefined when it is absent or not two finite numbers. */
+export function readTransferFate(value: unknown): { kept: number; thrownAway: number } | undefined {
+  let parsed = value;
+  if (typeof value === "string") {
+    try {
+      parsed = JSON.parse(value) as unknown;
+    } catch {
+      return undefined;
+    }
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const kept = (parsed as { kept?: unknown }).kept;
+  const thrownAway = (parsed as { thrownAway?: unknown }).thrownAway;
+  if (typeof kept !== "number" || typeof thrownAway !== "number") return undefined;
+  if (!Number.isFinite(kept) || !Number.isFinite(thrownAway)) return undefined;
+  return { kept, thrownAway };
+}
+
+/** One history row from the columns both SQL engines select. Null when the run has no startedAt. */
+export function linkHistoryFromStored(row: {
+  url: unknown;
+  startedAt: unknown;
+  materializedCount: unknown;
+  fate: unknown;
+}): LinkHistoryRow | null {
+  if (typeof row.startedAt !== "string" || row.startedAt === "") return null;
+  const count = Number(row.materializedCount);
+  const fate = readTransferFate(row.fate);
+  return {
+    url: typeof row.url === "string" && row.url !== "" ? row.url : null,
+    startedAt: row.startedAt,
+    materializedCount: Number.isFinite(count) ? count : 0,
+    ...(fate ? { fate } : {}),
+  };
+}
+
 /** Persistence port, implemented by all three repositories. Every state transition
  *  that can race (edit vs claim, claim vs claim) is atomic in the store. */
 export interface UserRequestStore {
@@ -147,6 +193,19 @@ export interface UserRequestStore {
    *  when unusable: the file still has a source of its own) and title. Oldest transfer first (a file several
    *  transfers landed is listed once per transfer); an id no transfer on record materialized is absent. */
   listLandingSources(input: { accountId: string; drive: string; fileIds: string[] }): Promise<LandingSource[]>;
+
+  /** Every transfer attempt of runs of this work (account + drive + title) whose run
+   *  started at or after `since`, excluding `excludeRunId`. The url is the candidate's
+   *  link in that run's own snapshots (null when unusable); a non-array
+   *  `materializedFileIds` counts as 0. `fate` is absent when it was not stored or is
+   *  malformed. Oldest run first, then that run's attempts in order. */
+  listLinkHistory(input: {
+    accountId: string;
+    drive: string;
+    titleKey: string;
+    since: string;
+    excludeRunId?: string;
+  }): Promise<LinkHistoryRow[]>;
 }
 
 export const USER_MESSAGE_LIMITS = {

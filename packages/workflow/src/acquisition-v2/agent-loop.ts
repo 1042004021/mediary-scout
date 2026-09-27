@@ -13,6 +13,7 @@ import {
   prepareStepSystemOverride,
 } from "./agent-loop-guards.js";
 import { interpretTool, type AgentToolEvent } from "./activity.js";
+import { LINK_HISTORY_PROMPT } from "./link-history.js";
 
 /**
  * Phase 3 — the agent loop harness. The strong agent drives its own
@@ -137,13 +138,15 @@ export function buildSandboxToolSet(
     },
     viewResourceSnapshot: {
       description:
-        "View the system's pre-warmed raw snapshot (活期文档). Read-only, free, repeatable — does NOT consume search budget. The system already searched the raw keyword (bare title) for you; this returns all those candidates (id + title, and · 发布 YYYY-MM-DD when the post date is known). Use this FIRST to see what's available. Do NOT use searchResources to re-search the raw keyword — searchResources is ONLY for 繁体/英文 upgrades when the raw snapshot is insufficient.",
+        "View the system's pre-warmed raw snapshot (活期文档). Read-only, free, repeatable — does NOT consume search budget. The system already searched the raw keyword (bare title) for you; this returns all those candidates (id + title, and · 发布 YYYY-MM-DD when the post date is known). Use this FIRST to see what's available. Do NOT use searchResources to re-search the raw keyword — searchResources is ONLY for 繁体/英文 upgrades when the raw snapshot is insufficient. " +
+        LINK_HISTORY_PROMPT,
       inputSchema: z.object({}),
       execute: () => Promise.resolve(sandbox.viewResourceSnapshot()),
     },
     searchResources: {
       description:
-        "Search the resource provider with ONE keyword. Read-only. Returns the full snapshot of candidates (no slicing); each has id, title, and postedAt (YYYY-MM-DD) when the post date is known. Repeats are deduped; the search budget is capped — decide from gathered evidence when refused. NOTE: raw keyword already pre-searched (see viewResourceSnapshot). Use searchResources ONLY for 繁体/英文/原名 upgrades.",
+        "Search the resource provider with ONE keyword. Read-only. Returns the full snapshot of candidates (no slicing); each has id, title, postedAt (YYYY-MM-DD) when the post date is known, and linkHistory when this work has transferred that same link. Repeats are deduped; the search budget is capped — decide from gathered evidence when refused. NOTE: raw keyword already pre-searched (see viewResourceSnapshot). Use searchResources ONLY for 繁体/英文/原名 upgrades. " +
+        LINK_HISTORY_PROMPT,
       inputSchema: z.object({ keyword: z.string() }),
       execute: (args: { keyword: string }) => asEvidence(() => sandbox.searchResources(args.keyword)),
     },

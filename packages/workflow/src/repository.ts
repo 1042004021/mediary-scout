@@ -28,11 +28,13 @@ import {
   compareUserMessagesCreated,
   type EpisodeSource,
   type LandingSource,
+  type LinkHistoryRow,
   type PendingReplacement,
   type RejectedResource,
   type UserMessage,
   type UserMessageScope,
   type UserRequestStore,
+  readTransferFate,
   userMessageDrive,
 } from "./user-requests.js";
 import type {
@@ -934,6 +936,34 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
             out.push({ fileId, url: typeof url === "string" && url !== "" ? url : null, title: c.title });
           }
         }
+      }
+    }
+    return out;
+  }
+
+  async listLinkHistory(input: Parameters<UserRequestStore["listLinkHistory"]>[0]): Promise<LinkHistoryRow[]> {
+    const runs = [...this.workflowRuns.values()]
+      .filter((run) => {
+        const work = workOfRun(run);
+        return (
+          work.accountId === input.accountId &&
+          work.drive === input.drive &&
+          work.titleKey === input.titleKey &&
+          run.workflowRun.startedAt >= input.since &&
+          run.workflowRun.id !== input.excludeRunId
+        );
+      })
+      .sort((a, b) => a.workflowRun.startedAt.localeCompare(b.workflowRun.startedAt) || a.workflowRun.id.localeCompare(b.workflowRun.id));
+    const out: LinkHistoryRow[] = [];
+    for (const run of runs) {
+      for (const attempt of run.transferAttempts) {
+        const fate = readTransferFate(attempt.fate);
+        out.push({
+          url: urlInRunSnapshots(run.resourceSnapshots, attempt.candidateId),
+          startedAt: run.workflowRun.startedAt,
+          materializedCount: Array.isArray(attempt.materializedFileIds) ? attempt.materializedFileIds.length : 0,
+          ...(fate ? { fate } : {}),
+        });
       }
     }
     return out;
@@ -1966,6 +1996,19 @@ export function compareTrackedSeasonStates(a: TrackedSeasonState, b: TrackedSeas
     a.season.seasonNumber - b.season.seasonNumber ||
     a.season.id.localeCompare(b.season.id)
   );
+}
+
+/** The candidate's url in the earliest snapshot that contains it; null when unusable or absent. */
+function urlInRunSnapshots(snapshots: ReadonlyArray<{ candidates: unknown }>, candidateId: string): string | null {
+  for (const snapshot of snapshots) {
+    const candidates = Array.isArray(snapshot.candidates) ? snapshot.candidates : [];
+    for (const candidate of candidates) {
+      if (!candidate || typeof candidate !== "object" || (candidate as { id?: unknown }).id !== candidateId) continue;
+      const url = (candidate as { providerPayload?: { url?: unknown } }).providerPayload?.url;
+      return typeof url === "string" && url !== "" ? url : null;
+    }
+  }
+  return null;
 }
 
 function sameWork(a: UserMessageScope, b: UserMessageScope): boolean {

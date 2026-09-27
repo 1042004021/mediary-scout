@@ -10,8 +10,9 @@ import type { ResourceProviderV2, ResourceSnapshotV2 } from "./fake-provider.js"
  * Phase 6 — the real PanSou provider as a ResourceProviderV2. It runs the real
  * search, records each candidate's full payload in the shared registry (so the
  * storage adapter can transfer by id), and hands the agent only the V2 view:
- * id, title, and postedAt (YYYY-MM-DD) when the payload date is real — never
- * the raw url or provider index.
+ * id, title, postedAt (YYYY-MM-DD) when the payload date is real, and
+ * linkHistory when this work has transferred that same link — never the raw
+ * url or provider index.
  *
  * The ids the agent sees are short run-local aliases (snapshot `s2`, candidate
  * `s2-14`), not the provider's `pansou_<runId>_<hash>_candidate_14`: the long form
@@ -36,6 +37,8 @@ export interface RealResourceProviderV2Options {
     list: () => Promise<Array<{ linkKey: string | null; label: string; sizeBytes: number | null }>>;
     strict?: boolean;
   };
+  /** resourceLinkKey → the note for that link. Absent = no history this run. */
+  linkHistory?: ReadonlyMap<string, string>;
 }
 
 export class RealResourceProviderV2 implements ResourceProviderV2 {
@@ -44,6 +47,7 @@ export class RealResourceProviderV2 implements ResourceProviderV2 {
   private readonly workflowRunId: string;
   private readonly deadLinkStore: DeadLinkStore | undefined;
   private readonly rejectedResources: RealResourceProviderV2Options["rejectedResources"];
+  private readonly linkHistory: ReadonlyMap<string, string> | undefined;
   private readonly observedSnapshots = new Map<string, ResourceSnapshot>();
   /** real snapshot id → `sN`. Content-addressed providers repeat a snapshot id
    *  across keywords; the same snapshot keeps the same alias. */
@@ -55,6 +59,7 @@ export class RealResourceProviderV2 implements ResourceProviderV2 {
     this.workflowRunId = options.workflowRunId;
     this.deadLinkStore = options.deadLinkStore;
     this.rejectedResources = options.rejectedResources;
+    this.linkHistory = options.linkHistory;
   }
 
   /** The domain snapshots observed this run (deduped by id — content-addressed
@@ -126,10 +131,14 @@ export class RealResourceProviderV2 implements ResourceProviderV2 {
       keyword: snapshot.keyword,
       candidates: kept.map((candidate) => {
         const postedAt = postedAtFromDatetime(candidate.providerPayload?.["datetime"]);
+        const rawUrl = candidate.providerPayload?.["url"];
+        const linkKey = typeof rawUrl === "string" ? resourceLinkKey(rawUrl) : null;
+        const linkHistory = linkKey ? this.linkHistory?.get(linkKey) : undefined;
         return {
           id: aliasOf.get(candidate.id)!,
           title: candidate.title,
           ...(postedAt ? { postedAt } : {}),
+          ...(linkHistory ? { linkHistory } : {}),
         };
       }),
       // 源健康态必须穿过这个边界。它在这里被丢掉过一次,后果是 6 天里源挂着,

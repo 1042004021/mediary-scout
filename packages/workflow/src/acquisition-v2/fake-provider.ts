@@ -18,6 +18,8 @@ export interface SimResourceCandidate {
   /** PanSou post date (YYYY-MM-DD) when the provider actually has one. A share
    *  posted before the missing episode aired almost certainly does not contain it. */
   postedAt?: string;
+  /** This work's own transfers of the same link over the last 30 days. */
+  linkHistory?: string;
 }
 
 export interface ResourceSnapshotV2 {

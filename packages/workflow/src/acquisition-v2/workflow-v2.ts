@@ -72,6 +72,8 @@ export interface RunAcquisitionV2WorkflowRequest {
   protectExisting?: RunAcquisitionV2Request["protectExisting"];
   /** See orchestrator.rejectedLookup. */
   rejectedLookup?: RunAcquisitionV2Request["rejectedLookup"];
+  /** See orchestrator.linkHistory. */
+  linkHistory?: RunAcquisitionV2Request["linkHistory"];
   onProgress?: (event: AgentToolEvent) => void;
 }
 
@@ -185,6 +187,7 @@ export async function runAcquisitionV2Workflow(
     ...(request.userRequest ? { userRequest: request.userRequest } : {}),
     ...(request.protectExisting ? { protectExisting: request.protectExisting } : {}),
     ...(request.rejectedLookup ? { rejectedLookup: request.rejectedLookup } : {}),
+    ...(request.linkHistory ? { linkHistory: request.linkHistory } : {}),
     ...(request.onProgress ? { onProgress: request.onProgress } : {}),
   });
 
