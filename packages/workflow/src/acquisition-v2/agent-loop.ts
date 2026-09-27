@@ -232,7 +232,7 @@ export function buildSandboxToolSet(
   if (sandbox.hasReplace?.()) {
     tools["rejectCurrentSource"] = {
       description:
-        "User request run only. Reject the CURRENT file(s) of the episodes the user complained about: pass the episode codes (movie: []) and the fileIds you saw in inspectTargetDir. The system records name+size (+link when known) and from then on hides every copy of it from your searches and refuses to transfer one. The files stay in place — never delete them.",
+        "User request run only. Reject the CURRENT file(s) of the episodes the user complained about: pass the episode codes (movie: []) and the fileIds you saw in inspectTargetDir. The system records name+size (+link when known) and from then on hides every copy of it from your searches and refuses to transfer one. The files stay in place — never delete them. Transfers stay refused until EVERY requested episode is rejected; for an episode that has no file in the library, call this with that episode and fileIds [] (nothing is rejected, the episode is just cleared for transfer).",
       inputSchema: z.object({ episodes: z.array(z.string()), fileIds: z.array(z.string()), reason: z.string() }),
       execute: (args: { episodes: string[]; fileIds: string[]; reason: string }) =>
         asEvidence(() => sandbox.rejectCurrentSource(args)),

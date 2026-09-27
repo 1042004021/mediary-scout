@@ -252,15 +252,17 @@ describe("runQueuedReplaceRequest", () => {
           return tool("inspectTargetDir", { season: 1 }, i);
         }
         if (i === 2) return tool("rejectCurrentSource", { episodes: ["S01E01"], fileIds: ["present_S01E01"], reason: "发蓝" }, i);
-        if (i === 3) return tool("searchResources", { keyword: "Show 01" }, i);
-        if (i === 4) {
+        // Every requested episode must be rejected before anything transfers.
+        if (i === 3) return tool("rejectCurrentSource", { episodes: ["S01E02"], fileIds: ["present_S01E02"], reason: "发蓝" }, i);
+        if (i === 4) return tool("searchResources", { keyword: "Show 01" }, i);
+        if (i === 5) {
           const search = lastToolOutput(options.prompt, "searchResources");
           const alias = (search.snapshot.candidates as Array<{ id: string; title: string }>).find((c) => c.title === NEW_TITLE)!.id;
           return tool("transferCandidate", { snapshotId: search.snapshot.id, candidateId: alias }, i);
         }
-        if (i === 5) return tool("moveToSeason", { moves: [{ season: 1, fileIds: ["new01"] }] }, i);
-        if (i === 6) return tool("markObtained", { codes: ["S01E01"] }, i);
-        if (i === 7) {
+        if (i === 6) return tool("moveToSeason", { moves: [{ season: 1, fileIds: ["new01"] }] }, i);
+        if (i === 7) return tool("markObtained", { codes: ["S01E01"] }, i);
+        if (i === 8) {
           const search = lastToolOutput(options.prompt, "searchResources");
           const alias = (search.snapshot.candidates as Array<{ id: string; title: string }>)[0]!.id;
           return tool(
@@ -269,7 +271,7 @@ describe("runQueuedReplaceRequest", () => {
             i,
           );
         }
-        if (i === 8) return tool("finish", {}, i);
+        if (i === 9) return tool("finish", {}, i);
         return text("done");
       },
     });
@@ -288,7 +290,7 @@ describe("runQueuedReplaceRequest", () => {
         { episode: "S01E01", outcome: "replaced", label: NEW_TITLE, sizeBytes: Math.round(1.9 * 1024 ** 3), note: "新版" },
         { episode: "S01E02", outcome: "not_found", note: "没找到别的版本" },
       ],
-      oldFiles: ["Season 01/Show.S01E01.mkv"],
+      oldFiles: ["Season 01/Show.S01E01.mkv", "Season 01/Show.S01E02.mkv"],
       runId: "run_rr",
     });
 
@@ -297,9 +299,12 @@ describe("runQueuedReplaceRequest", () => {
     expect(sources).toEqual([
       expect.objectContaining({ episode: "S01E01", label: NEW_TITLE, linkKey: `magnet:${"b".repeat(40)}`, runId: "run_rr", sizeBytes: Math.round(1.9 * 1024 ** 3) }),
     ]);
-    expect(await repository.listRejectedResources({ accountId: "acct_1", titleKey: "tmdb_tv_42" })).toEqual([
+    const rejected = await repository.listRejectedResources({ accountId: "acct_1", titleKey: "tmdb_tv_42" });
+    expect(rejected).toHaveLength(2);
+    expect(rejected).toEqual(expect.arrayContaining([
       expect.objectContaining({ episode: "S01E01", label: "Show.S01E01.mkv", messageId: message.id }),
-    ]);
+      expect.objectContaining({ episode: "S01E02", label: "Show.S01E02.mkv", messageId: message.id }),
+    ]));
 
     // The library is intact: both episodes obtained, old and new files side by side.
     const state = await repository.getTrackedSeasonState(season.id, { accountId: "acct_1", connectedStorageId: DRIVE });

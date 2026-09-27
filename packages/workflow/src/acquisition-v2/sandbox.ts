@@ -351,6 +351,11 @@ export class TaskSandbox {
   private readonly reportedEpisodes = new Map<string, "replaced" | "not_found">();
   /** Episodes the agent rejected via rejectCurrentSource (in order). */
   private readonly rejectedEpisodes: string[] = [];
+  /** Episodes the agent declared have no old file in the library (rejectCurrentSource
+   *  with that episode and fileIds []): nothing to reject, so they pass the
+   *  reject-before-transfer gate without a rejected row. The sandbox has no
+   *  file↔episode map, so this is the agent's call (see assertRejectedFirst). */
+  private readonly noFileEpisodes: string[] = [];
   /** Candidates that landed this run (reportReplacement's evidence): a succeeded
    *  attempt, or a failed one that still materialized files (quark marks some
    *  landings failed — the landing point is the truth, not the status flag). */
@@ -411,7 +416,14 @@ export class TaskSandbox {
    *  run). Their OLD file is already in the library, so a mark proves nothing until
    *  a new file has landed — see markObtained. Empty outside a replace run. */
   private replaceGuardedEpisodes(): Set<string> {
-    return this.replace ? new Set([...this.replace.requestedEpisodes, ...this.rejectedEpisodes]) : new Set();
+    return new Set(this.replaceEpisodes());
+  }
+
+  /** Every episode this replace run is about, in order: requested, then rejected or
+   *  declared file-less this run. Empty outside a replace run. */
+  private replaceEpisodes(): string[] {
+    if (!this.replace) return [];
+    return [...new Set([...this.replace.requestedEpisodes, ...this.rejectedEpisodes, ...this.noFileEpisodes])];
   }
 
   /** Whether a need token counts toward coverage. A replace-guarded episode counts
@@ -662,7 +674,7 @@ export class TaskSandbox {
     if (!snapshot) {
       throw new Error(`SANDBOX_SNAPSHOT_NOT_OBSERVED: ${input.snapshotId} was not seen in this task`);
     }
-    const candidate = snapshot.candidates.find((c) => c.id === input.candidateId);
+    const candidate = this.findObservedCandidate(input.candidateId, input.snapshotId);
     if (!candidate) {
       throw new Error(`SANDBOX_CANDIDATE_NOT_IN_SNAPSHOT: ${input.candidateId} is not in ${input.snapshotId}`);
     }
@@ -728,13 +740,13 @@ export class TaskSandbox {
       throw new Error("SANDBOX_NO_CANDIDATES: transferUntilLanded needs at least one candidate");
     }
     this.assertRejectedFirst();
+    const observed = new Map<string, ResourceSnapshotV2["candidates"][number]>();
     for (const candidateId of input.candidateIds) {
-      const observed = [...this.observedSnapshots.values()].some((snapshot) =>
-        snapshot.candidates.some((candidate) => candidate.id === candidateId),
-      );
-      if (!observed) {
+      const candidate = this.findObservedCandidate(candidateId);
+      if (!candidate) {
         throw new Error(`SANDBOX_CANDIDATE_NOT_OBSERVED: ${candidateId} was not seen in a search this task`);
       }
+      observed.set(candidateId, candidate);
     }
     for (const candidateId of input.candidateIds) {
       if (this.storage.candidateLinkKind(candidateId) !== "share") {
@@ -750,7 +762,7 @@ export class TaskSandbox {
     for (const candidateId of input.candidateIds) {
       // A copy of what the user rejected is skipped like a dead link (recorded, not
       // transferred) so the rest of the agent's ordered list still runs.
-      if (this.isRejected && (await this.isRejected({ id: candidateId, title: this.observedTitle(candidateId) }))) {
+      if (this.isRejected && (await this.isRejected({ id: candidateId, title: observed.get(candidateId)!.title }))) {
         attempts.push({ candidateId, status: "failed", providerMessage: "user rejected" });
         continue;
       }
@@ -977,10 +989,7 @@ export class TaskSandbox {
 
   /** Requested or rejected episodes with no reportReplacement yet, in request order. */
   private unreportedReplaceEpisodes(): string[] {
-    if (!this.replace) return [];
-    return [...new Set([...this.replace.requestedEpisodes, ...this.rejectedEpisodes])].filter(
-      (e) => !this.reportedEpisodes.has(e),
-    );
+    return this.replaceEpisodes().filter((e) => !this.reportedEpisodes.has(e));
   }
 
   /** The honest coverage picture from the obtained marks — the workflow decides what
@@ -1113,29 +1122,39 @@ export class TaskSandbox {
     this.protectedCaptured = true;
   }
 
-  /** Replace runs: nothing may be transferred before the user's current copy is
-   *  rejected. The raw snapshot is pre-warmed before the agent can reject anything,
-   *  so a model that transfers first could land the very file the user complained
-   *  about. Escape hatches (the gate would only get in the way):
-   *  - rejectCurrentSource has succeeded at least once this run;
-   *  - every requested episode already has a stored rejection from an earlier run
-   *    (a 待换 re-check — its copies are filtered from search and refused anyway). The
-   *    caller (runAcquisitionV2) only fills this in for a PENDING-ONLY re-check (no new
+  /** Replace runs: nothing may be transferred before the user's current copy of EVERY
+   *  requested episode is rejected. The raw snapshot is pre-warmed before the agent can
+   *  reject anything, and transfer tools carry no episode — so a gate opened by one
+   *  rejection would let a model reject E13 and re-land the very E24 the user
+   *  complained about. A requested episode is covered when it was:
+   *  - rejected this run (rejectCurrentSource with its current files);
+   *  - declared to have no old file here (rejectCurrentSource with that episode and
+   *    fileIds []) — the sandbox has no file↔episode map, so this is the agent's call;
+   *  - in alreadyRejectedEpisodes: a stored rejection from an earlier run (a 待换
+   *    re-check — its copies are filtered from search and refused anyway). The caller
+   *    (runAcquisitionV2) only fills this in for a PENDING-ONLY re-check (no new
    *    message this run): a new message means the user is unhappy with the file in
    *    place now, which may itself be an earlier replacement — that must be rejected
-   *    fresh, so the caller passes [] and this hatch closes.
-   *    Only when there is at least one requested episode: with none (a message with
-   *    no tags), the agent reads the episodes from the words and must reject them;
-   *  - the target dirs held no file at all when the run started (nothing to reject). */
+   *    fresh, so the caller passes [] and this closes.
+   *  With no requested episode at all (a TV message without tags) the agent reads the
+   *  episodes from the words, so the gate asks for at least one rejectCurrentSource
+   *  call (a rejection or a no-file declaration) before anything transfers.
+   *  Global hatch: the target dirs held no file at all when the run started. */
   private assertRejectedFirst(): void {
     if (!this.replace) return;
-    if (this.rejectedEpisodes.length > 0) return;
-    const requested = this.replace.requestedEpisodes;
-    const already = new Set(this.replace.alreadyRejectedEpisodes ?? []);
-    if (requested.length > 0 && requested.every((episode) => already.has(episode))) return;
     if (this.protectedCaptured && this.protectedFiles.size === 0) return;
+    const requested = this.replace.requestedEpisodes;
+    if (requested.length === 0) {
+      if (this.rejectedEpisodes.length > 0 || this.noFileEpisodes.length > 0) return;
+      throw new Error(
+        "SANDBOX_REJECT_FIRST: call rejectCurrentSource for the files the user complained about before transferring",
+      );
+    }
+    const covered = new Set([...this.rejectedEpisodes, ...this.noFileEpisodes, ...(this.replace.alreadyRejectedEpisodes ?? [])]);
+    const uncovered = requested.filter((episode) => !covered.has(episode));
+    if (uncovered.length === 0) return;
     throw new Error(
-      "SANDBOX_REJECT_FIRST: call rejectCurrentSource for the files the user complained about before transferring",
+      `SANDBOX_REJECT_FIRST: ${uncovered.join(",")} not rejected yet — call rejectCurrentSource with the current file of every requested episode before transferring (an episode with no file in the library: that episode and fileIds [])`,
     );
   }
 
@@ -1186,13 +1205,20 @@ export class TaskSandbox {
     }
   }
 
-  /** A candidate's title from the snapshots observed this run ("" when unseen). */
-  private observedTitle(candidateId: string): string {
-    for (const snapshot of this.observedSnapshots.values()) {
+  /** The candidate the agent means by `candidateId`, from the snapshots it saw this
+   *  run. These are the provider's AGENT-FACING snapshots (RealResourceProviderV2
+   *  hands back short aliases like s2-14), so the lookup is by the id the agent
+   *  passed — never by the provider's real id. `snapshotId` narrows it to one
+   *  snapshot (transferCandidate); omitted = any snapshot seen (transferUntilLanded).
+   *  Both transfer paths read the title the rejection check needs from here. */
+  private findObservedCandidate(candidateId: string, snapshotId?: string): ResourceSnapshotV2["candidates"][number] | undefined {
+    const snapshots =
+      snapshotId === undefined ? [...this.observedSnapshots.values()] : [this.observedSnapshots.get(snapshotId)].filter((x) => x !== undefined);
+    for (const snapshot of snapshots) {
       const hit = snapshot.candidates.find((c) => c.id === candidateId);
-      if (hit) return hit.title;
+      if (hit) return hit;
     }
-    return "";
+    return undefined;
   }
 
   /** Reject the current file(s) of the episodes the user complained about: the system
@@ -1200,16 +1226,27 @@ export class TaskSandbox {
    *  from later searches and refused at transfer. The files stay in place. The episodes
    *  join the need, so one the agent read from the user's words (no tag) can still pass
    *  the transfer gate. Movie: episodes [] = the film ("MOVIE"); a TV run must list
-   *  its episodes. Only files that were in the library before this run qualify. */
-  async rejectCurrentSource(input: { episodes: string[]; fileIds: string[]; reason: string }): Promise<{ rejected: number }> {
+   *  its episodes. Only files that were in the library before this run qualify.
+   *  Named episodes with fileIds [] declare "no old file of these here": nothing is
+   *  recorded as rejected, the episodes just pass the transfer gate. */
+  async rejectCurrentSource(
+    input: { episodes: string[]; fileIds: string[]; reason: string },
+  ): Promise<{ rejected: number; declaredNoFile?: string[] }> {
     if (!this.replace || !this.storage) throw new Error("SANDBOX_NO_REPLACE: this run has no user request");
+    if (input.fileIds.length === 0 && input.episodes.length === 0) {
+      throw new Error("SANDBOX_NO_FILES: pass the fileIds of the current copy (from inspectTargetDir)");
+    }
     const movieRun = this.movieDir !== undefined && this.seasonDirs.size === 0;
     if (!movieRun && input.episodes.length === 0) {
       throw new Error("SANDBOX_EPISODES_REQUIRED: list every episode the user named (e.g. S01E13) — [] is only for a movie");
     }
     this.assertEpisodeTokens(input.episodes);
     if (input.fileIds.length === 0) {
-      throw new Error("SANDBOX_NO_FILES: pass the fileIds of the current copy (from inspectTargetDir)");
+      for (const episode of input.episodes) {
+        if (!this.need.includes(episode)) this.need.push(episode);
+        if (!this.noFileEpisodes.includes(episode)) this.noFileEpisodes.push(episode);
+      }
+      return { rejected: 0, declaredNoFile: [...new Set(input.episodes)] };
     }
     const missing = input.fileIds.filter((id) => !this.protectedFiles.has(id));
     if (missing.length > 0) {
@@ -1244,11 +1281,11 @@ export class TaskSandbox {
   }): Promise<{ recorded: number; ignored: Array<{ episode: string; reason: string }> }> {
     if (!this.replace) throw new Error("SANDBOX_NO_REPLACE: this run has no user request");
     this.assertEpisodeTokens(input.results.map((r) => r.episode));
-    const allowed = new Set([...this.replace.requestedEpisodes, ...this.rejectedEpisodes]);
+    const allowed = new Set(this.replaceEpisodes());
     const byEpisode = new Map<string, (typeof input.results)[number]>();
     for (const r of input.results) {
       if (!allowed.has(r.episode)) {
-        throw new Error(`SANDBOX_EPISODE_NOT_REQUESTED: ${r.episode} was neither requested by the user nor rejected this run`);
+        throw new Error(`SANDBOX_EPISODE_NOT_REQUESTED: ${r.episode} was neither requested by the user nor passed to rejectCurrentSource this run`);
       }
       const first = byEpisode.get(r.episode);
       if (!first) byEpisode.set(r.episode, r);

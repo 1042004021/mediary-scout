@@ -122,8 +122,10 @@ describe("runAcquisitionV2 — user replace request", () => {
         i += 1;
         if (i === 1) return tool("inspectTargetDir", { season: 1 }, i);
         if (i === 2) return tool("rejectCurrentSource", { episodes: ["S01E13"], fileIds: ["old13"], reason: "发蓝" }, i);
-        if (i === 3) return tool("searchResources", { keyword: "Show 13" }, i);
-        if (i === 4) {
+        // Every requested episode must be rejected before anything transfers.
+        if (i === 3) return tool("rejectCurrentSource", { episodes: ["S01E24"], fileIds: ["old24"], reason: "发蓝" }, i);
+        if (i === 4) return tool("searchResources", { keyword: "Show 13" }, i);
+        if (i === 5) {
           const search = lastToolOutput(options.prompt, "searchResources");
           const candidates = search.snapshot.candidates as Array<{ id: string; title: string }>;
           seenTitlesOfShow13Search = candidates.map((c) => c.title);
@@ -131,10 +133,10 @@ describe("runAcquisitionV2 — user replace request", () => {
           alias = candidates.find((c) => c.title === NEKOMOE_TITLE)!.id;
           return tool("transferCandidate", { snapshotId: snapshotAlias, candidateId: alias }, i);
         }
-        if (i === 5) return tool("moveToSeason", { moves: [{ season: 1, fileIds: ["new13"] }] }, i);
-        if (i === 6) return tool("markObtained", { codes: ["S01E13"] }, i);
-        if (i === 7) return tool("reportReplacement", { results: [{ episode: "S01E13", outcome: "replaced", candidateId: alias, note: "喵萌版" }] }, i);
-        if (i === 8) return tool("finish", {}, i);
+        if (i === 6) return tool("moveToSeason", { moves: [{ season: 1, fileIds: ["new13"] }] }, i);
+        if (i === 7) return tool("markObtained", { codes: ["S01E13"] }, i);
+        if (i === 8) return tool("reportReplacement", { results: [{ episode: "S01E13", outcome: "replaced", candidateId: alias, note: "喵萌版" }] }, i);
+        if (i === 9) return tool("finish", {}, i);
         return text("done");
       },
     });
@@ -150,10 +152,16 @@ describe("runAcquisitionV2 — user replace request", () => {
       { episode: "S01E13", outcome: "replaced", candidateId: "cand_nekomoe", label: NEKOMOE_TITLE, linkKey: `magnet:${"b".repeat(40)}`, note: "喵萌版" },
       { episode: "S01E24", outcome: "not_found", note: "" },
     ]);
-    expect(result.replacement?.rejected).toEqual([expect.objectContaining({ episode: "S01E13", label: "Show - 13 [CR 1080p].mkv" })]);
-    expect(result.replacement?.oldFiles).toEqual(["Season 01/Show - 13 [CR 1080p].mkv"]);
-    // The rejection was written to the store.
-    expect(rejectedRows).toEqual([expect.objectContaining({ label: "Show - 13 [CR 1080p].mkv", sizeBytes: OLD_SIZE })]);
+    expect(result.replacement?.rejected).toEqual([
+      expect.objectContaining({ episode: "S01E13", label: "Show - 13 [CR 1080p].mkv" }),
+      expect.objectContaining({ episode: "S01E24", label: "Show - 24 [CR 1080p].mkv" }),
+    ]);
+    expect(result.replacement?.oldFiles).toEqual(["Season 01/Show - 13 [CR 1080p].mkv", "Season 01/Show - 24 [CR 1080p].mkv"]);
+    // The rejections were written to the store.
+    expect(rejectedRows).toEqual([
+      expect.objectContaining({ label: "Show - 13 [CR 1080p].mkv", sizeBytes: OLD_SIZE }),
+      expect.objectContaining({ label: "Show - 24 [CR 1080p].mkv", sizeBytes: OLD_SIZE }),
+    ]);
     // The look-alike of the rejected file never reached the agent:
     expect(seenTitlesOfShow13Search).not.toContain(CR13_TITLE);
     expect(seenTitlesOfShow13Search).toContain(NEKOMOE_TITLE);
@@ -175,13 +183,15 @@ describe("runAcquisitionV2 — user replace request", () => {
         i += 1;
         if (i === 1) return tool("viewResourceSnapshot", {}, i);
         if (i === 2) return tool("rejectCurrentSource", { episodes: ["S01E13"], fileIds: ["old13"], reason: "发蓝" }, i);
-        if (i === 3) {
+        // Every requested episode must be rejected before anything transfers.
+        if (i === 3) return tool("rejectCurrentSource", { episodes: ["S01E24"], fileIds: ["old24"], reason: "发蓝" }, i);
+        if (i === 4) {
           // The raw snapshot document lists "[s1-1] <title>" rows.
           const doc = String(lastToolOutput(options.prompt, "viewResourceSnapshot").document);
           const lookAlike = /\[(s(\d+)-\d+)\] Show - 13 \[CR 1080p\]/.exec(doc)!;
           return tool("transferCandidate", { snapshotId: `s${lookAlike[2]}`, candidateId: lookAlike[1] }, i);
         }
-        if (i === 4) {
+        if (i === 5) {
           transferOutput = lastToolOutput(options.prompt, "transferCandidate");
           return tool("reportReplacement", { results: [{ episode: "S01E13", outcome: "not_found", note: "只有同一版本" }] }, i);
         }
@@ -209,16 +219,18 @@ describe("runAcquisitionV2 — user replace request", () => {
       doGenerate: async (options) => {
         i += 1;
         if (i === 1) return tool("rejectCurrentSource", { episodes: ["S01E13"], fileIds: ["old13"], reason: "发蓝" }, i);
-        if (i === 2) return tool("reportReplacement", { results: [{ episode: "S01E13", outcome: "not_found", note: "先没找到" }] }, i);
-        if (i === 3) return tool("searchResources", { keyword: "Show 13" }, i);
-        if (i === 4) {
+        // Every requested episode must be rejected before anything transfers.
+        if (i === 2) return tool("rejectCurrentSource", { episodes: ["S01E24"], fileIds: ["old24"], reason: "发蓝" }, i);
+        if (i === 3) return tool("reportReplacement", { results: [{ episode: "S01E13", outcome: "not_found", note: "先没找到" }] }, i);
+        if (i === 4) return tool("searchResources", { keyword: "Show 13" }, i);
+        if (i === 5) {
           const search = lastToolOutput(options.prompt, "searchResources");
           alias = (search.snapshot.candidates as Array<{ id: string; title: string }>).find((c) => c.title === NEKOMOE_TITLE)!.id;
           return tool("transferCandidate", { snapshotId: search.snapshot.id, candidateId: alias }, i);
         }
-        if (i === 5) return tool("moveToSeason", { moves: [{ season: 1, fileIds: ["new13"] }] }, i);
-        if (i === 6) return tool("markObtained", { codes: ["S01E13"] }, i);
-        if (i === 7) return tool("reportReplacement", { results: [{ episode: "S01E13", outcome: "replaced", candidateId: alias, note: "喵萌版" }] }, i);
+        if (i === 6) return tool("moveToSeason", { moves: [{ season: 1, fileIds: ["new13"] }] }, i);
+        if (i === 7) return tool("markObtained", { codes: ["S01E13"] }, i);
+        if (i === 8) return tool("reportReplacement", { results: [{ episode: "S01E13", outcome: "replaced", candidateId: alias, note: "喵萌版" }] }, i);
         return text("done");
       },
     });
@@ -239,17 +251,19 @@ describe("runAcquisitionV2 — user replace request", () => {
       doGenerate: async (options) => {
         i += 1;
         if (i === 1) return tool("rejectCurrentSource", { episodes: ["S01E13"], fileIds: ["old13"], reason: "发蓝" }, i);
-        if (i === 2) return tool("searchResources", { keyword: "Show 13" }, i);
-        if (i === 3) {
+        // Every requested episode must be rejected before anything transfers.
+        if (i === 2) return tool("rejectCurrentSource", { episodes: ["S01E24"], fileIds: ["old24"], reason: "发蓝" }, i);
+        if (i === 3) return tool("searchResources", { keyword: "Show 13" }, i);
+        if (i === 4) {
           const search = lastToolOutput(options.prompt, "searchResources");
           alias = (search.snapshot.candidates as Array<{ id: string; title: string }>).find((c) => c.title === NEKOMOE_TITLE)!.id;
           return tool("transferCandidate", { snapshotId: search.snapshot.id, candidateId: alias }, i);
         }
-        if (i === 4) return contentFilter();
+        if (i === 5) return contentFilter();
         // Recovery turn.
-        if (i === 5) return tool("moveToSeason", { moves: [{ season: 1, fileIds: ["new13"] }] }, i);
-        if (i === 6) return tool("markObtained", { codes: ["S01E13"] }, i);
-        if (i === 7) return tool("reportReplacement", { results: [{ episode: "S01E13", outcome: "replaced", candidateId: alias, note: "喵萌版" }] }, i);
+        if (i === 6) return tool("moveToSeason", { moves: [{ season: 1, fileIds: ["new13"] }] }, i);
+        if (i === 7) return tool("markObtained", { codes: ["S01E13"] }, i);
+        if (i === 8) return tool("reportReplacement", { results: [{ episode: "S01E13", outcome: "replaced", candidateId: alias, note: "喵萌版" }] }, i);
         return text("done");
       },
     });

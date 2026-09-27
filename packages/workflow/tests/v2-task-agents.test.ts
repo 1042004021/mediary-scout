@@ -423,8 +423,9 @@ describe("user request block", () => {
   it("the header names the fence without a literal opener, and asks a TV work to list episodes", () => {
     const text = userRequestBlock({ userRequests: base });
     expect(text.indexOf("<user_requests>")).toBe(text.indexOf("\n<user_requests>\n") + 1);
-    expect(text).toMatch(/for a TV work reject every episode the user named/);
+    expect(text).toMatch(/reject the current file of EVERY requested episode \(for a TV work list them all/);
     expect(text).toMatch(/episodes \[\] is only for a movie/);
+    expect(text).toMatch(/For an episode with no file in the library, call rejectCurrentSource with that episode and fileIds \[\]/);
   });
   it("is part of both system prompts, right after the memory block", () => {
     for (const build of [buildTvAnimeSystemPrompt, buildMovieSystemPrompt]) {
