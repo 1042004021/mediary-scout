@@ -1352,6 +1352,204 @@ describe("runQueuedReplaceRequest — scope, metadata and bookkeeping", () => {
   });
 });
 
+describe("runQueuedReplaceRequest — the run stays active until its last write", () => {
+  const SCOPE = { accountId: "acct_1", connectedStorageId: DRIVE };
+
+  /** A two-season show with a message about S02E01, its replace run queued as `runId` (on season 1, the lock). */
+  async function twoSeasonRun(runId: string) {
+    const { repository, title, season } = await trackedShow();
+    const season2: TrackedSeason = { ...season, id: "tmdb_tv_42_s2", seasonNumber: 2, storageDirectoryId: "dir_s2" };
+    await seedTrackedSeason({ repository, title, season: season2, obtainedCodes: ["S02E01", "S02E02"] });
+    const storage = new FakeStorageExecutor();
+    await seedV2Season(storage, title, season, ["S01E01", "S01E02"]);
+    await repository.createUserMessage({ ...WORK, body: "第二季第一集没字幕", episodeTags: ["S02E01"], now: NOW });
+    await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => runId });
+    return { repository, storage };
+  }
+
+  /** `fn`, then `then` once the call has landed. */
+  function after<A extends unknown[], R>(fn: (...args: A) => Promise<R>, then: (...args: NoInfer<A>) => Promise<unknown> | void) {
+    return async (...args: A): Promise<R> => {
+      const result = await fn(...args);
+      await then(...args);
+      return result;
+    };
+  }
+
+  for (const when of ["right after the other season's record is saved", "right before the request bookkeeping"] as const) {
+    it(`untracking the work ${when} is refused (in_flight), so no later write of the run can bring it back`, async () => {
+      const runId = when.includes("after") ? "run_rr_gap_after" : "run_rr_gap_before";
+      const { repository, storage } = await twoSeasonRun(runId);
+      const untracks: unknown[] = [];
+      const untrack = async () => {
+        untracks.push(await repository.untrackTitle(42, SCOPE, "tv"));
+      };
+      if (when.includes("after")) {
+        repository.saveWorkflowRunSnapshot = after(repository.saveWorkflowRunSnapshot.bind(repository), (input) =>
+          input.workflowRun.id === `${runId}_s2` ? untrack() : undefined,
+        );
+      } else {
+        // The first bookkeeping write of a not_found episode: its 待换 row.
+        const add = repository.addPendingReplacements.bind(repository);
+        repository.addPendingReplacements = async (input) => {
+          await untrack();
+          return add(input);
+        };
+      }
+
+      await runQueuedReplaceRequest(baseRun(repository, storage, reportingModel(["S02E01"])));
+
+      expect(untracks).toEqual([{ status: "in_flight", removedSeasons: 0 }]);
+      expect((await repository.listTrackedSeasonStates(SCOPE)).map((s) => s.season.seasonNumber)).toEqual([1, 2]);
+      // The run has ended: the untrack goes through now, and the work stays gone.
+      expect(await repository.untrackTitle(42, SCOPE, "tv")).toEqual({ status: "untracked", removedSeasons: 2 });
+      expect(await repository.listTrackedSeasonStates(SCOPE)).toEqual([]);
+      expect(await repository.listPendingReplacements(WORK)).toEqual([]);
+    });
+  }
+
+  it("a movie replace run: untracking the film while its bookkeeping is written is refused (in_flight)", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    const title: MediaTitle = { id: "tmdb_movie_61", tmdbId: 61, type: "movie", title: "Film", originalTitle: "Film", year: 2010, aliases: [] };
+    const season = movieAnchorSeason({ titleId: title.id, qualityPreference: "4K", storageDirectoryId: "dir_movie" });
+    await repository.saveWorkflowRunSnapshot({
+      accountId: "acct_1",
+      connectedStorageId: DRIVE,
+      title,
+      season,
+      workflowRun: { id: "seed_movie61", kind: "movie_init", status: "succeeded", trackedSeasonId: season.id, startedAt: "2026-09-01T00:00:00.000Z", finishedAt: "2026-09-01T00:00:00.000Z", auditEvents: [] },
+      episodes: createEpisodeStates({ trackedSeasonId: season.id, seasonNumber: 1, totalEpisodes: 1, latestAiredEpisode: 1 }).map((e) => ({ ...e, obtained: true })),
+      resourceSnapshots: [],
+      decisions: [],
+      transferAttempts: [],
+      notifications: [],
+    });
+    const work = { accountId: "acct_1", drive: DRIVE, titleKey: title.id };
+    await repository.createUserMessage({ ...work, body: "这是假片", episodeTags: [], now: NOW });
+    await queueReplaceRequest({ repository, work, now: fixedNow, createWorkflowRunId: () => "run_rr_movie_gap" });
+    const untracks: unknown[] = [];
+    const add = repository.addPendingReplacements.bind(repository);
+    repository.addPendingReplacements = async (input) => {
+      untracks.push(await repository.untrackTitle(61, SCOPE, "movie"));
+      return add(input);
+    };
+
+    await runQueuedReplaceRequest(baseRun(repository, new FakeStorageExecutor(), reportingModel(["MOVIE"])));
+
+    expect(untracks).toEqual([{ status: "in_flight", removedSeasons: 0 }]);
+    const run = await repository.getWorkflowRunSnapshot("run_rr_movie_gap", SCOPE);
+    expect(run?.workflowRun.status).not.toMatch(/^(queued|running)$/);
+    expect(run?.notifications).toHaveLength(1);
+    expect(await repository.untrackTitle(61, SCOPE, "movie")).toEqual({ status: "untracked", removedSeasons: 1 });
+    expect(await repository.listPendingReplacements(work)).toEqual([]);
+  });
+
+  it("the lock run's terminal record, with its one notification, is the run's very last write; before it the lock run is only saved as running", async () => {
+    const { repository, storage } = await twoSeasonRun("run_rr_last");
+    const writes: string[] = [];
+    repository.saveWorkflowRunSnapshot = after(repository.saveWorkflowRunSnapshot.bind(repository), (input) => {
+      const status = input.workflowRun.status === "running" ? "running" : "terminal";
+      writes.push(`save ${input.workflowRun.id} ${status} notifications=${input.notifications.length}`);
+    });
+    repository.upsertEpisodeSource = after(repository.upsertEpisodeSource.bind(repository), () => void writes.push("upsertEpisodeSource"));
+    repository.removePendingReplacements = after(repository.removePendingReplacements.bind(repository), () => void writes.push("removePendingReplacements"));
+    repository.addPendingReplacements = after(repository.addPendingReplacements.bind(repository), () => void writes.push("addPendingReplacements"));
+    repository.finishUserMessages = after(repository.finishUserMessages.bind(repository), () => void writes.push("finishUserMessages"));
+    repository.releaseUserMessages = after(repository.releaseUserMessages.bind(repository), () => void writes.push("releaseUserMessages"));
+
+    const result = await runQueuedReplaceRequest(baseRun(repository, storage, reportingModel(["S02E01"])));
+
+    expect(result).toMatchObject({ status: "ran", workflowRunId: "run_rr_last" });
+    expect(writes).toEqual([
+      // The other season's record first, then the lock season's with the run's evidence — still running.
+      "save run_rr_last_s2 terminal notifications=0",
+      "save run_rr_last running notifications=0",
+      // The request bookkeeping while the run is still active…
+      "addPendingReplacements",
+      "finishUserMessages",
+      // …and the lock run's terminal record, with the notification, last.
+      "save run_rr_last terminal notifications=1",
+    ]);
+    const run = await repository.getWorkflowRunSnapshot("run_rr_last", SCOPE);
+    expect(run?.notifications.map((n) => n.kind)).toEqual(["replacement_done"]);
+    expect(run?.workflowRun.finishedAt).toBe(NOW);
+    expect((await repository.listUserMessages(WORK))[0]).toMatchObject({ status: "done", runId: "run_rr_last" });
+    expect(await repository.listActiveWorkflowRuns(SCOPE)).toEqual([]);
+  });
+
+  it("while its bookkeeping is written the lock run is still running, with its evidence, the claim's crash-recovery count and its live progress", async () => {
+    const { repository, storage } = await twoSeasonRun("run_rr_live");
+    // An earlier worker died with this run and crash recovery requeued it once.
+    const queued = await repository.getWorkflowRunSnapshot("run_rr_live", SCOPE);
+    await repository.saveWorkflowRunSnapshot({ ...queued!, workflowRun: { ...queued!.workflowRun, orphanRequeueCount: 1 } });
+    let during: Awaited<ReturnType<InMemoryWorkflowRepository["getWorkflowRunSnapshot"]>> = null;
+    const add = repository.addPendingReplacements.bind(repository);
+    repository.addPendingReplacements = async (input) => {
+      during = await repository.getWorkflowRunSnapshot("run_rr_live", SCOPE);
+      return add(input);
+    };
+
+    await runQueuedReplaceRequest(baseRun(repository, storage, reportingModel(["S02E01"])));
+
+    expect(during).not.toBeNull();
+    const live = during!;
+    expect(live.workflowRun).toMatchObject({ status: "running", finishedAt: null, orphanRequeueCount: 1 });
+    expect(live.workflowRun.progress).toBeDefined();
+    expect(live.resourceSnapshots.length).toBeGreaterThan(0);
+    expect(live.notifications).toEqual([]);
+    expect((await repository.getWorkflowRunSnapshot("run_rr_live", SCOPE))?.workflowRun.status).not.toMatch(/^(queued|running)$/);
+  });
+
+  it("a lock run terminal write that fails once is retried, so the run still ends (left running, it would hold its work until the next worker start)", async () => {
+    const { repository, storage } = await twoSeasonRun("run_rr_final_retry");
+    const save = repository.saveWorkflowRunSnapshot.bind(repository);
+    let failures = 0;
+    repository.saveWorkflowRunSnapshot = async (input) => {
+      if (failures === 0 && input.workflowRun.id === "run_rr_final_retry" && input.workflowRun.status !== "running") {
+        failures += 1;
+        throw new Error("connection reset");
+      }
+      return save(input);
+    };
+
+    const result = await runQueuedReplaceRequest(baseRun(repository, storage, reportingModel(["S02E01"])));
+
+    expect(failures).toBe(1);
+    expect(result).toMatchObject({ status: "ran", workflowRunId: "run_rr_final_retry" });
+    const run = await repository.getWorkflowRunSnapshot("run_rr_final_retry", SCOPE);
+    expect(run?.workflowRun.status).not.toMatch(/^(queued|running)$/);
+    expect(run?.notifications).toHaveLength(1);
+  });
+
+  for (const failing of ["the 待换 write (twice, so the messages go back)", "the reply write (twice)"] as const) {
+    it(`a bookkeeping failure — ${failing} — still ends the lock run with its terminal record`, async () => {
+      const runId = failing.startsWith("the 待换") ? "run_rr_bookfail_pending" : "run_rr_bookfail_reply";
+      const { repository, storage } = await twoSeasonRun(runId);
+      if (failing.startsWith("the 待换")) {
+        repository.addPendingReplacements = async () => {
+          throw new Error("db hiccup");
+        };
+        repository.releaseUserMessages = async () => {
+          throw new Error("db down too");
+        };
+      } else {
+        repository.finishUserMessages = async () => {
+          throw new Error("db down");
+        };
+      }
+
+      const result = await runQueuedReplaceRequest(baseRun(repository, storage, reportingModel(["S02E01"])));
+
+      expect(result).toMatchObject({ status: "ran", workflowRunId: runId });
+      const run = await repository.getWorkflowRunSnapshot(runId, SCOPE);
+      expect(run?.workflowRun.status).not.toMatch(/^(queued|running|failed)$/);
+      expect(run?.notifications).toHaveLength(1);
+      expect(await repository.listActiveWorkflowRuns(SCOPE)).toEqual([]);
+      expect((await repository.untrackTitle(42, SCOPE, "tv")).status).toBe("untracked");
+    });
+  }
+});
+
 describe("runQueuedReplaceRequest — 不换了 while the run works", () => {
   const CODES = Array.from({ length: 24 }, (_, i) => `S01E${String(i + 1).padStart(2, "0")}`);
 

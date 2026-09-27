@@ -1007,7 +1007,9 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
         );
         // …and a queued or running replace_request of the work, whichever season it is
         // recorded on: it covers every season tracked when it starts and writes a record for
-        // each when it ends, so a season untracked in between would be tracked again.
+        // each when it ends, so a season untracked in between would be tracked again. It stays
+        // running until its last write (its terminal record comes after the season records and
+        // the request bookkeeping), so once it has ended nothing of it is left to write.
         const replaceActive = this.selectWorkflowRunsForTitle(titleKey, accountId, storageValue).some(
           (run) => run.kind === "replace_request" && isActiveWorkflowStatus(run.status),
         );

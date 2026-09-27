@@ -1625,6 +1625,38 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         });
       });
 
+      it("a replace run saved running with its evidence, then terminal with its notification, keeps one copy of each — and untracking waits for the terminal save", async () => {
+        const repo = await fresh();
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_hold" };
+        const evidence = workflowPersistenceFixture();
+        const seed = queuedRun({ id: "hold_seed", status: "succeeded", connectedStorageId: "cs_hold", tmdbId: 654, type: "tv" });
+        await repo.saveWorkflowRunSnapshot(seed);
+        // The replace run's lock record, held open: episodes and evidence, no notification yet.
+        const held = {
+          ...seed,
+          workflowRun: { ...seed.workflowRun, id: "hold_run", kind: "replace_request" as const, status: "running" as const, finishedAt: null },
+          resourceSnapshots: evidence.resourceSnapshots,
+          decisions: evidence.decisions,
+          transferAttempts: evidence.transferAttempts.map((a) => ({ ...a, workflowRunId: "hold_run" })),
+          notifications: [],
+        };
+        await repo.saveWorkflowRunSnapshot(held);
+        expect(await repo.untrackTitle(654, scope, "tv")).toEqual({ status: "in_flight", removedSeasons: 0 });
+
+        await repo.saveWorkflowRunSnapshot({
+          ...held,
+          workflowRun: { ...held.workflowRun, status: "succeeded" as const, finishedAt: "2026-09-27T00:05:00.000Z" },
+          notifications: evidence.notifications.map((n) => ({ ...n, workflowRunId: "hold_run" })),
+        });
+        const saved = await repo.getWorkflowRunSnapshot("hold_run", scope);
+        expect(saved?.workflowRun).toMatchObject({ status: "succeeded", finishedAt: "2026-09-27T00:05:00.000Z" });
+        expect(saved?.resourceSnapshots.map((s) => s.id)).toEqual(["snapshot_1"]);
+        expect(saved?.decisions).toHaveLength(1);
+        expect(saved?.transferAttempts.map((a) => a.id)).toEqual(["transfer_1"]);
+        expect(saved?.notifications.map((n) => n.id)).toEqual(["notification_1"]);
+        expect(await repo.untrackTitle(654, scope, "tv")).toEqual({ status: "untracked", removedSeasons: 1 });
+      });
+
       it("untrackTitle (whole title) withdraws pending messages and drops pending replacements for that work only", async () => {
         const repo = await fresh();
         await repo.saveWorkflowRunSnapshot(

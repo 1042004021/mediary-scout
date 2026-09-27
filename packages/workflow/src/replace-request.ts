@@ -117,8 +117,10 @@ export async function queueReplaceRequest(input: {
   return { status: "not_tracked", workflowRunId: null };
 }
 
-/** How long a finished run may still hold its messages: the post-run bookkeeping
- *  (finishUserMessages) takes seconds, so anything older died before finishing. */
+/** How long a finished run may still hold its messages: a failed run is saved before it
+ *  releases them (releaseAfterFailure), which takes seconds, so anything older lost that
+ *  write — or its reply write (a run that succeeded finishes its messages before its own
+ *  terminal record). */
 const ORPHANED_MESSAGE_GRACE_MS = 10 * 60 * 1000;
 
 /** Idle-queue scan: every work with an urgent pending message and no active run. */
@@ -209,6 +211,8 @@ export async function runQueuedReplaceRequest(
   let sources: EpisodeSource[] = [];
   let replacement: RunAcquisitionV2Result["replacement"];
   let workflowStatus: WorkflowStatus;
+  /** Set once the run succeeded: writes the lock run's terminal record (see HeldLockRun). */
+  let finishLockRun: (() => Promise<void>) | undefined;
   /** A TV message this run carries names no (in-scope) episode: its episodes are read
    *  from the words, so the reply says whether any came out (see UserMessageReply.unidentified). */
   let untaggedTvMessage = false;
@@ -328,9 +332,11 @@ export async function runQueuedReplaceRequest(
         categoryParentId: requireCategoryParent(deps.moviesParentDirectoryId ?? input.moviesParentDirectoryId),
         // The film stays obtained only if it was: the old file is still there.
         priorObtained: filmObtained,
+        holdLockOpen: true,
       });
       replacement = result.replacement;
       workflowStatus = result.status;
+      finishLockRun = result.finishLockRun;
     } else {
       const seasons = await syncedSeasons(states, claimed.title.tmdbId, input.syncSeasonMetadata);
       const result = await runReplaceRequestV2AndPersist({
@@ -342,9 +348,11 @@ export async function runQueuedReplaceRequest(
         seasons,
         lockSeasonNumber: lockState.season.seasonNumber,
         lockAuditEvents: claimed.workflowRun.auditEvents,
+        holdLockOpen: true,
       });
       replacement = result.replacement;
       workflowStatus = result.status;
+      finishLockRun = result.finishLockRun;
     }
   } catch (error) {
     // The library stays as it was. The failure is recorded first: whether the run is
@@ -392,75 +400,88 @@ export async function runQueuedReplaceRequest(
     }
   }
 
-  // The run itself succeeded and is saved. What follows is bookkeeping: a failure
-  // here is logged, never turned into a failed run.
-  // A replaced episode's size is its new video file(s) as they lie in the target dir
-  // (a season pack's title carries the whole pack); the title is only a fallback.
-  const results = (replacement?.results ?? []).map((r) => ({
-    ...r,
-    sizeBytes: r.sizeBytes ?? (r.label ? parseSizeFromTitle(r.label) : null),
-  }));
-  const rejectedEpisodes = (replacement?.rejected ?? []).map((r) => r.episode);
-  const film = claimed.title.type === "movie";
-  const outcome = { repository, work, runId, results, messages, pendingRows, rejectedEpisodes, film, now };
+  // The run itself succeeded, but its lock run is still `running` (holdLockOpen): what
+  // follows is part of the run. Until its last write the run is active, so untracking
+  // the work is refused (in_flight) and nothing below can land on a work the user has
+  // just untracked. The terminal record is that last write, in the finally, so a
+  // bookkeeping failure still ends the run. A worker that dies before it (or a terminal
+  // write that fails twice) leaves the run `running`: crash recovery requeues it and the
+  // same run id claims its messages again (the claim is idempotent) — at worst the run
+  // is done twice. The bookkeeping itself is best-effort: a failure is logged, never
+  // turned into a failed run.
   try {
-    await recordReplacementOutcome(outcome);
-  } catch (firstError) {
+    // A replaced episode's size is its new video file(s) as they lie in the target dir
+    // (a season pack's title carries the whole pack); the title is only a fallback.
+    const results = (replacement?.results ?? []).map((r) => ({
+      ...r,
+      sizeBytes: r.sizeBytes ?? (r.label ? parseSizeFromTitle(r.label) : null),
+    }));
+    const rejectedEpisodes = (replacement?.rejected ?? []).map((r) => r.episode);
+    const film = claimed.title.type === "movie";
+    const outcome = { repository, work, runId, results, messages, pendingRows, rejectedEpisodes, film, now };
     try {
       await recordReplacementOutcome(outcome);
-    } catch (error) {
-      // The 待换 rows / episode sources are what bring a not-replaced episode back,
-      // so a reply without them would drop the request for good. Hand the messages
-      // back to the patrol instead (not urgent: a store that keeps failing must not be
-      // hit on every idle tick). The retry run may find the file this run landed and
-      // reject it as "current" — worse than nothing only in that one run, far better
-      // than silently forgetting the episode.
-      console.error(
-        `[user-message] run ${runId} bookkeeping failed twice (the run itself succeeded); messages go back to the patrol: ${String(firstError)} / ${String(error)}`,
-      );
-      if (messages.length > 0) {
-        try {
-          await repository.releaseUserMessages({ runId, now: now(), urgent: false });
-        } catch (releaseError) {
-          console.error(`[user-message] run ${runId} could not release its messages: ${String(releaseError)}`);
-        }
-      }
-      return { status: "ran", workflowRunId: runId, workflowStatus };
-    }
-  }
-  if (messages.length > 0) {
-    const reply: UserMessageReply = {
-      results: results.map((r): ReplacementResult => ({
-        episode: r.episode,
-        outcome: r.outcome,
-        // Only a replaced episode names a resource.
-        ...(r.outcome === "replaced" && r.label !== undefined ? { label: r.label } : {}),
-        ...(r.outcome === "replaced" && r.sizeBytes !== null ? { sizeBytes: r.sizeBytes } : {}),
-        note: r.note,
-      })),
-      oldFiles: replacement?.oldFiles ?? [],
-      runId,
-      ...(replacement?.rejectedPersistFailed ? { rejectedNotSaved: true } : {}),
-      // No episode came out of a TV message without tags: none was worked out from its
-      // words this run (the results, if any, are other messages' or older 待换 episodes),
-      // or no episode at all came out of the run (a movie always has its MOVIE result).
-      // Nothing is kept 待换 for that message, so say so. Releasing the messages instead
-      // would only run the same thing again.
-      ...(results.length === 0 || (untaggedTvMessage && replacement?.identified === false) ? { unidentified: true } : {}),
-    };
-    // One retry: a message left in processing is only released by the idle scan after
-    // the grace period, and then re-run from scratch — a transient hiccup should not cost that.
-    try {
-      await repository.finishUserMessages({ runId, reply, now: now() });
     } catch (firstError) {
       try {
-        await repository.finishUserMessages({ runId, reply, now: now() });
+        await recordReplacementOutcome(outcome);
       } catch (error) {
-        console.error(`[user-message] run ${runId} could not write the reply (retried once): ${String(firstError)} / ${String(error)}`);
+        // The 待换 rows / episode sources are what bring a not-replaced episode back,
+        // so a reply without them would drop the request for good. Hand the messages
+        // back to the patrol instead (not urgent: a store that keeps failing must not be
+        // hit on every idle tick). The retry run may find the file this run landed and
+        // reject it as "current" — worse than nothing only in that one run, far better
+        // than silently forgetting the episode.
+        console.error(
+          `[user-message] run ${runId} bookkeeping failed twice (the run itself succeeded); messages go back to the patrol: ${String(firstError)} / ${String(error)}`,
+        );
+        if (messages.length > 0) {
+          try {
+            await repository.releaseUserMessages({ runId, now: now(), urgent: false });
+          } catch (releaseError) {
+            console.error(`[user-message] run ${runId} could not release its messages: ${String(releaseError)}`);
+          }
+        }
+        return { status: "ran", workflowRunId: runId, workflowStatus };
       }
     }
+    if (messages.length > 0) {
+      const reply: UserMessageReply = {
+        results: results.map((r): ReplacementResult => ({
+          episode: r.episode,
+          outcome: r.outcome,
+          // Only a replaced episode names a resource.
+          ...(r.outcome === "replaced" && r.label !== undefined ? { label: r.label } : {}),
+          ...(r.outcome === "replaced" && r.sizeBytes !== null ? { sizeBytes: r.sizeBytes } : {}),
+          note: r.note,
+        })),
+        oldFiles: replacement?.oldFiles ?? [],
+        runId,
+        ...(replacement?.rejectedPersistFailed ? { rejectedNotSaved: true } : {}),
+        // No episode came out of a TV message without tags: none was worked out from its
+        // words this run (the results, if any, are other messages' or older 待换 episodes),
+        // or no episode at all came out of the run (a movie always has its MOVIE result).
+        // Nothing is kept 待换 for that message, so say so. Releasing the messages instead
+        // would only run the same thing again.
+        ...(results.length === 0 || (untaggedTvMessage && replacement?.identified === false) ? { unidentified: true } : {}),
+      };
+      // One retry: a message left in processing is only released by the idle scan after
+      // the grace period, and then re-run from scratch — a transient hiccup should not cost that.
+      try {
+        await repository.finishUserMessages({ runId, reply, now: now() });
+      } catch (firstError) {
+        try {
+          await repository.finishUserMessages({ runId, reply, now: now() });
+        } catch (error) {
+          console.error(`[user-message] run ${runId} could not write the reply (retried once): ${String(firstError)} / ${String(error)}`);
+        }
+      }
+    }
+    return { status: "ran", workflowRunId: runId, workflowStatus };
+  } finally {
+    // Retried once like the other writes of this run: a run left `running` holds its work
+    // (the patrol, untracking) until crash recovery at the next worker start.
+    await finishLockRun?.().catch(() => finishLockRun?.());
   }
-  return { status: "ran", workflowRunId: runId, workflowStatus };
 }
 
 /** 待换 records and episode sources after a replace run. */

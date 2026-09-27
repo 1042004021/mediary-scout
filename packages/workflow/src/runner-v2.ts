@@ -9,7 +9,9 @@ import type {
   NotificationEvent,
   TrackedSeason,
   WorkflowKind,
+  WorkflowRun,
   WorkflowRunMetadata,
+  WorkflowStatus,
 } from "./domain.js";
 import { runTvAcquisitionV2, type RunTvAcquisitionV2Request } from "./acquisition-v2/run-tv-v2.js";
 import type { BridgedV2Result } from "./acquisition-v2/workflow-v2-bridge.js";
@@ -18,7 +20,7 @@ import { makeAgentTraceSink, combineToolEventSinks } from "./acquisition-v2/agen
 import { runMovieAcquisitionV2, type MovieAcquisitionV2Result, type RunMovieAcquisitionV2Request } from "./movie-workflow-v2.js";
 import type { JevJudge } from "./jev-judge.js";
 import type { ResourceProvider, StorageExecutor } from "./ports.js";
-import type { WorkflowRepository } from "./repository.js";
+import type { PersistWorkflowRunSnapshotInput, WorkflowRepository } from "./repository.js";
 import { userMessageDrive } from "./user-requests.js";
 import { stampReplaceNotification } from "./notification-report.js";
 
@@ -406,10 +408,11 @@ export async function runSeriesInitializationV2AndPersist(
  * threaded to the agent. The episodes to replace stay obtained (the old files are
  * still there), gaps found on the way are filled too.
  *
- * Persistence: the claimed lock run itself becomes the lock season's record and
+ * Persistence: every other season gets a bare `${runId}_s${n}` record with its episode
+ * states only; then the claimed lock run itself becomes the lock season's record and
  * carries the run's evidence + the replacement notification (so the activity page,
- * which follows the lock run id, sees it finish); every other season gets a bare
- * `${runId}_s${n}` record with its episode states only.
+ * which follows the lock run id, sees it finish). With holdLockOpen the lock record is
+ * saved `running` and the caller writes the terminal one last (see HeldLockRun).
  */
 export async function runReplaceRequestV2AndPersist(
   input: TvV2Common & {
@@ -421,8 +424,10 @@ export async function runReplaceRequestV2AndPersist(
     userRequest: NonNullable<RunTvAcquisitionV2Request["userRequest"]>;
     /** How the replacement notification is pushed (see stampReplaceNotification). */
     notice?: ReplaceNotice;
+    /** See HeldLockRun. */
+    holdLockOpen?: boolean;
   },
-): Promise<BridgedV2Result> {
+): Promise<BridgedV2Result & Partial<HeldLockRun>> {
   const now = resolveNow(input);
   const priorObtained = input.seasons.flatMap((entry) =>
     entry.episodes.filter((episode) => episode.obtained).map((episode) => episode.episodeCode),
@@ -461,13 +466,21 @@ export async function runReplaceRequestV2AndPersist(
     ...rejectedLookupOption(input),
   });
 
+  const lock = bridged.seasons.find((entry) => entry.season.seasonNumber === input.lockSeasonNumber);
+  if (!lock) {
+    // Without it the claimed run would never get a record of its own and stay running.
+    throw new Error(`REPLACE_LOCK_SEASON_MISSING: season ${input.lockSeasonNumber} is not among the run's seasons`);
+  }
+  const owner = {
+    ...(input.accountId ? { accountId: input.accountId } : {}),
+    ...(input.connectedStorageId != null ? { connectedStorageId: input.connectedStorageId } : {}),
+  };
   const finishedAt = now();
   for (const seasonResult of bridged.seasons) {
-    const isLock = seasonResult.season.seasonNumber === input.lockSeasonNumber;
-    const runId = isLock ? input.workflowRun.id : `${input.workflowRun.id}_s${seasonResult.season.seasonNumber}`;
+    if (seasonResult === lock) continue;
+    const runId = `${input.workflowRun.id}_s${seasonResult.season.seasonNumber}`;
     await input.repository.saveWorkflowRunSnapshot({
-      ...(input.accountId ? { accountId: input.accountId } : {}),
-      ...(input.connectedStorageId != null ? { connectedStorageId: input.connectedStorageId } : {}),
+      ...owner,
       title: input.title,
       season: seasonResult.season,
       workflowRun: {
@@ -477,16 +490,99 @@ export async function runReplaceRequestV2AndPersist(
         trackedSeasonId: seasonResult.season.id,
         startedAt: input.workflowRun.startedAt,
         finishedAt,
-        auditEvents: isLock ? [...input.lockAuditEvents, ...bridged.auditEvents] : [],
+        auditEvents: [],
       },
       episodes: seasonResult.episodes,
-      resourceSnapshots: isLock ? bridged.resourceSnapshots : [],
-      decisions: isLock ? bridged.decisions : [],
-      transferAttempts: isLock ? bridged.transferAttempts : [],
-      notifications: isLock ? stampNotifications(bridged.notifications, input.notice) : [],
+      resourceSnapshots: [],
+      decisions: [],
+      transferAttempts: [],
+      notifications: [],
     });
   }
-  return bridged;
+  const held = await saveRunRecord(
+    { ...input, now },
+    bridged.status,
+    stampNotifications(bridged.notifications, input.notice),
+    (run, notifications) => ({
+      ...owner,
+      title: input.title,
+      season: lock.season,
+      workflowRun: {
+        ...run,
+        id: input.workflowRun.id,
+        kind: "replace_request",
+        trackedSeasonId: lock.season.id,
+        startedAt: input.workflowRun.startedAt,
+        auditEvents: [...input.lockAuditEvents, ...bridged.auditEvents],
+      },
+      episodes: lock.episodes,
+      resourceSnapshots: bridged.resourceSnapshots,
+      decisions: bridged.decisions,
+      transferAttempts: bridged.transferAttempts,
+      notifications,
+    }),
+  );
+  return { ...bridged, ...held };
+}
+
+/**
+ * holdLockOpen (replace runs): the run's own record is saved with status `running` —
+ * episodes and evidence written, no notification — and finishLockRun writes the
+ * terminal record (status, finishedAt, notification). The caller makes that its very
+ * last write, after the request bookkeeping: while a replace run is active, untracking
+ * its work is refused (in_flight), so nothing the run still has to write can land on a
+ * work the user has just untracked.
+ */
+export interface HeldLockRun {
+  finishLockRun: () => Promise<void>;
+}
+
+/** The run fields a record builder fills in; the builder adds the run's identity. */
+type RunRecordFields = Partial<WorkflowRun> & Pick<WorkflowRun, "status" | "finishedAt">;
+
+/** Saves a run's own record: terminal now, or — holdLockOpen — `running`, with a
+ *  finishLockRun for the terminal one (see HeldLockRun). */
+async function saveRunRecord(
+  input: {
+    repository: WorkflowRepository;
+    accountId?: string;
+    connectedStorageId?: string | null;
+    workflowRun: WorkflowRunMetadata;
+    holdLockOpen?: boolean;
+    now: () => string;
+  },
+  status: WorkflowStatus,
+  notifications: NotificationEvent[],
+  record: (run: RunRecordFields, notifications: NotificationEvent[]) => PersistWorkflowRunSnapshotInput,
+): Promise<Partial<HeldLockRun>> {
+  const terminal = () => input.repository.saveWorkflowRunSnapshot(record({ status, finishedAt: input.now() }, notifications));
+  if (!input.holdLockOpen) {
+    await terminal();
+    return {};
+  }
+  // Saved over the live run: what the claim and the run left on it stay — the
+  // crash-recovery count (the poison-run cap) and the progress the activity page shows.
+  await input.repository.saveWorkflowRunSnapshot(record({ ...(await liveRun(input)), status: "running", finishedAt: null }, []));
+  return { finishLockRun: terminal };
+}
+
+/** The run as stored now. Best-effort: a failed read only loses the fields it would keep. */
+async function liveRun(input: {
+  repository: WorkflowRepository;
+  accountId?: string;
+  connectedStorageId?: string | null;
+  workflowRun: WorkflowRunMetadata;
+}): Promise<Partial<WorkflowRun>> {
+  try {
+    const stored = await input.repository.getWorkflowRunSnapshot(input.workflowRun.id, {
+      accountId: input.accountId ?? DEFAULT_ACCOUNT_ID,
+      connectedStorageId: input.connectedStorageId ?? null,
+    });
+    return stored?.workflowRun ?? {};
+  } catch (error) {
+    console.error(`[user-message] run ${input.workflowRun.id} could not read its live record: ${String(error).slice(0, 300)}`);
+    return {};
+  }
 }
 
 /** See stampReplaceNotification. */
@@ -527,9 +623,11 @@ export async function runMovieAcquisitionV2AndPersist(input: {
   priorObtained?: boolean;
   /** Replace runs: how the notification is pushed (see stampReplaceNotification). */
   notice?: ReplaceNotice;
+  /** Replace runs: see HeldLockRun. */
+  holdLockOpen?: boolean;
   /** See TvV2Common.now — finishedAt is stamped post-run from this clock. */
   now?: () => string;
-}): Promise<MovieAcquisitionV2Result> {
+}): Promise<MovieAcquisitionV2Result & Partial<HeldLockRun>> {
   const now = resolveNow(input);
   const result = await runMovieAcquisitionV2({
     title: input.title,
@@ -560,25 +658,24 @@ export async function runMovieAcquisitionV2AndPersist(input: {
     ...memoryOption(input),
   });
 
-  await input.repository.saveWorkflowRunSnapshot({
+  const held = await saveRunRecord({ ...input, now }, result.status, stampNotifications(result.notifications, input.notice), (run, notifications) => ({
     ...(input.accountId ? { accountId: input.accountId } : {}),
     ...(input.connectedStorageId != null ? { connectedStorageId: input.connectedStorageId } : {}),
     title: input.title,
     season: result.season,
     workflowRun: {
+      ...run,
       id: input.workflowRun.id,
       kind: input.userRequest ? "replace_request" : "movie_init",
-      status: result.status,
       trackedSeasonId: result.season.id,
       startedAt: input.workflowRun.startedAt,
-      finishedAt: now(),
       auditEvents: result.auditEvents,
     },
     episodes: result.episodes,
     resourceSnapshots: result.resourceSnapshots,
     decisions: result.decisions,
     transferAttempts: result.transferAttempts,
-    notifications: stampNotifications(result.notifications, input.notice),
-  });
-  return result;
+    notifications,
+  }));
+  return { ...result, ...held };
 }
