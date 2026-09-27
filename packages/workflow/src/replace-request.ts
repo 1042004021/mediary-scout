@@ -262,17 +262,16 @@ export async function runQueuedReplaceRequest(
 
     const requested = [...new Set([...messages.flatMap((m) => m.episodeTags), ...pending])].filter(inScope);
     const requestedEpisodes = movie && requested.length === 0 ? ["MOVIE"] : requested;
-    // Prompt/link enrichment only — fail open (logged): the sandbox still requires
-    // rejectCurrentSource from the files' own name + size, so an empty list is safe,
-    // and a transient error (or an older DB without these tables) must not fail the run.
-    const rejected = await repository.listRejectedResources({ accountId: work.accountId, titleKey: work.titleKey }).catch((error: unknown) => {
-      console.error(`[user-message] run ${runId} could not read rejected resources: ${String(error).slice(0, 300)}`);
-      return [];
-    });
-    sources = await repository.listEpisodeSources(work).catch((error: unknown) => {
-      console.error(`[user-message] run ${runId} could not read episode sources: ${String(error).slice(0, 300)}`);
-      return [];
-    });
+    // Fail closed: the rejected list and the recorded source links are what keep a
+    // rejected source from being landed again (by name + size, and by link — a copy
+    // renamed and shared under the same link has only the link to go on). Without
+    // them the run could re-land the very file the user rejected, so a read error
+    // fails the run through the normal failure path (a transient error retries, a
+    // final one hands the messages to the patrol). The tables are created at startup,
+    // so this is a real outage, not an older database. Ordinary runs keep their
+    // rejected-list read fail-open (runner-v2 rejectedLookupOption).
+    const rejected = await repository.listRejectedResources({ accountId: work.accountId, titleKey: work.titleKey });
+    sources = await repository.listEpisodeSources(work);
     const userRequest: UserRequest = {
       requestedEpisodes,
       prompt: {

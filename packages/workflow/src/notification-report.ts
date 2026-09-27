@@ -282,7 +282,9 @@ export function buildReplacementReport(input: {
 }): NotificationReport {
   const replaced = input.results.filter((r) => r.outcome === "replaced").map((r) => r.episode);
   const pending = input.results.filter((r) => r.outcome === "not_found").map((r) => r.episode);
-  const newlyObtained = input.newlyObtained ?? [];
+  // An episode the user asked for that had no old file was a gap before the run, so it
+  // also shows up as newly obtained — it is news once, as 换好, never also as 新增.
+  const newlyObtained = (input.newlyObtained ?? []).filter((code) => !replaced.includes(code));
   const base = {
     titleName: input.titleName,
     seasonLabel: null,

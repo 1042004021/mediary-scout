@@ -1054,7 +1054,7 @@ describe("runQueuedReplaceRequest — scope, metadata and bookkeeping", () => {
   });
 
   for (const failing of ["listRejectedResources", "listEpisodeSources"] as const) {
-    it(`a failing ${failing} read does not fail the replace run (enrichment fails open)`, async () => {
+    it(`a failing ${failing} read fails the replace run closed: no agent, no reply, the message waits for the patrol`, async () => {
       const { repository, title, season } = await trackedShow();
       const storage = new FakeStorageExecutor();
       await seedV2Season(storage, title, season, ["S01E01", "S01E02"]);
@@ -1067,11 +1067,12 @@ describe("runQueuedReplaceRequest — scope, metadata and bookkeeping", () => {
 
       const result = await runQueuedReplaceRequest(baseRun(repository, storage, reportingModel(["S01E01"], seen)));
 
-      expect(result).toMatchObject({ status: "ran", workflowRunId: `run_rr_${failing}` });
-      // The agent really ran as a replace run …
-      expect(seen.prompt).toContain("call reportReplacement for every requested episode");
-      // … and the message finished instead of going back as urgent.
-      expect((await repository.listUserMessages(WORK))[0]).toMatchObject({ id: message.id, status: "done", runId: `run_rr_${failing}` });
+      // Without the rejected list / the recorded source links the run could re-land the
+      // very source the user rejected, so it does not run the agent at all …
+      expect(result).toMatchObject({ status: "failed", workflowRunId: `run_rr_${failing}` });
+      expect(seen.prompt).toBeUndefined();
+      // … and the message goes back unanswered, for the next patrol (a final failure).
+      expect((await repository.listUserMessages(WORK))[0]).toMatchObject({ id: message.id, status: "pending", urgent: false, reply: null });
     });
   }
 

@@ -436,6 +436,19 @@ describe("buildReplacementReport — a user-requested replace run", () => {
     expect(report.lines).toEqual(["换好 2 集（S01E02、S02E05）"]);
   });
 
+  it("an episode the user asked for that had no old file is 换好, not also 新增; a real gap still is 新增", () => {
+    // E13 was declared file-less, so it was in the pre-run missing set and lands in
+    // newlyObtained too; E14 is a genuinely new episode.
+    const report = buildReplacementReport({
+      titleName: "黄泉使者",
+      movie: false,
+      results: [{ episode: "S01E13", outcome: "replaced" }],
+      newlyObtained: ["S01E13", "S01E14"],
+    });
+    expect(report.lines).toEqual(["换好 1 集（E13）", "新增 E14"]);
+    expect(report.newlyObtained).toEqual(["S01E14"]);
+  });
+
   it("a movie: replaced vs still looking", () => {
     expect(buildReplacementReport({ titleName: "奥德赛", movie: true, results: [{ episode: "MOVIE", outcome: "replaced" }] })).toMatchObject({
       status: "replaced",
