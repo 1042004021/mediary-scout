@@ -58,13 +58,14 @@ function memoryDrive(seed: { dirs: Dir[]; files?: StoredFile[] }) {
       return { removed: true as const };
     },
   };
-  return { executor, removed, dirs };
+  return { executor, removed, dirs, files };
 }
 
 function drive(partial: Partial<StagingJanitorDrive> & Pick<StagingJanitorDrive, "storageId" | "executor">): StagingJanitorDrive {
   return {
     accountId: "acct",
     status: "active",
+    provider: "pan115",
     tvCid: "tv",
     animeCid: null,
     ...partial,
@@ -160,10 +161,9 @@ describe("sweepOrphanStagingDirs", () => {
       (note) => note.kind === "staging_leftover",
     );
     expect(notes).toHaveLength(1);
-    expect(notes[0]?.title).toContain("Show A");
-    expect(notes[0]?.body).toContain("staging-run-full");
-    expect(notes[0]?.body).toContain("2");
-    expect(notes[0]?.body).toContain("3 MB");
+    expect(notes[0]?.title).toBe("网盘暂存目录残留（1 个）");
+    expect(notes[0]?.body).toContain("Show A / staging-run-full：2 个文件，3 MB");
+    expect(notes[0]?.body).toContain("这些文件不在季目录里，请到网盘手动处理。");
 
     const tracked = await repo.listTrackedSeasonStates("acct");
     expect(tracked.some((state) => state.title.id.startsWith("staging-janitor"))).toBe(false);
@@ -232,6 +232,154 @@ describe("sweepOrphanStagingDirs", () => {
     });
     expect(disk.removed).toEqual([]);
     expect(disk.dirs.some((dir) => dir.id === "stg-empty")).toBe(true);
+  });
+
+  it("reports every newly found non-empty orphan of one drive in a single notification", async () => {
+    const repo = new InMemoryWorkflowRepository();
+    const disk = memoryDrive({
+      dirs: [
+        { id: "tv", name: "TV", parentId: "root" },
+        { id: "showA", name: "Show A", parentId: "tv" },
+        { id: "stg-a", name: "staging-run-a", parentId: "showA" },
+        { id: "showB", name: "Show B", parentId: "tv" },
+        { id: "stg-b", name: "staging-run-b", parentId: "showB" },
+      ],
+      files: [
+        { dirId: "stg-a", path: "a.mkv", providerFileId: "a", sizeBytes: 2 * 1024 * 1024 },
+        { dirId: "stg-b", path: "b.mkv", providerFileId: "b", sizeBytes: 1024 * 1024 },
+      ],
+    });
+    const good = drive({ storageId: "drive-batch", executor: disk.executor });
+    await sweepOrphanStagingDirs({ repository: repo, drives: [good], now: "2026-09-27T03:00:00.000Z" });
+    const first = (await repo.listNotifications({ accountId: "acct" })).filter((note) => note.kind === "staging_leftover");
+    expect(first).toHaveLength(1);
+    expect(first[0]?.title).toBe("网盘暂存目录残留（2 个）");
+    expect(first[0]?.body).toContain("Show A / staging-run-a：1 个文件，2 MB");
+    expect(first[0]?.body).toContain("Show B / staging-run-b：1 个文件，1 MB");
+    expect(first[0]?.id).toContain("2026-09-27T03:00:00.000Z");
+
+    disk.dirs.push({ id: "showC", name: "Show C", parentId: "tv" }, { id: "stg-c", name: "staging-run-c", parentId: "showC" });
+    disk.files.push({ dirId: "stg-c", path: "c.mkv", providerFileId: "c", sizeBytes: 1024 * 1024 });
+    await sweepOrphanStagingDirs({ repository: repo, drives: [good], now: "2026-09-28T03:00:00.000Z" });
+    const all = (await repo.listNotifications({ accountId: "acct" })).filter((note) => note.kind === "staging_leftover");
+    expect(all).toHaveLength(2);
+    const second = all.find((note) => note.id.includes("2026-09-28"));
+    expect(second?.title).toBe("网盘暂存目录残留（1 个）");
+    expect(second?.body).toContain("Show C / staging-run-c");
+    expect(second?.body).not.toContain("Show A");
+    expect(second?.body).not.toContain("Show B");
+  });
+
+  it("folds more than ten directories into one notice with a total line", async () => {
+    const repo = new InMemoryWorkflowRepository();
+    const dirs: Array<{ id: string; name: string; parentId: string }> = [{ id: "tv", name: "TV", parentId: "root" }];
+    const files: Array<{ dirId: string; path: string; providerFileId: string; sizeBytes: number }> = [];
+    for (let n = 1; n <= 11; n += 1) {
+      const showId = `show-${n}`;
+      const stgId = `stg-${n}`;
+      dirs.push({ id: showId, name: `S${String(n).padStart(2, "0")}`, parentId: "tv" });
+      dirs.push({ id: stgId, name: `staging-run-${n}`, parentId: showId });
+      files.push({ dirId: stgId, path: "a.mkv", providerFileId: `f-${n}`, sizeBytes: 1024 * 1024 });
+    }
+    const disk = memoryDrive({ dirs, files });
+    await sweepOrphanStagingDirs({
+      repository: repo,
+      drives: [drive({ storageId: "drive-many", executor: disk.executor })],
+      now: NOW,
+    });
+    const [note] = (await repo.listNotifications({ accountId: "acct" })).filter((item) => item.kind === "staging_leftover");
+    expect(note?.title).toBe("网盘暂存目录残留（11 个）");
+    expect(note?.body).toContain("S01 / staging-run-1：1 个文件，1 MB");
+    expect(note?.body).toContain("S10 / staging-run-10：1 个文件，1 MB");
+    expect(note?.body).not.toContain("S11 /");
+    expect(note?.body).toContain("…等共 11 个目录，合计 11 MB");
+    expect(note?.body).toContain("这些文件不在季目录里，请到网盘手动处理。");
+  });
+
+  it("spaces pan123 calls by 1500ms and does not space other brands", async () => {
+    let now = 0;
+    const sleeps: number[] = [];
+    const clock = {
+      now: () => now,
+      sleep: async (ms: number) => {
+        sleeps.push(ms);
+        now += ms;
+      },
+    };
+    function timed(label: string) {
+      const times: number[] = [];
+      return {
+        times,
+        executor: {
+          async listChildDirectories(parentId: string) {
+            times.push(now);
+            if (parentId === "tv") return [{ id: "show", name: label }];
+            return [{ id: "stg", name: "staging-old" }];
+          },
+          async listTree() {
+            times.push(now);
+            return [];
+          },
+          async removeDirectory(id: string) {
+            times.push(now);
+            return { removed: id.length > 0 };
+          },
+        },
+      };
+    }
+    const pan123 = timed("123");
+    const pan115 = timed("115");
+    const repo = new InMemoryWorkflowRepository();
+    await sweepOrphanStagingDirs({
+      repository: repo,
+      now: NOW,
+      clock,
+      drives: [
+        drive({ storageId: "d123", provider: "pan123", executor: pan123.executor }),
+        drive({ storageId: "d115", provider: "pan115", executor: pan115.executor }),
+      ],
+    });
+    // category list, show list, listTree, removeDirectory — three gaps.
+    expect(pan123.times.slice(1).map((time, index) => time - pan123.times[index]!)).toEqual([1500, 1500, 1500]);
+    expect(pan115.times.every((time) => time === pan115.times[0])).toBe(true);
+    expect(sleeps).toEqual([1500, 1500, 1500]);
+  });
+
+  it("resumes a cut-short walk at the show that threw, and clears the cursor after a full walk", async () => {
+    const repo = new InMemoryWorkflowRepository();
+    let failShowB = true;
+    const visited: string[] = [];
+    const executor = {
+      async listChildDirectories(parentId: string) {
+        if (parentId === "tv") {
+          return [
+            { id: "showA", name: "A" },
+            { id: "showB", name: "B" },
+            { id: "showC", name: "C" },
+          ];
+        }
+        visited.push(parentId);
+        if (parentId === "showB" && failShowB) {
+          throw new Error("budget exhausted");
+        }
+        return [];
+      },
+      async listTree() {
+        return [];
+      },
+      async removeDirectory() {
+        return { removed: true };
+      },
+    };
+    const target = drive({ storageId: "drive-resume", executor });
+    await sweepOrphanStagingDirs({ repository: repo, drives: [target], now: NOW });
+    expect(visited).toEqual(["showA", "showB"]);
+    expect(await repo.getAccountSetting("acct", "staging_janitor_cursor:drive-resume")).toBe("showB");
+
+    failShowB = false;
+    await sweepOrphanStagingDirs({ repository: repo, drives: [target], now: "2026-09-28T03:00:00.000Z" });
+    expect(visited).toEqual(["showA", "showB", "showB", "showC"]);
+    expect(await repo.getAccountSetting("acct", "staging_janitor_cursor:drive-resume")).toBe("");
   });
 
   it("does not touch a drive whose executor cannot list and remove", async () => {

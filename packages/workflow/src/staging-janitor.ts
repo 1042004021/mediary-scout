@@ -9,9 +9,44 @@ export interface StagingJanitorDrive {
   accountId: string;
   storageId: string;
   status: "active" | "frozen";
+  /** Drive brand. pan123 listings are spaced; other brands are not (115 paces itself). */
+  provider: string;
   tvCid: string | null;
   animeCid: string | null;
   executor: Partial<Pick<StorageExecutor, "listChildDirectories" | "listTree" | "removeDirectory">>;
+}
+
+export interface StagingJanitorClock {
+  now(): number;
+  sleep(ms: number): Promise<void>;
+}
+
+const PAN123_MIN_INTERVAL_MS = 1500;
+
+const realtimeClock: StagingJanitorClock = {
+  now: () => Date.now(),
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+};
+
+function minIntervalMs(provider: string): number {
+  return provider === "pan123" ? PAN123_MIN_INTERVAL_MS : 0;
+}
+
+/** Start-to-start gap. The first call does not wait. gap 0 never sleeps. */
+function pacerFor(gapMs: number, clock: StagingJanitorClock): <T>(run: () => Promise<T>) => Promise<T> {
+  let last = Number.NEGATIVE_INFINITY;
+  return async function pace<T>(run: () => Promise<T>): Promise<T> {
+    if (gapMs > 0 && Number.isFinite(last)) {
+      const wait = gapMs - (clock.now() - last);
+      if (wait > 0) {
+        await clock.sleep(wait);
+      }
+    }
+    if (gapMs > 0) {
+      last = clock.now();
+    }
+    return run();
+  };
 }
 
 type SweepRepository = Pick<
@@ -39,6 +74,32 @@ function reportedToken(storageId: string, directoryId: string): string {
   return `${storageId}:${directoryId}`;
 }
 
+function cursorKey(storageId: string): string {
+  return `staging_janitor_cursor:${storageId}`;
+}
+
+interface Leftover {
+  showName: string;
+  directoryId: string;
+  directoryName: string;
+  fileCount: number;
+  totalBytes: number;
+}
+
+const ADVICE = "这些文件不在季目录里，请到网盘手动处理。";
+
+function leftoverBody(items: Leftover[]): string {
+  const lines = items
+    .slice(0, 10)
+    .map((item) => `${item.showName} / ${item.directoryName}：${item.fileCount} 个文件，${formatBytes(item.totalBytes)}`);
+  if (items.length > 10) {
+    const totalBytes = items.reduce((sum, item) => sum + item.totalBytes, 0);
+    lines.push(`…等共 ${items.length} 个目录，合计 ${formatBytes(totalBytes)}`);
+  }
+  lines.push(ADVICE);
+  return lines.join("\n");
+}
+
 async function loadReported(repository: SweepRepository, accountId: string): Promise<Set<string>> {
   const raw = await repository.getAccountSetting(accountId, REPORTED_SETTING_KEY);
   if (!raw) {
@@ -59,27 +120,27 @@ async function saveReported(repository: SweepRepository, accountId: string, ids:
   await repository.setAccountSetting(accountId, REPORTED_SETTING_KEY, JSON.stringify([...ids].sort()));
 }
 
-async function recordLeftover(
+/** One notice for every newly found non-empty orphan of this drive. Returns how
+ *  many directories it remembered. A duplicate sweep id writes nothing. */
+async function recordLeftovers(
   repository: SweepRepository,
   drive: StagingJanitorDrive,
-  showName: string,
-  directoryId: string,
-  directoryName: string,
-  fileCount: number,
-  totalBytes: number,
+  items: Leftover[],
+  reported: Set<string>,
   now: string,
-): Promise<void> {
+): Promise<number> {
+  if (items.length === 0) {
+    return 0;
+  }
   const runId = `staging-janitor:${drive.storageId}`;
   const seasonId = `staging-janitor-season:${drive.storageId}`;
   const titleId = `staging-janitor-title:${drive.storageId}`;
   const notification: NotificationEvent = {
-    id: `staging_leftover:${drive.storageId}:${directoryId}`,
+    id: `staging_leftover:${drive.storageId}:${now}`,
     workflowRunId: runId,
     kind: "staging_leftover",
-    title: showName,
-    body:
-      `${showName} 的暂存目录 ${directoryName} 还有 ${fileCount} 个文件（${formatBytes(totalBytes)}），没有删除。` +
-      "这些文件不在季目录里，请到网盘手动处理。",
+    title: `网盘暂存目录残留（${items.length} 个）`,
+    body: leftoverBody(items),
     createdAt: now,
     trigger: "user",
   };
@@ -87,75 +148,95 @@ async function recordLeftover(
     accountId: drive.accountId,
     connectedStorageId: drive.storageId,
   });
+  if (existing?.notifications.some((item) => item.id === notification.id)) {
+    return 0;
+  }
   if (existing) {
-    if (existing.notifications.some((item) => item.id === notification.id)) {
-      return;
-    }
     await repository.saveWorkflowRunSnapshot({
       ...existing,
       notifications: [...existing.notifications, notification],
     });
-    return;
+  } else {
+    await repository.saveWorkflowRunSnapshot({
+      accountId: drive.accountId,
+      connectedStorageId: drive.storageId,
+      title: {
+        id: titleId,
+        tmdbId: 0,
+        type: "tv",
+        title: "暂存残留",
+        originalTitle: "",
+        year: 0,
+        aliases: [],
+      },
+      season: {
+        id: seasonId,
+        mediaTitleId: titleId,
+        seasonNumber: 0,
+        status: "completed",
+        qualityPreference: "",
+        storageDirectoryId: "",
+        totalEpisodes: 0,
+        latestAiredEpisode: 0,
+        latestAiredSource: "unknown",
+      },
+      workflowRun: {
+        id: runId,
+        kind: "type3_monitor",
+        status: "reserved",
+        trackedSeasonId: seasonId,
+        startedAt: now,
+        finishedAt: null,
+        auditEvents: [],
+      },
+      episodes: [],
+      resourceSnapshots: [],
+      decisions: [],
+      transferAttempts: [],
+      notifications: [notification],
+    });
   }
-  await repository.saveWorkflowRunSnapshot({
-    accountId: drive.accountId,
-    connectedStorageId: drive.storageId,
-    title: {
-      id: titleId,
-      tmdbId: 0,
-      type: "tv",
-      title: "暂存残留",
-      originalTitle: "",
-      year: 0,
-      aliases: [],
-    },
-    season: {
-      id: seasonId,
-      mediaTitleId: titleId,
-      seasonNumber: 0,
-      status: "completed",
-      qualityPreference: "",
-      storageDirectoryId: "",
-      totalEpisodes: 0,
-      latestAiredEpisode: 0,
-      latestAiredSource: "unknown",
-    },
-    workflowRun: {
-      id: runId,
-      kind: "type3_monitor",
-      status: "reserved",
-      trackedSeasonId: seasonId,
-      startedAt: now,
-      finishedAt: null,
-      auditEvents: [],
-    },
-    episodes: [],
-    resourceSnapshots: [],
-    decisions: [],
-    transferAttempts: [],
-    notifications: [notification],
-  });
+  for (const item of items) {
+    reported.add(reportedToken(drive.storageId, item.directoryId));
+  }
+  await saveReported(repository, drive.accountId, reported);
+  return items.length;
 }
 
 async function sweepDrive(
   drive: StagingJanitorDrive,
   repository: SweepRepository,
   now: string,
+  clock: StagingJanitorClock,
 ): Promise<{ removed: number; reported: number }> {
   if (drive.status !== "active" || !canSweep(drive.executor)) {
     return { removed: 0, reported: 0 };
   }
   const executor = drive.executor;
+  const pace = pacerFor(minIntervalMs(drive.provider), clock);
   const reported = await loadReported(repository, drive.accountId);
+  const pending: Leftover[] = [];
   let removed = 0;
-  let newlyReported = 0;
+
+  const shows: Array<{ id: string; name: string }> = [];
   for (const categoryId of [drive.tvCid, drive.animeCid]) {
     if (!categoryId) {
       continue;
     }
-    const shows = await executor.listChildDirectories(categoryId);
-    for (const show of shows) {
-      const children = await executor.listChildDirectories(show.id);
+    // A category listing that throws has no show id. Leave the previous cursor.
+    shows.push(...(await pace(() => executor.listChildDirectories(categoryId))));
+  }
+
+  const savedCursor = await repository.getAccountSetting(drive.accountId, cursorKey(drive.storageId));
+  const cursorIndex = savedCursor ? shows.findIndex((show) => show.id === savedCursor) : -1;
+  const start = cursorIndex < 0 ? 0 : cursorIndex;
+
+  const flush = (): Promise<number> => recordLeftovers(repository, drive, pending.splice(0), reported, now);
+
+  for (let index = start; index < shows.length; index += 1) {
+    const show = shows[index]!;
+    try {
+      const children = await pace(() => executor.listChildDirectories(show.id));
       for (const child of children) {
         const runId = stagingRunId(child.name);
         if (!runId) {
@@ -165,49 +246,61 @@ async function sweepDrive(
         if (snapshot && isActiveWorkflowStatus(snapshot.workflowRun.status)) {
           continue;
         }
-        const tree = await executor.listTree({ directoryId: child.id });
+        const tree = await pace(() => executor.listTree({ directoryId: child.id }));
         if (tree.length === 0) {
-          const result = await executor.removeDirectory(child.id);
+          const result = await pace(() => executor.removeDirectory(child.id));
           if (result.removed) {
             removed += 1;
           }
           continue;
         }
-        const token = reportedToken(drive.storageId, child.id);
-        if (reported.has(token)) {
+        if (reported.has(reportedToken(drive.storageId, child.id))) {
           continue;
         }
         const totalBytes = tree.reduce((sum, file) => sum + (Number.isFinite(file.sizeBytes) ? file.sizeBytes : 0), 0);
-        await recordLeftover(repository, drive, show.name, child.id, child.name, tree.length, totalBytes, now);
-        reported.add(token);
-        await saveReported(repository, drive.accountId, reported);
-        newlyReported += 1;
+        pending.push({
+          showName: show.name,
+          directoryId: child.id,
+          directoryName: child.name,
+          fileCount: tree.length,
+          totalBytes,
+        });
       }
+    } catch (error) {
+      await repository.setAccountSetting(drive.accountId, cursorKey(drive.storageId), show.id);
+      await flush();
+      throw error;
     }
   }
+
+  const newlyReported = await flush();
+  await repository.setAccountSetting(drive.accountId, cursorKey(drive.storageId), "");
   return { removed, reported: newlyReported };
 }
 
 /**
  * Daily-patrol pass over leftover `staging-<runId>` dirs. Empty orphans (the run
  * is not queued/running — missing counts) are removed. Non-empty ones are kept
- * and reported once per directory: a prior run may have marked those episodes
- * obtained while the files never left staging.
+ * and reported once per drive per sweep: a prior run may have marked those
+ * episodes obtained while the files never left staging.
  *
- * ponytail: one fresh executor per drive, so the 115 guard starts at zero. A
- * library whose show walk exceeds the agent wall stops that drive for today and
- * the next patrol starts from the top. Sequential on purpose.
+ * ponytail: one fresh executor per drive, so the 115 guard still caps a single
+ * sweep (~295 listings). A listing throw stores `staging_janitor_cursor:<storageId>`
+ * (the show dir id) and the next sweep continues there. pan123 calls are spaced
+ * 1500ms; other brands are not. Sequential on purpose.
  */
 export async function sweepOrphanStagingDirs(input: {
   repository: SweepRepository;
   drives: StagingJanitorDrive[];
   now: string;
+  clock?: StagingJanitorClock;
   log?: (line: string) => void;
 }): Promise<void> {
   const log = input.log ?? ((line: string) => console.log(line));
+  const clock = input.clock ?? realtimeClock;
   for (const drive of input.drives) {
     try {
-      const counts = await sweepDrive(drive, input.repository, input.now);
+      const counts = await sweepDrive(drive, input.repository, input.now, clock);
       log(
         `[patrol] staging janitor ${drive.storageId}: removed ${counts.removed} empty, reported ${counts.reported} non-empty`,
       );

@@ -102,6 +102,7 @@ export interface StagingLeak {
  *  and transient-error classification keep working (Copilot #260 r1). */
 const STAGING_LEAKS = Symbol.for("media-track.stagingLeaks");
 const STAGING_CLEANUP_UNVERIFIED = Symbol.for("media-track.stagingCleanupUnverified");
+const STAGING_KEPT_UNMOVED = Symbol.for("media-track.stagingKeptUnmoved");
 
 /** Removal failed and we could not read the show dir back to see if staging is
  *  still there. Distinct from a confirmed leak. */
@@ -166,12 +167,54 @@ export function stagingCleanupUnverifiedAuditEvent(event: StagingCleanupUnverifi
   };
 }
 
-/** Leaks and unverified cleanups, in that order. The failure persist sites
- *  (worker) record both or they record neither. */
+/** Staging was left in place because a move failed and those files never reached
+ *  a season dir (and were not deleted). */
+export interface StagingKeptUnmoved {
+  stagingDirectoryId: string;
+  showDirectoryId: string;
+  fileCount: number;
+}
+
+export function attachStagingKeptUnmoved<E>(error: E, events: StagingKeptUnmoved[]): E {
+  if (events.length > 0 && typeof error === "object" && error !== null) {
+    const prior = stagingKeptUnmovedOf(error);
+    Object.defineProperty(error, STAGING_KEPT_UNMOVED, {
+      value: [...prior, ...events],
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
+  }
+  return error;
+}
+
+export function stagingKeptUnmovedOf(error: unknown): StagingKeptUnmoved[] {
+  if (typeof error !== "object" || error === null) {
+    return [];
+  }
+  const events = (error as Record<symbol, unknown>)[STAGING_KEPT_UNMOVED];
+  return Array.isArray(events) ? (events as StagingKeptUnmoved[]) : [];
+}
+
+export function stagingKeptAuditEvent(event: StagingKeptUnmoved): AuditEvent {
+  return {
+    type: "staging_kept_unmoved_files",
+    message: `staging 目录里还有 ${event.fileCount} 个移动失败、没进季目录的文件，已保留不删：${event.stagingDirectoryId}`,
+    data: {
+      stagingDirectoryId: event.stagingDirectoryId,
+      showDirectoryId: event.showDirectoryId,
+      fileCount: event.fileCount,
+    },
+  };
+}
+
+/** Leaks, unverified cleanups, then dirs kept because a move failed. The failure
+ *  persist sites (worker) record all of them or they record none. */
 export function stagingFailureAuditEvents(error: unknown): AuditEvent[] {
   return [
     ...stagingLeaksOf(error).map((leak) => stagingLeakAuditEvent(leak)),
     ...stagingCleanupUnverifiedOf(error).map((event) => stagingCleanupUnverifiedAuditEvent(event)),
+    ...stagingKeptUnmovedOf(error).map((event) => stagingKeptAuditEvent(event)),
   ];
 }
 
@@ -204,6 +247,10 @@ export async function withStagingCleanup<T>(
     /** Removal failed and the show dir could not be read back. Same role as onLeak
      *  for the success path; the throw path also rides on the error. */
     onCleanupUnverified?: (event: StagingCleanupUnverified) => void;
+    /** Non-null: files whose move failed are still only in staging. Do not remove
+     *  the dir (a kept dir would also look like a leak, so skip the read-back). */
+    keep?: () => { fileCount: number } | null;
+    onKept?: (event: StagingKeptUnmoved) => void;
   },
   run: () => Promise<T>,
 ): Promise<T> {
@@ -217,6 +264,19 @@ export async function withStagingCleanup<T>(
     throw error;
   } finally {
     const cleanup = async (): Promise<void> => {
+      const kept = args.keep?.() ?? null;
+      if (kept) {
+        const event: StagingKeptUnmoved = {
+          stagingDirectoryId: args.stagingDirectoryId,
+          showDirectoryId: args.parentDirectoryId ?? "",
+          fileCount: kept.fileCount,
+        };
+        args.onKept?.(event);
+        if (threw) {
+          attachStagingKeptUnmoved(bodyError, [event]);
+        }
+        return;
+      }
       let removalFailed = false;
       let removalError: unknown;
       try {

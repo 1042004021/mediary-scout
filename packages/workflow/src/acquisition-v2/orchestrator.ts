@@ -137,6 +137,9 @@ export interface RunAcquisitionV2Request {
       add: (rows: Array<{ episode: string; linkKey: string | null; label: string; sizeBytes: number | null; reason: string }>) => Promise<void>;
     };
   };
+  /** Filled with the sandbox reader as soon as the sandbox exists, including when
+   *  the agent loop later throws. The harness cleanup reads it from `finally`. */
+  unmovedStaging?: { read: (() => string[]) | null };
 }
 
 /** The persistable trace of a V2 run, in the same shape the old serial path
@@ -472,6 +475,9 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
         }
       : {}),
   });
+  if (request.unmovedStaging) {
+    request.unmovedStaging.read = () => sandbox.unmovedStagingFileIds();
+  }
   // Replace run (or protected existing files): record every file already in the target dirs
   // BEFORE anything can touch them. Not best-effort — the protection is the whole
   // safety story, so a failing listing fails the run.

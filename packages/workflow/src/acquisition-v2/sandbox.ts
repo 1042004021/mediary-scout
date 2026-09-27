@@ -413,6 +413,10 @@ export class TaskSandbox {
    *  backs one episode: E24 can never be reported replaced by E13's file. A backing file
    *  can no longer be deleted this run (see deleteFiles). */
   private readonly fileBackedEpisode = new Map<string, string>();
+  /** Ids from a moveToSeason that threw MOVE_NOT_DONE and that a later successful
+   *  move or deleteFiles has not cleared. The harness reads this and will not
+   *  delete staging while it is non-empty — those files may be the only copies. */
+  private readonly unmovedFileIds = new Set<string>();
 
   constructor(options: TaskSandboxOptions) {
     this.provider = options.provider;
@@ -1046,7 +1050,16 @@ export class TaskSandbox {
         if (moved.moved.length !== move.fileIds.length) {
           throw new Error(`moveFiles moved ${moved.moved.length} of ${move.fileIds.length}`);
         }
+        for (const fileId of move.fileIds) {
+          this.unmovedFileIds.delete(fileId);
+        }
       } catch (error) {
+        // The whole batch stays "unmoved". A partial moveFiles still leaves the
+        // already-moved ids here until a later full move or deleteFiles clears them;
+        // keeping the dir is the safe side of that ambiguity.
+        for (const fileId of move.fileIds) {
+          this.unmovedFileIds.add(fileId);
+        }
         const reason = error instanceof Error ? error.message : String(error);
         throw new Error(
           `MOVE_NOT_DONE: these files did NOT move (${move.fileIds.join(", ")}). Do not markObtained their episodes this run — they are still only in staging. ${reason}`,
@@ -1091,7 +1104,15 @@ export class TaskSandbox {
     }
     const { deleted } = await this.storage.deleteFiles({ directoryId, fileIds: input.fileIds });
     this.markThrown(deleted);
+    for (const fileId of deleted) {
+      this.unmovedFileIds.delete(fileId);
+    }
     return { deleted, directory: await this.storage.listTree({ directoryId }) };
+  }
+
+  /** File ids still only in staging because their move failed. Read-only. */
+  unmovedStagingFileIds(): string[] {
+    return [...this.unmovedFileIds];
   }
 
   /** Record the episodes the agent declares obtained — the agent's FINAL action,

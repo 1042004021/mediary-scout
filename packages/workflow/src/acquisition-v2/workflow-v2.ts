@@ -5,9 +5,11 @@ import type { AuditEvent } from "../domain.js";
 import {
   ensureSeasonAcquisitionDirectories,
   stagingCleanupUnverifiedAuditEvent,
+  stagingKeptAuditEvent,
   stagingLeakAuditEvent,
   withStagingCleanup,
   type StagingCleanupUnverified,
+  type StagingKeptUnmoved,
   type StagingLeak,
   type AcquisitionDirectories,
 } from "./directory-lifecycle.js";
@@ -123,6 +125,10 @@ export async function runAcquisitionV2Workflow(
   // `staging_leaked` audit event instead of vanishing behind {removed:true}.
   const leaks: StagingLeak[] = [];
   const unverified: StagingCleanupUnverified[] = [];
+  const kept: StagingKeptUnmoved[] = [];
+  // Assigned inside runAcquisitionV2 the moment the sandbox exists, so a throw
+  // from the agent loop still lets this finally see files whose move failed.
+  const unmovedStaging: { read: (() => string[]) | null } = { read: null };
   const result = await withStagingCleanup(
     {
       executor: request.executor,
@@ -130,6 +136,11 @@ export async function runAcquisitionV2Workflow(
       parentDirectoryId: directories.showDirectoryId,
       onLeak: (leak) => leaks.push(leak),
       onCleanupUnverified: (event) => unverified.push(event),
+      keep: () => {
+        const fileCount = unmovedStaging.read?.().length ?? 0;
+        return fileCount > 0 ? { fileCount } : null;
+      },
+      onKept: (event) => kept.push(event),
     },
     async () => {
   const seasonsForSync = request.seasons.map((season) => ({
@@ -193,6 +204,7 @@ export async function runAcquisitionV2Workflow(
     ...(request.rejectedLookup ? { rejectedLookup: request.rejectedLookup } : {}),
     ...(request.linkHistory ? { linkHistory: request.linkHistory } : {}),
     ...(request.onProgress ? { onProgress: request.onProgress } : {}),
+    unmovedStaging,
   });
 
   // Reconcile from the AGENT'S coverage (its markObtained), NOT a 115 re-scan:
@@ -233,6 +245,7 @@ export async function runAcquisitionV2Workflow(
   const stagingEvents = [
     ...leaks.map((leak) => stagingLeakAuditEvent(leak)),
     ...unverified.map((event) => stagingCleanupUnverifiedAuditEvent(event)),
+    ...kept.map((event) => stagingKeptAuditEvent(event)),
   ];
   if (stagingEvents.length === 0) {
     return result;
