@@ -8,7 +8,7 @@ import {
   type MediaTitle,
   type TrackedSeason,
 } from "@media-track/workflow";
-import { loadMessageThread, nextPatrolLabel, resolveMessageWork } from "./user-message-server";
+import { loadMessageThread, nextPatrolLabel, resolveMessageWork, swapBadgeLabel } from "./user-message-server";
 
 const NOW = "2026-09-27T08:00:00.000Z";
 
@@ -174,5 +174,18 @@ describe("nextPatrolLabel", () => {
     expect(nextPatrolLabel(["06:00"], "14:02")).toBe("明早 06:00");
     expect(nextPatrolLabel(["06:00"], "05:00")).toBe("今天 06:00");
     expect(nextPatrolLabel(["23:30"], "23:40")).toBe("明天 23:30");
+  });
+});
+
+describe("swapBadgeLabel — the 待换 badge beside the title", () => {
+  it("counts a show's 待换 episodes; none → no badge", () => {
+    expect(swapBadgeLabel("tv", [])).toBeNull();
+    expect(swapBadgeLabel("tv", ["S01E24"])).toBe("1 集待换");
+    expect(swapBadgeLabel("tv", ["S01E03", "S02E01"])).toBe("2 集待换");
+  });
+
+  it("a film says 待换资源 only while the film itself is 待换", () => {
+    expect(swapBadgeLabel("movie", ["MOVIE"])).toBe("待换资源");
+    expect(swapBadgeLabel("movie", [])).toBeNull();
   });
 });

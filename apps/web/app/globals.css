@@ -891,6 +891,30 @@ p {
   color: var(--negative);
 }
 
+/* 待换: a user asked for this episode to be replaced and no new file has landed yet
+   (the old one is still there). Added on top of the cell's state class, so these rules
+   must stay after the state rules above to win. */
+.episode-cell.swap {
+  position: relative;
+  background: rgba(243, 114, 127, 0.14);
+  border-color: var(--negative);
+}
+
+.episode-cell.swap span {
+  color: var(--negative);
+}
+
+.episode-cell.swap::after {
+  content: "";
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--negative);
+}
+
 .episode-cell.unaired,
 .episode-cell.unknown {
   border-color: rgba(255, 255, 255, 0.08);
@@ -1865,6 +1889,13 @@ p {
   color: #bcd9ff;
   background: rgba(83, 157, 245, 0.16);
   border: 1px solid rgba(83, 157, 245, 0.55);
+}
+
+/* 待换 (「N 集待换」/「待换资源」) — negative red, like the 待换 episode cells. */
+.hub-badge.tone-red {
+  color: var(--negative);
+  background: rgba(243, 114, 127, 0.16);
+  border: 1px solid rgba(243, 114, 127, 0.55);
 }
 
 .card-badge {

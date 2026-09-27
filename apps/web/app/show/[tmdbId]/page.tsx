@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { connection } from "next/server";
-import { Suspense, type ReactNode } from "react";
+import { Suspense, cache, type ReactNode } from "react";
 import { TriangleAlert } from "lucide-react";
 import { isMovieUnreleased } from "@media-track/workflow";
 import { AcquiringPoller } from "../../../components/acquiring-poller";
@@ -23,7 +23,8 @@ import {
   type TitleHubView,
 } from "../../../lib/title-hub";
 import { seasonBadgeState } from "../../../lib/title-aggregate";
-import { resolveGlobalWorkspace } from "../../../lib/workflow-runtime";
+import { loadMessageThread, resolveMessageWork, swapBadgeLabel } from "../../../lib/user-message-server";
+import { getActiveWorkspaceScope, getWorkflowRepository, resolveGlobalWorkspace } from "../../../lib/workflow-runtime";
 
 const aggregateBadge = {
   untracked: null,
@@ -205,6 +206,7 @@ function TvHub({
               {view.airing && view.aggregate === "partial" ? (
                 <span className="hub-badge tone-indigo">追更中</span>
               ) : null}
+              <SwapBadge tmdbId={view.tmdbId} mediaType="tv" storageId={storageId} />
             </div>
           ) : null}
           <h1>
@@ -251,23 +253,7 @@ function TvHub({
 
       <section className="hub-seasons" aria-label="季列表">
         <ul className="hub-season-list">
-          {view.seasons.map((season) => (
-            <SeasonRow
-              key={season.seasonNumber}
-              season={season}
-              tmdbId={view.tmdbId}
-              storageId={storageId}
-              basePath={basePath}
-              acquiring={view.acquiring}
-              demoEntry={{
-                tmdbId: view.tmdbId,
-                title: view.title,
-                year: view.year,
-                type: "tv",
-                posterPath: view.posterPath,
-              }}
-            />
-          ))}
+          <SeasonRowsWithSwap view={view} storageId={storageId} basePath={basePath} />
         </ul>
       </section>
       {view.aggregate !== "untracked" ? <TitleMemorySection mediaType="tv" tmdbId={view.tmdbId} /> : null}
@@ -335,7 +321,12 @@ function MovieHub({
               )}
             </div>
             <div className="hub-title-block">
-              <span className={`hub-badge tone-${meta.tone}`}>{meta.label}</span>
+              <div className="hub-badges">
+                <span className={`hub-badge tone-${meta.tone}`}>{meta.label}</span>
+                {view.state !== "untracked" ? (
+                  <SwapBadge tmdbId={view.tmdbId} mediaType="movie" storageId={storageId} />
+                ) : null}
+              </div>
               <h1>
                 {view.title} <span className="hub-year">({view.year})</span>
               </h1>
@@ -422,6 +413,7 @@ function SeasonRow({
   storageId,
   basePath,
   acquiring,
+  swap,
   demoEntry,
 }: {
   season: TitleHubSeason;
@@ -431,6 +423,8 @@ function SeasonRow({
   /** Library path to return to after a whole-show untrack. */
   basePath: string;
   acquiring: boolean;
+  /** Episodes a user asked to replace that are still 待换 (their old file stays). */
+  swap: ReadonlySet<string>;
   demoEntry?: DemoAcquisitionEntry | undefined;
 }) {
   const total = season.totalEpisodes;
@@ -486,25 +480,31 @@ function SeasonRow({
       <details className="hub-season-details">
         <summary className="hub-season-row">{rowBody}</summary>
         <div className="episode-grid hub-episode-grid">
-          {season.episodes.map((episode) => (
-            <div
-              className={`episode-cell ${episode.displayState.replace("_", "-")}`}
-              key={episode.episodeCode}
-            >
-              <strong>{episode.episodeCode.replace(/^S\d+/, "")}</strong>
-              <span>
-                {episode.displayState === "obtained"
-                  ? "已获取"
-                  : episode.displayState === "missing_aired"
-                    ? "缺集"
-                    : episode.displayState === "provider_ahead"
-                      ? "超前"
-                      : episode.displayState === "unaired"
-                        ? "未播"
-                        : "未知"}
-              </span>
-            </div>
-          ))}
+          {season.episodes.map((episode) => {
+            const swapping = swap.has(episode.episodeCode);
+            return (
+              <div
+                className={`episode-cell ${episode.displayState.replace("_", "-")}${swapping ? " swap" : ""}`}
+                key={episode.episodeCode}
+                title={swapping ? "你要求换 · 巡检会继续找" : undefined}
+              >
+                <strong>{episode.episodeCode.replace(/^S\d+/, "")}</strong>
+                <span>
+                  {swapping
+                    ? "待换"
+                    : episode.displayState === "obtained"
+                      ? "已获取"
+                      : episode.displayState === "missing_aired"
+                        ? "缺集"
+                        : episode.displayState === "provider_ahead"
+                          ? "超前"
+                          : episode.displayState === "unaired"
+                            ? "未播"
+                            : "未知"}
+                </span>
+              </div>
+            );
+          })}
         </div>
         <div className="season-untrack-row">
           <UntrackButton
@@ -518,6 +518,67 @@ function SeasonRow({
         </div>
       </details>
     </li>
+  );
+}
+
+/** This work's messages and 待换 episodes, read once per request (the title badge and
+ *  the season grid both use them). The work is resolved the way the message actions
+ *  resolve it, so the page shows what the engine acts on. Null when the title is not
+ *  tracked on this drive. */
+const loadTitleMessages = cache(async (tmdbId: number, mediaType: "movie" | "tv", storageId: string | undefined) => {
+  const repo = getWorkflowRepository();
+  const work = await resolveMessageWork({ repo, scope: await getActiveWorkspaceScope(storageId), tmdbId, mediaType });
+  return work ? loadMessageThread(repo, work) : null;
+});
+
+/** 「N 集待换」 (show) /「待换资源」 (film) beside the title's status badge. */
+async function SwapBadge({
+  tmdbId,
+  mediaType,
+  storageId,
+}: {
+  tmdbId: number;
+  mediaType: "movie" | "tv";
+  storageId: string | undefined;
+}) {
+  const thread = await loadTitleMessages(tmdbId, mediaType, storageId);
+  const label = thread ? swapBadgeLabel(mediaType, thread.pendingReplacements) : null;
+  return label ? <span className="hub-badge tone-red">{label}</span> : null;
+}
+
+/** The season rows, each episode a user asked to replace drawn 「待换」 in red. */
+async function SeasonRowsWithSwap({
+  view,
+  storageId,
+  basePath,
+}: {
+  view: TitleHubView;
+  storageId: string | undefined;
+  basePath: string;
+}) {
+  const thread = view.aggregate === "untracked" ? null : await loadTitleMessages(view.tmdbId, "tv", storageId);
+  const swap = new Set(thread?.pendingReplacements ?? []);
+  return (
+    <>
+      {view.seasons.map((season) => (
+        <SeasonRow
+          key={season.seasonNumber}
+          season={season}
+          tmdbId={view.tmdbId}
+          storageId={storageId}
+          basePath={basePath}
+          acquiring={view.acquiring}
+          swap={swap}
+          demoEntry={{
+            tmdbId: view.tmdbId,
+            title: view.title,
+            year: view.year,
+            type: "tv",
+            posterPath: view.posterPath,
+          }}
+        />
+      ))}
+    </>
   );
 }
 

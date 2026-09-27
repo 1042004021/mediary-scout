@@ -75,3 +75,10 @@ export function nextPatrolLabel(times: string[], hhmm: string): string {
   const first = sorted[0] ?? "06:00";
   return first < "12:00" ? `明早 ${first}` : `明天 ${first}`;
 }
+
+/** The badge beside the title while something is 待换: how many episodes of a show, or
+ *  「待换资源」 for a film. Null when nothing is. */
+export function swapBadgeLabel(mediaType: "movie" | "tv", pendingReplacements: readonly string[]): string | null {
+  if (mediaType === "movie") return pendingReplacements.includes("MOVIE") ? "待换资源" : null;
+  return pendingReplacements.length > 0 ? `${pendingReplacements.length} 集待换` : null;
+}
