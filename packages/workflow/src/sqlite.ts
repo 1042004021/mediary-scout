@@ -323,6 +323,16 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
 
     const blocksTitle = titleBlockFilter(input);
     return this.db.transaction((): WorkflowRunReservationResult => {
+      // Before anything is written. The transaction is synchronous, so untrackTitle
+      // (also one synchronous transaction) runs wholly before or after this.
+      if (
+        input.requireTrackedSeason === true &&
+        this.db
+          .prepare("SELECT 1 FROM tracked_seasons WHERE id = ? AND connected_storage_id = ?")
+          .get(snapshot.season.id, connectedStorageId) === undefined
+      ) {
+        return { status: "not_tracked" };
+      }
       this.expireStaleActiveWorkflowRuns(input);
 
       if (blocksTitle) {

@@ -136,6 +136,14 @@ export interface ReserveWorkflowRunInput extends PersistWorkflowRunSnapshotInput
    * each other. Checked under the same lock as blockIfTitleHasActiveRun.
    */
   blockIfTitleHasActiveKinds?: WorkflowKind[];
+  /**
+   * Refuse — `not_tracked`, nothing written — unless the (season, drive) is still
+   * tracked when the reservation decides. For a caller that reserves from states it
+   * read earlier (queueReplaceRequest): the season may have been untracked in between,
+   * and writing the run would track it again. Postgres checks it under the title lock,
+   * which untrackTitle takes too; SQLite and InMemory decide synchronously.
+   */
+  requireTrackedSeason?: boolean;
   staleActiveRunStartedBefore?: string;
   staleFinishedAt?: string;
 }
@@ -152,6 +160,10 @@ export type WorkflowRunReservationResult =
   | {
       status: "already_has_episode_state";
       episodes: EpisodeState[];
+    }
+  | {
+      /** requireTrackedSeason was set and the (season, drive) is no longer tracked. */
+      status: "not_tracked";
     };
 
 export interface WorkflowRepository extends DeadLinkStore, AgentMemoryStore, UserRequestStore {
@@ -233,6 +245,8 @@ export interface WorkflowRepository extends DeadLinkStore, AgentMemoryStore, Use
    *  anime(同一 tv 命名空间)。seasonNumber 给定=只删该季。任一目标季有 running run
    *  时拒绝(in_flight);这部作品在本盘有排队中或进行中的 replace_request 时也拒绝
    *  (它记在最低一季上,结束时会给覆盖到的每一季写记录,中途取消的季会被写回来)。
+   *  与换源预留互斥(Postgres 共用作品锁;预留带 requireTrackedSeason 复核季仍在追踪):
+   *  先预留的让这里 in_flight,先取消的让预留 not_tracked,不会两边都成功。
    *  不碰网盘文件。 */
   untrackTitle(
     tmdbId: number,
@@ -902,6 +916,11 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
   async reserveWorkflowRun(input: ReserveWorkflowRunInput): Promise<WorkflowRunReservationResult> {
     const snapshot = workflowSnapshotFromReservation(input);
     validateWorkflowRunSnapshot(snapshot);
+    // Before anything is written (the stale-run expiry included) and, like the checks
+    // below, with no await between it and the write.
+    if (input.requireTrackedSeason === true && !this.isSeasonTracked(snapshot.season.id, snapshot.connectedStorageId)) {
+      return { status: "not_tracked" };
+    }
     this.expireStaleActiveWorkflowRuns(input);
 
     const reservingScope = {
@@ -1071,6 +1090,15 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
       .sort((a, b) => b.workflowRun.startedAt.localeCompare(a.workflowRun.startedAt));
     const latest = activeRuns[0];
     return latest ? withDerivedEpisodeSummaries(cloneWorkflowValue(latest)) : null;
+  }
+
+  /** Whether the (season, drive) is tracked. InMemory derives tracking from the run
+   *  records themselves, which untrackTitle deletes. */
+  private isSeasonTracked(seasonId: string, connectedStorageId: string | null | undefined): boolean {
+    const key = seasonScopeKey(seasonId, connectedStorageId);
+    return Array.from(this.workflowRuns.values()).some(
+      (stored) => seasonScopeKey(stored.season.id, stored.connectedStorageId) === key,
+    );
   }
 
   async listActiveWorkflowRuns(
@@ -1559,6 +1587,7 @@ export function isActiveWorkflowStatus(status: WorkflowStatus): boolean {
 export function workflowSnapshotFromReservation(input: ReserveWorkflowRunInput): PersistWorkflowRunSnapshotInput {
   const {
     blockIfEpisodeStatesExist: _blockIfEpisodeStatesExist,
+    requireTrackedSeason: _requireTrackedSeason,
     staleActiveRunStartedBefore: _staleActiveRunStartedBefore,
     staleFinishedAt: _staleFinishedAt,
     ...snapshot

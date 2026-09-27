@@ -467,13 +467,25 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
 
     const blocksTitle = titleBlockFilter(input);
     return this.withTransaction(async (client) => {
-      if (blocksTitle) {
+      if (blocksTitle || input.requireTrackedSeason === true) {
         // READ COMMITTED alone lets two concurrent reservations both see no active
         // run for the title and both insert. Serialize them per (account, drive,
-        // title) for the rest of this transaction.
-        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
-          `workflow_title:${accountId}:${snapshot.connectedStorageId ?? ""}:${snapshot.season.mediaTitleId}`,
-        ]);
+        // title) for the rest of this transaction; untrackTitle takes the same lock.
+        await lockWorkflowTitle(client, accountId, snapshot.connectedStorageId, snapshot.season.mediaTitleId);
+      }
+
+      // Under that lock and before anything is written: a season untracked since the
+      // caller read it stays untracked. FOR KEY SHARE also holds off a teardown that does
+      // not take the title lock (cancelling a queued init run) until this commits; one
+      // already under way is waited for, and then the row is gone.
+      if (input.requireTrackedSeason === true) {
+        const tracked = await client.query(
+          "SELECT 1 FROM tracked_seasons WHERE id = $1 AND connected_storage_id = $2 FOR KEY SHARE",
+          [snapshot.season.id, connectedStorageId],
+        );
+        if ((tracked.rowCount ?? 0) === 0) {
+          return { status: "not_tracked" };
+        }
       }
 
       await this.expireStaleActiveWorkflowRuns(client, input);
@@ -866,6 +878,10 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
 
     return this.withTransaction(async (client) => {
       await this.ensureSchema();
+      // First the lock a replace reservation takes: one reserved from states read before
+      // this untrack has either committed (and is seen below → in_flight) or waits, then
+      // finds the season gone (not_tracked) instead of tracking it again.
+      await lockWorkflowTitle(client, workScope.accountId, scope.connectedStorageId, workScope.titleKey);
       // In-flight guard: a running run on any target season → refuse, delete nothing.
       const running = await client.query(
         "SELECT 1 FROM workflow_runs WHERE tracked_season_id = ANY($1) AND connected_storage_id = $2 " +
@@ -2125,6 +2141,20 @@ async function lockUserMessageWork(client: PoolClient, scope: UserMessageScope):
   await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
     `user_messages:${scope.accountId}:${scope.drive}:${scope.titleKey}`,
   ]);
+}
+
+/** Transaction-scoped lock on one title's runs on one drive, taken first by a
+ *  title-exclusive (or requireTrackedSeason) reservation and by untrackTitle, so
+ *  neither decides on rows the other is changing. A null drive and the unscoped
+ *  sentinel are the same rows, so they are the same lock. */
+async function lockWorkflowTitle(
+  client: PoolClient,
+  accountId: string,
+  connectedStorageId: string | null | undefined,
+  mediaTitleId: string,
+): Promise<void> {
+  const drive = connectedStorageId === UNSCOPED_STORAGE ? "" : (connectedStorageId ?? "");
+  await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`workflow_title:${accountId}:${drive}:${mediaTitleId}`]);
 }
 
 /** This work's pending messages → not urgent (they wait for the patrol), on the pool or

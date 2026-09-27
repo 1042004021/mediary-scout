@@ -124,6 +124,9 @@ async function cleanup(pool: pg.Pool): Promise<void> {
     "tmdb_tv_500_s2",
     "tmdb_tv_501_s1",
     "tmdb_tv_502_s1",
+    "tmdb_tv_503_s1",
+    "tmdb_tv_504_s1",
+    "tmdb_tv_505_s1",
     "tmdb_tv_600_s1",
     "tmdb_movie_600_movie",
   ]) {
@@ -132,9 +135,43 @@ async function cleanup(pool: pg.Pool): Promise<void> {
     await pool.query("DELETE FROM tracked_seasons WHERE id = $1", [id]);
   }
   await pool.query(
-    "DELETE FROM media_titles WHERE id IN ('tmdb_tv_500','tmdb_tv_501','tmdb_tv_502','tmdb_tv_600','tmdb_movie_600')",
+    "DELETE FROM media_titles WHERE id IN ('tmdb_tv_500','tmdb_tv_501','tmdb_tv_502','tmdb_tv_503','tmdb_tv_504','tmdb_tv_505','tmdb_tv_600','tmdb_movie_600')",
   );
   await pool.query("DELETE FROM connected_storages WHERE id IN ($1,$2)", [DRIVE_A, DRIVE_B]);
+}
+
+/** A replace reservation from states read earlier, with only requireTrackedSeason set:
+ *  the option alone must take the title lock (not just blockIfTitleHasActiveRun). */
+async function replaceReservationFromRead(repo: PostgresWorkflowRepository, tmdbId: number, runId: string) {
+  const [read] = (await repo.listTrackedSeasonStates({ accountId: ACCOUNT, connectedStorageId: DRIVE_A })).filter(
+    (s) => s.title.tmdbId === tmdbId,
+  );
+  return {
+    accountId: ACCOUNT,
+    connectedStorageId: DRIVE_A,
+    title: read!.title,
+    season: read!.season,
+    workflowRun: {
+      id: runId,
+      kind: "replace_request" as const,
+      status: "queued" as const,
+      trackedSeasonId: read!.season.id,
+      startedAt: "2026-09-27T00:00:00.000Z",
+      finishedAt: null,
+      auditEvents: [],
+    },
+    episodes: read!.episodes,
+    resourceSnapshots: [],
+    decisions: [],
+    transferAttempts: [],
+    notifications: [],
+    requireTrackedSeason: true,
+  };
+}
+
+/** Resolves "waiting" if the promise is still pending after `ms` (blocked on a lock). */
+function stillPending(promise: Promise<unknown>, ms = 500): Promise<unknown> {
+  return Promise.race([promise, new Promise((resolve) => setTimeout(() => resolve("waiting"), ms))]);
 }
 
 d("untrackTitle (Postgres)", () => {
@@ -247,4 +284,105 @@ d("untrackTitle (Postgres)", () => {
       await pool.end();
     }
   });
+
+  // untrackTitle and a replace reservation from states read before it take the same
+  // per-(account, drive, title) advisory lock. Holding that lock from outside queues both
+  // behind it, so each order is deterministic.
+  const titleLock = (tmdbId: number) => `workflow_title:${ACCOUNT}:${DRIVE_A}:tmdb_tv_${tmdbId}`;
+
+  it("取消追踪先拿到作品锁:换源预留等锁后发现季已取消 → not_tracked,什么都不写", async () => {
+    const pool = new pg.Pool({ connectionString: URL });
+    const blocker = new pg.Client({ connectionString: URL });
+    const repo = new PostgresWorkflowRepository(pool);
+    try {
+      await initializeWorkflowPostgresSchema(pool);
+      await cleanup(pool);
+      await seedSeason(repo, { tmdbId: 503, seasonNumber: 1, storageId: DRIVE_A });
+      const reservationInput = await replaceReservationFromRead(repo, 503, "run_rr_503");
+      await blocker.connect();
+      await blocker.query("BEGIN");
+      await blocker.query("SELECT pg_advisory_xact_lock(hashtext($1))", [titleLock(503)]);
+
+      const untrack = repo.untrackTitle(503, { accountId: ACCOUNT, connectedStorageId: DRIVE_A }, "tv");
+      expect(await stillPending(untrack)).toBe("waiting");
+      const reservation = repo.reserveWorkflowRun(reservationInput);
+      expect(await stillPending(reservation)).toBe("waiting");
+      await blocker.query("COMMIT");
+
+      expect(await untrack).toEqual({ status: "untracked", removedSeasons: 1 });
+      expect(await reservation).toEqual({ status: "not_tracked" });
+      expect((await pool.query("SELECT 1 FROM tracked_seasons WHERE id = 'tmdb_tv_503_s1'")).rowCount).toBe(0);
+      expect((await pool.query("SELECT 1 FROM workflow_runs WHERE id = 'run_rr_503'")).rowCount).toBe(0);
+    } finally {
+      await blocker.query("ROLLBACK").catch(() => {});
+      await blocker.end().catch(() => {});
+      await cleanup(pool);
+      await pool.end();
+    }
+  }, 10_000);
+
+  it("换源预留先拿到作品锁:取消追踪等锁后看到排队中的换源 run → in_flight,季还在", async () => {
+    const pool = new pg.Pool({ connectionString: URL });
+    const blocker = new pg.Client({ connectionString: URL });
+    const repo = new PostgresWorkflowRepository(pool);
+    try {
+      await initializeWorkflowPostgresSchema(pool);
+      await cleanup(pool);
+      await seedSeason(repo, { tmdbId: 504, seasonNumber: 1, storageId: DRIVE_A });
+      const reservationInput = await replaceReservationFromRead(repo, 504, "run_rr_504");
+      await blocker.connect();
+      await blocker.query("BEGIN");
+      await blocker.query("SELECT pg_advisory_xact_lock(hashtext($1))", [titleLock(504)]);
+
+      const reservation = repo.reserveWorkflowRun(reservationInput);
+      expect(await stillPending(reservation)).toBe("waiting");
+      const untrack = repo.untrackTitle(504, { accountId: ACCOUNT, connectedStorageId: DRIVE_A }, "tv");
+      expect(await stillPending(untrack)).toBe("waiting");
+      await blocker.query("COMMIT");
+
+      expect((await reservation).status).toBe("reserved");
+      expect(await untrack).toEqual({ status: "in_flight", removedSeasons: 0 });
+      expect((await pool.query("SELECT 1 FROM tracked_seasons WHERE id = 'tmdb_tv_504_s1'")).rowCount).toBe(1);
+      expect((await pool.query("SELECT payload->>'status' AS status FROM workflow_runs WHERE id = 'run_rr_504'")).rows).toEqual([
+        { status: "queued" },
+      ]);
+    } finally {
+      await blocker.query("ROLLBACK").catch(() => {});
+      await blocker.end().catch(() => {});
+      await cleanup(pool);
+      await pool.end();
+    }
+  }, 10_000);
+
+  it("换源预留复核季时锁住季行:别的事务正在拆这季(未提交,不拿作品锁)时等它提交,再发现季已没了 → not_tracked", async () => {
+    const pool = new pg.Pool({ connectionString: URL });
+    const blocker = new pg.Client({ connectionString: URL });
+    const repo = new PostgresWorkflowRepository(pool);
+    try {
+      await initializeWorkflowPostgresSchema(pool);
+      await cleanup(pool);
+      await seedSeason(repo, { tmdbId: 505, seasonNumber: 1, storageId: DRIVE_A });
+      const reservationInput = await replaceReservationFromRead(repo, 505, "run_rr_505");
+      await blocker.connect();
+      await blocker.query("BEGIN");
+      // A teardown that does not take the title lock — how cancelling a queued init run
+      // removes its season.
+      await blocker.query("DELETE FROM episode_states WHERE tracked_season_id = 'tmdb_tv_505_s1'");
+      await blocker.query("DELETE FROM workflow_runs WHERE tracked_season_id = 'tmdb_tv_505_s1'");
+      await blocker.query("DELETE FROM tracked_seasons WHERE id = 'tmdb_tv_505_s1'");
+
+      const reservation = repo.reserveWorkflowRun(reservationInput);
+      expect(await stillPending(reservation)).toBe("waiting");
+      await blocker.query("COMMIT");
+
+      expect(await reservation).toEqual({ status: "not_tracked" });
+      expect((await pool.query("SELECT 1 FROM tracked_seasons WHERE id = 'tmdb_tv_505_s1'")).rowCount).toBe(0);
+      expect((await pool.query("SELECT 1 FROM workflow_runs WHERE id = 'run_rr_505'")).rowCount).toBe(0);
+    } finally {
+      await blocker.query("ROLLBACK").catch(() => {});
+      await blocker.end().catch(() => {});
+      await cleanup(pool);
+      await pool.end();
+    }
+  }, 10_000);
 });

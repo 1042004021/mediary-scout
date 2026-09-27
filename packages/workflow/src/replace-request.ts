@@ -51,6 +51,10 @@ async function workStates(repository: WorkflowRepository, work: UserMessageScope
  *  user (现在处理 / the idle scan for urgent messages — pushed on its own). */
 export type ReplaceRequestOrigin = "patrol" | "user";
 
+/** Reservations tried before giving up on a work whose lock season keeps being
+ *  untracked between the read and the reservation (see queueReplaceRequest). */
+const QUEUE_ATTEMPTS = 3;
+
 export async function queueReplaceRequest(input: {
   repository: WorkflowRepository;
   work: UserMessageScope;
@@ -60,45 +64,54 @@ export async function queueReplaceRequest(input: {
   origin?: ReplaceRequestOrigin;
 }): Promise<{ status: "queued" | "already_running" | "not_tracked"; workflowRunId: string | null }> {
   const now = input.now ?? (() => new Date().toISOString());
-  const states = await workStates(input.repository, input.work);
-  // The lowest season is the lock: the run is reserved on it, title-level exclusive.
-  const lock = states[0];
-  if (!lock) return { status: "not_tracked", workflowRunId: null };
   const workflowRunId = input.createWorkflowRunId?.() ?? crypto.randomUUID();
   const queuedAt = now();
-  const reservation = await input.repository.reserveWorkflowRun({
-    accountId: lock.accountId,
-    ...(lock.connectedStorageId != null ? { connectedStorageId: lock.connectedStorageId } : {}),
-    title: lock.title,
-    season: lock.season,
-    workflowRun: {
-      id: workflowRunId,
-      kind: "replace_request",
-      status: "queued",
-      trackedSeasonId: lock.season.id,
-      startedAt: queuedAt,
-      finishedAt: null,
-      auditEvents: [
-        {
-          type: "replace_request_queued",
-          message: `Queued replace request ${workflowRunId}`,
-          data: { origin: input.origin ?? "user" },
-        },
-      ],
-    },
-    // A reservation replaces the season's episode bucket wholesale: hand it back unchanged.
-    episodes: lock.episodes,
-    resourceSnapshots: [],
-    decisions: [],
-    transferAttempts: [],
-    notifications: [],
-    blockIfTitleHasActiveRun: true,
-  });
-  if (reservation.status === "already_active") {
-    return { status: "already_running", workflowRunId: reservation.snapshot.workflowRun.id };
+  for (let attempt = 0; attempt < QUEUE_ATTEMPTS; attempt++) {
+    const states = await workStates(input.repository, input.work);
+    // The lowest season is the lock: the run is reserved on it, title-level exclusive.
+    const lock = states[0];
+    if (!lock) return { status: "not_tracked", workflowRunId: null };
+    const reservation = await input.repository.reserveWorkflowRun({
+      accountId: lock.accountId,
+      ...(lock.connectedStorageId != null ? { connectedStorageId: lock.connectedStorageId } : {}),
+      title: lock.title,
+      season: lock.season,
+      workflowRun: {
+        id: workflowRunId,
+        kind: "replace_request",
+        status: "queued",
+        trackedSeasonId: lock.season.id,
+        startedAt: queuedAt,
+        finishedAt: null,
+        auditEvents: [
+          {
+            type: "replace_request_queued",
+            message: `Queued replace request ${workflowRunId}`,
+            data: { origin: input.origin ?? "user" },
+          },
+        ],
+      },
+      // A reservation replaces the season's episode bucket wholesale: hand it back unchanged.
+      episodes: lock.episodes,
+      resourceSnapshots: [],
+      decisions: [],
+      transferAttempts: [],
+      notifications: [],
+      blockIfTitleHasActiveRun: true,
+      // The states were read before this call: a season untracked in between must not
+      // be tracked again by the reservation. It writes nothing then, and the states are
+      // read again — the lowest season still tracked becomes the lock, none left means
+      // the work is gone from this drive.
+      requireTrackedSeason: true,
+    });
+    if (reservation.status === "not_tracked") continue;
+    if (reservation.status === "already_active") {
+      return { status: "already_running", workflowRunId: reservation.snapshot.workflowRun.id };
+    }
+    if (reservation.status !== "reserved") return { status: "already_running", workflowRunId: null };
+    return { status: "queued", workflowRunId };
   }
-  if (reservation.status !== "reserved") return { status: "already_running", workflowRunId: null };
-  return { status: "queued", workflowRunId };
+  return { status: "not_tracked", workflowRunId: null };
 }
 
 /** How long a finished run may still hold its messages: the post-run bookkeeping

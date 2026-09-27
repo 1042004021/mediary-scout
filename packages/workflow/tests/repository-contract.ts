@@ -1,5 +1,10 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { DuplicateUsernameError, type WorkflowRepository } from "../src/repository.js";
+import {
+  DuplicateUsernameError,
+  type ReserveWorkflowRunInput,
+  type TrackedSeasonState,
+  type WorkflowRepository,
+} from "../src/repository.js";
 import type { Account } from "../src/account-credentials.js";
 import { workflowPersistenceFixture } from "./workflow-fixtures.js";
 import { queueReplaceRequest } from "../src/replace-request.js";
@@ -1720,6 +1725,85 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         expect(await repo.listPendingReplacements(work)).toEqual([]);
         expect(await repo.listWorksWithPendingMessages({ urgentOnly: true })).toEqual([]);
         expect((await repo.listUserMessages(otherDrive))[0]).toMatchObject({ status: "pending" });
+      });
+
+      /** The reservation queueReplaceRequest makes from the states it read earlier. */
+      const replaceReservationFrom = (
+        state: TrackedSeasonState,
+        id: string,
+        over: Partial<ReserveWorkflowRunInput> = {},
+      ): ReserveWorkflowRunInput => ({
+        accountId: state.accountId,
+        ...(state.connectedStorageId != null ? { connectedStorageId: state.connectedStorageId } : {}),
+        title: state.title,
+        season: state.season,
+        workflowRun: {
+          id,
+          kind: "replace_request",
+          status: "queued",
+          trackedSeasonId: state.season.id,
+          startedAt: "2026-09-27T00:00:00.000Z",
+          finishedAt: null,
+          auditEvents: [],
+        },
+        episodes: state.episodes,
+        resourceSnapshots: [],
+        decisions: [],
+        transferAttempts: [],
+        notifications: [],
+        blockIfTitleHasActiveRun: true,
+        ...over,
+      });
+
+      it("requireTrackedSeason: a reservation from states read before the season was untracked is not_tracked and writes nothing; without it the reservation goes through as before", async () => {
+        const repo = await fresh();
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_rt" };
+        await repo.saveWorkflowRunSnapshot(queuedRun({ id: "rt", status: "succeeded", connectedStorageId: "cs_rt", tmdbId: 4321, type: "tv" }));
+        // What queueReplaceRequest read; then the user untracks the work before it reserves.
+        const [read] = await repo.listTrackedSeasonStates(scope);
+        expect(await repo.untrackTitle(4321, scope, "tv")).toEqual({ status: "untracked", removedSeasons: 1 });
+
+        expect(await repo.reserveWorkflowRun(replaceReservationFrom(read!, "rt_replace", { requireTrackedSeason: true }))).toEqual({
+          status: "not_tracked",
+        });
+
+        expect(await repo.listTrackedSeasonStates(scope)).toEqual([]);
+        expect(await repo.listActiveWorkflowRuns(scope)).toEqual([]);
+        expect(await repo.getWorkflowRunSnapshot("rt_replace", scope)).toBeNull();
+        // Without the option the same reservation still creates the tracking (how init
+        // runs start tracking a season).
+        expect((await repo.reserveWorkflowRun(replaceReservationFrom(read!, "rt_plain"))).status).toBe("reserved");
+        expect((await repo.listTrackedSeasonStates(scope)).map((s) => s.season.id)).toEqual(["season_rt"]);
+      });
+
+      it("untrackTitle racing a requireTrackedSeason replace reservation: never both — the untrack is in_flight or the reservation is not_tracked", async () => {
+        const repo = await fresh();
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_race" };
+        for (let round = 0; round < 10; round++) {
+          const tmdbId = 9100 + round;
+          const tracked = queuedRun({ id: `race${round}`, status: "succeeded", connectedStorageId: "cs_race", tmdbId, type: "tv" });
+          await repo.saveWorkflowRunSnapshot(tracked);
+          const read = (await repo.listTrackedSeasonStates(scope)).find((s) => s.title.id === tracked.title.id)!;
+          const replaceId = `race${round}_replace`;
+          const untrack = () => repo.untrackTitle(tmdbId, scope, "tv");
+          const reserve = () => repo.reserveWorkflowRun(replaceReservationFrom(read, replaceId, { requireTrackedSeason: true }));
+          // Alternate which one starts first (Postgres runs both transactions at once).
+          const [untrackResult, reservation] =
+            round % 2 === 0
+              ? await Promise.all([untrack(), reserve()])
+              : await Promise.all([reserve(), untrack()]).then(([r, u]) => [u, r] as const);
+
+          const stillTracked = (await repo.listTrackedSeasonStates(scope)).some((s) => s.title.id === tracked.title.id);
+          const replaceActive = (await repo.listActiveWorkflowRuns(scope)).some((run) => run.workflowRun.id === replaceId);
+          if (reservation.status === "reserved") {
+            expect(untrackResult).toEqual({ status: "in_flight", removedSeasons: 0 });
+            expect({ stillTracked, replaceActive }).toEqual({ stillTracked: true, replaceActive: true });
+          } else {
+            expect(reservation).toEqual({ status: "not_tracked" });
+            expect(untrackResult).toEqual({ status: "untracked", removedSeasons: 1 });
+            expect({ stillTracked, replaceActive }).toEqual({ stillTracked: false, replaceActive: false });
+          }
+        }
       });
 
       it("retryFailedWorkflowRun requeues a failed run so it becomes claimable", async () => {

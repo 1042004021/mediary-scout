@@ -15,6 +15,7 @@ import {
   type ResourceProvider,
   type TrackedSeason,
   type VerifiedFile,
+  type WorkflowRepository,
 } from "../src/index.js";
 
 const NOW = "2026-09-26T08:00:00.000Z";
@@ -281,6 +282,61 @@ describe("queueReplaceRequest", () => {
     const { repository } = await trackedShow();
     const result = await queueReplaceRequest({ repository, work: { ...WORK, drive: "other_drive" }, now: fixedNow });
     expect(result).toEqual({ status: "not_tracked", workflowRunId: null });
+  });
+
+  /** The repository, except that `race` runs once right after the first
+   *  listTrackedSeasonStates read — the caller still holds the states read before it. */
+  function raceAfterFirstStatesRead(repository: InMemoryWorkflowRepository, race: () => Promise<unknown>): WorkflowRepository {
+    let raced = false;
+    return new Proxy(repository, {
+      get(target, prop, receiver) {
+        if (prop === "listTrackedSeasonStates") {
+          return async (...args: Parameters<WorkflowRepository["listTrackedSeasonStates"]>) => {
+            const states = await target.listTrackedSeasonStates(...args);
+            if (!raced) {
+              raced = true;
+              await race();
+            }
+            return states;
+          };
+        }
+        const value: unknown = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  }
+
+  it("the work untracked between reading its seasons and reserving: not_tracked, and nothing tracks it again", async () => {
+    const { repository } = await trackedShow();
+    const scope = { accountId: "acct_1", connectedStorageId: DRIVE };
+    let untracked: unknown;
+    const racing = raceAfterFirstStatesRead(repository, async () => {
+      untracked = await repository.untrackTitle(42, scope, "tv");
+    });
+
+    const result = await queueReplaceRequest({ repository: racing, work: WORK, now: fixedNow, createWorkflowRunId: () => "run_rr_gone_mid" });
+
+    expect(untracked).toEqual({ status: "untracked", removedSeasons: 1 });
+    expect(result).toEqual({ status: "not_tracked", workflowRunId: null });
+    expect(await repository.listTrackedSeasonStates(scope)).toEqual([]);
+    expect(await repository.listActiveWorkflowRuns(scope)).toEqual([]);
+  });
+
+  it("only the lock season untracked between reading and reserving: queued on the lowest season still tracked, the untracked one stays gone", async () => {
+    const { repository, title, season } = await trackedShow();
+    const season2: TrackedSeason = { ...season, id: "tmdb_tv_42_s2", seasonNumber: 2, storageDirectoryId: "dir_s2" };
+    await seedTrackedSeason({ repository, title, season: season2, obtainedCodes: ["S02E01", "S02E02"] });
+    const scope = { accountId: "acct_1", connectedStorageId: DRIVE };
+    const racing = raceAfterFirstStatesRead(repository, () => repository.untrackTitle(42, scope, "tv", 1));
+
+    const result = await queueReplaceRequest({ repository: racing, work: WORK, now: fixedNow, createWorkflowRunId: () => "run_rr_s2" });
+
+    expect(result).toEqual({ status: "queued", workflowRunId: "run_rr_s2" });
+    expect((await repository.listTrackedSeasonStates(scope)).map((s) => s.season.seasonNumber)).toEqual([2]);
+    const active = await repository.listActiveWorkflowRuns(scope);
+    expect(active.map((run) => [run.workflowRun.id, run.workflowRun.kind, run.workflowRun.trackedSeasonId])).toEqual([
+      ["run_rr_s2", "replace_request", season2.id],
+    ]);
   });
 });
 
