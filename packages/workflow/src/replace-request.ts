@@ -5,6 +5,7 @@ import { syncSeasonAgainstMetadata } from "./season-sync.js";
 import type { ResourceProvider, StorageExecutor } from "./ports.js";
 import type { JevJudge } from "./jev-judge.js";
 import type { RunAcquisitionV2Request, RunAcquisitionV2Result } from "./acquisition-v2/orchestrator.js";
+import { deadLinkKey } from "./acquisition-v2/dead-links.js";
 import {
   parseSizeFromTitle,
   userMessageDrive,
@@ -282,6 +283,16 @@ export async function runQueuedReplaceRequest(
       },
       // An episode replaced once before has a known link: its rejection carries it.
       sourceLinkKeys: Object.fromEntries(sources.flatMap((s): Array<[string, string]> => (s.linkKey ? [[s.episode, s.linkKey]] : []))),
+      // A file's own link, from the transfer that landed it: the only link a file an
+      // ordinary run landed has (no episode source is recorded for it).
+      landingLinkKeys: async (fileIds) => {
+        const keys = new Map<string, string>();
+        for (const s of await repository.listLandingSources({ accountId: work.accountId, drive: work.drive, fileIds })) {
+          const key = deadLinkKey(s.url)?.key;
+          if (key && !keys.has(s.fileId)) keys.set(s.fileId, key); // oldest transfer wins
+        }
+        return Object.fromEntries(keys);
+      },
       rejectedStore: {
         list: async () =>
           (await repository.listRejectedResources({ accountId: work.accountId, titleKey: work.titleKey })).map((r) => ({

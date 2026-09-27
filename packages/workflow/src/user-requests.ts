@@ -83,6 +83,13 @@ export interface EpisodeSource extends UserMessageScope {
   recordedAt: string;
 }
 
+/** A file on a drive and the resource whose transfer put it there. */
+export interface LandingSource {
+  fileId: string;
+  url: string;
+  title: string;
+}
+
 /** Persistence port, implemented by all three repositories. Every state transition
  *  that can race (edit vs claim, claim vs claim) is atomic in the store. */
 export interface UserRequestStore {
@@ -131,6 +138,12 @@ export interface UserRequestStore {
 
   upsertEpisodeSource(input: EpisodeSource): Promise<void>;
   listEpisodeSources(scope: UserMessageScope): Promise<EpisodeSource[]>;
+
+  /** For each of `fileIds`: the candidate whose transfer — in a run of this account on this drive that is
+   *  still on record (finished runs are pruned after 30 days) — materialized that file, with its link and
+   *  title. Oldest transfer first (a file several transfers landed is listed once per transfer); an id no
+   *  transfer on record materialized is simply absent. */
+  listLandingSources(input: { accountId: string; drive: string; fileIds: string[] }): Promise<LandingSource[]>;
 }
 
 export const USER_MESSAGE_LIMITS = {

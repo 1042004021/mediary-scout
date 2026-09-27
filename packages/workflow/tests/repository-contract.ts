@@ -6,6 +6,7 @@ import {
   type WorkflowRepository,
 } from "../src/repository.js";
 import type { Account } from "../src/account-credentials.js";
+import type { TransferAttempt } from "../src/domain.js";
 import { workflowPersistenceFixture } from "./workflow-fixtures.js";
 import { queueReplaceRequest } from "../src/replace-request.js";
 
@@ -313,6 +314,160 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         await repo.upsertEpisodeSource(large);
         expect(await repo.listEpisodeSources(scope)).toEqual([unknown, large]);
         expect(await repo.listEpisodeSources({ ...scope, drive: "cs_2" })).toEqual([]);
+      });
+
+      describe("listLandingSources", () => {
+        const magnet = (c: string) => `magnet:?xt=urn:btih:${c.repeat(40)}`;
+        const titleOf = (runId: string, key: string) => `title ${runId} ${key}`;
+        /** A finished run with one snapshot of `candidates` and one transfer attempt per
+         *  entry of `transfers` (in order). Snapshot / attempt ids are per run: they are
+         *  primary keys in both SQL engines. */
+        function landingRun(input: {
+          id: string;
+          startedAt: string;
+          accountId?: string;
+          /** Omitted: saved with no connected storage. */
+          drive?: string;
+          candidates: Array<{ key: string; url?: unknown }>;
+          transfers: Array<{ key: string; fileIds: unknown; status?: TransferAttempt["status"] }>;
+        }) {
+          const base = workflowPersistenceFixture();
+          const seasonId = `season_${input.id}`;
+          const snapshotId = `snap_${input.id}`;
+          return {
+            ...base,
+            accountId: input.accountId ?? "acct_a",
+            ...(input.drive === undefined ? {} : { connectedStorageId: input.drive }),
+            season: { ...base.season, id: seasonId },
+            workflowRun: { ...base.workflowRun, id: input.id, trackedSeasonId: seasonId, startedAt: input.startedAt, finishedAt: input.startedAt },
+            episodes: [],
+            resourceSnapshots: [
+              {
+                id: snapshotId,
+                provider: "pansou",
+                keyword: "奥德赛",
+                createdAt: input.startedAt,
+                candidates: input.candidates.map((c, index) => ({
+                  id: `${input.id}_${c.key}`,
+                  snapshotId,
+                  index,
+                  title: titleOf(input.id, c.key),
+                  type: "magnet" as const,
+                  source: "pansou",
+                  providerPayload: c.url === undefined ? {} : { url: c.url },
+                })),
+              },
+            ],
+            decisions: [],
+            transferAttempts: input.transfers.map((t, ordinal) => ({
+              id: `ta_${input.id}_${ordinal}`,
+              workflowRunId: input.id,
+              candidateId: `${input.id}_${t.key}`,
+              status: t.status ?? ("succeeded" as const),
+              providerMessage: "",
+              materializedFileIds: t.fileIds as string[],
+            })),
+            notifications: [],
+          };
+        }
+
+        it("returns the link and title of the candidate whose transfer landed each id, from runs of this account on this drive only", async () => {
+          const repo = await fresh();
+          // Older runs of another drive and of another account claim the same file id.
+          await repo.saveWorkflowRunSnapshot(landingRun({
+            id: "run_other_drive", drive: "cs_2", startedAt: "2026-09-01T00:00:00.000Z",
+            candidates: [{ key: "x", url: magnet("d") }], transfers: [{ key: "x", fileIds: ["f1"] }],
+          }));
+          await repo.saveWorkflowRunSnapshot(landingRun({
+            id: "run_other_account", accountId: "acct_b", drive: "cs_1", startedAt: "2026-09-01T00:00:00.000Z",
+            candidates: [{ key: "x", url: magnet("e") }], transfers: [{ key: "x", fileIds: ["f1"] }],
+          }));
+          await repo.saveWorkflowRunSnapshot(landingRun({
+            id: "run_landed", drive: "cs_1", startedAt: "2026-09-10T00:00:00.000Z",
+            candidates: [{ key: "a", url: magnet("a") }, { key: "b", url: magnet("b") }],
+            // A transfer the provider called failed still landed f3: status is not a filter.
+            transfers: [{ key: "a", fileIds: ["f1", "f2"] }, { key: "b", fileIds: ["f3"], status: "failed" }],
+          }));
+
+          expect(await repo.listLandingSources({ accountId: "acct_a", drive: "cs_1", fileIds: ["f1", "f3", "f_never_landed"] })).toEqual([
+            { fileId: "f1", url: magnet("a"), title: titleOf("run_landed", "a") },
+            { fileId: "f3", url: magnet("b"), title: titleOf("run_landed", "b") },
+          ]);
+        });
+
+        it("an empty id list reads nothing", async () => {
+          const repo = await fresh();
+          await repo.saveWorkflowRunSnapshot(landingRun({
+            id: "run_landed", drive: "cs_1", startedAt: t0, candidates: [{ key: "a", url: magnet("a") }], transfers: [{ key: "a", fileIds: ["f1"] }],
+          }));
+          expect(await repo.listLandingSources({ accountId: "acct_a", drive: "cs_1", fileIds: [] })).toEqual([]);
+        });
+
+        it("drive '' is the run saved with no connected storage, and only that run", async () => {
+          const repo = await fresh();
+          await repo.saveWorkflowRunSnapshot(landingRun({
+            id: "run_unbound", startedAt: t0, candidates: [{ key: "u", url: magnet("a") }], transfers: [{ key: "u", fileIds: ["f1"] }],
+          }));
+          await repo.saveWorkflowRunSnapshot(landingRun({
+            id: "run_bound", drive: "cs_1", startedAt: t0, candidates: [{ key: "b", url: magnet("b") }], transfers: [{ key: "b", fileIds: ["f1"] }],
+          }));
+          expect(await repo.listLandingSources({ accountId: "acct_a", drive: "", fileIds: ["f1"] })).toEqual([
+            { fileId: "f1", url: magnet("a"), title: titleOf("run_unbound", "u") },
+          ]);
+          expect(await repo.listLandingSources({ accountId: "acct_a", drive: "cs_1", fileIds: ["f1"] })).toEqual([
+            { fileId: "f1", url: magnet("b"), title: titleOf("run_bound", "b") },
+          ]);
+        });
+
+        it("oldest run first, then the run's transfers in order, each transfer's files in landing order", async () => {
+          const repo = await fresh();
+          // Saved first, started later.
+          await repo.saveWorkflowRunSnapshot(landingRun({
+            id: "run_late", drive: "cs_1", startedAt: "2026-09-20T00:00:00.000Z",
+            candidates: [{ key: "l", url: magnet("c") }], transfers: [{ key: "l", fileIds: ["f7"] }],
+          }));
+          await repo.saveWorkflowRunSnapshot(landingRun({
+            id: "run_early", drive: "cs_1", startedAt: "2026-09-10T00:00:00.000Z",
+            candidates: [{ key: "e1", url: magnet("a") }, { key: "e2", url: magnet("b") }],
+            transfers: [{ key: "e1", fileIds: ["f7"] }, { key: "e2", fileIds: ["f7", "f8"] }],
+          }));
+
+          expect(await repo.listLandingSources({ accountId: "acct_a", drive: "cs_1", fileIds: ["f8", "f7"] })).toEqual([
+            { fileId: "f7", url: magnet("a"), title: titleOf("run_early", "e1") },
+            { fileId: "f7", url: magnet("b"), title: titleOf("run_early", "e2") },
+            { fileId: "f8", url: magnet("b"), title: titleOf("run_early", "e2") },
+            { fileId: "f7", url: magnet("c"), title: titleOf("run_late", "l") },
+          ]);
+        });
+
+        it("skips a transfer whose candidate has no usable url: missing, empty or not a string", async () => {
+          const repo = await fresh();
+          await repo.saveWorkflowRunSnapshot(landingRun({
+            id: "run_urls", drive: "cs_1", startedAt: t0,
+            candidates: [{ key: "missing" }, { key: "empty", url: "" }, { key: "number", url: 42 }, { key: "good", url: magnet("a") }],
+            transfers: [
+              { key: "missing", fileIds: ["f1"] },
+              { key: "empty", fileIds: ["f2"] },
+              { key: "number", fileIds: ["f3"] },
+              { key: "good", fileIds: ["f4"] },
+            ],
+          }));
+          expect(await repo.listLandingSources({ accountId: "acct_a", drive: "cs_1", fileIds: ["f1", "f2", "f3", "f4"] })).toEqual([
+            { fileId: "f4", url: magnet("a"), title: titleOf("run_urls", "good") },
+          ]);
+        });
+
+        it("a transfer whose landed files are not a list counts as landing nothing, without breaking the read", async () => {
+          const repo = await fresh();
+          await repo.saveWorkflowRunSnapshot(landingRun({
+            id: "run_odd", drive: "cs_1", startedAt: t0,
+            candidates: [{ key: "a", url: magnet("a") }],
+            transfers: [{ key: "a", fileIds: "f1" }, { key: "a", fileIds: undefined }, { key: "a", fileIds: ["f1"] }],
+          }));
+          expect(await repo.listLandingSources({ accountId: "acct_a", drive: "cs_1", fileIds: ["f1"] })).toEqual([
+            { fileId: "f1", url: magnet("a"), title: titleOf("run_odd", "a") },
+          ]);
+        });
       });
     });
 

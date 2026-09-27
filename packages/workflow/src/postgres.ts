@@ -68,6 +68,7 @@ import {
   userMessageFromRow,
   type EpisodeSource,
   type EpisodeSourceRow,
+  type LandingSource,
   type PendingReplacement,
   type PendingReplacementRow,
   type RejectedResource,
@@ -1793,6 +1794,32 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       [scope.accountId, scope.drive, scope.titleKey],
     );
     return result.rows.map(episodeSourceFromRow);
+  }
+
+  async listLandingSources(input: Parameters<UserRequestStore["listLandingSources"]>[0]): Promise<LandingSource[]> {
+    if (input.fileIds.length === 0) return [];
+    await this.ensureSchema();
+    // An unbound work ("") is stored under the sentinel, never NULL (see storageFromColumn).
+    const storage = input.drive === "" ? UNSCOPED_STORAGE : input.drive;
+    // jsonb_array_elements* throws on a non-array: the CASE guards read one as [].
+    const result = await this.pool.query<{ file_id: string; url: string; title: string | null }>(
+      "SELECT f.id AS file_id, c->'providerPayload'->>'url' AS url, c->>'title' AS title " +
+        "FROM transfer_attempts t " +
+        "JOIN workflow_runs r ON r.id = t.workflow_run_id " +
+        "CROSS JOIN LATERAL jsonb_array_elements_text(" +
+        "CASE WHEN jsonb_typeof(t.payload->'materializedFileIds') = 'array' THEN t.payload->'materializedFileIds' ELSE '[]'::jsonb END" +
+        ") WITH ORDINALITY AS f(id, ord) " +
+        "JOIN resource_snapshots s ON s.workflow_run_id = t.workflow_run_id " +
+        "CROSS JOIN LATERAL jsonb_array_elements(" +
+        "CASE WHEN jsonb_typeof(s.payload->'candidates') = 'array' THEN s.payload->'candidates' ELSE '[]'::jsonb END" +
+        ") AS c " +
+        "WHERE r.account_id = $1 AND r.connected_storage_id = $2 AND f.id = ANY($3::text[]) " +
+        "AND c->>'id' = t.candidate_id " +
+        "AND jsonb_typeof(c->'providerPayload'->'url') = 'string' AND c->'providerPayload'->>'url' <> '' " +
+        "ORDER BY r.payload->>'startedAt', r.id, t.ordinal, f.ord, s.ordinal",
+      [input.accountId, storage, input.fileIds],
+    );
+    return result.rows.map((r) => ({ fileId: String(r.file_id), url: String(r.url), title: String(r.title ?? "") }));
   }
 
   // ---- private ----

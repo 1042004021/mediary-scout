@@ -27,6 +27,7 @@ import {
 import {
   compareUserMessagesCreated,
   type EpisodeSource,
+  type LandingSource,
   type PendingReplacement,
   type RejectedResource,
   type UserMessage,
@@ -909,6 +910,32 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
       .filter((s) => sameWork(s, scope))
       .sort((a, b) => a.episode.localeCompare(b.episode))
       .map((s) => ({ ...s }));
+  }
+
+  async listLandingSources(input: Parameters<UserRequestStore["listLandingSources"]>[0]): Promise<LandingSource[]> {
+    if (input.fileIds.length === 0) return [];
+    const wanted = new Set(input.fileIds);
+    const runs = [...this.workflowRuns.values()]
+      .filter((run) => {
+        const work = workOfRun(run);
+        return work.accountId === input.accountId && work.drive === input.drive;
+      })
+      .sort((a, b) => a.workflowRun.startedAt.localeCompare(b.workflowRun.startedAt) || a.workflowRun.id.localeCompare(b.workflowRun.id));
+    const out: LandingSource[] = [];
+    for (const run of runs) {
+      // The candidate is looked up in the run's own snapshots, like the SQL join.
+      const candidates = run.resourceSnapshots.flatMap((s) => (Array.isArray(s.candidates) ? s.candidates : []));
+      for (const attempt of run.transferAttempts) {
+        const landed = Array.isArray(attempt.materializedFileIds) ? attempt.materializedFileIds : [];
+        for (const fileId of landed.filter((id) => wanted.has(id))) {
+          for (const c of candidates) {
+            const url = c.providerPayload?.["url"];
+            if (c.id === attempt.candidateId && typeof url === "string" && url !== "") out.push({ fileId, url, title: c.title });
+          }
+        }
+      }
+    }
+    return out;
   }
 
   async saveWorkflowRunSnapshot(input: PersistWorkflowRunSnapshotInput): Promise<void> {

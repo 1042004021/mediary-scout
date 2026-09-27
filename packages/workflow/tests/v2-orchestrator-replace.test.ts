@@ -5,6 +5,8 @@ import type { ResourceProvider } from "../src/ports.js";
 import type { ResourceCandidate, VerifiedFile } from "../src/domain.js";
 import { FakeStorageExecutor } from "../src/fakes.js";
 import { InMemoryWorkflowRepository } from "../src/repository.js";
+import { deadLinkKey } from "../src/acquisition-v2/dead-links.js";
+import { resourceFingerprintMatches } from "../src/user-requests.js";
 
 const USAGE = {
   inputTokens: { total: undefined, noCache: undefined, cacheRead: undefined, cacheWrite: undefined },
@@ -763,5 +765,211 @@ describe("runAcquisitionV2 — user replace request", () => {
     expect(tools).not.toContain("reportReplacement");
     expect(system).not.toContain("USER REQUESTS");
     expect(result.replacement).toBeUndefined();
+  });
+});
+
+// 《奥德赛》 on 115 (production, 2026-09-27): an ordinary run landed the YTS magnet under the
+// file name below. The user called it a fake; its name normalizes to something else than the
+// magnet's title, so only the transfer that landed the file ties the two together.
+const ODYSSEY_FILE = "The.Odyssey.2026.1080p.WEBRip.x264.AAC5.1-[YTS.GG - YTS.BZ].mp4";
+const ODYSSEY_SIZE = 1702305907;
+const YTS_TITLE = "奥德赛-The Odyssey (2026) [1080p] [WEBRip] [5.1] [YTS.GG - YTS.BZ][1.6G]";
+const YTS_URL = "magnet:?xt=urn:btih:3F8A2C71D9B04E6A5C1D7E2B9A0F4C8D6E1B3A57&dn=The.Odyssey.2026.1080p.WEBRip.x264.AAC5.1-%5BYTS.GG%5D";
+const YTS_KEY = deadLinkKey(YTS_URL)!.key;
+const REAL_TITLE = "奥德赛 The.Odyssey.2026.2160p.WEB-DL.DDP5.1.Atmos [18.2G]";
+const YTS_ROW = /\[(s(\d+)-\d+)\] 奥德赛-The Odyssey \(2026\)/;
+
+function odysseyProvider(): ResourceProvider {
+  return {
+    search: async ({ keyword }) => {
+      const snapshotId = `snap_${keyword}`;
+      const candidates: ResourceCandidate[] =
+        keyword === "奥德赛"
+          ? [
+              { id: "cand_yts", snapshotId, index: 0, title: YTS_TITLE, type: "magnet", source: "pansou", providerPayload: { url: YTS_URL } },
+              { id: "cand_real", snapshotId, index: 1, title: REAL_TITLE, type: "magnet", source: "pansou", providerPayload: { url: `magnet:?xt=urn:btih:${"e".repeat(40)}` } },
+            ]
+          : [];
+      return { id: snapshotId, provider: "pansou", keyword, candidates, createdAt: NOW };
+    },
+  };
+}
+
+function odysseyExecutor(otherFiles: VerifiedFile[] = []) {
+  return new FakeStorageExecutor({
+    directories: {
+      film: [
+        { id: "odyssey_yts", storageDirectoryId: "film", name: ODYSSEY_FILE, sizeBytes: ODYSSEY_SIZE, episodeCode: null, providerFileId: "odyssey_yts" },
+        ...otherFiles,
+      ],
+    },
+    transferOutcomes: {
+      // Reached only if the fake were not refused: it would land a second time.
+      cand_yts: {
+        status: "succeeded",
+        providerMessage: "ok",
+        files: [{ id: "odyssey_again", storageDirectoryId: "film", name: ODYSSEY_FILE, sizeBytes: ODYSSEY_SIZE, episodeCode: null, providerFileId: "odyssey_again" }],
+      },
+    },
+  });
+}
+
+function odysseyRequest(
+  model: MockLanguageModelV3,
+  exec: FakeStorageExecutor,
+  rejectedRows: RejectedRow[],
+  landingLinkKeys: (fileIds: string[]) => Promise<Record<string, string>>,
+): RunAcquisitionV2Request {
+  return {
+    provider: odysseyProvider(),
+    executor: exec,
+    model,
+    workflowRunId: "run-replace-odyssey",
+    target: { kind: "movie", title: "奥德赛", aliases: ["The Odyssey"], year: 2026, qualityPreference: "1080p", tmdbId: 7007 },
+    stagingDirectoryId: "film",
+    targetMovieDirectoryId: "film",
+    userRequest: {
+      requestedEpisodes: ["MOVIE"],
+      prompt: { messages: [{ body: "这是假片", episodeTags: [], createdAt: NOW }], rejected: [], pending: [] },
+      landingLinkKeys,
+      rejectedStore: {
+        list: async () => rejectedRows,
+        add: async (rows) => {
+          rejectedRows.push(...rows);
+        },
+      },
+    },
+  };
+}
+
+describe("runAcquisitionV2 — a rejection carries the link of the transfer that landed the file", () => {
+  it("《奥德赛》: the fake an ordinary run landed is rejected by its magnet — hidden from the raw snapshot and refused at transfer, though neither its name nor its size-matched label matches the title", async () => {
+    // The hole being closed: name + size alone never catch this file's magnet.
+    expect(resourceFingerprintMatches(YTS_TITLE, { label: ODYSSEY_FILE, sizeBytes: ODYSSEY_SIZE })).toBe(false);
+    const rejectedRows: RejectedRow[] = [];
+    const landingCalls: string[][] = [];
+    let ytsRow: RegExpExecArray | null = null;
+    let docAfter = "";
+    let transferOutput: any;
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        i += 1;
+        if (i === 1) return tool("viewResourceSnapshot", {}, i);
+        if (i === 2) {
+          // Remembered from the pre-search, before the rejection hides it.
+          ytsRow = YTS_ROW.exec(String(lastToolOutput(options.prompt, "viewResourceSnapshot").document));
+          return tool("rejectCurrentSource", { episodes: [], fileIds: ["odyssey_yts"], reason: "假片" }, i);
+        }
+        if (i === 3) return tool("viewResourceSnapshot", {}, i);
+        if (i === 4) {
+          docAfter = String(lastToolOutput(options.prompt, "viewResourceSnapshot").document);
+          return tool("transferCandidate", { snapshotId: `s${ytsRow![2]}`, candidateId: ytsRow![1] }, i);
+        }
+        if (i === 5) transferOutput = lastToolOutput(options.prompt, "transferCandidate");
+        return text("done");
+      },
+    });
+
+    const result = await runAcquisitionV2(
+      odysseyRequest(model, odysseyExecutor(), rejectedRows, async (fileIds) => {
+        landingCalls.push(fileIds);
+        return { odyssey_yts: YTS_KEY };
+      }),
+    );
+
+    expect(landingCalls).toEqual([["odyssey_yts"]]);
+    expect(rejectedRows).toEqual([{ episode: "MOVIE", linkKey: YTS_KEY, label: ODYSSEY_FILE, sizeBytes: ODYSSEY_SIZE, reason: "假片" }]);
+    expect(result.replacement?.rejected).toEqual([expect.objectContaining({ episode: "MOVIE", linkKey: YTS_KEY })]);
+    expect(ytsRow).not.toBeNull();
+    expect(docAfter).not.toContain(YTS_TITLE);
+    expect(docAfter).toContain(REAL_TITLE);
+    expect(String(transferOutput?.error)).toMatch(/SANDBOX_CANDIDATE_REJECTED/);
+    expect(result.outcome.transferAttempts).toEqual([]);
+  });
+
+  it("a landing link that cannot be read fails the rejection closed: nothing recorded, the fake stays refused (SANDBOX_REJECT_FIRST), and the retry once the read recovers goes through", async () => {
+    const rejectedRows: RejectedRow[] = [];
+    let historyDown = true;
+    let ytsRow: RegExpExecArray | null = null;
+    let firstReject: any;
+    let rowsAfterFailure = -1;
+    let gatedTransfer: any;
+    let retryReject: any;
+    let repeatReject: any;
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        i += 1;
+        if (i === 1) return tool("viewResourceSnapshot", {}, i);
+        if (i === 2) {
+          ytsRow = YTS_ROW.exec(String(lastToolOutput(options.prompt, "viewResourceSnapshot").document));
+          return tool("rejectCurrentSource", { episodes: [], fileIds: ["odyssey_yts"], reason: "假片" }, i);
+        }
+        if (i === 3) {
+          firstReject = lastToolOutput(options.prompt, "rejectCurrentSource");
+          rowsAfterFailure = rejectedRows.length;
+          // The fake itself, straight from the pre-search: the gate is still shut.
+          return tool("transferCandidate", { snapshotId: `s${ytsRow![2]}`, candidateId: ytsRow![1] }, i);
+        }
+        if (i === 4) {
+          gatedTransfer = lastToolOutput(options.prompt, "transferCandidate");
+          historyDown = false;
+          return tool("rejectCurrentSource", { episodes: [], fileIds: ["odyssey_yts"], reason: "假片" }, i);
+        }
+        if (i === 5) {
+          retryReject = lastToolOutput(options.prompt, "rejectCurrentSource");
+          // Down again: a repeat has nothing new to record, so it needs no read.
+          historyDown = true;
+          return tool("rejectCurrentSource", { episodes: [], fileIds: ["odyssey_yts"], reason: "假片" }, i);
+        }
+        if (i === 6) repeatReject = lastToolOutput(options.prompt, "rejectCurrentSource");
+        return text("done");
+      },
+    });
+
+    const result = await runAcquisitionV2(
+      odysseyRequest(model, odysseyExecutor(), rejectedRows, async () => {
+        if (historyDown) throw new Error("db down");
+        return { odyssey_yts: YTS_KEY };
+      }),
+    );
+
+    expect(String(firstReject?.error)).toMatch(/^SANDBOX_REJECT_SOURCE_UNAVAILABLE: could not read which transfer landed these files \(db down\)/);
+    expect(rowsAfterFailure).toBe(0);
+    expect(String(gatedTransfer?.error)).toMatch(/SANDBOX_REJECT_FIRST/);
+    expect(retryReject).toEqual({ rejected: 1 });
+    expect(repeatReject).toEqual({ rejected: 1 });
+    expect(rejectedRows).toEqual([expect.objectContaining({ episode: "MOVIE", linkKey: YTS_KEY, label: ODYSSEY_FILE })]);
+    expect(result.replacement?.rejected).toEqual([expect.objectContaining({ linkKey: YTS_KEY })]);
+    expect(result.replacement?.oldFiles).toEqual([ODYSSEY_FILE]);
+    expect(result.outcome.transferAttempts).toEqual([]);
+  });
+
+  it("a file with no landing entry falls back to the episode's recorded source link, else none; a file with one keeps its own", async () => {
+    // An older copy whose transfer is no longer on record (finished runs are pruned).
+    const OLD_FILE = "奥德赛.2026.HDRip.1080p.mkv";
+    const SOURCE_KEY = `magnet:${"c".repeat(40)}`;
+    const rejectBoth = async (sourceLinkKeys?: Record<string, string>) => {
+      const rejectedRows: RejectedRow[] = [];
+      let i = 0;
+      const model = new MockLanguageModelV3({
+        doGenerate: async () => {
+          i += 1;
+          if (i === 1) return tool("rejectCurrentSource", { episodes: [], fileIds: ["odyssey_yts", "odyssey_old"], reason: "假片" }, i);
+          return text("done");
+        },
+      });
+      const exec = odysseyExecutor([
+        { id: "odyssey_old", storageDirectoryId: "film", name: OLD_FILE, sizeBytes: 2_000_000_000, episodeCode: null, providerFileId: "odyssey_old" },
+      ]);
+      const req = odysseyRequest(model, exec, rejectedRows, async () => ({ odyssey_yts: YTS_KEY }));
+      if (sourceLinkKeys) req.userRequest = { ...req.userRequest!, sourceLinkKeys };
+      await runAcquisitionV2(req);
+      return rejectedRows.map((r) => [r.label, r.linkKey]);
+    };
+
+    expect(await rejectBoth({ MOVIE: SOURCE_KEY })).toEqual([[ODYSSEY_FILE, YTS_KEY], [OLD_FILE, SOURCE_KEY]]);
+    expect(await rejectBoth()).toEqual([[ODYSSEY_FILE, YTS_KEY], [OLD_FILE, null]]);
   });
 });

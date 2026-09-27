@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { MockLanguageModelV3 } from "ai/test";
 import {
   createEpisodeStates,
+  deadLinkKey,
   enqueueUrgentReplaceRequests,
   FakeStorageExecutor,
   formatDailyDigestPushText,
@@ -11,6 +12,7 @@ import {
   runQueuedReplaceRequest,
   scheduledDigestItems,
   type MediaTitle,
+  type PersistWorkflowRunSnapshotInput,
   type ResourceCandidate,
   type ResourceProvider,
   type TrackedSeason,
@@ -2096,5 +2098,70 @@ describe("replace_request — an episode identified from an untagged message", (
     expect(result).toMatchObject({ status: "ran", workflowRunId: "run_rr_nofile", workflowStatus: "succeeded" });
     expect((await repository.listPendingReplacements(WORK)).map((p) => p.episode)).toEqual(["S01E02"]);
     expect((await repository.listUserMessages(WORK))[0]).toMatchObject({ status: "done" });
+  });
+});
+
+describe("replace_request — a rejection carries the link of the transfer that landed the file", () => {
+  it("《奥德赛》: the fake an earlier ordinary run landed on this drive is rejected by that transfer's magnet; a run on another drive claiming the same file id is ignored", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    const title: MediaTitle = { id: "tmdb_movie_7007", tmdbId: 7007, type: "movie", title: "奥德赛", originalTitle: "The Odyssey", year: 2026, aliases: [] };
+    const season = movieAnchorSeason({ titleId: title.id, qualityPreference: "1080p", storageDirectoryId: "dir_movie" });
+    const FILE = "The.Odyssey.2026.1080p.WEBRip.x264.AAC5.1-[YTS.GG - YTS.BZ].mp4";
+    const SIZE = 1702305907;
+    const YTS_URL = "magnet:?xt=urn:btih:3F8A2C71D9B04E6A5C1D7E2B9A0F4C8D6E1B3A57&dn=The.Odyssey.2026.1080p.WEBRip.x264.AAC5.1-%5BYTS.GG%5D";
+    /** A finished movie run of acct_1 on `drive` whose one transfer landed file odyssey_yts from a candidate linking `url`. */
+    const landingRun = (id: string, drive: string, startedAt: string, url: string): PersistWorkflowRunSnapshotInput => {
+      const snapshotId = `pansou_${id}_snapshot`;
+      const candidateId = `${snapshotId}_candidate_3`;
+      return {
+        accountId: "acct_1",
+        connectedStorageId: drive,
+        title,
+        season,
+        workflowRun: { id, kind: "movie_init", status: "succeeded", trackedSeasonId: season.id, startedAt, finishedAt: startedAt, auditEvents: [] },
+        episodes: createEpisodeStates({ trackedSeasonId: season.id, seasonNumber: 1, totalEpisodes: 1, latestAiredEpisode: 1 }).map((e) => ({ ...e, obtained: true })),
+        resourceSnapshots: [
+          {
+            id: snapshotId,
+            provider: "pansou",
+            keyword: "奥德赛",
+            createdAt: startedAt,
+            candidates: [
+              { id: candidateId, snapshotId, index: 3, title: "奥德赛-The Odyssey (2026) [1080p] [WEBRip] [5.1] [YTS.GG - YTS.BZ][1.6G]", type: "magnet", source: "pansou", providerPayload: { url } },
+            ],
+          },
+        ],
+        decisions: [],
+        transferAttempts: [{ id: `${id}_transfer_1`, workflowRunId: id, candidateId, status: "succeeded", providerMessage: "ok", materializedFileIds: ["odyssey_yts"] }],
+        notifications: [],
+      };
+    };
+    // Older, on another drive: taken for this drive's history, it would win (oldest first).
+    await repository.saveWorkflowRunSnapshot(landingRun("run_other_drive", "cs_drive_2", "2026-08-01T00:00:00.000Z", `magnet:?xt=urn:btih:${"d".repeat(40)}`));
+    await repository.saveWorkflowRunSnapshot(landingRun("run_landed_fake", DRIVE, "2026-09-14T00:00:00.000Z", YTS_URL));
+    const work = { accountId: "acct_1", drive: DRIVE, titleKey: title.id };
+    const storage = new FakeStorageExecutor();
+    const movieDir = await storage.createDirectory({ name: "奥德赛 (2026) {tmdb-7007}", parentId: "movies_root" });
+    storage.seedDirectoryFiles(movieDir, [
+      { id: "odyssey_yts", storageDirectoryId: movieDir, name: FILE, sizeBytes: SIZE, episodeCode: null, providerFileId: "odyssey_yts" },
+    ]);
+    await repository.createUserMessage({ ...work, body: "这是假片", episodeTags: [], now: NOW });
+    await queueReplaceRequest({ repository, work, now: fixedNow, createWorkflowRunId: () => "run_rr_odyssey" });
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => {
+        i += 1;
+        if (i === 1) return tool("rejectCurrentSource", { episodes: [], fileIds: ["odyssey_yts"], reason: "假片" }, i);
+        if (i === 2) return tool("reportReplacement", { results: [{ episode: "MOVIE", outcome: "not_found", note: "没有别的版本" }] }, i);
+        return text("done");
+      },
+    });
+
+    const result = await runQueuedReplaceRequest(baseRun(repository, storage, model));
+
+    expect(result).toMatchObject({ status: "ran", workflowRunId: "run_rr_odyssey" });
+    expect(await repository.listRejectedResources({ accountId: "acct_1", titleKey: title.id })).toEqual([
+      expect.objectContaining({ episode: "MOVIE", label: FILE, sizeBytes: SIZE, linkKey: deadLinkKey(YTS_URL)!.key }),
+    ]);
   });
 });

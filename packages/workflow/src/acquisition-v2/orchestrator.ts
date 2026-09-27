@@ -118,8 +118,14 @@ export interface RunAcquisitionV2Request {
     /** Episode → link key of the copy an earlier replace run put in place (the
      *  episode_sources rows). A rejection of that episode carries the link, so the same
      *  resource is refused under any name: in the store, and for the rest of this run
-     *  even when the store write fails. */
+     *  even when the store write fails. The fallback for a file landingLinkKeys has no
+     *  link for. */
     sourceLinkKeys?: Record<string, string>;
+    /** File id → link key of the resource whose transfer landed that file (this account + drive's
+     *  transfer history; nothing for a file landed before the history was pruned). How a rejection of a
+     *  file an ordinary run landed carries its link: its name and size rarely match the search titles
+     *  (a magnet's title is not its file name). */
+    landingLinkKeys?: (fileIds: string[]) => Promise<Record<string, string>>;
     rejectedStore: {
       /** `episode` lets a repeated rejection be skipped (see onReject). */
       list: () => Promise<Array<{ episode?: string; linkKey: string | null; label: string; sizeBytes: number | null }>>;
@@ -155,7 +161,8 @@ export interface RunAcquisitionV2Result extends AcquisitionAgentResult {
       sizeBytes?: number;
       note: string;
     }>;
-    /** linkKey: the episode's recorded source link it was rejected by too (null = none known). */
+    /** linkKey: the link it was rejected by too — of the transfer that landed the file, else
+     *  the episode's recorded source (null = none known). */
     rejected: Array<{ episode: string; label: string; sizeBytes: number | null; linkKey: string | null; reason: string }>;
     /** Paths (relative to the library dir) of the rejected files, still in place. */
     oldFiles: string[];
@@ -348,13 +355,29 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
                 seen.add(k);
                 return true;
               });
+              // Read before anything is recorded. A rejection without its link is the very
+              // hole this closes, so an unreadable history refuses the whole call (fail
+              // closed, like the run's other strict reads) and the agent can call again.
+              let landed = new Map<string, string>();
+              if (fresh.length > 0 && userRequest.landingLinkKeys) {
+                const fileIds = [...new Set(fresh.map((i) => i.fileId))];
+                try {
+                  landed = new Map(Object.entries(await userRequest.landingLinkKeys(fileIds)));
+                } catch (error) {
+                  throw new Error(
+                    `SANDBOX_REJECT_SOURCE_UNAVAILABLE: could not read which transfer landed these files (${errorText(error)}) — try again in a moment`,
+                  );
+                }
+              }
               for (const i of items) oldFiles.add(i.path);
               if (fresh.length === 0) return;
-              // An episode replaced once before has a known link: reject it by link too,
-              // not only name+size — here and in the store.
+              // Reject by link too, not only name+size — here and in the store: the link of
+              // the transfer that landed the file (an episode replaced once has two files,
+              // each with its own source), else the episode's recorded source (a file whose
+              // transfer is no longer on record).
               const rows = fresh.map((i) => ({
                 episode: i.episode,
-                linkKey: userRequest.sourceLinkKeys?.[i.episode] ?? null,
+                linkKey: landed.get(i.fileId) ?? userRequest.sourceLinkKeys?.[i.episode] ?? null,
                 label: i.label,
                 sizeBytes: i.sizeBytes,
                 reason: i.reason,
