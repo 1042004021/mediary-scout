@@ -292,6 +292,9 @@ describe("run wiring", () => {
     const req = { messages: [{ body: "13 发蓝", episodeTags: ["S01E13"], createdAt: "2026-09-26T06:00:00.000Z" }], rejected: [], pending: [] };
     expect(await userTurn(req, [])).toContain("(none — this run is for the USER REQUESTS in your instructions)");
     expect(await userTurn(req, [])).toMatch(/call reportReplacement for every requested episode, then finish/);
+    expect(await userTurn(req, [])).toContain(
+      "for a message without episode tags, until you have identified its episodes with rejectCurrentSource",
+    );
     expect(await userTurn(undefined, ["S01E14"])).not.toContain("reportReplacement");
     expect(await userTurn(req, ["S01E14"])).toContain("Missing episodes (the coverage need — may span multiple seasons): S01E14.");
     expect(await userTurn(undefined, ["S01E14"])).not.toContain("USER REQUESTS");
@@ -427,6 +430,14 @@ describe("user request block", () => {
     expect(text).toMatch(/episodes \[\] is only for a movie/);
     expect(text).toMatch(/For an episode with no file in the library, call rejectCurrentSource with that episode and fileIds \[\]/);
   });
+  it("asks a TV work to read the episodes of an untagged message from its words first, and says finish waits for it", () => {
+    const text = userRequestBlock({ userRequests: base });
+    expect(text).toContain(
+      "- A TV message without [episodes: …] tags still means particular episodes: work out from its words which ones, and call rejectCurrentSource for them before anything else (fileIds [] for an episode with no file). finish is refused until at least one episode is identified.",
+    );
+    // A rule, not user data: above the fence.
+    expect(text.indexOf("A TV message without")).toBeLessThan(text.indexOf("\n<user_requests>\n"));
+  });
   it("is part of both system prompts, right after the memory block", () => {
     for (const build of [buildTvAnimeSystemPrompt, buildMovieSystemPrompt]) {
       const prompt = build({ userRequests: base });
@@ -501,10 +512,14 @@ describe("replace tools registration", () => {
         provider: new FakeResourceProviderV2(),
         need: [],
         targetSeasonDirectoryIds: { 1: "season" },
-        replace: { requestedEpisodes: ["S01E13"], onReject: async () => undefined, onReport: async () => undefined },
+        replace: { requestedEpisodes: ["S01E13"], hasMessages: true, onReject: async () => undefined, onReport: async () => undefined },
       }),
     ) as Record<string, DescribedTool>;
     expect(replace.finish?.description).toContain("refused until every requested episode has a reportReplacement");
+    expect(replace.finish?.description).toContain(
+      "for a message that names no episode, until you have worked out from its words which episode(s) the user means and passed them to rejectCurrentSource (fileIds [] for an episode with no file)",
+    );
+    expect(plain.finish?.description).not.toContain("names no episode");
   });
 
   it("the finish tool of a replace run returns the report requirement as evidence, not a crash", async () => {
@@ -512,7 +527,7 @@ describe("replace tools registration", () => {
       provider: new FakeResourceProviderV2(),
       need: [],
       targetSeasonDirectoryIds: { 1: "season" },
-      replace: { requestedEpisodes: ["S01E13"], onReject: async () => undefined, onReport: async () => undefined },
+      replace: { requestedEpisodes: ["S01E13"], hasMessages: true, onReject: async () => undefined, onReport: async () => undefined },
     });
     const tools = buildSandboxToolSet(sandbox) as Record<string, ExecutableTool>;
     await expect(tools.finish!.execute({}, {})).resolves.toEqual({ error: expect.stringContaining("SANDBOX_REPORT_REQUIRED: S01E13") });

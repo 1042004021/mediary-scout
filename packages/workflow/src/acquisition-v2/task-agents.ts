@@ -374,7 +374,7 @@ export async function runTvAnimeTaskAgent(request: RunTvAnimeRequest): Promise<A
 Missing episodes (the coverage need — may span multiple seasons): ${missingLine}.
 If one pack covers multiple seasons, distribute its files in ONE plan with a move per season (moveToSeason({moves:[{season,fileIds}]})) and take only still-missing episodes — never recopy a season already present. Cover every missing episode with the fewest reliable transfers, keep each season directory clean, mark what truly landed, then finish.${
     promptOptions.userRequests
-      ? "\nUser requests: before you finish, call reportReplacement for every requested episode, then finish (finish is refused until they are all reported)."
+      ? "\nUser requests: before you finish, call reportReplacement for every requested episode, then finish (finish is refused until they are all reported — and, for a message without episode tags, until you have identified its episodes with rejectCurrentSource)."
       : ""
   }`;
   return runAcquisitionAgent({

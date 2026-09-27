@@ -394,6 +394,10 @@ export async function runQueuedReplaceRequest(
       oldFiles: replacement?.oldFiles ?? [],
       runId,
       ...(replacement?.rejectedPersistFailed ? { rejectedNotSaved: true } : {}),
+      // No episode came out of the messages (a TV message without tags, none worked out
+      // from the words; a movie always has its MOVIE result): nothing is kept 待换, so
+      // say so. Releasing the messages instead would only run the same thing again.
+      ...(results.length === 0 ? { unidentified: true } : {}),
     };
     // One retry: a message left in processing is only released by the idle scan after
     // the grace period, and then re-run from scratch — a transient hiccup should not cost that.

@@ -222,6 +222,11 @@ export interface TaskSandboxOptions {
    *  per-episode outcomes. Absent = the replace tools refuse. */
   replace?: {
     requestedEpisodes: string[];
+    /** Whether the run carries at least one user message (false = a pending-only
+     *  re-check of 待换 episodes). A message is words the agent reads episodes from: a
+     *  TV message without tags requests none by itself, so declareFinish refuses until
+     *  the agent has identified at least one. */
+    hasMessages: boolean;
     /** Requested episodes whose current source an earlier run already rejected (the
      *  stored list). When every requested episode is in here the agent may transfer
      *  without calling rejectCurrentSource again — see assertRejectedFirst. */
@@ -1031,11 +1036,20 @@ export class TaskSandbox {
   }
 
   /** The agent's `finish` tool. On a replace run it is refused while an episode the
-   *  user asked about (or the agent rejected) has no reportReplacement yet: the error
-   *  goes back to the agent and the loop continues (the step cap and the recovery
-   *  turn still end it; finalizeReplacement then records the rest as not_found). */
+   *  user asked about (or the agent rejected) has no reportReplacement yet, and — on a
+   *  run with a message — while no episode is identified at all: a TV message without
+   *  tags requests none, the agent reads them from the words, and finishing with none
+   *  would record nothing (the request would be lost). The error goes back to the agent
+   *  and the loop continues (the step cap and the recovery turn still end it;
+   *  finalizeReplacement then records the rest as not_found, and a run that still
+   *  identified nothing answers the message as unidentified). */
   async declareFinish(): Promise<Awaited<ReturnType<TaskSandbox["finish"]>>> {
     if (this.replace) {
+      if (this.replace.hasMessages && this.replaceEpisodes().length === 0) {
+        throw new Error(
+          "SANDBOX_NO_EPISODE_IDENTIFIED: work out from the user's words which episode(s) they mean, call rejectCurrentSource for them (fileIds [] for an episode with no file), then reportReplacement",
+        );
+      }
       const unreported = this.unreportedReplaceEpisodes();
       if (unreported.length > 0) {
         throw new Error(

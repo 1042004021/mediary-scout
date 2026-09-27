@@ -35,6 +35,10 @@ export interface UserMessageReply {
   /** The rejected list could not be saved this run: it was honoured in the run, but
    *  the next run will not know it (the UI says so). */
   rejectedNotSaved?: boolean;
+  /** The agent could not tell which episodes the user meant (a message without episode
+   *  tags, and none worked out from its words), so nothing was kept 待换. The UI asks
+   *  the user to pick the episodes and send again. */
+  unidentified?: boolean;
 }
 
 export interface UserMessage extends UserMessageScope {

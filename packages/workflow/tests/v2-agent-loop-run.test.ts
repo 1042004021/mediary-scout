@@ -305,6 +305,7 @@ describe("runAcquisitionAgent — the real AI SDK tool-loop over the sandbox", (
       need: ["S01E01"],
       replace: {
         requestedEpisodes: ["S01E01"],
+        hasMessages: true,
         onReject: async () => {},
         onReport: async (r) => { reported.push(...r); },
       },

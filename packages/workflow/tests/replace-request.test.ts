@@ -585,6 +585,34 @@ describe("runQueuedReplaceRequest", () => {
     expect(message?.status).toBe("done");
     expect(message?.reply).toMatchObject({ rejectedNotSaved: true, results: [{ episode: "S01E01", outcome: "not_found" }] });
   });
+
+  it("a TV message without tags whose episodes the agent never identifies: done with an unidentified reply, nothing kept 待换", async () => {
+    const { repository, title, season } = await trackedShow();
+    const storage = new FakeStorageExecutor();
+    await seedV2Season(storage, title, season, ["S01E01", "S01E02"]);
+    const message = await repository.createUserMessage({ ...WORK, body: "画面有点发蓝", episodeTags: [], now: NOW });
+    await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => "run_rr_untagged" });
+    let finishOutput: any;
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        i += 1;
+        if (i === 1) return tool("finish", {}, i);
+        if (i === 2) finishOutput = lastToolOutput(options.prompt, "finish");
+        return text("看不出是哪几集");
+      },
+    });
+
+    const result = await runQueuedReplaceRequest(baseRun(repository, storage, model));
+
+    expect(result).toMatchObject({ status: "ran", workflowRunId: "run_rr_untagged" });
+    // The agent was told to work out the episodes first; it gave up instead.
+    expect(String(finishOutput?.error)).toMatch(/^SANDBOX_NO_EPISODE_IDENTIFIED/);
+    const [done] = await repository.listUserMessages(WORK);
+    expect(done).toMatchObject({ id: message.id, status: "done", runId: "run_rr_untagged" });
+    expect(done!.reply).toEqual({ results: [], oldFiles: [], runId: "run_rr_untagged", unidentified: true });
+    expect(await repository.listPendingReplacements(WORK)).toEqual([]);
+  });
 });
 
 /** A model that only reports the given episodes not_found, capturing the user prompt. */

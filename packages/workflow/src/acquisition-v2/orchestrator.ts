@@ -276,6 +276,9 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
       ? {
           replace: {
             requestedEpisodes: userRequest.requestedEpisodes,
+            // A message is words to read episodes from (an untagged TV message requests
+            // none up front); a pending-only re-check has only its 待换 episodes.
+            hasMessages: userRequest.prompt.messages.length > 0,
             // Stored rejections from earlier runs let a PENDING-ONLY re-check (no new
             // message this run — the earlier rejection is why we are here) skip
             // rejecting again. A NEW message means the user is unhappy with what is in
