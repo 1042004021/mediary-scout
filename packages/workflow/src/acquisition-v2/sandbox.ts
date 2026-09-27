@@ -427,11 +427,13 @@ export class TaskSandbox {
   }
 
   /** Whether a need token counts toward coverage. A replace-guarded episode counts
-   *  only once some transfer succeeded this run (it may have been marked before the
-   *  agent rejected it), so the old file can never close the transfer gate. */
+   *  only once reportReplacement recorded it replaced (which checks its mark and a
+   *  landed candidate). A mark alone is not enough: it may predate the rejection, or
+   *  be unlocked by a transfer that carried a different episode — either way the old
+   *  file would close the transfer gate before this episode was ever replaced. */
   private countsAsObtained(token: string): boolean {
     if (!this.obtainedCodes.has(token)) return false;
-    return this.succeededCandidates.size > 0 || !this.replaceGuardedEpisodes().has(token);
+    return !this.replaceGuardedEpisodes().has(token) || this.reportedEpisodes.get(token) === "replaced";
   }
 
   /** Search one keyword. Repeats are deduped (no extra provider hit); distinct
@@ -903,7 +905,9 @@ export class TaskSandbox {
    *  already there, and marking it would meet coverage and block every transfer. So
    *  such a mark is refused (whole call, nothing recorded) until at least one
    *  transfer succeeded this run. Deliberately coarse — any landed transfer unlocks
-   *  it; which episodes that transfer carried stays the agent's judgment. */
+   *  the mark; which episodes that transfer carried stays the agent's judgment. The
+   *  mark still does not count toward coverage until reportReplacement records the
+   *  episode replaced (see countsAsObtained). */
   async markObtained(input: { codes: string[]; subtitleFallback?: boolean }): Promise<{ confirmed: string[] }> {
     if (this.replace && this.succeededCandidates.size === 0) {
       const guarded = this.replaceGuardedEpisodes();

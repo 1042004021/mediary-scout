@@ -175,7 +175,7 @@ describe("TaskSandbox — replace", () => {
     await expect(sandbox.markObtained({ codes: ["S01E13"] })).resolves.toEqual({ confirmed: ["S01E13"] });
   });
 
-  it("an episode marked before it was rejected does not meet coverage (nor block a transfer) until something lands", async () => {
+  it("an episode marked before it was rejected does not meet coverage (nor block a transfer) until it is reported replaced", async () => {
     const { sandbox, old13, old24, rejectE24 } = await setup();
     // Not requested yet → the mark is accepted...
     await sandbox.markObtained({ codes: ["S01E25"] });
@@ -188,9 +188,51 @@ describe("TaskSandbox — replace", () => {
     const snap = (await sandbox.searchResources("Show")).snapshot!;
     const out = await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_new13" });
     expect(out.attempt.status).toBe("succeeded");
-    // S01E25 is covered; the requested S01E13/S01E24 still need their own marks.
+    // Something landed, but S01E25's mark is still its old file: it counts only once
+    // reported replaced. The requested S01E13/S01E24 still need their own marks.
     expect(sandbox.isCoverageMet()).toBe(false);
+    expect((await sandbox.finish()).missing).toEqual(["S01E25", "S01E13", "S01E24"]);
+    await sandbox.reportReplacement({ results: [{ episode: "S01E25", outcome: "replaced", candidateId: "cand_new13", note: "x" }] });
     expect((await sandbox.finish()).missing).toEqual(["S01E13", "S01E24"]);
+  });
+
+  it("coverage is per episode: landing a genuinely missing episode does not let the requested one's old mark count", async () => {
+    const storage = new Storage115Simulator({
+      packs: {
+        old_pack: { files: [{ path: "Show - 13 [CR 1080p].mkv", sizeBytes: 1_400_000_000 }] },
+        cand_e14: { files: [{ path: "Show - 14 [CR 1080p].mkv", sizeBytes: 1_400_000_000 }] },
+        cand_new13: { files: [{ path: "[Nekomoe] Show - 13 [1080p].mkv", sizeBytes: 1_100_000_000 }] },
+      },
+    });
+    const staging = await storage.createDirectory({ name: "staging", parentId: "root" });
+    const season = await storage.createDirectory({ name: "Season 01", parentId: "root" });
+    await storage.transferCandidate({ candidateId: "old_pack", intoDirectoryId: season });
+    const old13 = (await storage.listTree({ directoryId: season }))[0]!.id;
+    const sandbox = new TaskSandbox({
+      provider: new FakeResourceProviderV2({
+        results: { Show: [{ id: "cand_e14", title: "Show 14" }, { id: "cand_new13", title: "[Nekomoe] Show 13" }] },
+      }),
+      storage, stagingDirectoryId: staging, targetSeasonDirectoryIds: { 1: season },
+      // E13 is obtained but requested; E14 is genuinely missing.
+      need: ["S01E13", "S01E14"],
+      replace: { requestedEpisodes: ["S01E13"], onReject: async () => {}, onReport: async () => {} },
+    });
+    await sandbox.captureProtectedFiles();
+    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
+    const snap = (await sandbox.searchResources("Show")).snapshot!;
+    await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_e14" });
+    // Something landed, so the marks are accepted — but E13's is still the old file.
+    await sandbox.markObtained({ codes: ["S01E13", "S01E14"] });
+    expect(sandbox.isCoverageMet()).toBe(false);
+    expect((await sandbox.finish()).missing).toEqual(["S01E13"]);
+    // Transfers are still allowed: E13 has not been replaced.
+    await expect(sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_new13" })).resolves.toMatchObject({
+      attempt: { status: "succeeded" },
+    });
+    expect(sandbox.isCoverageMet()).toBe(false);
+    await sandbox.reportReplacement({ results: [{ episode: "S01E13", outcome: "replaced", candidateId: "cand_new13", note: "喵萌版" }] });
+    expect(sandbox.isCoverageMet()).toBe(true);
+    expect((await sandbox.finish()).missing).toEqual([]);
   });
 
   it("a normal (non-replace) run marks and meets coverage without any transfer", async () => {
