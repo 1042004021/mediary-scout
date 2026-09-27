@@ -66,6 +66,7 @@ export interface RejectedResource {
   accountId: string;
   titleKey: string;
   episode: string;
+  /** resourceLinkKey of the rejected copy's link; null when none is known. */
   linkKey: string | null;
   label: string;
   sizeBytes: number | null;
@@ -76,6 +77,7 @@ export interface RejectedResource {
 
 export interface EpisodeSource extends UserMessageScope {
   episode: string;
+  /** resourceLinkKey of the link the episode's copy was transferred by. */
   linkKey: string | null;
   label: string;
   sizeBytes: number | null;

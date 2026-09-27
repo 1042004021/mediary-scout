@@ -3,6 +3,7 @@ import type { ResourceProvider } from "../ports.js";
 import { resourceFingerprintMatches } from "../user-requests.js";
 import type { CandidateRegistry } from "./candidate-registry.js";
 import { deadLinkKey, type DeadLinkStore } from "./dead-links.js";
+import { resourceLinkKey } from "./resource-link.js";
 import type { ResourceProviderV2, ResourceSnapshotV2 } from "./fake-provider.js";
 
 /**
@@ -72,13 +73,16 @@ export class RealResourceProviderV2 implements ResourceProviderV2 {
     let deadDropped = 0;
     let rejectedDropped = 0;
     const kept = snapshot.candidates.filter((candidate) => {
-      const identity = deadLinkKey(String(candidate.providerPayload?.["url"] ?? ""));
+      const url = String(candidate.providerPayload?.["url"] ?? "");
+      const identity = deadLinkKey(url);
       if (identity && deadKeys.has(identity.key)) {
         deadDropped++;
         return false;
       }
+      // A rejection follows every drive's share links, not only the ones dead-link tracking keys.
+      const linkKey = resourceLinkKey(url);
       if (
-        (identity && rejectedKeys.has(identity.key)) ||
+        (linkKey !== null && rejectedKeys.has(linkKey)) ||
         rejected.some((r) => resourceFingerprintMatches(candidate.title, r))
       ) {
         rejectedDropped++;

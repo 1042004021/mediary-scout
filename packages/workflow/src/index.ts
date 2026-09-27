@@ -61,6 +61,7 @@ export * from "./acquisition-v2/task-agents.js";
 export * from "./acquisition-v2/skill.js";
 export * from "./acquisition-v2/interrogation.js";
 export * from "./acquisition-v2/dead-links.js";
+export * from "./acquisition-v2/resource-link.js";
 export * from "./acquisition-v2/search-profile.js";
 export * from "./acquisition-v2/activity.js";
 export * from "./acquisition-v2/repetition-stop.js";

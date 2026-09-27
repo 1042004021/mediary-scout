@@ -6,7 +6,8 @@ import type { ResourceProvider, StorageExecutor } from "../ports.js";
 import type { AcquisitionAgentResult } from "./agent-loop.js";
 import type { AgentToolEvent } from "./activity.js";
 import { CandidateRegistry } from "./candidate-registry.js";
-import { deadLinkKey, type DeadLinkStore } from "./dead-links.js";
+import type { DeadLinkStore } from "./dead-links.js";
+import { resourceLinkKey } from "./resource-link.js";
 import { resourceFingerprintMatches } from "../user-requests.js";
 import type { UserRequestPromptInput } from "./user-request-block.js";
 import { RealResourceProviderV2 } from "./real-provider-adapter.js";
@@ -296,9 +297,9 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
             // pre-search may predate a rejection; a repeated keyword is cached).
             try {
               const rows = await listRejected();
-              const key = deadLinkKey(String(registry.get(candidate.id)?.providerPayload?.["url"] ?? ""))?.key;
+              const key = resourceLinkKey(String(registry.get(candidate.id)?.providerPayload?.["url"] ?? ""));
               return rows.some(
-                (r) => (key !== undefined && r.linkKey === key) || resourceFingerprintMatches(candidate.title, r),
+                (r) => (key !== null && r.linkKey === key) || resourceFingerprintMatches(candidate.title, r),
               );
             } catch (error) {
               // Replace run: fail closed — refuse the transfer (the agent sees why and can
@@ -414,7 +415,7 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
                     ? {
                         candidateId: candidate.id,
                         label: candidate.title,
-                        linkKey: deadLinkKey(String(candidate.providerPayload?.["url"] ?? ""))?.key ?? null,
+                        linkKey: resourceLinkKey(String(candidate.providerPayload?.["url"] ?? "")),
                       }
                     : {}),
                   ...(r.outcome === "replaced" && r.sizeBytes !== undefined ? { sizeBytes: r.sizeBytes } : {}),

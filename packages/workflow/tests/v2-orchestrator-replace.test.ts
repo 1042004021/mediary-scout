@@ -6,6 +6,7 @@ import type { ResourceCandidate, VerifiedFile } from "../src/domain.js";
 import { FakeStorageExecutor } from "../src/fakes.js";
 import { InMemoryWorkflowRepository } from "../src/repository.js";
 import { deadLinkKey } from "../src/acquisition-v2/dead-links.js";
+import { resourceLinkKey } from "../src/acquisition-v2/resource-link.js";
 import { resourceFingerprintMatches } from "../src/user-requests.js";
 
 const USAGE = {
@@ -779,15 +780,16 @@ const YTS_KEY = deadLinkKey(YTS_URL)!.key;
 const REAL_TITLE = "奥德赛 The.Odyssey.2026.2160p.WEB-DL.DDP5.1.Atmos [18.2G]";
 const YTS_ROW = /\[(s(\d+)-\d+)\] 奥德赛-The Odyssey \(2026\)/;
 
-function odysseyProvider(): ResourceProvider {
+/** The fake's and the real film's links default to magnets; a test may make either a share link. */
+function odysseyProvider(urls: { fake?: string; real?: string } = {}): ResourceProvider {
   return {
     search: async ({ keyword }) => {
       const snapshotId = `snap_${keyword}`;
       const candidates: ResourceCandidate[] =
         keyword === "奥德赛"
           ? [
-              { id: "cand_yts", snapshotId, index: 0, title: YTS_TITLE, type: "magnet", source: "pansou", providerPayload: { url: YTS_URL } },
-              { id: "cand_real", snapshotId, index: 1, title: REAL_TITLE, type: "magnet", source: "pansou", providerPayload: { url: `magnet:?xt=urn:btih:${"e".repeat(40)}` } },
+              { id: "cand_yts", snapshotId, index: 0, title: YTS_TITLE, type: "magnet", source: "pansou", providerPayload: { url: urls.fake ?? YTS_URL } },
+              { id: "cand_real", snapshotId, index: 1, title: REAL_TITLE, type: "magnet", source: "pansou", providerPayload: { url: urls.real ?? `magnet:?xt=urn:btih:${"e".repeat(40)}` } },
             ]
           : [];
       return { id: snapshotId, provider: "pansou", keyword, candidates, createdAt: NOW };
@@ -795,7 +797,7 @@ function odysseyProvider(): ResourceProvider {
   };
 }
 
-function odysseyExecutor(otherFiles: VerifiedFile[] = []) {
+function odysseyExecutor(otherFiles: VerifiedFile[] = [], realLands: VerifiedFile[] = []) {
   return new FakeStorageExecutor({
     directories: {
       film: [
@@ -810,6 +812,7 @@ function odysseyExecutor(otherFiles: VerifiedFile[] = []) {
         providerMessage: "ok",
         files: [{ id: "odyssey_again", storageDirectoryId: "film", name: ODYSSEY_FILE, sizeBytes: ODYSSEY_SIZE, episodeCode: null, providerFileId: "odyssey_again" }],
       },
+      ...(realLands.length > 0 ? { cand_real: { status: "succeeded" as const, providerMessage: "ok", files: realLands } } : {}),
     },
   });
 }
@@ -1031,5 +1034,50 @@ describe("runAcquisitionV2 — a rejection carries the link of the transfer that
     await runAcquisitionV2(odysseyRequest(model, odysseyExecutor(), rejectedRows, async () => ({ odyssey_yts: YTS_KEY })));
 
     expect(rejectedRows.map((r) => r.linkKey)).toEqual([null, YTS_KEY]);
+  });
+  it("on a share-only drive (夸克): the rejected share is hidden and refused by its share id, and a replacement's source is recorded by its share id", async () => {
+    const FAKE_SHARE = "https://pan.quark.cn/s/1a2B3c4D?pwd=zzzz";
+    const REAL_SHARE = "https://pan.quark.cn/s/9z8Y7x6W";
+    const rejectedRows: RejectedRow[] = [];
+    let ytsRow: RegExpExecArray | null = null;
+    let realAlias = "";
+    let docAfter = "";
+    let refused: any;
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        i += 1;
+        if (i === 1) return tool("viewResourceSnapshot", {}, i);
+        if (i === 2) {
+          const doc = String(lastToolOutput(options.prompt, "viewResourceSnapshot").document);
+          ytsRow = YTS_ROW.exec(doc);
+          realAlias = /\[(s\d+-\d+)\] 奥德赛 The\.Odyssey\.2026\.2160p/.exec(doc)![1]!;
+          return tool("rejectCurrentSource", { episodes: [], fileIds: ["odyssey_yts"], reason: "假片" }, i);
+        }
+        if (i === 3) return tool("viewResourceSnapshot", {}, i);
+        if (i === 4) {
+          docAfter = String(lastToolOutput(options.prompt, "viewResourceSnapshot").document);
+          return tool("transferCandidate", { snapshotId: `s${ytsRow![2]}`, candidateId: ytsRow![1] }, i);
+        }
+        if (i === 5) {
+          refused = lastToolOutput(options.prompt, "transferCandidate");
+          return tool("transferCandidate", { snapshotId: realAlias.split("-")[0]!, candidateId: realAlias }, i);
+        }
+        if (i === 6) return tool("markObtained", { codes: ["MOVIE"] }, i);
+        if (i === 7) return tool("reportReplacement", { results: [{ episode: "MOVIE", outcome: "replaced", candidateId: realAlias, fileIds: ["odyssey_real"], note: "诺兰版" }] }, i);
+        return text("done");
+      },
+    });
+    const exec = odysseyExecutor([], [
+      { id: "odyssey_real", storageDirectoryId: "film", name: "The.Odyssey.2026.2160p.WEB-DL.mkv", sizeBytes: 19_000_000_000, episodeCode: null, providerFileId: "odyssey_real" },
+    ]);
+    const req = odysseyRequest(model, exec, rejectedRows, async () => ({ odyssey_yts: resourceLinkKey(FAKE_SHARE)! }));
+
+    const result = await runAcquisitionV2({ ...req, provider: odysseyProvider({ fake: FAKE_SHARE, real: REAL_SHARE }) });
+
+    expect(rejectedRows).toEqual([expect.objectContaining({ label: ODYSSEY_FILE, linkKey: "quark:1a2B3c4D" })]);
+    expect(docAfter).not.toContain(YTS_TITLE);
+    expect(String(refused?.error)).toMatch(/SANDBOX_CANDIDATE_REJECTED/);
+    expect(result.replacement?.results).toEqual([expect.objectContaining({ episode: "MOVIE", outcome: "replaced", linkKey: "quark:9z8Y7x6W" })]);
   });
 });

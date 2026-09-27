@@ -2102,44 +2102,41 @@ describe("replace_request — an episode identified from an untagged message", (
 });
 
 describe("replace_request — a rejection carries the link of the transfer that landed the file", () => {
-  it("《奥德赛》: the fake an earlier ordinary run landed on this drive is rejected by that transfer's magnet; a run on another drive claiming the same file id is ignored", async () => {
-    const repository = new InMemoryWorkflowRepository();
-    const title: MediaTitle = { id: "tmdb_movie_7007", tmdbId: 7007, type: "movie", title: "奥德赛", originalTitle: "The Odyssey", year: 2026, aliases: [] };
-    const season = movieAnchorSeason({ titleId: title.id, qualityPreference: "1080p", storageDirectoryId: "dir_movie" });
-    const FILE = "The.Odyssey.2026.1080p.WEBRip.x264.AAC5.1-[YTS.GG - YTS.BZ].mp4";
-    const SIZE = 1702305907;
-    const YTS_URL = "magnet:?xt=urn:btih:3F8A2C71D9B04E6A5C1D7E2B9A0F4C8D6E1B3A57&dn=The.Odyssey.2026.1080p.WEBRip.x264.AAC5.1-%5BYTS.GG%5D";
-    /** A finished movie run of acct_1 on `drive` whose one transfer landed file odyssey_yts from a candidate linking `url`. */
-    const landingRun = (id: string, drive: string, startedAt: string, url: string): PersistWorkflowRunSnapshotInput => {
-      const snapshotId = `pansou_${id}_snapshot`;
-      const candidateId = `${snapshotId}_candidate_3`;
-      return {
-        accountId: "acct_1",
-        connectedStorageId: drive,
-        title,
-        season,
-        workflowRun: { id, kind: "movie_init", status: "succeeded", trackedSeasonId: season.id, startedAt, finishedAt: startedAt, auditEvents: [] },
-        episodes: createEpisodeStates({ trackedSeasonId: season.id, seasonNumber: 1, totalEpisodes: 1, latestAiredEpisode: 1 }).map((e) => ({ ...e, obtained: true })),
-        resourceSnapshots: [
-          {
-            id: snapshotId,
-            provider: "pansou",
-            keyword: "奥德赛",
-            createdAt: startedAt,
-            candidates: [
-              { id: candidateId, snapshotId, index: 3, title: "奥德赛-The Odyssey (2026) [1080p] [WEBRip] [5.1] [YTS.GG - YTS.BZ][1.6G]", type: "magnet", source: "pansou", providerPayload: { url } },
-            ],
-          },
-        ],
-        decisions: [],
-        transferAttempts: [{ id: `${id}_transfer_1`, workflowRunId: id, candidateId, status: "succeeded", providerMessage: "ok", materializedFileIds: ["odyssey_yts"] }],
-        notifications: [],
-      };
+  const title: MediaTitle = { id: "tmdb_movie_7007", tmdbId: 7007, type: "movie", title: "奥德赛", originalTitle: "The Odyssey", year: 2026, aliases: [] };
+  const season = movieAnchorSeason({ titleId: title.id, qualityPreference: "1080p", storageDirectoryId: "dir_movie" });
+  const FILE = "The.Odyssey.2026.1080p.WEBRip.x264.AAC5.1-[YTS.GG - YTS.BZ].mp4";
+  const SIZE = 1702305907;
+  const YTS_URL = "magnet:?xt=urn:btih:3F8A2C71D9B04E6A5C1D7E2B9A0F4C8D6E1B3A57&dn=The.Odyssey.2026.1080p.WEBRip.x264.AAC5.1-%5BYTS.GG%5D";
+  const work = { accountId: "acct_1", drive: DRIVE, titleKey: title.id };
+  /** A finished movie run of acct_1 on `drive` whose one transfer landed file odyssey_yts from a candidate linking `url`. */
+  const landingRun = (id: string, drive: string, startedAt: string, url: string): PersistWorkflowRunSnapshotInput => {
+    const snapshotId = `pansou_${id}_snapshot`;
+    const candidateId = `${snapshotId}_candidate_3`;
+    return {
+      accountId: "acct_1",
+      connectedStorageId: drive,
+      title,
+      season,
+      workflowRun: { id, kind: "movie_init", status: "succeeded", trackedSeasonId: season.id, startedAt, finishedAt: startedAt, auditEvents: [] },
+      episodes: createEpisodeStates({ trackedSeasonId: season.id, seasonNumber: 1, totalEpisodes: 1, latestAiredEpisode: 1 }).map((e) => ({ ...e, obtained: true })),
+      resourceSnapshots: [
+        {
+          id: snapshotId,
+          provider: "pansou",
+          keyword: "奥德赛",
+          createdAt: startedAt,
+          candidates: [
+            { id: candidateId, snapshotId, index: 3, title: "奥德赛-The Odyssey (2026) [1080p] [WEBRip] [5.1] [YTS.GG - YTS.BZ][1.6G]", type: "magnet", source: "pansou", providerPayload: { url } },
+          ],
+        },
+      ],
+      decisions: [],
+      transferAttempts: [{ id: `${id}_transfer_1`, workflowRunId: id, candidateId, status: "succeeded", providerMessage: "ok", materializedFileIds: ["odyssey_yts"] }],
+      notifications: [],
     };
-    // Older, on another drive: taken for this drive's history, it would win (oldest first).
-    await repository.saveWorkflowRunSnapshot(landingRun("run_other_drive", "cs_drive_2", "2026-08-01T00:00:00.000Z", `magnet:?xt=urn:btih:${"d".repeat(40)}`));
-    await repository.saveWorkflowRunSnapshot(landingRun("run_landed_fake", DRIVE, "2026-09-14T00:00:00.000Z", YTS_URL));
-    const work = { accountId: "acct_1", drive: DRIVE, titleKey: title.id };
+  };
+  /** The user calls the film in the library (file odyssey_yts) a fake; the agent rejects it and finds nothing else. */
+  async function rejectTheFake(repository: InMemoryWorkflowRepository) {
     const storage = new FakeStorageExecutor();
     const movieDir = await storage.createDirectory({ name: "奥德赛 (2026) {tmdb-7007}", parentId: "movies_root" });
     storage.seedDirectoryFiles(movieDir, [
@@ -2156,12 +2153,34 @@ describe("replace_request — a rejection carries the link of the transfer that 
         return text("done");
       },
     });
-
     const result = await runQueuedReplaceRequest(baseRun(repository, storage, model));
-
     expect(result).toMatchObject({ status: "ran", workflowRunId: "run_rr_odyssey" });
-    expect(await repository.listRejectedResources({ accountId: "acct_1", titleKey: title.id })).toEqual([
+    return repository.listRejectedResources({ accountId: "acct_1", titleKey: title.id });
+  }
+
+  it("《奥德赛》: the fake an earlier ordinary run landed on this drive is rejected by that transfer's magnet; a run on another drive claiming the same file id is ignored", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    // Older, on another drive: taken for this drive's history, it would win (oldest first).
+    await repository.saveWorkflowRunSnapshot(landingRun("run_other_drive", "cs_drive_2", "2026-08-01T00:00:00.000Z", `magnet:?xt=urn:btih:${"d".repeat(40)}`));
+    await repository.saveWorkflowRunSnapshot(landingRun("run_landed_fake", DRIVE, "2026-09-14T00:00:00.000Z", YTS_URL));
+
+    expect(await rejectTheFake(repository)).toEqual([
       expect.objectContaining({ episode: "MOVIE", label: FILE, sizeBytes: SIZE, linkKey: deadLinkKey(YTS_URL)!.key }),
     ]);
+  });
+
+  it("a copy landed from a 夸克 share is rejected by its share id", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    await repository.saveWorkflowRunSnapshot(landingRun("run_landed_fake", DRIVE, "2026-09-14T00:00:00.000Z", "https://pan.quark.cn/s/1a2B3c4D?pwd=zzzz"));
+
+    expect(await rejectTheFake(repository)).toEqual([expect.objectContaining({ label: FILE, linkKey: "quark:1a2B3c4D" })]);
+  });
+
+  it("the oldest transfer decides, even when its link has no key: a later claim on the same file (a lagging listing) does not lend its link", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    await repository.saveWorkflowRunSnapshot(landingRun("run_first", DRIVE, "2026-09-14T00:00:00.000Z", "https://example.com/The.Odyssey.2026.mp4"));
+    await repository.saveWorkflowRunSnapshot(landingRun("run_later", DRIVE, "2026-09-15T00:00:00.000Z", YTS_URL));
+
+    expect(await rejectTheFake(repository)).toEqual([expect.objectContaining({ label: FILE, linkKey: null })]);
   });
 });

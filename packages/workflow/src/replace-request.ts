@@ -5,7 +5,7 @@ import { syncSeasonAgainstMetadata } from "./season-sync.js";
 import type { ResourceProvider, StorageExecutor } from "./ports.js";
 import type { JevJudge } from "./jev-judge.js";
 import type { RunAcquisitionV2Request, RunAcquisitionV2Result } from "./acquisition-v2/orchestrator.js";
-import { deadLinkKey } from "./acquisition-v2/dead-links.js";
+import { resourceLinkKey } from "./acquisition-v2/resource-link.js";
 import {
   parseSizeFromTitle,
   userMessageDrive,
@@ -287,9 +287,14 @@ export async function runQueuedReplaceRequest(
       // ordinary run landed has (no episode source is recorded for it).
       landingLinkKeys: async (fileIds) => {
         const keys = new Map<string, string>();
+        const decided = new Set<string>();
         for (const s of await repository.listLandingSources({ accountId: work.accountId, drive: work.drive, fileIds })) {
-          const key = deadLinkKey(s.url)?.key;
-          if (key && !keys.has(s.fileId)) keys.set(s.fileId, key); // oldest transfer wins
+          // The oldest transfer decides — a later one can only have claimed the file through
+          // a lagging listing — even when its link has no key.
+          if (decided.has(s.fileId)) continue;
+          decided.add(s.fileId);
+          const key = resourceLinkKey(s.url);
+          if (key) keys.set(s.fileId, key);
         }
         return Object.fromEntries(keys);
       },
