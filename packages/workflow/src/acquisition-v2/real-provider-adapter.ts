@@ -28,8 +28,12 @@ export interface RealResourceProviderV2Options {
   deadLinkStore?: DeadLinkStore;
   /** The work's rejected resources (user said "not this one"), re-read on every search
    *  so a rejection made earlier in THIS run applies at once. Matching candidates are
-   *  dropped like dead links. A failing read filters nothing. */
-  rejectedResources?: { list: () => Promise<Array<{ linkKey: string | null; label: string; sizeBytes: number | null }>> };
+   *  dropped like dead links. A failing read filters nothing — unless `strict` (a user
+   *  replace run), where it fails the search instead. */
+  rejectedResources?: {
+    list: () => Promise<Array<{ linkKey: string | null; label: string; sizeBytes: number | null }>>;
+    strict?: boolean;
+  };
 }
 
 export class RealResourceProviderV2 implements ResourceProviderV2 {
@@ -143,6 +147,9 @@ export class RealResourceProviderV2 implements ResourceProviderV2 {
 
   private async readRejected(): Promise<Array<{ linkKey: string | null; label: string; sizeBytes: number | null }>> {
     if (!this.rejectedResources) return [];
+    // A user replace run reads strictly: showing what the user rejected is worse than a
+    // failed search (the agent sees the error and can search again).
+    if (this.rejectedResources.strict) return this.rejectedResources.list();
     try {
       return await this.rejectedResources.list();
     } catch (error) {

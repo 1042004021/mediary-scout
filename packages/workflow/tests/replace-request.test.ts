@@ -2075,3 +2075,26 @@ describe("replace_request retry — what a retried run claims", () => {
     ]);
   });
 });
+
+describe("replace_request — an episode identified from an untagged message", () => {
+  it("declared file-less and not found, it still becomes 待换: it was not 待换 when the run started, so the 「不换了」 guard does not apply", async () => {
+    const { repository } = await trackedShow();
+    await repository.createUserMessage({ ...WORK, body: "第 2 集没有文件，帮我找一个", episodeTags: [], now: NOW });
+    await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => "run_rr_nofile" });
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => {
+        i += 1;
+        if (i === 1) return tool("rejectCurrentSource", { episodes: ["S01E02"], fileIds: [], reason: "库里没有这集的文件" }, i);
+        if (i === 2) return tool("reportReplacement", { results: [{ episode: "S01E02", outcome: "not_found", note: "没找到" }] }, i);
+        return text("done");
+      },
+    });
+
+    const result = await runQueuedReplaceRequest(baseRun(repository, new FakeStorageExecutor(), model));
+
+    expect(result).toMatchObject({ status: "ran", workflowRunId: "run_rr_nofile", workflowStatus: "succeeded" });
+    expect((await repository.listPendingReplacements(WORK)).map((p) => p.episode)).toEqual(["S01E02"]);
+    expect((await repository.listUserMessages(WORK))[0]).toMatchObject({ status: "done" });
+  });
+});

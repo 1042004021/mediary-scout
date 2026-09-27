@@ -317,7 +317,9 @@ describe("runAcquisitionV2 — user replace request", () => {
     req.userRequest = {
       ...req.userRequest!,
       rejectedStore: {
-        list: async () => { throw new Error("db down"); },
+        // The READ works (strict reads in a replace run fail closed — see below); the
+        // WRITE fails, and the in-memory copy keeps the rejection effective.
+        list: async () => [],
         add: async () => { throw new Error("db down"); },
       },
     };
@@ -326,6 +328,54 @@ describe("runAcquisitionV2 — user replace request", () => {
     expect(seen).toContain(NEKOMOE_TITLE);
     expect(result.replacement?.rejected).toEqual([expect.objectContaining({ episode: "S01E13" })]);
     expect(result.replacement?.rejectedPersistFailed).toBe(true);
+  });
+
+  it("a replace run fails closed when the rejected list cannot be read mid-run: the search errors, a transfer is refused, nothing lands", async () => {
+    const exec = executor();
+    let dbDown = false;
+    let searchOutput: any;
+    let transferOutput: any;
+    let rawRow: RegExpExecArray | null = null;
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        i += 1;
+        if (i === 1) return tool("viewResourceSnapshot", {}, i);
+        if (i === 2) {
+          rawRow = /\[(s(\d+)-\d+)\] \[Nekomoe/.exec(String(lastToolOutput(options.prompt, "viewResourceSnapshot").document));
+          return tool("rejectCurrentSource", { episodes: ["S01E13"], fileIds: ["old13"], reason: "发蓝" }, i);
+        }
+        if (i === 3) return tool("rejectCurrentSource", { episodes: ["S01E24"], fileIds: ["old24"], reason: "发蓝" }, i);
+        if (i === 4) {
+          dbDown = true; // the database blips after the rejections are recorded
+          return tool("searchResources", { keyword: "Show 13" }, i);
+        }
+        if (i === 5) {
+          searchOutput = lastToolOutput(options.prompt, "searchResources");
+          return tool("transferCandidate", { snapshotId: `s${rawRow![2]}`, candidateId: rawRow![1] }, i);
+        }
+        if (i === 6) transferOutput = lastToolOutput(options.prompt, "transferCandidate");
+        return text("done");
+      },
+    });
+    const req = baseRequest(model, exec, []);
+    req.userRequest = {
+      ...req.userRequest!,
+      rejectedStore: {
+        list: async () => {
+          if (dbDown) throw new Error("db down");
+          return [];
+        },
+        add: async () => undefined,
+      },
+    };
+
+    const result = await runAcquisitionV2(req);
+
+    expect(rawRow).not.toBeNull();
+    expect(String(searchOutput?.error)).toMatch(/db down/);
+    expect(String(transferOutput?.error)).toMatch(/SANDBOX_REJECTED_LIST_UNAVAILABLE/);
+    expect(result.outcome.transferAttempts).toEqual([]);
   });
 
   it("a rejected list that could not be saved still refuses the episode's recorded source link for the rest of the run — under another name, with no size in the title", async () => {

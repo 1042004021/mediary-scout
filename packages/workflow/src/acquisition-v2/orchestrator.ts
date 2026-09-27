@@ -174,6 +174,9 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
   // Where the stored rejected list comes from (see rejectedLookup). Absent = no
   // rejection filtering at all (callers that do not know the work).
   const rejectedSource: RunAcquisitionV2Request["rejectedLookup"] = request.userRequest?.rejectedStore ?? request.rejectedLookup;
+  // A user replace run reads the rejected list strictly (fail closed): its whole point
+  // is that a rejected source never comes back. Ordinary runs read it best-effort.
+  const strictRejected = request.userRequest !== undefined;
   // Wrapping HERE (not at the call site) is what makes the pre-warm and every agent
   // searchResources go through the same filter — they all funnel through this adapter.
   const searchProvider = request.jevJudge
@@ -186,7 +189,7 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
     ...(request.deadLinkStore ? { deadLinkStore: request.deadLinkStore } : {}),
     // Re-read on every search (closure over the collectors declared below; first
     // called only once the agent searches).
-    ...(rejectedSource ? { rejectedResources: { list: () => listRejected() } } : {}),
+    ...(rejectedSource ? { rejectedResources: { list: () => listRejected(), ...(strictRejected ? { strict: true } : {}) } } : {}),
   });
   const storage = new RealStorageV2({
     executor: request.executor,
@@ -233,6 +236,10 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
     try {
       stored = await readStored();
     } catch (error) {
+      // A user replace run reads strictly: an unreadable rejected list must not let a
+      // rejected source through (the search / transfer fails instead and says so).
+      // Ordinary runs filter on a best-effort basis and carry on.
+      if (strictRejected) throw error;
       console.log(`[user-message] run ${request.workflowRunId} rejected list read failed: ${errorText(error)}`);
     }
     return [...stored, ...replaceRejected.map((r) => ({ linkKey: r.linkKey, label: r.label, sizeBytes: r.sizeBytes }))];
@@ -287,6 +294,13 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
                 (r) => (key !== undefined && r.linkKey === key) || resourceFingerprintMatches(candidate.title, r),
               );
             } catch (error) {
+              // Replace run: fail closed — refuse the transfer (the agent sees why and can
+              // retry) rather than risk landing the very source the user rejected.
+              if (strictRejected) {
+                throw new Error(
+                  `SANDBOX_REJECTED_LIST_UNAVAILABLE: could not read the user's rejected list (${errorText(error)}) — try again in a moment`,
+                );
+              }
               console.log(`[user-message] run ${request.workflowRunId} rejected check failed (allowing): ${errorText(error)}`);
               return false;
             }

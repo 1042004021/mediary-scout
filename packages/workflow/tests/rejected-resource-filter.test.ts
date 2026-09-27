@@ -50,6 +50,16 @@ describe("RealResourceProviderV2 — rejected resources", () => {
     expect((await adapter.search("x")).candidates).toHaveLength(1);
   });
 
+  it("strict (a user replace run): a failing rejected list fails the search instead of showing what the user rejected", async () => {
+    const adapter = new RealResourceProviderV2({
+      provider: { search: async () => snapshotOf("snap_a", [{ id: "a", title: "x", url: "https://115.com/s/a" }]) },
+      registry: new CandidateRegistry(), workflowRunId: "r",
+      rejectedResources: { list: async () => { throw new Error("db down"); }, strict: true },
+    });
+    await expect(adapter.search("x")).rejects.toThrow(/db down/);
+    expect(adapter.snapshots()).toEqual([]);
+  });
+
   it("unions persisted snapshots by candidate id instead of overwriting — a candidate already surfaced (and possibly transferred) stays persisted even after a later rejection filters it from view", async () => {
     let rejected: Array<{ linkKey: string | null; label: string; sizeBytes: number | null }> = [];
     // Same snapshot id on every call, like a real content-addressed provider
