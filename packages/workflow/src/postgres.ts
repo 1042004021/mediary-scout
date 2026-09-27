@@ -360,6 +360,13 @@ const PERMANENT_SCHEMA_INIT_SQLSTATES = new Set<string>([
   "3D000", // invalid_catalog_name (database does not exist)
 ]);
 
+/** connected_storage_id is NOT NULL and holds UNSCOPED_STORAGE for unbound works; the
+ *  sentinel is internal, so every reader hands callers null instead. */
+function storageFromColumn(raw: unknown): string | null {
+  const value = (raw as string | null | undefined) ?? null;
+  return value === UNSCOPED_STORAGE ? null : value;
+}
+
 function isPermanentSchemaInitError(error: unknown): boolean {
   const code = (error as { code?: unknown } | null | undefined)?.code;
   return typeof code === "string" && PERMANENT_SCHEMA_INIT_SQLSTATES.has(code);
@@ -709,8 +716,7 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       return false;
     }
     const ownerAccount = (owner.account_id as string | undefined) ?? DEFAULT_ACCOUNT_ID;
-    const ownerStorage = (owner.connected_storage_id as string | null | undefined) ?? null;
-    return scopeMatches(scope, ownerAccount, ownerStorage);
+    return scopeMatches(scope, ownerAccount, storageFromColumn(owner.connected_storage_id));
   }
 
   async clearAgentSteps(workflowRunId: string): Promise<void> {
@@ -939,7 +945,7 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
     const title = await this.requireTitle(this.pool, season);
     return {
       accountId: scope.accountId,
-      connectedStorageId: (row.connected_storage_id as string | null | undefined) ?? null,
+      connectedStorageId: storageFromColumn(row.connected_storage_id),
       title,
       season,
       episodes: await this.selectEpisodeStates(this.pool, season.id, (row.connected_storage_id as string | null) ?? UNSCOPED_STORAGE),
@@ -961,7 +967,7 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       const season = row.payload as TrackedSeason;
       states.push({
         accountId: scope.accountId,
-        connectedStorageId: (row.connected_storage_id as string | null | undefined) ?? null,
+        connectedStorageId: storageFromColumn(row.connected_storage_id),
         title: await this.requireTitle(this.pool, season),
         season,
         episodes: await this.selectEpisodeStates(this.pool, season.id, (row.connected_storage_id as string | null) ?? UNSCOPED_STORAGE),
@@ -981,7 +987,7 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       const accountId = (row.account_id as string | undefined) ?? DEFAULT_ACCOUNT_ID;
       states.push({
         accountId,
-        connectedStorageId: (row.connected_storage_id as string | null | undefined) ?? null,
+        connectedStorageId: storageFromColumn(row.connected_storage_id),
         title: await this.requireTitle(this.pool, season),
         season,
         episodes: await this.selectEpisodeStates(this.pool, season.id, (row.connected_storage_id as string | null) ?? UNSCOPED_STORAGE),

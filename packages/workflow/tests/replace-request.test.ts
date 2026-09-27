@@ -219,6 +219,57 @@ describe("queueReplaceRequest", () => {
     expect(state?.episodes.every((episode) => episode.obtained)).toBe(true);
   });
 
+  it("an unbound work (no drive) is queued and its message processed, not not_tracked", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    const { title, season } = trackedFixture();
+    const episodes = createEpisodeStates({
+      trackedSeasonId: season.id,
+      seasonNumber: season.seasonNumber,
+      totalEpisodes: season.totalEpisodes,
+      latestAiredEpisode: season.latestAiredEpisode,
+    }).map((episode) => ({ ...episode, obtained: true }));
+    await repository.saveWorkflowRunSnapshot({
+      accountId: "acct_1",
+      title,
+      season,
+      workflowRun: {
+        id: "seed_unbound",
+        kind: "type2_init",
+        status: "succeeded",
+        trackedSeasonId: season.id,
+        startedAt: "2026-09-01T00:00:00.000Z",
+        finishedAt: "2026-09-01T00:00:00.000Z",
+        auditEvents: [],
+      },
+      episodes,
+      resourceSnapshots: [],
+      decisions: [],
+      transferAttempts: [],
+      notifications: [],
+    });
+    const unbound = { ...WORK, drive: "" };
+    const storage = new FakeStorageExecutor();
+    await seedV2Season(storage, title, season, ["S01E01", "S01E02"]);
+    await repository.createUserMessage({ ...unbound, body: "1 集发蓝", episodeTags: ["S01E01"], now: NOW });
+
+    const queued = await queueReplaceRequest({ repository, work: unbound, now: fixedNow, createWorkflowRunId: () => "run_rr_unbound" });
+    expect(queued).toEqual({ status: "queued", workflowRunId: "run_rr_unbound" });
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => {
+        i += 1;
+        if (i === 1) return tool("reportReplacement", { results: [{ episode: "S01E01", outcome: "not_found", note: "没找到" }] }, i);
+        return text("done");
+      },
+    });
+    const result = await runQueuedReplaceRequest(baseRun(repository, storage, model));
+
+    expect(result).toMatchObject({ status: "ran", workflowRunId: "run_rr_unbound", workflowStatus: "succeeded" });
+    const [message] = await repository.listUserMessages(unbound);
+    expect(message).toMatchObject({ status: "done", runId: "run_rr_unbound" });
+    expect((await repository.listPendingReplacements(unbound)).map((p) => p.episode)).toEqual(["S01E01"]);
+  });
+
   it("a work that is not tracked on that drive is not queued", async () => {
     const { repository } = await trackedShow();
     const result = await queueReplaceRequest({ repository, work: { ...WORK, drive: "other_drive" }, now: fixedNow });

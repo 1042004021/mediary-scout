@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import { DuplicateUsernameError, type WorkflowRepository } from "../src/repository.js";
 import type { Account } from "../src/account-credentials.js";
 import { workflowPersistenceFixture } from "./workflow-fixtures.js";
+import { queueReplaceRequest } from "../src/replace-request.js";
 
 /** A factory that yields a FRESH, empty repository and a teardown. Postgres/SQLite
  *  return async; InMemory is sync — accept both. */
@@ -1559,6 +1560,35 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         const snap = await repo.getWorkflowRunSnapshot("run_1");
         // The domain contract says the sentinel must surface as null, never leak "__unscoped__".
         expect(snap?.connectedStorageId).toBeNull();
+      });
+
+      it("tracked-season readers list an unbound season with connectedStorageId=null", async () => {
+        const repo = await fresh();
+        await repo.saveWorkflowRunSnapshot({
+          ...workflowPersistenceFixture(),
+          accountId: "acct_default",
+          transferAttempts: [],
+          notifications: [],
+        });
+        const seasonId = workflowPersistenceFixture().season.id;
+        const scoped = await repo.listTrackedSeasonStates({ accountId: "acct_default", connectedStorageId: null });
+        expect(scoped.map((state) => [state.season.id, state.connectedStorageId])).toEqual([[seasonId, null]]);
+        expect(scoped[0]?.episodes.length).toBeGreaterThan(0);
+        const all = await repo.listAllTrackedSeasonStates();
+        expect(all.map((state) => [state.season.id, state.connectedStorageId])).toEqual([[seasonId, null]]);
+        expect(all[0]?.episodes.length).toBeGreaterThan(0);
+        const one = await repo.getTrackedSeasonState(seasonId, { accountId: "acct_default", connectedStorageId: null });
+        expect(one?.connectedStorageId).toBeNull();
+        expect(one?.episodes.length).toBeGreaterThan(0);
+      });
+
+      it("an unbound work's replace request is found by its message drive ('') and queued", async () => {
+        const repo = await fresh();
+        const fixture = workflowPersistenceFixture();
+        await repo.saveWorkflowRunSnapshot({ ...fixture, accountId: "acct_default", transferAttempts: [], notifications: [] });
+        const work = { accountId: "acct_default", drive: "", titleKey: fixture.title.id };
+        const result = await queueReplaceRequest({ repository: repo, work, createWorkflowRunId: () => "run_rr_unbound" });
+        expect(result).toEqual({ status: "queued", workflowRunId: "run_rr_unbound" });
       });
     });
 
