@@ -919,22 +919,42 @@ describe("runScheduledType3Monitoring — user requests", () => {
     expect(plain.left).toEqual([]);
   });
 
-  it("a failing episode-source read does not fail the patrol run (the kept-duplicates hint is best-effort)", async () => {
+  it("a failing episode-source read does not fail the patrol run, and its existing files stay protected (fail closed)", async () => {
     const repository = new InMemoryWorkflowRepository();
     const { title, season } = trackedFixture();
     // E02 is a real gap, so the patrol runs the agent (and would read episode sources).
     await seedTrackedSeason({ repository, title, season, obtainedCodes: ["S01E01"] });
     const storage = new FakeStorageExecutor();
-    await seedV2Season(storage, title, season, ["S01E01"]);
+    const seasonDir = await seedV2Season(storage, title, season, ["S01E01"]);
     repository.listEpisodeSources = async () => {
       throw new Error("episode_sources table missing");
     };
+    let system = "";
+    let deleteResult: unknown;
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        i += 1;
+        if (i === 1) {
+          system = JSON.stringify(options.prompt.find((m) => m.role === "system") ?? "");
+          return {
+            content: [{ type: "tool-call" as const, toolCallId: "c1", toolName: "deleteFiles", input: JSON.stringify({ directory: "season", season: 1, fileIds: ["present_S01E01_0"] }) }],
+            finishReason: { unified: "tool-calls" as const, raw: "tool-calls" as const },
+            usage: USAGE,
+            warnings: [],
+          };
+        }
+        const messages = options.prompt as Array<{ role: string; content: Array<{ type: string; output?: { value?: unknown } }> }>;
+        if (i === 2) deleteResult = messages.filter((m) => m.role === "tool").at(-1)?.content[0]?.output?.value;
+        return { content: [{ type: "text" as const, text: "done" }], finishReason: { unified: "stop" as const, raw: "stop" as const }, usage: USAGE, warnings: [] };
+      },
+    });
 
     const outcomes = await runScheduledType3Monitoring({
       repository,
       resourceProvider: emptyProvider(),
       storage,
-      model: noCoverageModel(),
+      model,
       storageParentDirectoryId: "library_root",
       now: fixedNow,
       createWorkflowRunId: () => "run_sources_down",
@@ -942,6 +962,12 @@ describe("runScheduledType3Monitoring — user requests", () => {
 
     expect(outcomes).toEqual([expect.objectContaining({ trackedSeasonId: season.id, status: "ran" })]);
     expect((await repository.getWorkflowRunSnapshot("run_sources_down"))?.workflowRun.status).not.toBe("failed");
+    // Protection is on without naming episodes …
+    expect(system).toMatch(/files already in the target folders .* are protected this run — do not delete or move them/);
+    expect(system).not.toMatch(/intentionally kept duplicates/);
+    // … and the old file really survives the agent's delete.
+    expect(deleteResult).toEqual({ error: expect.stringContaining("SANDBOX_FILE_PROTECTED") });
+    expect((await storage.listTree({ directoryId: seasonDir })).map((f) => f.providerFileId)).toEqual(["present_S01E01_0"]);
   });
 
   it("only the work with a request is taken out of the sweep; another show is patrolled as before", async () => {

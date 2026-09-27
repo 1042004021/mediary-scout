@@ -590,6 +590,28 @@ describe("runQueuedReplaceRequest — scope, metadata and bookkeeping", () => {
     expect(result).toMatchObject({ status: "ran", workflowRunId: "run_rr_sync_fail" });
   });
 
+  for (const failing of ["listRejectedResources", "listEpisodeSources"] as const) {
+    it(`a failing ${failing} read does not fail the replace run (enrichment fails open)`, async () => {
+      const { repository, title, season } = await trackedShow();
+      const storage = new FakeStorageExecutor();
+      await seedV2Season(storage, title, season, ["S01E01", "S01E02"]);
+      const message = await repository.createUserMessage({ ...WORK, body: "1 发蓝", episodeTags: ["S01E01"], now: NOW });
+      await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => `run_rr_${failing}` });
+      repository[failing] = async () => {
+        throw new Error(`relation for ${failing} does not exist`);
+      };
+      const seen: { prompt?: string } = {};
+
+      const result = await runQueuedReplaceRequest(baseRun(repository, storage, reportingModel(["S01E01"], seen)));
+
+      expect(result).toMatchObject({ status: "ran", workflowRunId: `run_rr_${failing}` });
+      // The agent really ran as a replace run …
+      expect(seen.prompt).toContain("call reportReplacement for every requested episode");
+      // … and the message finished instead of going back as urgent.
+      expect((await repository.listUserMessages(WORK))[0]).toMatchObject({ id: message.id, status: "done", runId: `run_rr_${failing}` });
+    });
+  }
+
   it("drops requested and 待换 episodes outside the tracked seasons and deletes those stale 待换 rows", async () => {
     const { repository, title, season } = await trackedShow();
     const storage = new FakeStorageExecutor();

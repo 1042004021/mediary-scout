@@ -450,10 +450,18 @@ describe("user request rules — old and new copies coexist", () => {
 
   it("kept duplicates from earlier replacements are named in both system prompts, only when there are some", () => {
     for (const build of [buildTvAnimeSystemPrompt, buildMovieSystemPrompt]) {
-      const withKept = build({ keptDuplicates: ["S01E13", "S01E24"] });
+      const withKept = build({ protectExisting: { episodes: ["S01E13", "S01E24"] } });
       expect(withKept).toMatch(/intentionally kept duplicates \(old \+ replacement\) — do not dedup or delete them: S01E13, S01E24/);
-      expect(build({})).not.toMatch(/intentionally kept duplicates/);
-      expect(build({ keptDuplicates: [] })).not.toMatch(/intentionally kept duplicates/);
+      expect(build({})).not.toMatch(/intentionally kept duplicates|are protected this run/);
+      expect(build({ protectExisting: { episodes: [] } })).not.toMatch(/intentionally kept duplicates|are protected this run/);
+    }
+  });
+
+  it("unknown kept duplicates (unreadable) still protect the existing files in both prompts, naming no episode", () => {
+    for (const build of [buildTvAnimeSystemPrompt, buildMovieSystemPrompt]) {
+      const unknown = build({ protectExisting: { episodes: "unknown" } });
+      expect(unknown).toMatch(/files already in the target folders .* are protected this run — do not delete or move them/);
+      expect(unknown).not.toMatch(/intentionally kept duplicates/);
     }
   });
 });
@@ -480,6 +488,22 @@ describe("replace tools registration", () => {
     await expect(
       tools.reportReplacement!.execute({ results: [{ episode: "S01E13", outcome: "replaced", candidateId: "c", note: "" }] }, {}),
     ).resolves.toEqual({ error: "SANDBOX_REPLACEMENT_NOT_MARKED: S01E13" });
+  });
+
+  it("only a replace run's finish description mentions reportReplacement", () => {
+    type DescribedTool = { description?: string };
+    const plain = buildSandboxToolSet(new TaskSandbox({ provider: new FakeResourceProviderV2() })) as Record<string, DescribedTool>;
+    expect(plain.finish?.description).toContain("Declare the task done.");
+    expect(plain.finish?.description).not.toContain("reportReplacement");
+    const replace = buildSandboxToolSet(
+      new TaskSandbox({
+        provider: new FakeResourceProviderV2(),
+        need: [],
+        targetSeasonDirectoryIds: { 1: "season" },
+        replace: { requestedEpisodes: ["S01E13"], onReject: async () => undefined, onReport: async () => undefined },
+      }),
+    ) as Record<string, DescribedTool>;
+    expect(replace.finish?.description).toContain("refused until every requested episode has a reportReplacement");
   });
 
   it("the finish tool of a replace run returns the report requirement as evidence, not a crash", async () => {

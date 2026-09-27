@@ -206,7 +206,9 @@ export function buildSandboxToolSet(
     },
     finish: {
       description:
-        "Declare the task done. Returns the honest coverage summary (what is obtained, what remains). TERMINAL: a successful finish ENDS the task immediately — do all clean-up BEFORE calling it, and never call it twice. User request run: refused until every requested episode has a reportReplacement.",
+        "Declare the task done. Returns the honest coverage summary (what is obtained, what remains). TERMINAL: a successful finish ENDS the task immediately — do all clean-up BEFORE calling it, and never call it twice." +
+        // `?.` like the replace tools below: partial test doubles typed as TaskSandbox.
+        (sandbox.hasReplace?.() ? " User request run: refused until every requested episode has a reportReplacement." : ""),
       inputSchema: z.object({}),
       execute: () => asEvidence(() => sandbox.declareFinish()),
     },

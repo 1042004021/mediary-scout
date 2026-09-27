@@ -97,9 +97,11 @@ export interface RunAcquisitionV2Request {
     now?: () => string;
   };
   /** Episodes of this work that carry an old + replacement copy on purpose (the
-   *  episode_sources rows). Their existing files are protected for the whole run and
-   *  named in the prompt, so keep-larger dedup never undoes a replacement. */
-  keptDuplicates?: string[];
+   *  episode_sources rows). Present = the files already in the target dirs are
+   *  protected for the whole run, so keep-larger dedup never undoes a replacement;
+   *  the episodes are named in the prompt. "unknown" = the rows could not be read:
+   *  protection stays on (fail closed), the prompt names no episode. */
+  protectExisting?: { episodes: string[] | "unknown" };
   /** This work's rejected resources (account + work scoped: the user said "not this
    *  one", on any drive). Read on every search to filter them out, and again at every
    *  transfer — in EVERY run of the work, not only replace runs, so a patrol never
@@ -174,6 +176,10 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
   });
   const need = request.target.kind === "tv" ? needForTvTarget(request.target) : needForMovie();
   const userRequest = request.userRequest;
+  const protectExisting =
+    request.protectExisting && (request.protectExisting.episodes === "unknown" || request.protectExisting.episodes.length > 0)
+      ? request.protectExisting
+      : undefined;
   if (userRequest) {
     // The replace tools must never be registered without the rules that go with them;
     // the prompt block renders only when there is a message or a pending episode.
@@ -247,7 +253,7 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
     ...(request.searchBudget === undefined ? {} : { searchBudget: request.searchBudget }),
     ...(request.searchProfile === undefined ? {} : { searchProfile: request.searchProfile }),
     ...(memoryBinding ? { memory: memoryBinding } : {}),
-    ...((request.keptDuplicates?.length ?? 0) > 0 ? { protectExistingFiles: true } : {}),
+    ...(protectExisting ? { protectExistingFiles: true } : {}),
     ...(rejectedSource
       ? {
           isRejected: async (candidate: { id: string; title: string }) => {
@@ -340,10 +346,10 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
         }
       : {}),
   });
-  // Replace run (or kept duplicates): record every file already in the target dirs
+  // Replace run (or protected existing files): record every file already in the target dirs
   // BEFORE anything can touch them. Not best-effort — the protection is the whole
   // safety story, so a failing listing fails the run.
-  if (userRequest || (request.keptDuplicates?.length ?? 0) > 0) await sandbox.captureProtectedFiles();
+  if (userRequest || protectExisting) await sandbox.captureProtectedFiles();
   const loadedMemory = await loadMemoryForRun(request, memoryBinding);
 
   // Pre-warm the raw snapshot (bare title) BEFORE building the system prompt, so the
@@ -435,7 +441,7 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
         }
       : {}),
     ...(userRequest ? { userRequests: userRequest.prompt } : {}),
-    ...((request.keptDuplicates?.length ?? 0) > 0 ? { keptDuplicates: request.keptDuplicates } : {}),
+    ...(protectExisting ? { protectExisting } : {}),
   };
 
   const result =

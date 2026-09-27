@@ -116,24 +116,25 @@ function memoryOption(input: {
 
 /** Episodes of this work (on this drive) that hold an old + replacement copy on
  *  purpose — every run of it protects its existing files and says so to the agent,
- *  so a later keep-larger dedup cannot undo a replacement. Best-effort: a failed read
- *  is logged and the run goes ahead without the hint (it must never fail a patrol). */
-async function keptDuplicatesOption(input: {
+ *  so a later keep-larger dedup cannot undo a replacement. A failed read fails
+ *  CLOSED: it is logged and the run still protects its existing files, only without
+ *  naming episodes (it must never fail a patrol, nor let one delete a kept copy). */
+async function protectExistingOption(input: {
   repository: WorkflowRepository;
   accountId?: string;
   connectedStorageId?: string | null;
   title: MediaTitle;
-}): Promise<{ keptDuplicates?: string[] }> {
+}): Promise<{ protectExisting?: NonNullable<RunTvAcquisitionV2Request["protectExisting"]> }> {
   try {
     const sources = await input.repository.listEpisodeSources({
       accountId: input.accountId ?? DEFAULT_ACCOUNT_ID,
       drive: userMessageDrive(input.connectedStorageId),
       titleKey: input.title.id,
     });
-    return sources.length > 0 ? { keptDuplicates: sources.map((s) => s.episode) } : {};
+    return sources.length > 0 ? { protectExisting: { episodes: sources.map((s) => s.episode) } } : {};
   } catch (error) {
     console.error(`[user-message] could not read episode sources of ${input.title.id}: ${String(error).slice(0, 300)}`);
-    return {};
+    return { protectExisting: { episodes: "unknown" } };
   }
 }
 
@@ -252,7 +253,7 @@ export async function runType2InitializationV2AndPersist(
       storage: input.storage,
     }),
     ...passthrough(input),
-    ...(await keptDuplicatesOption(input)),
+    ...(await protectExistingOption(input)),
     ...rejectedLookupOption(input),
   });
 
@@ -302,7 +303,7 @@ export async function runType3MonitoringV2AndPersist(
       storage: input.storage,
     }),
     ...passthrough(input),
-    ...(await keptDuplicatesOption(input)),
+    ...(await protectExistingOption(input)),
     ...rejectedLookupOption(input),
   });
 
@@ -353,7 +354,7 @@ export async function runSeriesInitializationV2AndPersist(
       storage: input.storage,
     }),
     ...passthrough(input),
-    ...(await keptDuplicatesOption(input)),
+    ...(await protectExistingOption(input)),
     ...rejectedLookupOption(input),
   });
 
@@ -456,7 +457,7 @@ export async function runReplaceRequestV2AndPersist(
       storage: input.storage,
     }),
     ...passthrough(input),
-    ...(await keptDuplicatesOption(input)),
+    ...(await protectExistingOption(input)),
     ...rejectedLookupOption(input),
   });
 
@@ -554,7 +555,7 @@ export async function runMovieAcquisitionV2AndPersist(input: {
     ...(input.jevJudge === undefined ? {} : { jevJudge: input.jevJudge }),
     ...(input.userRequest === undefined ? {} : { userRequest: input.userRequest }),
     ...(input.priorObtained === undefined ? {} : { priorObtained: input.priorObtained }),
-    ...(await keptDuplicatesOption(input)),
+    ...(await protectExistingOption(input)),
     ...rejectedLookupOption(input),
     ...memoryOption(input),
   });

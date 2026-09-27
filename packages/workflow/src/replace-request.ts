@@ -226,8 +226,17 @@ export async function runQueuedReplaceRequest(
 
     const requested = [...new Set([...messages.flatMap((m) => m.episodeTags), ...pending])].filter(inScope);
     const requestedEpisodes = movie && requested.length === 0 ? ["MOVIE"] : requested;
-    const rejected = await repository.listRejectedResources({ accountId: work.accountId, titleKey: work.titleKey });
-    sources = await repository.listEpisodeSources(work);
+    // Prompt/link enrichment only — fail open (logged): the sandbox still requires
+    // rejectCurrentSource from the files' own name + size, so an empty list is safe,
+    // and a transient error (or an older DB without these tables) must not fail the run.
+    const rejected = await repository.listRejectedResources({ accountId: work.accountId, titleKey: work.titleKey }).catch((error: unknown) => {
+      console.error(`[user-message] run ${runId} could not read rejected resources: ${String(error).slice(0, 300)}`);
+      return [];
+    });
+    sources = await repository.listEpisodeSources(work).catch((error: unknown) => {
+      console.error(`[user-message] run ${runId} could not read episode sources: ${String(error).slice(0, 300)}`);
+      return [];
+    });
     const userRequest: UserRequest = {
       requestedEpisodes,
       prompt: {

@@ -63,8 +63,8 @@ export interface RunMovieAcquisitionV2Request {
   /** Replace runs: the film was obtained before the run (its old file is there), so
    *  it stays obtained whether or not a replacement landed. Default false. */
   priorObtained?: boolean;
-  /** See orchestrator.keptDuplicates (["MOVIE"] when the film has a kept replacement). */
-  keptDuplicates?: string[];
+  /** See orchestrator.protectExisting (episodes ["MOVIE"] when the film has a kept replacement). */
+  protectExisting?: RunAcquisitionV2Request["protectExisting"];
   /** See orchestrator.rejectedLookup. */
   rejectedLookup?: RunAcquisitionV2Request["rejectedLookup"];
   onProgress?: (event: AgentToolEvent) => void;
@@ -123,7 +123,7 @@ export async function runMovieAcquisitionV2(
     ...(request.deadLinkStore ? { deadLinkStore: request.deadLinkStore } : {}),
     ...(request.memory ? { memory: request.memory } : {}),
     ...(request.userRequest ? { userRequest: request.userRequest } : {}),
-    ...(request.keptDuplicates?.length ? { keptDuplicates: request.keptDuplicates } : {}),
+    ...(request.protectExisting ? { protectExisting: request.protectExisting } : {}),
     ...(request.rejectedLookup ? { rejectedLookup: request.rejectedLookup } : {}),
     ...(request.onProgress ? { onProgress: request.onProgress } : {}),
   });
