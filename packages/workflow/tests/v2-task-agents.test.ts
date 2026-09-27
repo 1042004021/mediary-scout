@@ -325,6 +325,37 @@ describe("run wiring", () => {
     expect(await userTurn(false)).not.toContain("reportReplacement");
   });
 
+  it("the movie user turn says the film is already in the library only when it was obtained before the run", async () => {
+    const userTurn = async (filmObtained: boolean | undefined) => {
+      let prompt = "";
+      const model = new MockLanguageModelV3({
+        doGenerate: async (options) => {
+          prompt = JSON.stringify(options.prompt.filter((m) => m.role === "user"));
+          return { content: [{ type: "text" as const, text: "done" }], finishReason: { unified: "stop" as const, raw: "stop" as const }, usage: USAGE, warnings: [] };
+        },
+      });
+      await runMovieTaskAgent({
+        sandbox: await sandboxFor(needForMovie()),
+        model,
+        target: { title: "Some Film", aliases: [], year: 2025, qualityPreference: "1080p" },
+        userRequests: {
+          messages: [{ body: "找个正版", episodeTags: [], createdAt: "2026-09-26T06:00:00.000Z" }],
+          rejected: [],
+          pending: [],
+          ...(filmObtained === undefined ? {} : { filmObtained }),
+        },
+      });
+      return prompt;
+    };
+    expect(await userTurn(true)).toContain("The film is already in the library: this run is for the USER REQUESTS");
+    for (const notBefore of [false, undefined]) {
+      const prompt = await userTurn(notBefore);
+      expect(prompt).not.toContain("already in the library");
+      expect(prompt).toMatch(/this run is for the USER REQUESTS in your instructions.*do not mark MOVIE until the new file is in place/);
+      expect(prompt).toMatch(/call reportReplacement for MOVIE, then finish/);
+    }
+  });
+
   it("runMovieTaskAgent drives the loop with the MOVIE need", async () => {
     const sandbox = await sandboxFor(needForMovie());
     const result = await runMovieTaskAgent({
@@ -430,10 +461,10 @@ describe("user request block", () => {
     expect(text).toMatch(/episodes \[\] is only for a movie/);
     expect(text).toMatch(/For an episode with no file in the library, call rejectCurrentSource with that episode and fileIds \[\]/);
   });
-  it("asks a TV work to read the episodes of an untagged message from its words first, and says finish waits for it", () => {
+  it("asks a TV work to read the episodes of an untagged message from its words in the first step, and says finish waits for it", () => {
     const text = userRequestBlock({ userRequests: base });
     expect(text).toContain(
-      "- A TV message without [episodes: …] tags still means particular episodes: work out from its words which ones, and call rejectCurrentSource for them before anything else (fileIds [] for an episode with no file). finish is refused until you have done so at least once in this run — the episodes already requested (tagged, or still waiting from earlier requests) do not count.",
+      "- A TV message without [episodes: …] tags still means particular episodes: work out from its words which ones, and call rejectCurrentSource for them right after inspectTargetDir, in that FIRST STEP (fileIds [] for an episode with no file). finish is refused until you have done so at least once in this run — the episodes already requested (tagged, or still waiting from earlier requests) do not count.",
     );
     // A rule, not user data: above the fence.
     expect(text.indexOf("A TV message without")).toBeLessThan(text.indexOf("\n<user_requests>\n"));
@@ -562,5 +593,61 @@ describe("replace tools registration", () => {
   it("the activity page has 中文 lines for both tools", () => {
     expect(interpretTool("rejectCurrentSource", {})).toEqual({ activity: "正在记下你不要的那份资源…", phase: "search" });
     expect(interpretTool("reportReplacement", {})).toEqual({ activity: "正在整理换源结果…", phase: "finalize" });
+  });
+});
+
+describe("user request prompts — one first step, and the order of the last calls", () => {
+  const req = { messages: [{ body: "13 发蓝", episodeTags: ["S01E13"], createdAt: "2026-09-26T06:00:00.000Z" }], rejected: [], pending: [] };
+  type DescribedTool = { description?: string };
+
+  it("every first-step directive of a replace run names inspectTargetDir (then rejectCurrentSource) — none says to start with viewResourceSnapshot or a search", () => {
+    for (const build of [buildTvAnimeSystemPrompt, buildMovieSystemPrompt]) {
+      const prompt = build({ userRequests: req, prefetchedCandidateCount: 5 });
+      expect(prompt).toContain(
+        "FIRST STEP of this run, before viewResourceSnapshot or any search or transfer: inspectTargetDir to see the current files, then rejectCurrentSource",
+      );
+      const firstStepLines = prompt.split("\n").filter((line) => /first step/i.test(line));
+      expect(firstStepLines.length).toBeGreaterThan(1);
+      for (const line of firstStepLines) expect(line).toContain("inspectTargetDir");
+      expect(prompt).not.toContain("before anything else");
+      // The raw snapshot is still pointed at — after the first step.
+      expect(prompt).toContain("call viewResourceSnapshot()");
+    }
+  });
+
+  it("outside a replace run the snapshot pointer and loops are unchanged", () => {
+    for (const build of [buildTvAnimeSystemPrompt, buildMovieSystemPrompt]) {
+      const prompt = build({ prefetchedCandidateCount: 5 });
+      expect(prompt).toContain("Your FIRST step: call viewResourceSnapshot()");
+      expect(prompt).not.toContain("User request run");
+    }
+  });
+
+  it("the movie loop of a replace run marks, then reports, then finishes — markObtained is not the last step there", () => {
+    const replace = buildMovieSystemPrompt({ userRequests: req });
+    expect(replace).not.toContain("the LAST step");
+    expect(replace).toMatch(/\n7\. markObtained\(\["MOVIE"\]\)[^\n]*\n8\. reportReplacement for MOVIE[^\n]*\n9\. finish\(\)/);
+    expect(buildMovieSystemPrompt({})).toContain('7. markObtained(["MOVIE"]) — the LAST step, only once the film is in place.');
+  });
+
+  it("the TV loop of a replace run puts reportReplacement between markObtained and the clean-up + finish", () => {
+    const replace = buildTvAnimeSystemPrompt({ userRequests: req });
+    expect(replace).toContain("After step 7 (markObtained), call reportReplacement for every requested episode, then do step 8.");
+    expect(buildTvAnimeSystemPrompt({})).not.toContain("reportReplacement");
+  });
+
+  it("a replace run's markObtained tool says reportReplacement and finish come after it", () => {
+    const plain = buildSandboxToolSet(new TaskSandbox({ provider: new FakeResourceProviderV2() })) as Record<string, DescribedTool>;
+    const replace = buildSandboxToolSet(
+      new TaskSandbox({
+        provider: new FakeResourceProviderV2(),
+        need: [],
+        targetSeasonDirectoryIds: { 1: "season" },
+        replace: { requestedEpisodes: ["S01E13"], hasMessages: true, untaggedMessages: 0, onReject: async () => undefined, onReport: async () => undefined },
+      }),
+    ) as Record<string, DescribedTool>;
+    const note = "User request run: not the last call — reportReplacement for the requested episodes, then finish, come after it.";
+    expect(replace.markObtained?.description).toContain(note);
+    expect(plain.markObtained?.description).not.toContain(note);
   });
 });

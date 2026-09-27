@@ -1122,6 +1122,36 @@ describe("runQueuedReplaceRequest — scope, metadata and bookkeeping", () => {
     expect((await repository.getWorkflowRunSnapshot("run_rr_gone", SCOPE))?.episodes).toEqual([]);
   });
 
+  it("the movie replace prompt says the film is already in the library only when it was obtained before the run", async () => {
+    for (const obtained of [true, false]) {
+      const repository = new InMemoryWorkflowRepository();
+      const title: MediaTitle = { id: `tmdb_movie_${obtained ? 31 : 32}`, tmdbId: obtained ? 31 : 32, type: "movie", title: "Film", originalTitle: "Film", year: 2010, aliases: [] };
+      const season = movieAnchorSeason({ titleId: title.id, qualityPreference: "4K", storageDirectoryId: "dir_movie" });
+      await repository.saveWorkflowRunSnapshot({
+        accountId: "acct_1",
+        connectedStorageId: DRIVE,
+        title,
+        season,
+        workflowRun: { id: `seed_${title.id}`, kind: "movie_init", status: obtained ? "succeeded" : "no_coverage", trackedSeasonId: season.id, startedAt: "2026-09-01T00:00:00.000Z", finishedAt: "2026-09-01T00:00:00.000Z", auditEvents: [] },
+        episodes: createEpisodeStates({ trackedSeasonId: season.id, seasonNumber: 1, totalEpisodes: 1, latestAiredEpisode: 1 }).map((e) => ({ ...e, obtained })),
+        resourceSnapshots: [],
+        decisions: [],
+        transferAttempts: [],
+        notifications: [],
+      });
+      const work = { accountId: "acct_1", drive: DRIVE, titleKey: title.id };
+      await repository.createUserMessage({ ...work, body: "找个正版", episodeTags: [], now: NOW });
+      await queueReplaceRequest({ repository, work, now: fixedNow, createWorkflowRunId: () => `run_rr_${title.id}` });
+      const seen: { prompt?: string } = {};
+
+      await runQueuedReplaceRequest(baseRun(repository, new FakeStorageExecutor(), reportingModel(["MOVIE"], seen)));
+
+      if (obtained) expect(seen.prompt).toContain("The film is already in the library");
+      else expect(seen.prompt).not.toContain("already in the library");
+      expect(seen.prompt).toContain("this run is for the USER REQUESTS in your instructions");
+    }
+  });
+
   it("a movie that was never obtained stays unobtained when the replace run lands nothing", async () => {
     const repository = new InMemoryWorkflowRepository();
     const title: MediaTitle = { id: "tmdb_movie_5", tmdbId: 5, type: "movie", title: "Film", originalTitle: "Film", year: 2010, aliases: [] };

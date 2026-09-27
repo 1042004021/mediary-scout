@@ -204,6 +204,9 @@ export async function runQueuedReplaceRequest(
     }
     const lockState = states.find((s) => s.season.id === claimed.season.id)!;
     const movie = claimed.title.type === "movie";
+    // A film obtained before the run: its old file is in the library, so it stays
+    // obtained whatever this run lands, and the prompt may say it is there.
+    const filmObtained = movie && lockState.episodes.some((e) => e.obtained);
 
     // Only episodes of the seasons tracked here can be replaced (movie: the film). An
     // old tag or a 待换 row of a season untracked since would only be refused by the
@@ -256,6 +259,7 @@ export async function runQueuedReplaceRequest(
         messages: messages.map((m) => ({ body: m.body, episodeTags: m.episodeTags.filter(inScope), createdAt: m.createdAt })),
         rejected: rejected.map((r) => ({ episode: r.episode, label: r.label, sizeBytes: r.sizeBytes, reason: r.reason })),
         pending,
+        ...(movie ? { filmObtained } : {}),
       },
       rejectedStore: {
         list: async () =>
@@ -310,7 +314,7 @@ export async function runQueuedReplaceRequest(
         title: claimed.title,
         categoryParentId: requireCategoryParent(deps.moviesParentDirectoryId ?? input.moviesParentDirectoryId),
         // The film stays obtained only if it was: the old file is still there.
-        priorObtained: lockState.episodes.some((e) => e.obtained),
+        priorObtained: filmObtained,
       });
       replacement = result.replacement;
       workflowStatus = result.status;

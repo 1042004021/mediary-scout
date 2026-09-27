@@ -5,7 +5,7 @@ import type { TaskSandbox } from "./sandbox.js";
 import { skillIndexForAgent } from "./skill.js";
 import { getStorageBrand } from "../storage-brands.js";
 import { stripMemoryFence, type AgentMemory } from "../agent-memory.js";
-import { userRequestBlock, type UserRequestPromptInput } from "./user-request-block.js";
+import { hasUserRequests, userRequestBlock, type UserRequestPromptInput } from "./user-request-block.js";
 
 export { userRequestBlock, type UserRequestPromptInput } from "./user-request-block.js";
 
@@ -52,6 +52,37 @@ Hard-won rules:
 - Multi-resource coverage is fine; UNVERIFIED mechanical multi-resource execution is the disaster (the 莉可丽丝 mess). After each transfer, re-read what actually landed and what is still missing before deciding whether you even need another resource — a pack you thought covered 1-8 may have covered 1-13, in which case STOP.
 - A foreign / different work bundled into a pack (e.g. El Camino inside a Breaking Bad pack) is NEVER moved into a season and NEVER mapped to an episode — leave it in staging and discardStaging wipes it with the rest. Do NOT isolate it for separate review or hand-classify it.
 - Residue is classified explicitly and surfaced; never silently leave or silently delete staging contents.`;
+
+/** The TV loop. A user request run gets one more line up front: its first step (the one
+ *  USER REQUESTS names) comes before the loop's search, and its report comes after the
+ *  mark. Outside a replace run the loop is unchanged. */
+function tvLoopGuidance(options: Pick<TaskAgentPromptOptions, "userRequests">): string {
+  if (!hasUserRequests(options)) return LOOP_GUIDANCE;
+  const [head, ...rest] = LOOP_GUIDANCE.split("\n");
+  return [
+    head,
+    "0. User request run — FIRST STEP: inspectTargetDir, then rejectCurrentSource for every requested episode (see USER REQUESTS), before step 1. After step 7 (markObtained), call reportReplacement for every requested episode, then do step 8.",
+    ...rest,
+  ].join("\n");
+}
+
+/** The movie loop's first and last steps; a user request run starts with its first step
+ *  and ends mark → report → finish (markObtained is not the last call there). */
+function movieLoopEnds(options: Pick<TaskAgentPromptOptions, "userRequests">): { first: string; last: string } {
+  if (!hasUserRequests(options)) {
+    return {
+      first: "",
+      last: `7. markObtained(["MOVIE"]) — the LAST step, only once the film is in place.
+8. finish() — done. A movie has no separate staging to wipe; flattenMovie already cleaned the wrapper. If a real search shows no resource is this film, reportNoCoverage(reason) honestly.`,
+    };
+  }
+  return {
+    first: "0. User request run — FIRST STEP: inspectTargetDir, then rejectCurrentSource for the current film (see USER REQUESTS), before step 1.\n",
+    last: `7. markObtained(["MOVIE"]) — only once the NEW film is in place. Not the last call in this run: reportReplacement and finish follow.
+8. reportReplacement for MOVIE — "replaced" naming the new film's fileIds, or "not_found" with one 中文 sentence when no different copy of this film could be landed.
+9. finish() — done. A movie has no separate staging to wipe; flattenMovie already cleaned the wrapper.`,
+  };
+}
 
 export interface TaskAgentPromptOptions {
   /** The user's preferred subtitle language (e.g. "中文"), standing context. */
@@ -228,6 +259,11 @@ function rawSnapshotPointer(options: TaskAgentPromptOptions): string {
   if (options.prefetchedCandidateCount === undefined || options.prefetchedCandidateCount === 0) {
     return "";
   }
+  // A user request run has one first step, and it is not this: the copies it rejects are
+  // hidden from the snapshot afterwards anyway.
+  if (hasUserRequests(options)) {
+    return `\n📋 RAW SNAPSHOT (活期文档): The system has already pre-searched the raw keyword (bare title) for you and found ${options.prefetchedCandidateCount} candidates. Right after the FIRST STEP in USER REQUESTS (inspectTargetDir, then rejectCurrentSource), call viewResourceSnapshot() to view this live document — it's free, read-only, contains all the raw candidates (id + title), and no longer shows the copies you rejected. Do NOT use searchResources to re-search the raw keyword; searchResources is ONLY for 繁体/英文/原名 upgrades when the raw snapshot is insufficient.\n`;
+  }
   return `\n📋 RAW SNAPSHOT (活期文档): The system has already pre-searched the raw keyword (bare title) for you and found ${options.prefetchedCandidateCount} candidates. Your FIRST step: call viewResourceSnapshot() to view this live document — it's free, read-only, and contains all the raw candidates (id + title). Do NOT use searchResources to re-search the raw keyword; searchResources is ONLY for 繁体/英文/原名 upgrades when the raw snapshot is insufficient.\n`;
 }
 
@@ -271,10 +307,11 @@ ${languageLine(options)}
 ${transferModelLine(options)}
 ${searchHintsBlock(options)}
 ${qualityGuidanceBlock(options)}
-${LOOP_GUIDANCE}`;
+${tvLoopGuidance(options)}`;
 }
 
 export function buildMovieSystemPrompt(options: TaskAgentPromptOptions): string {
+  const loopEnds = movieLoopEnds(options);
   return `${SANDBOX_BOUNDARY}
 
 ${skillMandate("movie")}
@@ -292,14 +329,13 @@ ${transferModelLine(options)}
 ${searchHintsBlock(options)}
 ${qualityGuidanceBlock(options)}
 Your loop (you drive it; the system only orchestrates the tool calls). A MOVIE is simple — there is NO season distribution and NO separate staging to discard (the film lands in the movie directory and flattenMovie cleans the wrapper in place). At EVERY decision point lay out Evidence → Facts → Decision (read your skill's "protocol" section); once a transfer has LANDED, do NOT keep searching/transferring — verify and finish.
-1. searchResources — bare title first; re-keyword (add the original/English name or "全集") only if weak. Stop the moment you can identify the one correct film.
+${loopEnds.first}1. searchResources — bare title first; re-keyword (add the original/English name or "全集") only if weak. Stop the moment you can identify the one correct film.
 2. Decide the ONE correct film (right title AND year, not a remake / same-IP other film / a same-keyword different work) and RANK its candidate links best-first.
 3. Transfer it: transferUntilLanded over your ranked shares (it burns through the dead ones), or transferCandidate for a single share / a magnet.
 4. inspectStaging — read the TRUE landed files and confirm it IS the film.
 5. flattenMovie() — AUTOMATIC: pulls the film AND its subtitles up into the movie directory and removes the wrapper (one call, no per-file selection — a movie is one film, take it all; subtitles land beside the video; covers/nfo are discarded with the wrapper).
 6. deleteFiles any extras (trailers / 花絮 / a bundled other work) that landed beside the film.
-7. markObtained(["MOVIE"]) — the LAST step, only once the film is in place.
-8. finish() — done. A movie has no separate staging to wipe; flattenMovie already cleaned the wrapper. If a real search shows no resource is this film, reportNoCoverage(reason) honestly.`;
+${loopEnds.last}`;
 }
 
 /** Coverage tokens for a TV/anime task — exactly the missing episode codes. */
@@ -393,13 +429,17 @@ If one pack covers multiple seasons, distribute its files in ONE plan with a mov
 
 export async function runMovieTaskAgent(request: RunMovieRequest): Promise<AcquisitionAgentResult> {
   const { sandbox, model, target, maxSteps, onProgress, apiCallCount, budgetSoftAt, ...promptOptions } = request;
+  // Only a film that was obtained before this run is known to be in the library.
+  const requestLine = promptOptions.userRequests
+    ? `\n${
+        promptOptions.userRequests.filmObtained === true
+          ? "The film is already in the library: this run is for the USER REQUESTS in your instructions — land a DIFFERENT copy"
+          : "Whatever the movie directory holds now, this run is for the USER REQUESTS in your instructions — land a copy the user has not rejected"
+      }, and do not mark MOVIE until the new file is in place. Then call reportReplacement for MOVIE, then finish (finish is refused until it is reported).`
+    : "";
   const prompt = `Acquire the movie "${target.title}" (${target.year})${target.aliases.length ? ` (aliases: ${target.aliases.join(", ")})` : ""}.
 This is the coverage need: the single MOVIE token. Cross-check title AND year so you do not grab a remake or same-IP different film.
-Find the one correct film, transfer it, keep the directory clean, mark it present, then finish.${
-    promptOptions.userRequests
-      ? "\nThe film is already in the library: this run is for the USER REQUESTS in your instructions — land a DIFFERENT copy, and do not mark MOVIE until the new file is in place. Then call reportReplacement for MOVIE, then finish (finish is refused until it is reported)."
-      : ""
-  }`;
+Find the one correct film, transfer it, keep the directory clean, mark it present, then finish.${requestLine}`;
   return runAcquisitionAgent({
     sandbox,
     model,
