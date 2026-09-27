@@ -124,6 +124,11 @@ describe("reflection digest — what became of the transferred files", () => {
     expect(sandbox.materializedFate("film")).toEqual({ kept: 2, thrownAway: 0 });
   });
 
+  it("counts a file as kept only when moveFiles reports that it moved", async () => {
+    expect((await moveFateSandbox([])).materializedFate("pack")).toEqual({ kept: 0, thrownAway: 2 });
+    expect((await moveFateSandbox(["f1"])).materializedFate("pack")).toEqual({ kept: 1, thrownAway: 1 });
+  });
+
   it("an attempt without a file fate keeps the plain file count", () => {
     const digest = buildReflectionDigest({
       searches: [],
@@ -198,6 +203,53 @@ async function flattenFateSandbox(removed: string[]): Promise<TaskSandbox> {
   });
   const snapshotId = (await sandbox.searchResources("film")).snapshot!.id;
   await sandbox.transferCandidate({ snapshotId, candidateId: "film" });
+  return sandbox;
+}
+
+const MOVE_FILES: SimTreeFile[] = [
+  { id: "f1", path: "E01.mkv", sizeBytes: 1, isVideo: true, isSubtitle: false },
+  { id: "f2", path: "E02.mkv", sizeBytes: 1, isVideo: true, isSubtitle: false },
+];
+
+async function moveFateSandbox(moved: string[]): Promise<TaskSandbox> {
+  const storage: StorageV2 = {
+    async createDirectory() {
+      return "dir";
+    },
+    async transferCandidate() {
+      return { status: "succeeded", materializedFileIds: MOVE_FILES.map((file) => file.id) };
+    },
+    candidateLinkKind: () => "unknown",
+    async listTree() {
+      return MOVE_FILES.map((file) => ({ ...file }));
+    },
+    async listSubdirectories() {
+      return [];
+    },
+    async moveFiles() {
+      return { moved: [...moved] };
+    },
+    async renameFile() {},
+    async deleteFiles() {
+      return { deleted: [] };
+    },
+    async removeDirectory() {
+      return { removed: [] };
+    },
+    async transferSubtitleUrls() {
+      return [];
+    },
+  };
+  const sandbox = new TaskSandbox({
+    provider: new FakeResourceProviderV2({ results: { show: [{ id: "pack", title: "Pack" }] } }),
+    storage,
+    stagingDirectoryId: "staging",
+    targetSeasonDirectoryIds: { 1: "season" },
+    need: ["S01E01"],
+  });
+  const snapshotId = (await sandbox.searchResources("show")).snapshot!.id;
+  await sandbox.transferCandidate({ snapshotId, candidateId: "pack" });
+  await sandbox.moveToSeason({ moves: [{ season: 1, fileIds: ["f1", "f2"] }] });
   return sandbox;
 }
 

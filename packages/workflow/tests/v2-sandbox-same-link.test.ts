@@ -162,7 +162,140 @@ describe("TaskSandbox — same link is not transferred twice in one run", () => 
     expect(second.transferredCandidateId).toBe("b");
     expect(transferred).toEqual(["a", "b"]);
   });
+
+  it("reserves the link before the transfer await, so two concurrent transferCandidate calls hit storage once", async () => {
+    const gate = deferred();
+    const calls: string[] = [];
+    const { sandbox, snapshotId } = await aliasedSandbox({
+      ids: ["a", "b"],
+      kind: "tv",
+      transferCandidate: async (input) => {
+        calls.push(input.candidateId);
+        await gate.promise;
+        return { status: "succeeded", materializedFileIds: [`${input.candidateId}-file`] };
+      },
+    });
+    const pending = Promise.allSettled([
+      sandbox.transferCandidate({ snapshotId, candidateId: "a" }),
+      sandbox.transferCandidate({ snapshotId, candidateId: "b" }),
+    ]);
+    expect(calls).toEqual(["a"]);
+    gate.resolve();
+    const [first, second] = await pending;
+    expect(first.status).toBe("fulfilled");
+    expect(second.status).toBe("rejected");
+    expect(String((second as PromiseRejectedResult).reason)).toBe(
+      "Error: SANDBOX_SAME_LINK: b is the same link as a, which is being transferred right now — wait for that result and inspect it instead of transferring again",
+    );
+  });
+
+  it("a transferUntilLanded that overlaps an in-flight transferCandidate of the same link does not transfer", async () => {
+    const gate = deferred();
+    const calls: string[] = [];
+    const { sandbox, snapshotId } = await aliasedSandbox({
+      ids: ["a", "b"],
+      kind: "movie",
+      transferCandidate: async (input) => {
+        calls.push(input.candidateId);
+        if (input.candidateId !== "a") return { status: "succeeded", materializedFileIds: ["b-file"] };
+        await gate.promise;
+        return { status: "succeeded", materializedFileIds: ["a-file"] };
+      },
+    });
+    const inflight = sandbox.transferCandidate({ snapshotId, candidateId: "a" });
+    const until = await sandbox.transferUntilLanded({ candidateIds: ["b"] });
+    expect(calls).toEqual(["a"]);
+    expect(until.attempts).toEqual([
+      {
+        candidateId: "b",
+        status: "failed",
+        providerMessage:
+          "same link as a, which is being transferred right now — wait for that result and inspect it instead of transferring again",
+      },
+    ]);
+    gate.resolve();
+    await inflight;
+  });
+
+  it("releases the reservation when the in-flight transfer materializes nothing, so a later alias transfers", async () => {
+    const gate = deferred();
+    const calls: string[] = [];
+    const { sandbox, snapshotId } = await aliasedSandbox({
+      ids: ["a", "b", "c"],
+      kind: "tv",
+      transferCandidate: async (input) => {
+        calls.push(input.candidateId);
+        if (input.candidateId === "a") {
+          await gate.promise;
+          return { status: "succeeded", materializedFileIds: [] };
+        }
+        return { status: "succeeded", materializedFileIds: ["c-file"] };
+      },
+    });
+    const inflight = sandbox.transferCandidate({ snapshotId, candidateId: "a" });
+    await expect(sandbox.transferCandidate({ snapshotId, candidateId: "b" })).rejects.toThrow(
+      /SANDBOX_SAME_LINK: b is the same link as a, which is being transferred right now/,
+    );
+    gate.resolve();
+    await inflight;
+    const later = await sandbox.transferCandidate({ snapshotId, candidateId: "c" });
+    expect(later.attempt.materializedFileIds).toEqual(["c-file"]);
+    expect(calls).toEqual(["a", "c"]);
+  });
 });
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+async function aliasedSandbox(options: {
+  ids: string[];
+  kind: "tv" | "movie";
+  transferCandidate: StorageV2["transferCandidate"];
+}): Promise<{ sandbox: TaskSandbox; snapshotId: string }> {
+  const storage: StorageV2 = {
+    async createDirectory() {
+      return "dir";
+    },
+    transferCandidate: options.transferCandidate,
+    candidateLinkKind: () => "share",
+    async listTree() {
+      return [];
+    },
+    async listSubdirectories() {
+      return [];
+    },
+    async moveFiles() {
+      return { moved: [] };
+    },
+    async renameFile() {},
+    async deleteFiles() {
+      return { deleted: [] };
+    },
+    async removeDirectory() {
+      return { removed: [] };
+    },
+    async transferSubtitleUrls() {
+      return [];
+    },
+  };
+  const sandbox = new TaskSandbox({
+    provider: new FakeResourceProviderV2({
+      results: { show: options.ids.map((id) => ({ id, title: id })) },
+    }),
+    storage,
+    stagingDirectoryId: "staging",
+    ...(options.kind === "movie" ? { targetMovieDirectoryId: "staging" } : { targetSeasonDirectoryIds: { 1: "season" } }),
+    need: options.kind === "movie" ? ["MOVIE"] : ["S01E01"],
+    linkOf: () => SAME,
+  });
+  const snapshotId = (await sandbox.searchResources("show")).snapshot!.id;
+  return { sandbox, snapshotId };
+}
 
 /** A returns succeeded with nothing materialized — the status flag without files. */
 async function emptySuccessSandbox(kind: "tv" | "movie"): Promise<{ sandbox: TaskSandbox; snapshotId: string; transferred: string[] }> {
