@@ -1655,6 +1655,74 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         expect(all.map((state) => state.title.title)).toEqual(["Alpha", "Bravo"]);
       });
 
+      it("hides the staging-janitor inbox run from tracked-season listings but keeps its notifications", async () => {
+        const repo = await fresh();
+        await repo.saveWorkflowRunSnapshot(
+          trackedSnapshot({ key: "real", titleName: "Real Show", connectedStorageId: "cs_default" }),
+        );
+        const storageId = "cs_janitor";
+        const runId = `staging-janitor:${storageId}`;
+        const seasonId = `staging-janitor-season:${storageId}`;
+        const titleId = `staging-janitor-title:${storageId}`;
+        await repo.saveWorkflowRunSnapshot({
+          accountId: "acct_default",
+          connectedStorageId: storageId,
+          title: {
+            id: titleId,
+            tmdbId: 0,
+            type: "tv",
+            title: "暂存残留",
+            originalTitle: "",
+            year: 0,
+            aliases: [],
+          },
+          season: {
+            id: seasonId,
+            mediaTitleId: titleId,
+            seasonNumber: 0,
+            status: "completed",
+            qualityPreference: "",
+            storageDirectoryId: "",
+            totalEpisodes: 0,
+            latestAiredEpisode: 0,
+            latestAiredSource: "unknown",
+          },
+          workflowRun: {
+            id: runId,
+            kind: "type3_monitor",
+            status: "reserved",
+            trackedSeasonId: seasonId,
+            startedAt: "2026-09-27T03:00:00.000Z",
+            finishedAt: null,
+            auditEvents: [],
+          },
+          episodes: [],
+          resourceSnapshots: [],
+          decisions: [],
+          transferAttempts: [],
+          notifications: [
+            {
+              id: `staging_leftover:${storageId}:sweep`,
+              workflowRunId: runId,
+              kind: "staging_leftover",
+              title: "网盘暂存目录残留（1 个）",
+              body: "Show / staging-run：1 个文件，1 MB",
+              createdAt: "2026-09-27T03:00:00.000Z",
+              trigger: "user",
+            },
+          ],
+        });
+        const accountScope = { accountId: "acct_default", connectedStorageId: null as null };
+        expect(await repo.getTrackedSeasonState(seasonId, { accountId: "acct_default", connectedStorageId: storageId })).toBeNull();
+        expect((await repo.listTrackedSeasonStates(accountScope)).map((state) => state.season.id)).toEqual(["season_real"]);
+        expect((await repo.listAllTrackedSeasonStates()).some((state) => state.season.id === seasonId)).toBe(false);
+        expect((await repo.listAllTrackedSeasonStates()).some((state) => state.season.id === "season_real")).toBe(true);
+        const notes = await repo.listNotifications({ accountId: "acct_default", connectedStorageId: storageId });
+        expect(notes.map((note) => note.kind)).toContain("staging_leftover");
+        const recent = await repo.listRecentNotificationsWithAccount();
+        expect(recent.some((entry) => entry.notification.kind === "staging_leftover" && entry.accountId === "acct_default" && entry.connectedStorageId === storageId)).toBe(true);
+      });
+
       it("listEpisodeStates returns the drive's episodes for a concrete scope", async () => {
         const repo = await fresh();
         await repo.saveWorkflowRunSnapshot(

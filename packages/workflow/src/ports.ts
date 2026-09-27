@@ -57,9 +57,13 @@ export interface StorageExecutor {
    *  loop's budget soft-warning. Optional: only the real 115 executor implements it;
    *  fakes/sims omit it. */
   apiCallCount?(): number;
-  /** The configured HARD 115 call budget — lets the agent loop derive its SOFT
-   *  warning threshold from the real limit. Optional (real 115 executor only). */
+  /** The agent-facing 115 call budget (hard limit minus the harness cleanup
+   *  reserve). The agent loop derives its SOFT warning from this. Optional
+   *  (real 115 executor only). */
   apiCallBudget?(): number;
+  /** Run `fn` on the harness cleanup reserve. Executors without a per-run budget
+   *  omit it; withStagingCleanup uses it when present. */
+  withCleanupBudget?<T>(fn: () => Promise<T>): Promise<T>;
   /** Subtitle direct-link landing. Submits the http url as a drive offline task
    *  and confirms the named file landed via listTree (NOT listVideoFiles —
    *  subtitle extensions are invisible to that path). Optional AND the

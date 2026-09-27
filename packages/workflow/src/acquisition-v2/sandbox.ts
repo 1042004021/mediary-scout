@@ -413,6 +413,10 @@ export class TaskSandbox {
    *  backs one episode: E24 can never be reported replaced by E13's file. A backing file
    *  can no longer be deleted this run (see deleteFiles). */
   private readonly fileBackedEpisode = new Map<string, string>();
+  /** Ids from a moveToSeason that threw MOVE_NOT_DONE and that a later successful
+   *  move or deleteFiles has not cleared. The harness reads this and will not
+   *  delete staging while it is non-empty — those files may be the only copies. */
+  private readonly unmovedFileIds = new Set<string>();
 
   constructor(options: TaskSandboxOptions) {
     this.provider = options.provider;
@@ -1024,21 +1028,63 @@ export class TaskSandbox {
       return { season: move.season, targetDir, fileIds: move.fileIds };
     });
     // Validate ALL fileIds against the current staging snapshot before any move.
-    const stagingIds = new Set(
-      (await this.storage.listTree({ directoryId: this.stagingDirectoryId })).map((file) => file.id),
-    );
+    // A budget refusal here never reaches the move loop, so it has to hold the
+    // ids itself — otherwise markObtained plus harness cleanup deletes the only copies.
+    let stagingTree;
+    try {
+      stagingTree = await this.storage.listTree({ directoryId: this.stagingDirectoryId });
+    } catch (error) {
+      const ids = resolved.flatMap((move) => move.fileIds);
+      for (const fileId of ids) this.unmovedFileIds.add(fileId);
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `MOVE_NOT_DONE: these files did NOT move (${ids.join(", ")}). Do not markObtained their episodes this run — they are still only in staging. ${reason}`,
+      );
+    }
+    const stagingIds = new Set(stagingTree.map((file) => file.id));
     const outOfScope = resolved.flatMap((move) => move.fileIds).filter((fileId) => !stagingIds.has(fileId));
     if (outOfScope.length > 0) {
       throw new Error(`SANDBOX_FILES_NOT_IN_STAGING: ${outOfScope.join(",")}`);
     }
     // A movie's staging IS its movie dir, so the old film sits "in staging" too.
     this.assertNotProtected(resolved.flatMap((move) => move.fileIds));
+    // Hold every validated id before the first move. A throw on season 1 must not
+    // leave season 2's files unmarked — the loop never reaches them.
+    for (const fileId of resolved.flatMap((move) => move.fileIds)) {
+      this.unmovedFileIds.add(fileId);
+    }
     // Execute each move (the system does the per-file moves under the hood).
+    // A failure — a 115 budget refusal in particular — must come back saying the
+    // files did not move. The agent otherwise marks the episodes obtained and the
+    // only copies sit in staging (2026-09-27, 14 episodes).
     for (const move of resolved) {
-      const { moved } = await this.storage.moveFiles({ fileIds: move.fileIds, targetDirectoryId: move.targetDir });
-      // A movie's target IS staging, so those files were already kept at landing.
-      // 115 can answer ok:false and return moved: [] — those files are still in staging.
-      if (move.targetDir !== this.stagingDirectoryId) this.markKept(moved);
+      // null = moveFiles threw before any list. A returned list, even a short one,
+      // is the ids already in the season; only the rest are still only in staging.
+      let landed: readonly string[] | null = null;
+      try {
+        const moved = await this.storage.moveFiles({ fileIds: move.fileIds, targetDirectoryId: move.targetDir });
+        landed = moved.moved;
+        // A movie's target IS staging, so those files were already kept at landing.
+        // 115 can answer ok:false and return moved: [] — those files are still in staging.
+        if (move.targetDir !== this.stagingDirectoryId) this.markKept(moved.moved);
+        if (moved.moved.length !== move.fileIds.length) {
+          throw new Error(`moveFiles moved ${moved.moved.length} of ${move.fileIds.length}`);
+        }
+        for (const fileId of move.fileIds) {
+          this.unmovedFileIds.delete(fileId);
+        }
+      } catch (error) {
+        const landedIds = new Set(landed ?? []);
+        for (const fileId of move.fileIds) {
+          if (landedIds.has(fileId)) this.unmovedFileIds.delete(fileId);
+          else this.unmovedFileIds.add(fileId);
+        }
+        const reason = error instanceof Error ? error.message : String(error);
+        const missed = landed === null ? move.fileIds : move.fileIds.filter((fileId) => !landedIds.has(fileId));
+        throw new Error(
+          `MOVE_NOT_DONE: these files did NOT move (${missed.join(", ")}). Do not markObtained their episodes this run — they are still only in staging. ${reason}`,
+        );
+      }
     }
     // Force-reread every touched target season + staging for one-shot verification.
     const seasons: Record<number, SimTreeFile[]> = {};
@@ -1078,7 +1124,15 @@ export class TaskSandbox {
     }
     const { deleted } = await this.storage.deleteFiles({ directoryId, fileIds: input.fileIds });
     this.markThrown(deleted);
+    for (const fileId of deleted) {
+      this.unmovedFileIds.delete(fileId);
+    }
     return { deleted, directory: await this.storage.listTree({ directoryId }) };
+  }
+
+  /** File ids still only in staging because their move failed. Read-only. */
+  unmovedStagingFileIds(): string[] {
+    return [...this.unmovedFileIds];
   }
 
   /** Record the episodes the agent declares obtained — the agent's FINAL action,
@@ -1131,6 +1185,12 @@ export class TaskSandbox {
     if (this.allTargetDirIds().includes(this.stagingDirectoryId)) {
       throw new Error(
         "SANDBOX_STAGING_IS_TARGET: this task has no separate staging to discard (a movie flattens in place)",
+      );
+    }
+    if (this.unmovedFileIds.size > 0) {
+      const ids = [...this.unmovedFileIds];
+      throw new Error(
+        `SANDBOX_STAGING_HOLDS_UNMOVED: ${ids.length} file(s) whose move failed are still in staging (${ids.join(", ")}) — move them into their season with moveToSeason, or deleteFiles them on purpose, before discarding staging`,
       );
     }
     return this.storage.removeDirectory({ directoryId: this.stagingDirectoryId });

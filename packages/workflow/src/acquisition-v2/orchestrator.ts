@@ -137,6 +137,9 @@ export interface RunAcquisitionV2Request {
       add: (rows: Array<{ episode: string; linkKey: string | null; label: string; sizeBytes: number | null; reason: string }>) => Promise<void>;
     };
   };
+  /** Filled with the sandbox reader as soon as the sandbox exists, including when
+   *  the agent loop later throws. The harness cleanup reads it from `finally`. */
+  unmovedStaging?: { read: (() => string[]) | null };
 }
 
 /** The persistable trace of a V2 run, in the same shape the old serial path
@@ -472,6 +475,9 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
         }
       : {}),
   });
+  if (request.unmovedStaging) {
+    request.unmovedStaging.read = () => sandbox.unmovedStagingFileIds();
+  }
   // Replace run (or protected existing files): record every file already in the target dirs
   // BEFORE anything can touch them. Not best-effort — the protection is the whole
   // safety story, so a failing listing fails the run.
@@ -550,8 +556,9 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
     // Real 115 exposes its cumulative call count → drives the budget soft-warning
     // in the agent loop; fakes/sim omit apiCallCount → no nudge.
     ...(request.executor.apiCallCount ? { apiCallCount: () => request.executor.apiCallCount!() } : {}),
-    // Soft threshold derived from the configured HARD budget so they stay consistent
-    // even when MEDIA_TRACK_115_MAX_API_CALLS overrides the limit.
+    // Soft threshold derived from the agent-facing budget (apiCallBudget is the
+    // hard limit minus the harness cleanup reserve) so the nudge lands before the
+    // wall the agent can hit, including when MEDIA_TRACK_115_MAX_API_CALLS overrides it.
     ...(request.executor.apiCallBudget
       ? { budgetSoftAt: budgetSoftThreshold(request.executor.apiCallBudget()) }
       : {}),

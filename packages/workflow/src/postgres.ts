@@ -3,6 +3,7 @@ import type { Pool, PoolClient } from "pg";
 import {
   DEFAULT_ACCOUNT_ID,
   episodeNumberFromCode,
+  isStagingJanitorId,
   type AgentDecision,
   type AgentStep,
   type EpisodeState,
@@ -1028,6 +1029,9 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       return null;
     }
     const season = row.payload as TrackedSeason;
+    if (isStagingJanitorId(season.id)) {
+      return null;
+    }
     const title = await this.requireTitle(this.pool, season);
     return {
       accountId: scope.accountId,
@@ -1051,6 +1055,9 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
     const states: TrackedSeasonState[] = [];
     for (const row of result.rows) {
       const season = row.payload as TrackedSeason;
+      if (isStagingJanitorId(season.id)) {
+        continue;
+      }
       states.push({
         accountId: scope.accountId,
         connectedStorageId: storageFromColumn(row.connected_storage_id),
@@ -1070,6 +1077,9 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
     const states: TrackedSeasonState[] = [];
     for (const row of result.rows) {
       const season = row.payload as TrackedSeason;
+      if (isStagingJanitorId(season.id)) {
+        continue;
+      }
       const accountId = (row.account_id as string | undefined) ?? DEFAULT_ACCOUNT_ID;
       states.push({
         accountId,

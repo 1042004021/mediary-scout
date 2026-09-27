@@ -46,6 +46,7 @@ import {
   runQueuedType2Workflow,
   resolveDriveSourceLabels,
   runScheduledType3Monitoring,
+  sweepOrphanStagingDirs,
   sendPushNotifications,
   createPostgresWorkflowRepositorySync,
   createSqliteWorkflowRepository,
@@ -82,6 +83,7 @@ import {
   type ResourceProvider,
   type ResourceType,
   type SeasonMetadataSync,
+  type StagingJanitorDrive,
   type StorageExecutor,
   type TianyiSession,
   type TianyiQrSession,
@@ -1782,6 +1784,17 @@ export async function runScheduledType3(options?: {
       onAuthErrorFreeze: (id, reason) => freezeConnectedStorage(id, reason),
       ...(sync ? { syncSeasonMetadata: sync } : {}),
     });
+    try {
+      await sweepOrphanStagingDirs({
+        repository,
+        drives: await stagingJanitorDrives(),
+        now: new Date().toISOString(),
+      });
+    } catch (error) {
+      console.error(
+        `[patrol] staging janitor failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
     await repository.setSetting(LAST_SWEEP_COMPLETED_AT_SETTING_KEY, new Date().toISOString());
     await pushNotificationsSince(repository, startedAt, { sweep: true });
     return { outcomes: result };
@@ -1832,6 +1845,46 @@ function tmdbSeasonMetadataSync(): SeasonMetadataSync | undefined {
       totalEpisodes: target.season.totalEpisodes,
     };
   };
+}
+
+/** One fresh executor per connected drive. Frozen drives are handed over with an
+ *  empty executor — the janitor skips them before any call. A drive whose
+ *  executor cannot be built is omitted; the rest of the patrol still runs. */
+async function stagingJanitorDrives(): Promise<StagingJanitorDrive[]> {
+  const repository = getWorkflowRepository();
+  const drives: StagingJanitorDrive[] = [];
+  for (const account of await repository.listAccounts()) {
+    for (const storage of await repository.listConnectedStorages(account.id)) {
+      if (storage.status !== "active") {
+        drives.push({
+          accountId: account.id,
+          storageId: storage.id,
+          status: storage.status,
+          provider: storage.provider,
+          tvCid: storage.tvCid,
+          animeCid: storage.animeCid,
+          executor: {},
+        });
+        continue;
+      }
+      try {
+        drives.push({
+          accountId: account.id,
+          storageId: storage.id,
+          status: storage.status,
+          provider: storage.provider,
+          tvCid: storage.tvCid,
+          animeCid: storage.animeCid,
+          executor: await getWorkerStorageExecutor(account.id, storage.id),
+        });
+      } catch (error) {
+        console.error(
+          `[patrol] staging janitor: executor for ${storage.id} failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+  }
+  return drives;
 }
 
 async function seedDemoIfEmpty(targetRepository: WorkflowRepository): Promise<void> {

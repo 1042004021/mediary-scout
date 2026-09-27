@@ -152,3 +152,151 @@ describe("withStagingCleanup leak detection (verify the landing point, don't tru
     expect(calls).toEqual(["remove:stg"]);
   });
 });
+
+describe("withStagingCleanup harness cleanup budget", () => {
+  it("runs removal and the read-back inside withCleanupBudget, and not the body", async () => {
+    let inScope = false;
+    let bodySawScope = true;
+    const seen: string[] = [];
+    const executor = {
+      async withCleanupBudget<T>(fn: () => Promise<T>): Promise<T> {
+        inScope = true;
+        try {
+          return await fn();
+        } finally {
+          inScope = false;
+        }
+      },
+      async removeDirectory(id: string) {
+        seen.push(`remove:${id}:${inScope}`);
+        return { removed: true };
+      },
+      async listChildDirectories(parentId: string) {
+        seen.push(`list:${parentId}:${inScope}`);
+        return [{ id: "season", name: "Season 01" }];
+      },
+    };
+    const result = await withStagingCleanup(
+      { executor, stagingDirectoryId: "stg", parentDirectoryId: "show", onLeak: () => undefined },
+      async () => {
+        bodySawScope = inScope;
+        return "ok";
+      },
+    );
+    expect(result).toBe("ok");
+    expect(bodySawScope).toBe(false);
+    expect(seen).toEqual(["remove:stg:true", "list:show:true"]);
+  });
+});
+
+describe("withStagingCleanup unverified cleanup (removal failed and read-back could not be done)", () => {
+  it("records staging_cleanup_unverified when removal throws and the read-back throws", async () => {
+    const unverified: Array<{ stagingDirectoryId: string; showDirectoryId: string; error?: unknown }> = [];
+    const leaks: unknown[] = [];
+    const executor = {
+      async removeDirectory() {
+        throw new Error("PAN115_RATE_LIMIT: API call budget exhausted before deleteItems");
+      },
+      async listChildDirectories() {
+        throw new Error("PAN115_RATE_LIMIT: API call budget exhausted before listItems");
+      },
+    };
+    const result = await withStagingCleanup(
+      {
+        executor,
+        stagingDirectoryId: "stg",
+        parentDirectoryId: "show",
+        onLeak: (leak) => leaks.push(leak),
+        onCleanupUnverified: (event) => unverified.push(event),
+      },
+      async () => "ok",
+    );
+    expect(result).toBe("ok");
+    expect(leaks).toEqual([]);
+    expect(unverified).toHaveLength(1);
+    expect(unverified[0]).toMatchObject({ stagingDirectoryId: "stg", showDirectoryId: "show" });
+    expect(String(unverified[0]?.error)).toContain("budget exhausted before deleteItems");
+  });
+
+  it("records staging_cleanup_unverified when removal returns removed:false and there is no read-back capability", async () => {
+    const unverified: Array<{ stagingDirectoryId: string; showDirectoryId: string; error?: unknown }> = [];
+    const executor = {
+      async removeDirectory() {
+        return { removed: false };
+      },
+    };
+    await withStagingCleanup(
+      {
+        executor,
+        stagingDirectoryId: "stg",
+        parentDirectoryId: "show",
+        onCleanupUnverified: (event) => unverified.push(event),
+      },
+      async () => "ok",
+    );
+    expect(unverified).toHaveLength(1);
+    expect(String(unverified[0]?.error)).toMatch(/removed:\s*false|removed:false/);
+  });
+
+  it("stays quiet when removal succeeded and the read-back failed", async () => {
+    const unverified: unknown[] = [];
+    const leaks: unknown[] = [];
+    const executor = {
+      async removeDirectory() {
+        return { removed: true };
+      },
+      async listChildDirectories() {
+        throw new Error("network down");
+      },
+    };
+    const result = await withStagingCleanup(
+      {
+        executor,
+        stagingDirectoryId: "stg",
+        parentDirectoryId: "show",
+        onLeak: (leak) => leaks.push(leak),
+        onCleanupUnverified: (event) => unverified.push(event),
+      },
+      async () => "ok",
+    );
+    expect(result).toBe("ok");
+    expect(leaks).toEqual([]);
+    expect(unverified).toEqual([]);
+  });
+
+  it("attaches the unverified event to a thrown body error (the failure persist path)", async () => {
+    const { attachStagingCleanupUnverified: _attach, stagingCleanupUnverifiedOf } = await import(
+      "../src/acquisition-v2/directory-lifecycle.js"
+    );
+    const executor = {
+      async removeDirectory() {
+        throw new Error("budget exhausted before deleteItems");
+      },
+      async listChildDirectories() {
+        throw new Error("budget exhausted before listItems");
+      },
+    };
+    let caught: unknown;
+    try {
+      await withStagingCleanup(
+        {
+          executor,
+          stagingDirectoryId: "stg",
+          parentDirectoryId: "show",
+          onCleanupUnverified: () => undefined,
+        },
+        async () => {
+          throw new Error("agent gave up");
+        },
+      );
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toBe("agent gave up");
+    const events = stagingCleanupUnverifiedOf(caught);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ stagingDirectoryId: "stg", showDirectoryId: "show" });
+    expect(String(events[0]?.error)).toContain("budget exhausted before deleteItems");
+  });
+});

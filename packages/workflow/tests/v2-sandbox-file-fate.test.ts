@@ -336,7 +336,10 @@ async function moveFateSandbox(moved: string[]): Promise<TaskSandbox> {
   });
   const snapshotId = (await sandbox.searchResources("show")).snapshot!.id;
   await sandbox.transferCandidate({ snapshotId, candidateId: "pack" });
-  await sandbox.moveToSeason({ moves: [{ season: 1, fileIds: ["f1", "f2"] }] });
+  const move = sandbox.moveToSeason({ moves: [{ season: 1, fileIds: ["f1", "f2"] }] });
+  // A move that did not take every file comes back MOVE_NOT_DONE; what did move still counts as kept.
+  if (moved.length < 2) await expect(move).rejects.toThrow("MOVE_NOT_DONE");
+  else await move;
   return sandbox;
 }
 

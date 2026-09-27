@@ -1,5 +1,6 @@
 import {
   DEFAULT_ACCOUNT_ID,
+  isStagingJanitorId,
   type AgentDecision,
   type AgentStep,
   type EpisodeState,
@@ -1413,6 +1414,7 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     const latestSnapshot = Array.from(this.workflowRuns.values())
       .filter(
         (snapshot) =>
+          isVisibleTrackedSnapshot(snapshot) &&
           snapshot.season.id === trackedSeasonId &&
           scopeMatches(scope, snapshot.accountId, snapshot.connectedStorageId),
       )
@@ -1438,7 +1440,11 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     const scope = normalizeScope(scopeArg);
     const latestBySeason = new Map<string, PersistWorkflowRunSnapshotInput>();
     const snapshots = Array.from(this.workflowRuns.values())
-      .filter((snapshot) => scopeMatches(scope, snapshot.accountId, snapshot.connectedStorageId))
+      .filter(
+        (snapshot) =>
+          isVisibleTrackedSnapshot(snapshot) &&
+          scopeMatches(scope, snapshot.accountId, snapshot.connectedStorageId),
+      )
       .sort((a, b) => b.workflowRun.startedAt.localeCompare(a.workflowRun.startedAt));
     for (const snapshot of snapshots) {
       // Key by (season, drive): season.id is drive-independent, so the same season on
@@ -1467,9 +1473,9 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
 
   async listAllTrackedSeasonStates(): Promise<TrackedSeasonState[]> {
     const latestBySeason = new Map<string, PersistWorkflowRunSnapshotInput>();
-    const snapshots = Array.from(this.workflowRuns.values()).sort((a, b) =>
-      b.workflowRun.startedAt.localeCompare(a.workflowRun.startedAt),
-    );
+    const snapshots = Array.from(this.workflowRuns.values())
+      .filter((snapshot) => isVisibleTrackedSnapshot(snapshot))
+      .sort((a, b) => b.workflowRun.startedAt.localeCompare(a.workflowRun.startedAt));
     for (const snapshot of snapshots) {
       // Key by (season, drive): season.id is drive-independent, so the same season on
       // two drives is two distinct tracked entities — collapsing by season id alone
@@ -1681,6 +1687,11 @@ export function cloneWorkflowValue<T>(value: T): T {
 
 export function isActiveWorkflowStatus(status: WorkflowStatus): boolean {
   return status === "queued" || status === "running";
+}
+
+/** The staging janitor's inbox run is a notification carrier, not a show. */
+function isVisibleTrackedSnapshot(snapshot: PersistWorkflowRunSnapshotInput): boolean {
+  return !isStagingJanitorId(snapshot.workflowRun.id) && !isStagingJanitorId(snapshot.season.id);
 }
 
 export function workflowSnapshotFromReservation(input: ReserveWorkflowRunInput): PersistWorkflowRunSnapshotInput {

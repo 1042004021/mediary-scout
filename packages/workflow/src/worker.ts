@@ -20,7 +20,7 @@ import {
 } from "./repository.js";
 import { isTransientAcquisitionError } from "./acquisition-v2/transient-error.js";
 import type { JevJudge } from "./jev-judge.js";
-import { stagingLeakAuditEvent, stagingLeaksOf } from "./acquisition-v2/directory-lifecycle.js";
+import { stagingFailureAuditEvents } from "./acquisition-v2/directory-lifecycle.js";
 import { describeAgentRunError, summarizeErrorForNotification } from "./agent-error.js";
 import { formatReportPushText } from "./notification-report.js";
 import { isMovieUnreleased } from "./domain.js";
@@ -239,7 +239,7 @@ export async function handleWorkflowRunFailure(input: {
   // A staging dir that survived the harness cleanup on this failed body rides on
   // the error (attachStagingLeaks). This handler is the ONLY persist path for a
   // failed/requeued run, so the leak is recorded here or nowhere (Copilot #260 r1).
-  const leakEvents = stagingLeaksOf(error).map((leak) => stagingLeakAuditEvent(leak));
+  const leakEvents = stagingFailureAuditEvents(error);
   const claimedRun =
     leakEvents.length === 0
       ? claimed.workflowRun
@@ -720,7 +720,7 @@ async function patrolTrackedState(args: {
               type: "type3_scheduled",
               message: "Scheduled Type 3 monitoring reserved",
             },
-            ...stagingLeaksOf(error).map((leak) => stagingLeakAuditEvent(leak)),
+            ...stagingFailureAuditEvents(error),
             { type: "workflow_failed", message: errorMessage },
           ],
         },
@@ -898,7 +898,7 @@ async function patrolMovie(args: {
             type: "movie_patrol_scheduled",
             message: "Scheduled movie patrol reserved",
           },
-          ...stagingLeaksOf(error).map((leak) => stagingLeakAuditEvent(leak)),
+          ...stagingFailureAuditEvents(error),
           { type: "workflow_failed", message: errorMessage },
         ],
       },
