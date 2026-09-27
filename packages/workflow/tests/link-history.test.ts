@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { linkHistoryByKey, linkHistoryNoteForUrl } from "../src/acquisition-v2/link-history.js";
+import { readTransferFate } from "../src/user-requests.js";
 
 const SHARE = "https://www.123pan.com/s/Ab-cD_12";
 const SAME_SHARE = "https://www.123pan.cn/s/Ab-cD_12?pwd=1234";
@@ -68,6 +69,23 @@ describe("link history notes", () => {
     const annotated = titles.map((title) => ({ title, linkHistory: linkHistoryNoteForUrl(notes, SHARE) }));
     expect(annotated[0]!.linkHistory).toBe(annotated[1]!.linkHistory);
     expect(annotated[0]!.linkHistory).toBe("近 30 天转过 1 次（最近 09-26），文件每次都被丢掉");
+  });
+
+  it("a fate is two non-negative integers that count at least one file", () => {
+    expect(readTransferFate({ kept: 0, thrownAway: -1 })).toBeUndefined();
+    expect(readTransferFate({ kept: 0.5, thrownAway: 2 })).toBeUndefined();
+    expect(readTransferFate({ kept: 0, thrownAway: 0 })).toBeUndefined();
+    expect(readTransferFate({ kept: 0, thrownAway: 12 })).toEqual({ kept: 0, thrownAway: 12 });
+    expect(readTransferFate({ kept: 3, thrownAway: 0 })).toEqual({ kept: 3, thrownAway: 0 });
+  });
+
+  it("a link whose only fates are malformed gets no fate phrase", () => {
+    const notes = linkHistoryByKey([
+      { url: SHARE, startedAt: "2026-09-20T00:00:00.000Z", materializedCount: 12, fate: { kept: 0, thrownAway: -1 } },
+      { url: SHARE, startedAt: "2026-09-26T00:00:00.000Z", materializedCount: 12, fate: { kept: 0.5, thrownAway: 2 } },
+      { url: SHARE, startedAt: "2026-09-22T00:00:00.000Z", materializedCount: 12, fate: { kept: 0, thrownAway: 0 } },
+    ]);
+    expect(linkHistoryNoteForUrl(notes, SHARE)).toBe("近 30 天转过 3 次（最近 09-26）");
   });
 
   it("a malformed fate counts as not recorded", () => {

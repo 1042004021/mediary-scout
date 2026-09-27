@@ -706,6 +706,26 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
           ]);
         });
 
+        it("a stored fate that is not two non-negative integers counting at least one file comes back without fate", async () => {
+          const repo = await fresh();
+          await repo.saveWorkflowRunSnapshot(historyRun({
+            id: "run_bad_fate", drive: "cs_1", startedAt: "2026-09-07T00:00:00.000Z",
+            candidates: [{ key: "a", url: share }],
+            transfers: [
+              { key: "a", fileIds: ["f1"], fate: { kept: 0, thrownAway: -1 } },
+              { key: "a", fileIds: ["f2"], fate: { kept: 0.5, thrownAway: 2 } },
+              { key: "a", fileIds: ["f3"], fate: { kept: 0, thrownAway: 0 } },
+              { key: "a", fileIds: ["f4"], fate: { kept: 0, thrownAway: 12 } },
+            ],
+          }));
+          expect(await repo.listLinkHistory(query)).toEqual([
+            { url: share, startedAt: "2026-09-07T00:00:00.000Z", materializedCount: 1 },
+            { url: share, startedAt: "2026-09-07T00:00:00.000Z", materializedCount: 1 },
+            { url: share, startedAt: "2026-09-07T00:00:00.000Z", materializedCount: 1 },
+            { url: share, startedAt: "2026-09-07T00:00:00.000Z", materializedCount: 1, fate: { kept: 0, thrownAway: 12 } },
+          ]);
+        });
+
         it("orders by startedAt, then run id, then the run's transfer order", async () => {
           const repo = await fresh();
           await repo.saveWorkflowRunSnapshot(historyRun({

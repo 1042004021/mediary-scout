@@ -103,7 +103,11 @@ export interface LinkHistoryRow {
   fate?: { kept: number; thrownAway: number };
 }
 
-/** A stored fate, or undefined when it is absent or not two finite numbers. */
+/**
+ * A stored fate, or undefined when it is absent or not a real count: both numbers
+ * must be non-negative integers, and together they must count at least one file
+ * (a fate is only written for an attempt that materialized something).
+ */
 export function readTransferFate(value: unknown): { kept: number; thrownAway: number } | undefined {
   let parsed = value;
   if (typeof value === "string") {
@@ -117,7 +121,8 @@ export function readTransferFate(value: unknown): { kept: number; thrownAway: nu
   const kept = (parsed as { kept?: unknown }).kept;
   const thrownAway = (parsed as { thrownAway?: unknown }).thrownAway;
   if (typeof kept !== "number" || typeof thrownAway !== "number") return undefined;
-  if (!Number.isFinite(kept) || !Number.isFinite(thrownAway)) return undefined;
+  if (!Number.isInteger(kept) || !Number.isInteger(thrownAway)) return undefined;
+  if (kept < 0 || thrownAway < 0 || kept + thrownAway < 1) return undefined;
   return { kept, thrownAway };
 }
 
