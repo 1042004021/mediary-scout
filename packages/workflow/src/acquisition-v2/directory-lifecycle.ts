@@ -78,7 +78,11 @@ export async function ensureSeasonAcquisitionDirectories(
  * ~1.4 TB leaked over a month with zero signal. So when the caller hands over the
  * parent dir, the cleanup READS BACK whether the staging dir is still listed under
  * it and reports a leak through `onLeak` (audit trail + notification upstream).
- * The read-back is best-effort: a failing listing never masks the run's outcome.
+ * The read-back is best-effort when removal succeeded: a failing listing then
+ * never masks the run's outcome. When removal itself failed AND the read-back
+ * could not be done (threw, or the executor cannot list), that is no longer
+ * silent — it is a `staging_cleanup_unverified` event (2026-09-27: the 115 budget
+ * was spent, so both the delete and the listing were refused and nothing was recorded).
  */
 export interface StagingLeak {
   stagingDirectoryId: string;
@@ -97,6 +101,15 @@ export interface StagingLeak {
  *  identity (class, message, cause chain) is untouched: brand *AuthError freezes
  *  and transient-error classification keep working (Copilot #260 r1). */
 const STAGING_LEAKS = Symbol.for("media-track.stagingLeaks");
+const STAGING_CLEANUP_UNVERIFIED = Symbol.for("media-track.stagingCleanupUnverified");
+
+/** Removal failed and we could not read the show dir back to see if staging is
+ *  still there. Distinct from a confirmed leak. */
+export interface StagingCleanupUnverified {
+  stagingDirectoryId: string;
+  showDirectoryId: string;
+  error: unknown;
+}
 
 export function attachStagingLeaks<E>(error: E, leaks: StagingLeak[]): E {
   if (leaks.length > 0 && typeof error === "object" && error !== null) {
@@ -119,6 +132,49 @@ export function stagingLeaksOf(error: unknown): StagingLeak[] {
   return Array.isArray(leaks) ? (leaks as StagingLeak[]) : [];
 }
 
+export function attachStagingCleanupUnverified<E>(error: E, events: StagingCleanupUnverified[]): E {
+  if (events.length > 0 && typeof error === "object" && error !== null) {
+    const prior = stagingCleanupUnverifiedOf(error);
+    Object.defineProperty(error, STAGING_CLEANUP_UNVERIFIED, {
+      value: [...prior, ...events],
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
+  }
+  return error;
+}
+
+export function stagingCleanupUnverifiedOf(error: unknown): StagingCleanupUnverified[] {
+  if (typeof error !== "object" || error === null) {
+    return [];
+  }
+  const events = (error as Record<symbol, unknown>)[STAGING_CLEANUP_UNVERIFIED];
+  return Array.isArray(events) ? (events as StagingCleanupUnverified[]) : [];
+}
+
+export function stagingCleanupUnverifiedAuditEvent(event: StagingCleanupUnverified): AuditEvent {
+  const text = event.error instanceof Error ? event.error.message : String(event.error);
+  return {
+    type: "staging_cleanup_unverified",
+    message: `staging 目录清理失败且无法复核是否还在网盘上(${event.stagingDirectoryId})：${text}`,
+    data: {
+      stagingDirectoryId: event.stagingDirectoryId,
+      showDirectoryId: event.showDirectoryId,
+      cleanupError: text,
+    },
+  };
+}
+
+/** Leaks and unverified cleanups, in that order. The failure persist sites
+ *  (worker) record both or they record neither. */
+export function stagingFailureAuditEvents(error: unknown): AuditEvent[] {
+  return [
+    ...stagingLeaksOf(error).map((leak) => stagingLeakAuditEvent(leak)),
+    ...stagingCleanupUnverifiedOf(error).map((event) => stagingCleanupUnverifiedAuditEvent(event)),
+  ];
+}
+
 /** The ONE shape of the `staging_leaked` audit event, shared by the success path
  *  (workflow-v2 result) and every failure persist site (worker). */
 export function stagingLeakAuditEvent(leak: StagingLeak): AuditEvent {
@@ -137,13 +193,17 @@ export function stagingLeakAuditEvent(leak: StagingLeak): AuditEvent {
 
 export async function withStagingCleanup<T>(
   args: {
-    executor: Pick<StorageExecutor, "removeDirectory"> & Partial<Pick<StorageExecutor, "listChildDirectories">>;
+    executor: Pick<StorageExecutor, "removeDirectory"> &
+      Partial<Pick<StorageExecutor, "listChildDirectories" | "withCleanupBudget">>;
     stagingDirectoryId: string;
     /** The show dir the staging dir was created under. When given (together with a
      *  listChildDirectories-capable executor) the cleanup verifies removal by reading
      *  back the parent. Omit for the legacy fire-and-forget form. */
     parentDirectoryId?: string;
     onLeak?: (leak: StagingLeak) => void;
+    /** Removal failed and the show dir could not be read back. Same role as onLeak
+     *  for the success path; the throw path also rides on the error. */
+    onCleanupUnverified?: (event: StagingCleanupUnverified) => void;
   },
   run: () => Promise<T>,
 ): Promise<T> {
@@ -156,33 +216,75 @@ export async function withStagingCleanup<T>(
     bodyError = error;
     throw error;
   } finally {
-    let cleanupError: unknown;
-    try {
-      await args.executor.removeDirectory(args.stagingDirectoryId);
-    } catch (error) {
-      // Idempotent: staging may already be gone (agent discarded it). Never let
-      // a cleanup failure throw over the real outcome.
-      cleanupError = error;
-    }
-    if (args.parentDirectoryId !== undefined && args.executor.listChildDirectories && args.onLeak) {
+    const cleanup = async (): Promise<void> => {
+      let removalFailed = false;
+      let removalError: unknown;
       try {
-        const children = await args.executor.listChildDirectories(args.parentDirectoryId);
+        const removed = await args.executor.removeDirectory(args.stagingDirectoryId);
+        if (removed?.removed === false) {
+          removalFailed = true;
+          removalError = new Error("removeDirectory returned {removed:false}");
+        }
+      } catch (error) {
+        // Idempotent: staging may already be gone (agent discarded it). Never let
+        // a cleanup failure throw over the real outcome.
+        removalFailed = true;
+        removalError = error;
+      }
+
+      const parentId = args.parentDirectoryId;
+      if (parentId === undefined) {
+        return;
+      }
+      const reportUnverified = (error: unknown): void => {
+        const event: StagingCleanupUnverified = {
+          stagingDirectoryId: args.stagingDirectoryId,
+          showDirectoryId: parentId,
+          error,
+        };
+        args.onCleanupUnverified?.(event);
+        if (threw) {
+          attachStagingCleanupUnverified(bodyError, [event]);
+        }
+      };
+      const list = args.executor.listChildDirectories;
+      if (typeof list !== "function") {
+        if (removalFailed) {
+          reportUnverified(removalError);
+        }
+        return;
+      }
+      try {
+        const children = await list.call(args.executor, parentId);
         if (children.some((child) => child.id === args.stagingDirectoryId)) {
           const leak: StagingLeak = {
             stagingDirectoryId: args.stagingDirectoryId,
-            showDirectoryId: args.parentDirectoryId,
-            error: cleanupError,
+            showDirectoryId: parentId,
+            error: removalError,
           };
-          args.onLeak(leak);
+          args.onLeak?.(leak);
           if (threw) {
             // The rethrown body error is the only thing leaving this frame: make
             // it carry the leak so the failure persist path can record it.
             attachStagingLeaks(bodyError, [leak]);
           }
         }
-      } catch {
-        // Read-back is diagnostic only; a listing failure must not mask the result.
+      } catch (readBackError) {
+        // A successful removal plus a failed listing stays quiet (the dir is
+        // gone as far as the delete told us). A failed removal we could not
+        // check is the silent hole the 115 budget exhaustion fell into.
+        if (!removalFailed) {
+          return;
+        }
+        const removalText = removalError instanceof Error ? removalError.message : String(removalError);
+        const readText = readBackError instanceof Error ? readBackError.message : String(readBackError);
+        reportUnverified(new Error(`${removalText}; read-back failed: ${readText}`));
       }
+    };
+    if (typeof args.executor.withCleanupBudget === "function") {
+      await args.executor.withCleanupBudget(cleanup);
+    } else {
+      await cleanup();
     }
   }
 }

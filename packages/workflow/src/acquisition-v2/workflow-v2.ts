@@ -4,8 +4,10 @@ import type { ResourceProvider, StorageExecutor } from "../ports.js";
 import type { AuditEvent } from "../domain.js";
 import {
   ensureSeasonAcquisitionDirectories,
+  stagingCleanupUnverifiedAuditEvent,
   stagingLeakAuditEvent,
   withStagingCleanup,
+  type StagingCleanupUnverified,
   type StagingLeak,
   type AcquisitionDirectories,
 } from "./directory-lifecycle.js";
@@ -120,12 +122,14 @@ export async function runAcquisitionV2Workflow(
   // ignored (123 file/trash + string FileId, 2026-09-20) must surface as a
   // `staging_leaked` audit event instead of vanishing behind {removed:true}.
   const leaks: StagingLeak[] = [];
+  const unverified: StagingCleanupUnverified[] = [];
   const result = await withStagingCleanup(
     {
       executor: request.executor,
       stagingDirectoryId: directories.stagingDirectoryId,
       parentDirectoryId: directories.showDirectoryId,
       onLeak: (leak) => leaks.push(leak),
+      onCleanupUnverified: (event) => unverified.push(event),
     },
     async () => {
   const seasonsForSync = request.seasons.map((season) => ({
@@ -226,11 +230,15 @@ export async function runAcquisitionV2Workflow(
   };
     },
   );
-  if (leaks.length === 0) {
+  const stagingEvents = [
+    ...leaks.map((leak) => stagingLeakAuditEvent(leak)),
+    ...unverified.map((event) => stagingCleanupUnverifiedAuditEvent(event)),
+  ];
+  if (stagingEvents.length === 0) {
     return result;
   }
   return {
     ...result,
-    auditEvents: [...result.auditEvents, ...leaks.map((leak) => stagingLeakAuditEvent(leak))],
+    auditEvents: [...result.auditEvents, ...stagingEvents],
   };
 }

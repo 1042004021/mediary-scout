@@ -6,6 +6,7 @@ import {
   Pan115ApiGuard,
   Pan115AuthError,
   Pan115RiskControlError,
+  PAN115_HARNESS_RESERVE_CALLS,
   PAN115_TRANSFER_RESERVE_CALLS,
   Storage115Executor,
   type Pan115ActionResult,
@@ -987,15 +988,16 @@ describe("Storage115Executor", () => {
       api,
       env: {
         MEDIA_TRACK_115_TEST_ROOT_CID: "test_root",
-        MEDIA_TRACK_115_MAX_API_CALLS: "2",
+        MEDIA_TRACK_115_MAX_API_CALLS: "8", // agent wall = 8 − harness reserve
         MEDIA_TRACK_115_MIN_DELAY_MS: "1",
       },
     });
 
     await executor.listVideoFiles("season_1");
     await executor.listVideoFiles("season_1");
+    await executor.listVideoFiles("season_1");
     await expect(executor.listVideoFiles("season_1")).rejects.toThrow(
-      "maxCallsPerOperation=2",
+      `maxCallsPerOperation=${8 - PAN115_HARNESS_RESERVE_CALLS}`,
     );
   });
 
@@ -1046,7 +1048,7 @@ describe("115 factories wire the transfer reserve (收尾永远有额度)", () =
         MEDIA_TRACK_115_MIN_DELAY_MS: "1",
       },
     });
-    expect(executor.apiCallBudget()).toBe(44);
+    expect(executor.apiCallBudget()).toBe(44 - PAN115_HARNESS_RESERVE_CALLS);
     expect(executor.apiTransferCallBudget()).toBe(4);
     for (let i = 0; i < 4; i += 1) {
       await executor.listVideoFiles("season_1");
@@ -1069,7 +1071,7 @@ describe("115 factories wire the transfer reserve (收尾永远有额度)", () =
 
   it("createBootstrapPan115CookieStorageExecutor carries the same reserve (kept in sync)", () => {
     const executor = createBootstrapPan115CookieStorageExecutor({ cookie: "UID=1_abc" });
-    expect(executor.apiCallBudget()).toBe(300);
+    expect(executor.apiCallBudget()).toBe(300 - PAN115_HARNESS_RESERVE_CALLS);
     expect(executor.apiTransferCallBudget()).toBe(300 - PAN115_TRANSFER_RESERVE_CALLS);
   });
 

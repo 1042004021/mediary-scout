@@ -1,6 +1,6 @@
 import { createRequire } from "node:module";
 import type Database from "better-sqlite3";
-import { DEFAULT_ACCOUNT_ID, episodeNumberFromCode } from "./domain.js";
+import { DEFAULT_ACCOUNT_ID, episodeNumberFromCode, isStagingJanitorId } from "./domain.js";
 import type {
   AgentDecision,
   AgentStep,
@@ -1191,7 +1191,7 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
         kind: run.kind,
         status: run.status,
       };
-    });
+    }).filter((row) => !isStagingJanitorId(row.id) && !isStagingJanitorId(row.trackedSeasonId));
   }
 
   /** Keep only the latest (startedAt desc) run row per season id. */

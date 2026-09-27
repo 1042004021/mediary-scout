@@ -550,8 +550,9 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
     // Real 115 exposes its cumulative call count → drives the budget soft-warning
     // in the agent loop; fakes/sim omit apiCallCount → no nudge.
     ...(request.executor.apiCallCount ? { apiCallCount: () => request.executor.apiCallCount!() } : {}),
-    // Soft threshold derived from the configured HARD budget so they stay consistent
-    // even when MEDIA_TRACK_115_MAX_API_CALLS overrides the limit.
+    // Soft threshold derived from the agent-facing budget (apiCallBudget is the
+    // hard limit minus the harness cleanup reserve) so the nudge lands before the
+    // wall the agent can hit, including when MEDIA_TRACK_115_MAX_API_CALLS overrides it.
     ...(request.executor.apiCallBudget
       ? { budgetSoftAt: budgetSoftThreshold(request.executor.apiCallBudget()) }
       : {}),

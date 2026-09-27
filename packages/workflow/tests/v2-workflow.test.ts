@@ -143,6 +143,39 @@ describe("runAcquisitionV2Workflow — outer orchestration (dirs → sync → ag
     expect(leak?.message).toContain("staging");
   });
 
+  it("records staging_cleanup_unverified when removal fails and the read-back cannot run", async () => {
+    // Provisioning also lists children. Only the cleanup's read-back (the listing
+    // that follows removeDirectory) is the one that must fail closed.
+    class BlindCleanupExecutor extends FakeStorageExecutor {
+      private cleanupStarted = false;
+      override async removeDirectory(): Promise<{ removed: boolean }> {
+        this.cleanupStarted = true;
+        throw new Error("PAN115_RATE_LIMIT: API call budget exhausted before deleteItems");
+      }
+      override async listChildDirectories(parentId: string): Promise<Array<{ id: string; name: string }>> {
+        if (this.cleanupStarted) {
+          throw new Error("PAN115_RATE_LIMIT: API call budget exhausted before listItems");
+        }
+        return super.listChildDirectories(parentId);
+      }
+    }
+    const result = await runAcquisitionV2Workflow({
+      provider: emptyProvider(),
+      executor: new BlindCleanupExecutor(),
+      model: searchThenReportModel(),
+      workflowRunId: "run-unverified",
+      title: { name: "Show", year: 2024, aliases: [], tmdbId: 42 },
+      categoryParentId: "tv_root",
+      seasons: [{ seasonNumber: 1, latestAiredEpisode: 3 }],
+      qualityPreference: "1080p",
+    });
+    const event = result.auditEvents.find((item) => item.type === "staging_cleanup_unverified");
+    expect(event).toBeDefined();
+    expect(event?.message).toContain("budget exhausted before deleteItems");
+    expect(event?.data).toMatchObject({ showDirectoryId: result.directories.showDirectoryId });
+    expect(result.auditEvents.some((item) => item.type === "staging_leaked")).toBe(false);
+  });
+
   it("records NO staging_leaked event when the cleanup really removed the staging dir", async () => {
     const executor = new FakeStorageExecutor();
     const result = await runAcquisitionV2Workflow({

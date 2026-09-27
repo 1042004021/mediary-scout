@@ -73,13 +73,19 @@ const PAN115_TRANSFER_OPERATIONS: ReadonlySet<Pan115Operation> = new Set<Pan115O
 
 /** Calls held back from transfers so the wrap-up (inspectStaging + moveToSeason /
  *  flattenMovie + discardStaging) always fits: default hard 300 → transfers stop
- *  at 260 while listing/moving/deleting run to 300. Sits ABOVE the agent's soft
- *  nudge (240 = 300 − BUDGET_SOFT_HEADROOM) so the agent is warned first and keeps
- *  ~20 calls of its own discretion before the mechanical stop. One wrap-up pass on
- *  a 3-pack staging costs ~15–20 calls (2026-09-20 LIAR GAME run d98dc4ca: a
- *  22-file subtitle package spent 260 calls in ONE step, the wrap-up then hit the
- *  hard limit and 15 episodes stayed in staging); 40 fits one pass and a half. */
+ *  at 260 while the agent's other calls run to the agent wall. Sits ABOVE the
+ *  agent's soft nudge so the agent is warned first. One wrap-up pass on a 3-pack
+ *  staging costs ~15–20 calls (2026-09-20 LIAR GAME run d98dc4ca: a 22-file
+ *  subtitle package spent 260 calls in ONE step, the wrap-up then hit the hard
+ *  limit and 15 episodes stayed in staging); 40 fits one pass and a half. */
 export const PAN115_TRANSFER_RESERVE_CALLS = 40;
+
+/** Calls the agent cannot spend, kept for the harness backstop. removeDirectory
+ *  is getDirectoryInfo + deleteItems and the read-back is one listItems (3).
+ *  5 leaves a little slack. 2026-09-27: nine leftover staging dirs on the 115
+ *  drive had no staging_leaked event — every run had spent 300/300, so discard,
+ *  removeDirectory and the read-back were all refused and the failure was swallowed. */
+export const PAN115_HARNESS_RESERVE_CALLS = 5;
 
 export interface Pan115Item {
   id?: string | number;
@@ -205,10 +211,16 @@ export interface Pan115ApiGuardOptions {
   maxCallsPerOperation?: number;
   /** Calls held back from TRANSFER-class operations (receiveShare / addOfflineTask):
    *  they are refused once callCount reaches maxCallsPerOperation − this value,
-   *  while every other operation keeps running to the hard limit — so a run that
+   *  while every other operation keeps running to the agent wall — so a run that
    *  spent its budget on transfers can still move landed files into their season
    *  and discard staging. Default 0 = no tiering (a plain hard cap). */
   transferReserveCalls?: number;
+  /** Calls held back from the AGENT for the harness backstop (withStagingCleanup).
+   *  Normal calls are refused once callCount reaches maxCallsPerOperation − this
+   *  value; calls inside withCleanupBudget may use them up to the hard limit.
+   *  Default 0. Production factories set PAN115_HARNESS_RESERVE_CALLS. Independent
+   *  of transferReserveCalls: transfers still stop at hard − transfer reserve. */
+  harnessReserveCalls?: number;
   maxListItemsPerResponse?: number;
   riskMessagePatterns?: RegExp[];
   now?: () => number;
@@ -227,6 +239,7 @@ export class Pan115ApiGuard {
   private readonly minDelayMs: number;
   private readonly maxCallsPerOperation: number;
   private readonly transferReserveCalls: number;
+  private readonly harnessReserveCalls: number;
   private readonly maxListItemsPerResponse: number;
   private readonly riskMessagePatterns: RegExp[];
   private readonly now: () => number;
@@ -234,12 +247,14 @@ export class Pan115ApiGuard {
   private readonly onEvent: (event: Pan115ApiGuardEvent) => void;
   private lastCallAt: number | null = null;
   private callCount = 0;
+  private cleanupDepth = 0;
   private circuitOpenReason: string | null = null;
 
   constructor(options: Pan115ApiGuardOptions = {}) {
     this.minDelayMs = options.minDelayMs ?? 0;
     this.maxCallsPerOperation = options.maxCallsPerOperation ?? 80;
     this.transferReserveCalls = Math.max(0, options.transferReserveCalls ?? 0);
+    this.harnessReserveCalls = Math.max(0, options.harnessReserveCalls ?? 0);
     // Matches the client's paginated stitch cap (DEFAULT_MAX_LIST_TOTAL=1000): the
     // client refuses dirs bigger than that, so a result above it is a real anomaly.
     this.maxListItemsPerResponse = options.maxListItemsPerResponse ?? 1000;
@@ -254,22 +269,47 @@ export class Pan115ApiGuard {
     return this.callCount;
   }
 
-  /** The HARD call budget: checked BEFORE each call, the guard refuses (throws
-   *  Pan115RiskControlError) the next call once callCount has reached this value.
-   *  Surfaced so the agent loop can derive its SOFT-warning threshold from the
-   *  actually-configured limit instead of hardcoding a number. */
+  /** The agent-facing call budget: hard limit minus the harness cleanup reserve,
+   *  clamped into [0, hard]. The guard refuses a normal call once callCount has
+   *  reached this. Surfaced so the agent loop's SOFT warning is derived from the
+   *  wall the agent can actually hit, not the calls kept for the backstop. */
   callBudget(): number {
-    return this.maxCallsPerOperation;
+    return this.agentCallLimit();
   }
 
   /** The TRANSFER call budget: receiveShare / addOfflineTask are refused once
-   *  callCount reaches this (hard limit minus the wrap-up reserve, clamped into
-   *  [0, hard]). Equals callBudget() when no reserve is configured. */
+   *  callCount reaches this (hard limit minus the wrap-up reserve, and never past
+   *  the agent wall). Equals callBudget() when no transfer reserve is configured. */
   transferCallBudget(): number {
-    // Clamped into [0, hard]: a reserve at or above the hard limit leaves no room
-    // for transfers (every call is wrap-up), and the line never exceeds the hard
-    // limit itself — a transfer must never be allowed where the hard cap would refuse it.
-    return Math.min(this.maxCallsPerOperation, Math.max(0, this.maxCallsPerOperation - this.transferReserveCalls));
+    // Clamped into [0, agent wall]: a reserve at or above the hard limit leaves no
+    // room for transfers, and a transfer must never be allowed where the agent
+    // wall (or the hard cap) would refuse it.
+    return Math.min(this.rawTransferLimit(), this.agentCallLimit());
+  }
+
+  /** Let the harness backstop spend the reserve the agent was refused, up to the
+   *  real hard limit. Nested scopes stay inside the reserve. */
+  async withCleanupBudget<T>(fn: () => Promise<T>): Promise<T> {
+    this.cleanupDepth += 1;
+    try {
+      return await fn();
+    } finally {
+      this.cleanupDepth -= 1;
+    }
+  }
+
+  private agentCallLimit(): number {
+    return Math.min(
+      this.maxCallsPerOperation,
+      Math.max(0, this.maxCallsPerOperation - this.harnessReserveCalls),
+    );
+  }
+
+  private rawTransferLimit(): number {
+    return Math.min(
+      this.maxCallsPerOperation,
+      Math.max(0, this.maxCallsPerOperation - this.transferReserveCalls),
+    );
   }
 
   /** Fail fast on the transfer line BEFORE a caller spends preparatory calls
@@ -330,26 +370,39 @@ export class Pan115ApiGuard {
   }
 
   private assertBudget(operation: Pan115Operation): void {
-    const limit = PAN115_TRANSFER_OPERATIONS.has(operation)
-      ? this.transferCallBudget()
-      : this.maxCallsPerOperation;
+    const hard = this.maxCallsPerOperation;
+    const agentLimit = this.agentCallLimit();
+    const transferLine = this.rawTransferLimit();
+    const inCleanup = this.cleanupDepth > 0;
+    const limit = inCleanup
+      ? hard
+      : PAN115_TRANSFER_OPERATIONS.has(operation)
+        ? Math.min(transferLine, agentLimit)
+        : agentLimit;
     if (this.callCount < limit) {
       return;
     }
-    // A transfer refused inside the reserve zone gets a message that says what the
-    // remaining calls are FOR — the agent reads it as tool output and must switch to
-    // wrapping up, not retry. Neither refusal is counted nor opens the circuit. The
-    // branch keys on STATE, not on config: once callCount has passed the hard limit
-    // there are no wrap-up calls left, so promising a reserve would be a lie.
-    const remaining = Math.max(0, this.maxCallsPerOperation - this.callCount);
-    const message =
-      this.callCount < this.maxCallsPerOperation
-        ? `PAN115_RATE_LIMIT: transfer budget exhausted before ${operation}; ` +
-          `${this.callCount} of maxCallsPerOperation=${this.maxCallsPerOperation} calls spent, ` +
-          `transfers stop at ${limit} and the remaining ${remaining} calls are reserved for wrap-up ` +
-          `(moveToSeason / flattenMovie / discardStaging / finish) — do not transfer again, wrap up now`
-        : `PAN115_RATE_LIMIT: API call budget exhausted before ${operation}; ` +
-          `maxCallsPerOperation=${this.maxCallsPerOperation}`;
+    // A transfer refused inside the transfer-reserve zone gets a message that says
+    // what the remaining calls are FOR — the agent reads it as tool output and must
+    // switch to wrapping up, not retry. A normal call refused at the agent wall
+    // (the harness reserve) is a plain budget exhaustion: those last calls are not
+    // the agent's. Neither refusal is counted nor opens the circuit. The branch
+    // keys on STATE: once callCount has reached the agent wall there are no wrap-up
+    // calls left for the agent, so promising a reserve would be a lie. Inside the
+    // cleanup scope the wall is the real hard limit.
+    const transferReserveRefusal =
+      !inCleanup &&
+      PAN115_TRANSFER_OPERATIONS.has(operation) &&
+      this.callCount < hard &&
+      this.callCount < agentLimit;
+    const remaining = Math.max(0, agentLimit - this.callCount);
+    const message = transferReserveRefusal
+      ? `PAN115_RATE_LIMIT: transfer budget exhausted before ${operation}; ` +
+        `${this.callCount} of maxCallsPerOperation=${hard} calls spent, ` +
+        `transfers stop at ${transferLine} and the remaining ${remaining} calls are reserved for wrap-up ` +
+        `(moveToSeason / flattenMovie / discardStaging / finish) — do not transfer again, wrap up now`
+      : `PAN115_RATE_LIMIT: API call budget exhausted before ${operation}; ` +
+        `maxCallsPerOperation=${inCleanup ? hard : agentLimit}`;
     this.onEvent({
       kind: "budget_exhausted",
       operation,
@@ -460,10 +513,17 @@ export class Storage115Executor implements StorageExecutor {
     return this.apiGuard.callsSpent();
   }
 
-  /** The configured HARD call budget — the agent loop derives its SOFT-warning
-   *  threshold from this so the two stay consistent when the limit is overridden. */
+  /** The agent-facing call budget (hard limit minus the harness cleanup reserve).
+   *  The agent loop derives its SOFT warning from this, so the nudge lands before
+   *  the wall the agent can hit. */
   apiCallBudget(): number {
     return this.apiGuard.callBudget();
+  }
+
+  /** Spend the harness cleanup reserve. withStagingCleanup wraps its removal and
+   *  read-back in this so they still run after the agent has been cut off. */
+  async withCleanupBudget<T>(fn: () => Promise<T>): Promise<T> {
+    return this.apiGuard.withCleanupBudget(fn);
   }
 
   /** The TRANSFER call budget (hard limit minus the wrap-up reserve): where
@@ -1344,15 +1404,16 @@ export function createProtectedStorage115Executor(
     executorOptions.apiGuardOptions = {
       minDelayMs: positiveIntFromEnv(env["MEDIA_TRACK_115_MIN_DELAY_MS"]) ?? 1_200,
       // HARD limit (throws Pan115RiskControlError) — default 300, configurable here.
-      // The agent gets a SOFT wrap-up warning earlier, at
-      // budgetSoftThreshold(maxCallsPerOperation) (= that value minus a fixed
-      // headroom) via the agent loop, so its own markObtained/
-      // discardStaging cleanup still fits before the hard stop. Override-safe: the
-      // soft threshold is derived from this value, never hardcoded.
+      // The agent is cut off PAN115_HARNESS_RESERVE_CALLS earlier (apiCallBudget)
+      // and gets a SOFT wrap-up warning at budgetSoftThreshold(apiCallBudget).
+      // Override-safe: the soft threshold is derived from the agent wall, never hardcoded.
       maxCallsPerOperation: positiveIntFromEnv(env["MEDIA_TRACK_115_MAX_API_CALLS"]) ?? 300,
-      // Wrap-up reserve: transfers stop at maxCallsPerOperation − 40 (default 260),
-      // listing/moving/deleting continue to the hard limit. See PAN115_TRANSFER_RESERVE_CALLS.
+      // Wrap-up reserve: transfers stop at maxCallsPerOperation − 40 (default 260).
+      // See PAN115_TRANSFER_RESERVE_CALLS.
       transferReserveCalls: PAN115_TRANSFER_RESERVE_CALLS,
+      // Harness reserve: the agent stops at max − 5; withCleanupBudget may spend
+      // the rest. See PAN115_HARNESS_RESERVE_CALLS.
+      harnessReserveCalls: PAN115_HARNESS_RESERVE_CALLS,
       maxListItemsPerResponse: 1000,
       ...options.apiGuardOptions,
     };

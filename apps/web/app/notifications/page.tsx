@@ -48,6 +48,7 @@ const kindIcon: Record<string, { tone: string; icon: typeof Bell }> = {
   transfer_failed: { tone: "amber", icon: XCircle },
   replacement_done: { tone: "indigo", icon: Repeat },
   foreign_work_detected: { tone: "amber", icon: Film },
+  staging_leftover: { tone: "amber", icon: TriangleAlert },
 };
 
 const statusMeta: Record<NotificationReportStatus, { label: string; tone: string; icon: typeof Bell }> = {

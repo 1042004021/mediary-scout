@@ -1034,11 +1034,24 @@ export class TaskSandbox {
     // A movie's staging IS its movie dir, so the old film sits "in staging" too.
     this.assertNotProtected(resolved.flatMap((move) => move.fileIds));
     // Execute each move (the system does the per-file moves under the hood).
+    // A failure — a 115 budget refusal in particular — must come back saying the
+    // files did not move. The agent otherwise marks the episodes obtained and the
+    // only copies sit in staging (2026-09-27, 14 episodes).
     for (const move of resolved) {
-      const { moved } = await this.storage.moveFiles({ fileIds: move.fileIds, targetDirectoryId: move.targetDir });
-      // A movie's target IS staging, so those files were already kept at landing.
-      // 115 can answer ok:false and return moved: [] — those files are still in staging.
-      if (move.targetDir !== this.stagingDirectoryId) this.markKept(moved);
+      try {
+        const moved = await this.storage.moveFiles({ fileIds: move.fileIds, targetDirectoryId: move.targetDir });
+        // A movie's target IS staging, so those files were already kept at landing.
+        // 115 can answer ok:false and return moved: [] — those files are still in staging.
+        if (move.targetDir !== this.stagingDirectoryId) this.markKept(moved.moved);
+        if (moved.moved.length !== move.fileIds.length) {
+          throw new Error(`moveFiles moved ${moved.moved.length} of ${move.fileIds.length}`);
+        }
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        throw new Error(
+          `MOVE_NOT_DONE: these files did NOT move (${move.fileIds.join(", ")}). Do not markObtained their episodes this run — they are still only in staging. ${reason}`,
+        );
+      }
     }
     // Force-reread every touched target season + staging for one-shot verification.
     const seasons: Record<number, SimTreeFile[]> = {};
