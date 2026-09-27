@@ -74,6 +74,14 @@ export function titleBlockFilter(
   return null;
 }
 
+/** Whether the reservation refuses (`not_tracked`) a (season, drive) that is no longer
+ *  tracked: asked for directly, or implied by keepCurrentEpisodes (nothing to keep). */
+export function reservationRequiresTrackedSeason(
+  input: Pick<ReserveWorkflowRunInput, "requireTrackedSeason" | "keepCurrentEpisodes">,
+): boolean {
+  return input.requireTrackedSeason === true || input.keepCurrentEpisodes === true;
+}
+
 export interface PersistWorkflowRunSnapshotInput {
   /** Owning account. Optional at the call site (single-user = implicit
    *  acct_default); the repository stamps it onto the account_id column. */
@@ -144,6 +152,15 @@ export interface ReserveWorkflowRunInput extends PersistWorkflowRunSnapshotInput
    * which untrackTitle takes too; SQLite and InMemory decide synchronously.
    */
   requireTrackedSeason?: boolean;
+  /**
+   * Write ONLY the new run: the title, the season record and its episode states stay
+   * exactly as stored when the reservation decides (the passed copies are not written).
+   * For a caller that reserves from states it read earlier (queueReplaceRequest): a run
+   * of that season that saved in between (an episode landed) must not be rolled back to
+   * the stale copy. Decided in the same atomic section as the other checks. Implies
+   * requireTrackedSeason: a season that is not tracked has nothing to keep.
+   */
+  keepCurrentEpisodes?: boolean;
   staleActiveRunStartedBefore?: string;
   staleFinishedAt?: string;
 }
@@ -918,7 +935,7 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     validateWorkflowRunSnapshot(snapshot);
     // Before anything is written (the stale-run expiry included) and, like the checks
     // below, with no await between it and the write.
-    if (input.requireTrackedSeason === true && !this.isSeasonTracked(snapshot.season.id, snapshot.connectedStorageId)) {
+    if (reservationRequiresTrackedSeason(input) && !this.isSeasonTracked(snapshot.season.id, snapshot.connectedStorageId)) {
       return { status: "not_tracked" };
     }
     this.expireStaleActiveWorkflowRuns(input);
@@ -980,11 +997,21 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     const cloned = cloneWorkflowValue(snapshot);
     cloned.accountId = cloned.accountId ?? DEFAULT_ACCOUNT_ID;
     cloned.connectedStorageId = storageValue;
-    this.workflowRuns.set(cloned.workflowRun.id, cloned);
-    this.episodesBySeason.set(
-      seasonScopeKey(cloned.season.id, storageValue),
-      cloneWorkflowValue(cloned.episodes),
-    );
+    const bucketKey = seasonScopeKey(cloned.season.id, storageValue);
+    if (input.keepCurrentEpisodes === true) {
+      // Tracking here is the latest run record of the (season, drive) plus its episode
+      // bucket: this run's record carries the CURRENT title, season and episodes (not the
+      // copies it was handed) and the bucket is left alone, so the season reads exactly
+      // as before. The tracked check above guarantees a record exists.
+      const current = this.latestSeasonRecordSync(cloned.season.id, storageValue)!;
+      cloned.title = cloneWorkflowValue(current.title);
+      cloned.season = cloneWorkflowValue(current.season);
+      cloned.episodes = cloneWorkflowValue(this.episodesBySeason.get(bucketKey) ?? current.episodes);
+      this.workflowRuns.set(cloned.workflowRun.id, cloned);
+    } else {
+      this.workflowRuns.set(cloned.workflowRun.id, cloned);
+      this.episodesBySeason.set(bucketKey, cloneWorkflowValue(cloned.episodes));
+    }
 
     return {
       status: "reserved",
@@ -1099,6 +1126,18 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     return Array.from(this.workflowRuns.values()).some(
       (stored) => seasonScopeKey(stored.season.id, stored.connectedStorageId) === key,
     );
+  }
+
+  /** The run record the (season, drive)'s tracking is read from — the latest one, as in
+   *  listTrackedSeasonStates — or undefined when it is not tracked. */
+  private latestSeasonRecordSync(
+    seasonId: string,
+    connectedStorageId: string | null | undefined,
+  ): PersistWorkflowRunSnapshotInput | undefined {
+    const key = seasonScopeKey(seasonId, connectedStorageId);
+    return Array.from(this.workflowRuns.values())
+      .filter((stored) => seasonScopeKey(stored.season.id, stored.connectedStorageId) === key)
+      .sort((a, b) => b.workflowRun.startedAt.localeCompare(a.workflowRun.startedAt))[0];
   }
 
   async listActiveWorkflowRuns(
@@ -1588,6 +1627,7 @@ export function workflowSnapshotFromReservation(input: ReserveWorkflowRunInput):
   const {
     blockIfEpisodeStatesExist: _blockIfEpisodeStatesExist,
     requireTrackedSeason: _requireTrackedSeason,
+    keepCurrentEpisodes: _keepCurrentEpisodes,
     staleActiveRunStartedBefore: _staleActiveRunStartedBefore,
     staleFinishedAt: _staleFinishedAt,
     ...snapshot

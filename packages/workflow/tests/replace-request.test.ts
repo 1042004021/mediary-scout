@@ -338,6 +338,43 @@ describe("queueReplaceRequest", () => {
       ["run_rr_s2", "replace_request", season2.id],
     ]);
   });
+
+  it("a run of the lock season that saved between reading the seasons and reserving keeps what it landed: the reservation writes only the run", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    const { title, season } = trackedFixture();
+    await seedTrackedSeason({ repository, title, season, obtainedCodes: ["S01E01"] });
+    const scope = { accountId: "acct_1", connectedStorageId: DRIVE };
+    // A patrol run of S01, still running when the seasons were read, lands E02 and saves.
+    const racing = raceAfterFirstStatesRead(repository, async () => {
+      const state = (await repository.getTrackedSeasonState(season.id, scope))!;
+      await repository.saveWorkflowRunSnapshot({
+        accountId: "acct_1",
+        connectedStorageId: DRIVE,
+        title,
+        season: state.season,
+        workflowRun: {
+          id: "run_patrol_landed",
+          kind: "type3_monitor",
+          status: "succeeded",
+          trackedSeasonId: season.id,
+          startedAt: "2026-09-25T00:00:00.000Z",
+          finishedAt: "2026-09-25T00:10:00.000Z",
+          auditEvents: [],
+        },
+        episodes: state.episodes.map((episode) => ({ ...episode, obtained: true })),
+        resourceSnapshots: [],
+        decisions: [],
+        transferAttempts: [],
+        notifications: [],
+      });
+    });
+
+    const result = await queueReplaceRequest({ repository: racing, work: WORK, now: fixedNow, createWorkflowRunId: () => "run_rr_after_landing" });
+
+    expect(result).toEqual({ status: "queued", workflowRunId: "run_rr_after_landing" });
+    const state = await repository.getTrackedSeasonState(season.id, scope);
+    expect(state?.episodes.map((e) => [e.episodeCode, e.obtained])).toEqual([["S01E01", true], ["S01E02", true]]);
+  });
 });
 
 describe("runQueuedReplaceRequest", () => {

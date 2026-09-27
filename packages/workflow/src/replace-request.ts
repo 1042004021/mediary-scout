@@ -91,7 +91,7 @@ export async function queueReplaceRequest(input: {
           },
         ],
       },
-      // A reservation replaces the season's episode bucket wholesale: hand it back unchanged.
+      // Not written (keepCurrentEpisodes below): the season's stored episodes stay as they are.
       episodes: lock.episodes,
       resourceSnapshots: [],
       decisions: [],
@@ -103,6 +103,9 @@ export async function queueReplaceRequest(input: {
       // read again — the lowest season still tracked becomes the lock, none left means
       // the work is gone from this drive.
       requireTrackedSeason: true,
+      // …and a run of the lock season that saved in between (an episode landed) must not
+      // be rolled back to this copy: the reservation writes only the run.
+      keepCurrentEpisodes: true,
     });
     if (reservation.status === "not_tracked") continue;
     if (reservation.status === "already_active") {

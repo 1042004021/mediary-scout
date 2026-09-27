@@ -1806,6 +1806,69 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         }
       });
 
+      it("keepCurrentEpisodes: a replace reservation from a stale read writes only the run — what a run persisted in between stays; without it the reservation writes what it was handed, as before", async () => {
+        const repo = await fresh();
+        /** Track a season, read it (S01E02 missing), let a patrol run of it finish (S01E02
+         *  lands, the season and title records change), then reserve from the stale read. */
+        const reserveFromStaleRead = async (id: string, tmdbId: number, over: Partial<ReserveWorkflowRunInput>) => {
+          const scope = { accountId: "acct_default", connectedStorageId: `cs_${id}` };
+          const tracked = queuedRun({ id, status: "succeeded", tmdbId, type: "tv" });
+          await repo.saveWorkflowRunSnapshot(tracked);
+          const [read] = await repo.listTrackedSeasonStates(scope);
+          expect(read!.episodes.map((e) => [e.episodeCode, e.obtained])).toEqual([["S01E01", true], ["S01E02", false]]);
+          await repo.saveWorkflowRunSnapshot({
+            ...tracked,
+            title: { ...tracked.title, aliases: ["Alias learned later"] },
+            season: { ...tracked.season, latestAiredEpisode: 2 },
+            workflowRun: {
+              ...tracked.workflowRun,
+              id: `${id}_patrol`,
+              kind: "type3_monitor",
+              startedAt: "2026-09-26T00:00:00.000Z",
+              finishedAt: "2026-09-26T00:10:00.000Z",
+            },
+            episodes: tracked.episodes.map((e) => ({ ...e, airStatus: "aired" as const, obtained: true, verifiedFileIds: [`file_${e.episodeCode}`] })),
+          });
+          const current = (await repo.getTrackedSeasonState(`season_${id}`, scope))!;
+          expect(current.episodes.map((e) => [e.episodeCode, e.obtained])).toEqual([["S01E01", true], ["S01E02", true]]);
+          const reservation = await repo.reserveWorkflowRun(replaceReservationFrom(read!, `${id}_replace`, over));
+          const after = (await repo.getTrackedSeasonState(`season_${id}`, scope))!;
+          const active = (await repo.listActiveWorkflowRuns(scope)).map((run) => run.workflowRun.id);
+          return { read: read!, current, reservation, after, active };
+        };
+
+        const kept = await reserveFromStaleRead("kc_keep", 5101, { requireTrackedSeason: true, keepCurrentEpisodes: true });
+        expect(kept.reservation.status).toBe("reserved");
+        expect(kept.active).toEqual(["kc_keep_replace"]);
+        // The season record, its episode states and the title are exactly what was stored.
+        expect(kept.after).toEqual(kept.current);
+        // The reservation reports what it kept, not the stale copy it was handed.
+        expect(kept.reservation.status === "reserved" && {
+          title: kept.reservation.snapshot.title,
+          season: kept.reservation.snapshot.season,
+          episodes: kept.reservation.snapshot.episodes,
+        }).toEqual({ title: kept.current.title, season: kept.current.season, episodes: kept.current.episodes });
+
+        // Without the option the handed copy is written wholesale (how init and patrol
+        // reservations set a season's state).
+        const plain = await reserveFromStaleRead("kc_plain", 5102, { requireTrackedSeason: true });
+        expect(plain.reservation.status).toBe("reserved");
+        expect(plain.after.season).toEqual(plain.read.season);
+        expect(plain.after.episodes).toEqual(plain.read.episodes);
+
+        // There is nothing current to keep for a season that is not tracked: refused, nothing written.
+        const untrackedScope = { accountId: "acct_default", connectedStorageId: "cs_kc_gone" };
+        const gone = queuedRun({ id: "kc_gone", status: "succeeded", tmdbId: 5103, type: "tv" });
+        await repo.saveWorkflowRunSnapshot(gone);
+        const [goneRead] = await repo.listTrackedSeasonStates(untrackedScope);
+        expect(await repo.untrackTitle(5103, untrackedScope, "tv")).toEqual({ status: "untracked", removedSeasons: 1 });
+        expect(await repo.reserveWorkflowRun(replaceReservationFrom(goneRead!, "kc_gone_replace", { keepCurrentEpisodes: true }))).toEqual({
+          status: "not_tracked",
+        });
+        expect(await repo.listTrackedSeasonStates(untrackedScope)).toEqual([]);
+        expect(await repo.getWorkflowRunSnapshot("kc_gone_replace", untrackedScope)).toBeNull();
+      });
+
       it("retryFailedWorkflowRun requeues a failed run so it becomes claimable", async () => {
         const repo = await fresh();
         await repo.saveWorkflowRunSnapshot(

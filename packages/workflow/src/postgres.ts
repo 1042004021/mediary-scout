@@ -26,6 +26,7 @@ import {
   isActiveWorkflowStatus,
   isQueueClaimableKind,
   isStaleActiveWorkflowRun,
+  reservationRequiresTrackedSeason,
   titleBlockFilter,
   type PersistedWorkflowRunSnapshot,
   type PersistWorkflowRunSnapshotInput,
@@ -466,8 +467,9 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
     const connectedStorageId = snapshot.connectedStorageId ?? UNSCOPED_STORAGE;
 
     const blocksTitle = titleBlockFilter(input);
+    const requireTracked = reservationRequiresTrackedSeason(input);
     return this.withTransaction(async (client) => {
-      if (blocksTitle || input.requireTrackedSeason === true) {
+      if (blocksTitle || requireTracked) {
         // READ COMMITTED alone lets two concurrent reservations both see no active
         // run for the title and both insert. Serialize them per (account, drive,
         // title) for the rest of this transaction; untrackTitle takes the same lock.
@@ -478,7 +480,7 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       // caller read it stays untracked. FOR KEY SHARE also holds off a teardown that does
       // not take the title lock (cancelling a queued init run) until this commits; one
       // already under way is waited for, and then the row is gone.
-      if (input.requireTrackedSeason === true) {
+      if (requireTracked) {
         const tracked = await client.query(
           "SELECT 1 FROM tracked_seasons WHERE id = $1 AND connected_storage_id = $2 FOR KEY SHARE",
           [snapshot.season.id, connectedStorageId],
@@ -520,6 +522,18 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       const existingEpisodes = await this.selectEpisodeStates(client, snapshot.season.id, connectedStorageId);
       if (input.blockIfEpisodeStatesExist === true && existingEpisodes.length > 0) {
         return { status: "already_has_episode_state", episodes: existingEpisodes };
+      }
+
+      if (input.keepCurrentEpisodes === true) {
+        // Only the run: the title, season record and episode states are not written at
+        // all, so a run that saved them since the caller read them keeps what it saved.
+        // The reply is the run as stored, with the season's current state.
+        await this.replaceWorkflowRunSnapshot(client, snapshot, { runOnly: true });
+        const reserved = await this.loadWorkflowRunSnapshot(client, snapshot.workflowRun.id);
+        if (!reserved) {
+          throw new Error(`Missing reserved workflow run ${snapshot.workflowRun.id}`);
+        }
+        return { status: "reserved", snapshot: reserved };
       }
 
       await this.replaceWorkflowRunSnapshot(client, snapshot);
@@ -1863,6 +1877,9 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
   private async replaceWorkflowRunSnapshot(
     client: PoolClient,
     snapshot: PersistWorkflowRunSnapshotInput,
+    /** runOnly: write the run and its child rows only — the title, season record and
+     *  episode states stay as stored (a keepCurrentEpisodes reservation). */
+    options: { runOnly?: boolean } = {},
   ): Promise<void> {
     // A re-persist may omit accountId/connectedStorageId (the worker finalize path
     // doesn't re-thread them). upsertWorkflowRun preserves the stored values on
@@ -1880,17 +1897,26 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       snapshot.accountId ?? existing.rows[0]?.account_id ?? DEFAULT_ACCOUNT_ID;
     const connectedStorageId =
       snapshot.connectedStorageId ?? existing.rows[0]?.connected_storage_id ?? UNSCOPED_STORAGE;
-    await this.upsert(client, "media_titles", "(id, payload)", [snapshot.title.id, json(snapshot.title)], "$1, $2::jsonb");
-    await this.upsertTrackedSeason(client, snapshot.season, accountId, connectedStorageId);
+    const writeSeasonState = options.runOnly !== true;
+    if (writeSeasonState) {
+      await this.upsert(client, "media_titles", "(id, payload)", [snapshot.title.id, json(snapshot.title)], "$1, $2::jsonb");
+      await this.upsertTrackedSeason(client, snapshot.season, accountId, connectedStorageId);
+    }
     await this.upsertWorkflowRun(client, snapshot.workflowRun, accountId, connectedStorageId);
-    await this.deleteWorkflowRunChildren(client, snapshot.workflowRun.id, snapshot.season.id, connectedStorageId);
+    await this.deleteWorkflowRunChildren(client, snapshot.workflowRun.id);
 
-    for (const [ordinal, episode] of snapshot.episodes.entries()) {
-      void ordinal;
+    if (writeSeasonState) {
+      // Scope to THIS drive's episodes — never wipe another drive's episodes for the same season.
       await client.query(
-        "INSERT INTO episode_states (tracked_season_id, connected_storage_id, episode_code, payload) VALUES ($1, $2, $3, $4::jsonb)",
-        [snapshot.season.id, connectedStorageId, episode.episodeCode, json(episode)],
+        "DELETE FROM episode_states WHERE tracked_season_id = $1 AND connected_storage_id = $2",
+        [snapshot.season.id, connectedStorageId],
       );
+      for (const episode of snapshot.episodes) {
+        await client.query(
+          "INSERT INTO episode_states (tracked_season_id, connected_storage_id, episode_code, payload) VALUES ($1, $2, $3, $4::jsonb)",
+          [snapshot.season.id, connectedStorageId, episode.episodeCode, json(episode)],
+        );
+      }
     }
     // Snapshot ids are content-addressed and can legitimately recur; keep
     // persistence idempotent on the id instead of crashing on a duplicate.
@@ -1966,8 +1992,6 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
   private async deleteWorkflowRunChildren(
     client: PoolClient,
     workflowRunId: string,
-    trackedSeasonId: string,
-    connectedStorageId: string,
   ): Promise<void> {
     await client.query("DELETE FROM notifications WHERE workflow_run_id = $1", [workflowRunId]);
     await client.query("DELETE FROM transfer_attempts WHERE workflow_run_id = $1", [workflowRunId]);
@@ -1978,11 +2002,6 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
     // would wipe a completed run's trace at finalize. Cross-attempt clearing is handled
     // by clearAgentSteps (sink start); true teardown is in cancel/untrack.
     await client.query("DELETE FROM resource_snapshots WHERE workflow_run_id = $1", [workflowRunId]);
-    // Scope to THIS drive's episodes — never wipe another drive's episodes for the same season.
-    await client.query(
-      "DELETE FROM episode_states WHERE tracked_season_id = $1 AND connected_storage_id = $2",
-      [trackedSeasonId, connectedStorageId],
-    );
   }
 
   private async expireStaleActiveWorkflowRuns(

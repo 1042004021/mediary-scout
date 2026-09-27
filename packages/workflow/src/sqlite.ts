@@ -65,6 +65,7 @@ import {
   isQueueClaimableKind,
   isStaleActiveWorkflowRun,
   recoverOrphanRunningRun,
+  reservationRequiresTrackedSeason,
   tearsDownTrackingOnCancel,
   retriedWorkflowRun,
   seasonScopeKey,
@@ -326,7 +327,7 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
       // Before anything is written. The transaction is synchronous, so untrackTitle
       // (also one synchronous transaction) runs wholly before or after this.
       if (
-        input.requireTrackedSeason === true &&
+        reservationRequiresTrackedSeason(input) &&
         this.db
           .prepare("SELECT 1 FROM tracked_seasons WHERE id = ? AND connected_storage_id = ?")
           .get(snapshot.season.id, connectedStorageId) === undefined
@@ -369,6 +370,17 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
       const existingEpisodes = this.selectEpisodeStates(snapshot.season.id, connectedStorageId);
       if (input.blockIfEpisodeStatesExist === true && existingEpisodes.length > 0) {
         return { status: "already_has_episode_state", episodes: existingEpisodes };
+      }
+
+      if (input.keepCurrentEpisodes === true) {
+        // Only the run: the title, season record and episode states are not written at
+        // all (see postgres.ts). The reply is the run as stored, with the season's current state.
+        this.replaceWorkflowRunSnapshot(snapshot, { runOnly: true });
+        const reserved = this.loadSnapshot(snapshot.workflowRun.id);
+        if (!reserved) {
+          throw new Error(`Missing reserved workflow run ${snapshot.workflowRun.id}`);
+        }
+        return { status: "reserved", snapshot: reserved };
       }
 
       this.replaceWorkflowRunSnapshot(snapshot);
@@ -465,7 +477,12 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
     return rows.map((row) => JSON.parse(row.payload) as T);
   }
 
-  private replaceWorkflowRunSnapshot(snapshot: PersistWorkflowRunSnapshotInput): void {
+  private replaceWorkflowRunSnapshot(
+    snapshot: PersistWorkflowRunSnapshotInput,
+    /** runOnly: write the run and its child rows only — the title, season record and
+     *  episode states stay as stored (a keepCurrentEpisodes reservation). */
+    options: { runOnly?: boolean } = {},
+  ): void {
     // A re-persist may omit accountId/connectedStorageId (the worker finalize path
     // doesn't re-thread them). upsertWorkflowRun preserves the stored values on
     // conflict, but the season upsert + episode bucket delete/insert below key on
@@ -481,27 +498,35 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
     const accountId = snapshot.accountId ?? existing?.account_id ?? DEFAULT_ACCOUNT_ID;
     const connectedStorageId =
       snapshot.connectedStorageId ?? existing?.connected_storage_id ?? UNSCOPED_STORAGE;
+    const writeSeasonState = options.runOnly !== true;
 
-    this.db
-      .prepare(
-        "INSERT INTO media_titles (id, payload) VALUES (?, ?) ON CONFLICT (id) DO UPDATE SET payload = excluded.payload",
-      )
-      .run(snapshot.title.id, JSON.stringify(snapshot.title));
-
-    this.upsertTrackedSeason(snapshot.season, accountId, connectedStorageId);
+    if (writeSeasonState) {
+      this.db
+        .prepare(
+          "INSERT INTO media_titles (id, payload) VALUES (?, ?) ON CONFLICT (id) DO UPDATE SET payload = excluded.payload",
+        )
+        .run(snapshot.title.id, JSON.stringify(snapshot.title));
+      this.upsertTrackedSeason(snapshot.season, accountId, connectedStorageId);
+    }
     this.upsertWorkflowRun(snapshot.workflowRun, accountId, connectedStorageId);
-    this.deleteWorkflowRunChildren(snapshot.workflowRun.id, snapshot.season.id, connectedStorageId);
+    this.deleteWorkflowRunChildren(snapshot.workflowRun.id);
 
-    const insertEpisode = this.db.prepare(
-      "INSERT INTO episode_states (tracked_season_id, connected_storage_id, episode_code, payload) VALUES (?, ?, ?, ?)",
-    );
-    for (const episode of snapshot.episodes) {
-      insertEpisode.run(
-        snapshot.season.id,
-        connectedStorageId,
-        episode.episodeCode,
-        JSON.stringify(episode),
+    if (writeSeasonState) {
+      // Scope to THIS drive's episodes — never wipe another drive's episodes for the season.
+      this.db
+        .prepare("DELETE FROM episode_states WHERE tracked_season_id = ? AND connected_storage_id = ?")
+        .run(snapshot.season.id, connectedStorageId);
+      const insertEpisode = this.db.prepare(
+        "INSERT INTO episode_states (tracked_season_id, connected_storage_id, episode_code, payload) VALUES (?, ?, ?, ?)",
       );
+      for (const episode of snapshot.episodes) {
+        insertEpisode.run(
+          snapshot.season.id,
+          connectedStorageId,
+          episode.episodeCode,
+          JSON.stringify(episode),
+        );
+      }
     }
     // Snapshot ids are content-addressed and can legitimately recur; keep
     // persistence idempotent on the id instead of crashing on a duplicate.
@@ -584,21 +609,13 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
       );
   }
 
-  private deleteWorkflowRunChildren(
-    workflowRunId: string,
-    trackedSeasonId: string,
-    connectedStorageId: string,
-  ): void {
+  private deleteWorkflowRunChildren(workflowRunId: string): void {
     this.db.prepare("DELETE FROM notifications WHERE workflow_run_id = ?").run(workflowRunId);
     this.db.prepare("DELETE FROM transfer_attempts WHERE workflow_run_id = ?").run(workflowRunId);
     this.db.prepare("DELETE FROM agent_decisions WHERE workflow_run_id = ?").run(workflowRunId);
     // NOTE: do NOT delete agent_steps here (see postgres.ts) — they're written
     // incrementally by the trace sink and are NOT part of the snapshot.
     this.db.prepare("DELETE FROM resource_snapshots WHERE workflow_run_id = ?").run(workflowRunId);
-    // Scope to THIS drive's episodes — never wipe another drive's episodes for the season.
-    this.db
-      .prepare("DELETE FROM episode_states WHERE tracked_season_id = ? AND connected_storage_id = ?")
-      .run(trackedSeasonId, connectedStorageId);
   }
 
   private expireStaleActiveWorkflowRuns(input: ReserveWorkflowRunInput): void {
