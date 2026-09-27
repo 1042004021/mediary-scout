@@ -1284,6 +1284,15 @@ export class TaskSandbox {
     }
   }
 
+  /** Season number of a SxxEyy token (already validated in scope by assertEpisodeTokens),
+   *  or undefined for a non-episode token like the movie "MOVIE". The token's declared
+   *  season is the agent's claim — checking a replacement file lives in THAT season's dir
+   *  is a fact check, never filename parsing. */
+  private seasonOfEpisode(episode: string): number | undefined {
+    const m = /^S(\d{2,})E(\d{2,})$/.exec(episode);
+    return m ? Number(m[1]) : undefined;
+  }
+
   /** The candidate the agent means by `candidateId`, from the snapshots it saw this
    *  run. These are the provider's AGENT-FACING snapshots (RealResourceProviderV2
    *  hands back short aliases like s2-14), so the lookup is by the id the agent
@@ -1433,26 +1442,43 @@ export class TaskSandbox {
       }
       return { ...r, fileIds };
     });
-    // Where the named files are NOW: the target dirs, listed once for this call (only
-    // when something is reported replaced), never remembered. For TV the season dir is
-    // separate from staging, so a new copy never moved in is not beside the old one; a
-    // replacement moved in and deleted since is gone too.
-    const live = toRecord.some((r) => r.outcome === "replaced")
-      ? new Map((await this.inspectTargetDir()).map((file) => [file.id, file]))
-      : new Map<string, SimTreeFile>();
-    // A named file not in a target dir records THAT episode not_found (it stays 待换)
-    // instead of throwing the whole batch away — moved in and reported again, it is
-    // upgraded, exactly like an earlier not_found; its files back no episode until then.
-    // Among files that are there, one must be a video: subtitles ride along with the new
-    // video, they never replace an episode on their own (that refuses the whole call).
+    // Where the named files are NOW, read once for this call (only when something is
+    // reported replaced), never remembered. Keep each scoped target dir SEPARATE so a
+    // replacement is checked against its OWN dir: for TV, one live set per season (keyed
+    // by season number) — a new S01E13 file that was moved into Season 02's dir does NOT
+    // satisfy S01E13; for a movie, the single movie dir. The season dir is separate from
+    // staging, so a new copy never moved in is not beside the old one; a replacement moved
+    // in and deleted since is gone too. Same number of listTree calls as one union list.
+    const anyReplaced = toRecord.some((r) => r.outcome === "replaced");
+    const movieRun = this.isMovieRun();
+    const movieLive =
+      anyReplaced && movieRun ? new Map((await this.inspectTargetDir()).map((file) => [file.id, file])) : new Map<string, SimTreeFile>();
+    const liveBySeason = new Map<number, Map<string, SimTreeFile>>();
+    if (anyReplaced && !movieRun) {
+      const seasons = [...this.seasonDirs.keys()];
+      const trees = await Promise.all(seasons.map((season) => this.inspectTargetDir({ season })));
+      seasons.forEach((season, i) => liveBySeason.set(season, new Map(trees[i]!.map((file) => [file.id, file]))));
+    }
+    // The live set an episode's files must be in: its OWN season's dir (TV) or the movie dir.
+    const liveFor = (episode: string): Map<string, SimTreeFile> => {
+      if (movieRun) return movieLive;
+      const season = this.seasonOfEpisode(episode);
+      return (season !== undefined ? liveBySeason.get(season) : undefined) ?? new Map<string, SimTreeFile>();
+    };
+    // A named file not in the episode's OWN target dir records THAT episode not_found (it
+    // stays 待换) instead of throwing the whole batch away — moved into its own season and
+    // reported again, it is upgraded, exactly like an earlier not_found; its files back no
+    // episode until then. Among files that are there, one must be a video: subtitles ride
+    // along with the new video, they never replace an episode on their own (refuses the call).
     const notInTarget: Array<{ episode: string; reason: string }> = [];
     const recorded = toRecord.map((r) => {
       if (r.outcome !== "replaced") return r;
       const fileIds = r.fileIds ?? [];
+      const live = liveFor(r.episode);
       const absent = fileIds.filter((id) => !live.has(id));
       if (absent.length > 0) {
         // A movie's staging IS its directory: a file missing from it is gone.
-        const retry = this.isMovieRun() ? "" : `; if it is still in staging, moveToSeason it into the season directory, then report ${r.episode} again`;
+        const retry = movieRun ? "" : `; if it is still in staging, moveToSeason it into the season directory, then report ${r.episode} again`;
         notInTarget.push({
           episode: r.episode,
           reason: `not in the target directory now: ${absent.join(",")} — recorded not_found${retry}`,

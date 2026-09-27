@@ -433,6 +433,23 @@ describe("runQueuedReplaceRequest", () => {
     expect(await repository.listPendingReplacements(WORK)).toEqual([]);
   });
 
+  it("a patrol-queued replace whose acquisition throws saves the failure notification with trigger 'scheduled'; a user-queued one stays 'user'", async () => {
+    for (const origin of ["patrol", "user"] as const) {
+      const { repository } = await trackedShow();
+      await repository.createUserMessage({ ...WORK, body: "换第 1 集", episodeTags: ["S01E01"], now: NOW });
+      const runId = `run_rr_fail_${origin}`;
+      await queueReplaceRequest({ repository, work: WORK, now: fixedNow, origin, createWorkflowRunId: () => runId });
+
+      const result = await runQueuedReplaceRequest(baseRun(repository, new FakeStorageExecutor(), throwingModel()));
+
+      expect(result).toMatchObject({ status: "failed", workflowRunId: runId });
+      const run = await repository.getWorkflowRunSnapshot(runId, { accountId: "acct_1", connectedStorageId: DRIVE });
+      expect(run?.notifications).toHaveLength(1);
+      // Patrol failures join the daily digest (trigger "scheduled"); user failures are pushed individually ("user").
+      expect(run?.notifications[0]?.trigger).toBe(origin === "patrol" ? "scheduled" : "user");
+    }
+  });
+
   it("with no message and no pending episode the claimed run just succeeds", async () => {
     const { repository } = await trackedShow();
     await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => "run_rr_empty" });

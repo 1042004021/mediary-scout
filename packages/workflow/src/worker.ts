@@ -216,6 +216,10 @@ export async function handleWorkflowRunFailure(input: {
   now: () => string;
   /** Freeze the run's connected drive on brand *AuthError (cookie/token dead). */
   onAuthErrorFreeze?: (storageId: string, reason: string) => Promise<void>;
+  /** Trigger stamped on the failure/retry notification. Default "user" (individual push).
+   *  A patrol-origin replace run passes "scheduled" so its failure joins the daily digest,
+   *  matching the success path (stampReplaceNotification). */
+  notificationTrigger?: "user" | "scheduled";
 }): Promise<{ status: "auto_requeued" | "failed"; workflowRunId: string; errorMessage: string }> {
   const { claimed, error, repository } = input;
   const nowIso = input.now();
@@ -266,7 +270,7 @@ export async function handleWorkflowRunFailure(input: {
     title: claimed.title.title,
     body: formatReportPushText(report),
     createdAt: nowIso,
-    trigger: "user",
+    trigger: input.notificationTrigger ?? "user",
     report,
   };
   // One stdout line per failure (console.log — stdout, beside the worker's other

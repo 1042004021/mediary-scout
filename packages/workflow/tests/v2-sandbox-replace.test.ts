@@ -803,6 +803,53 @@ describe("TaskSandbox — replace: a replaced needs the NEW file in a target dir
     expect(sandbox.hasReplace()).toBe(false);
     await expect(sandbox.reportReplacement({ results: [] })).rejects.toThrow(/NO_REPLACE/);
   });
+
+  it("TV multi-season: a replaced file in the WRONG season's dir is recorded not_found; moved into its own season and re-reported, it is upgraded", async () => {
+    const storage = new Storage115Simulator({
+      packs: {
+        old_pack: { files: [{ path: "Show - 13 [CR 1080p].mkv", sizeBytes: 1_400_000_000 }] },
+        cand_new13: { files: [{ path: "[Nekomoe] Show - 13 [1080p].mkv", sizeBytes: 1_100_000_000 }] },
+      },
+    });
+    const staging = await storage.createDirectory({ name: "staging", parentId: "root" });
+    const s1 = await storage.createDirectory({ name: "Season 01", parentId: "root" });
+    const s2 = await storage.createDirectory({ name: "Season 02", parentId: "root" });
+    // The old S01E13 lives in Season 01, as an earlier run left it.
+    await storage.transferCandidate({ candidateId: "old_pack", intoDirectoryId: s1 });
+    const old13 = (await storage.listTree({ directoryId: s1 })).find((f) => f.path.includes("13"))!.id;
+    const results: Array<Record<string, unknown>> = [];
+    const sandbox = new TaskSandbox({
+      provider: new FakeResourceProviderV2({ results: { Show: [{ id: "cand_new13", title: "[Nekomoe] Show 13 1080p" }] } }),
+      storage, stagingDirectoryId: staging, targetSeasonDirectoryIds: { 1: s1, 2: s2 }, need: [],
+      replace: { requestedEpisodes: ["S01E13"], hasMessages: true, untaggedMessages: 0, onReject: async () => {}, onReport: async (r) => { results.push(...r); } },
+    });
+    await sandbox.captureProtectedFiles();
+    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
+    const snap = (await sandbox.searchResources("Show")).snapshot!;
+    const out = await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_new13" });
+    const [new13] = out.attempt.materializedFileIds;
+    // The agent moves the new E13 into the WRONG season (Season 02), then marks + reports it for S01E13.
+    await sandbox.moveToSeason({ moves: [{ season: 2, fileIds: [new13!] }] });
+    await sandbox.markObtained({ codes: ["S01E13"] });
+
+    // The file is live only in Season 02's dir, not S01E13's own (Season 01) → recorded not_found (stays 待换).
+    const wrong = await sandbox.reportReplacement({
+      results: [{ episode: "S01E13", outcome: "replaced", candidateId: "cand_new13", fileIds: [new13!], note: "喵萌版" }],
+    });
+    expect(wrong.recorded).toBe(1);
+    expect(wrong.notInTarget).toEqual([{ episode: "S01E13", reason: expect.stringContaining(`not in the target directory now: ${new13}`) }]);
+    expect(results).toMatchObject([{ episode: "S01E13", outcome: "not_found" }]);
+    expect(results).not.toContainEqual(expect.objectContaining({ outcome: "replaced" }));
+    expect(sandbox.isCoverageMet()).toBe(false);
+
+    // Move it into its OWN season (Season 01) and report again → upgraded to replaced.
+    await storage.moveFiles({ fileIds: [new13!], targetDirectoryId: s1 });
+    const right = await sandbox.reportReplacement({
+      results: [{ episode: "S01E13", outcome: "replaced", candidateId: "cand_new13", fileIds: [new13!], note: "喵萌版" }],
+    });
+    expect(right).toEqual({ recorded: 1, ignored: [] });
+    expect(results).toContainEqual(expect.objectContaining({ episode: "S01E13", outcome: "replaced", candidateId: "cand_new13" }));
+  });
 });
 
 describe("TaskSandbox — replace: a replaced names that episode's own new file(s), checked per episode", () => {

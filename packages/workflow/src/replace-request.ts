@@ -351,6 +351,10 @@ export async function runQueuedReplaceRequest(
       error,
       repository,
       now,
+      // A patrol-queued failure joins the daily digest (trigger "scheduled"), matching the
+      // success path (see stampReplaceNotification / the `notice.trigger` above); a user
+      // request keeps its individual "user" push.
+      notificationTrigger: queuedBy(claimed.workflowRun.auditEvents) === "patrol" ? "scheduled" : "user",
       ...(input.onAuthErrorFreeze === undefined ? {} : { onAuthErrorFreeze: input.onAuthErrorFreeze }),
     });
     return handled.status === "auto_requeued"
