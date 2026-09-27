@@ -1,7 +1,7 @@
 "use client";
 
 import { useRouter as useNextRouter } from "next/navigation";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { scheduleRefreshNudges } from "./refresh-nudge";
 
 /**
@@ -18,73 +18,30 @@ import { scheduleRefreshNudges } from "./refresh-nudge";
  * react#36134 and whose router.refresh works on streamed pages.
  * A later React state update retries the stuck deferred render (a rAF does
  * not). After `refresh()`, nudge the calling component for a few seconds.
- *
- * Next's router is one object (`window.next.router` is that same object), so
- * the wrap is installed on it. A direct `router.refresh()` — including the
- * harness — nudges every mounted caller of this hook.
  */
 type AppRouter = ReturnType<typeof useNextRouter>;
-
-const bumps = new Set<() => void>();
-let realRefresh: (() => void) | null = null;
-let nudgeCancel: (() => void) | null = null;
-
-function restartNudges() {
-  nudgeCancel?.();
-  if (bumps.size === 0) {
-    nudgeCancel = null;
-    return;
-  }
-  nudgeCancel = scheduleRefreshNudges(() => {
-    for (const bump of [...bumps]) bump();
-  });
-}
-
-function callRealRefresh(router: AppRouter) {
-  if (realRefresh) {
-    realRefresh();
-    return;
-  }
-  router.refresh();
-}
-
-function ensureWrapped(router: AppRouter) {
-  if (realRefresh) return;
-  const original = router.refresh.bind(router);
-  realRefresh = original;
-  router.refresh = () => {
-    original();
-    restartNudges();
-  };
-}
-
-function restoreRefresh(router: AppRouter) {
-  nudgeCancel?.();
-  nudgeCancel = null;
-  if (realRefresh) {
-    router.refresh = realRefresh;
-    realRefresh = null;
-  }
-}
 
 export function useRouter(): AppRouter {
   const router = useNextRouter();
   const [, setTick] = useState(0);
+  const cancelRef = useRef<(() => void) | null>(null);
+
   useEffect(() => {
-    const bump = () => setTick((n) => n + 1);
-    bumps.add(bump);
-    ensureWrapped(router);
     return () => {
-      bumps.delete(bump);
-      if (bumps.size === 0) restoreRefresh(router);
+      cancelRef.current?.();
+      cancelRef.current = null;
     };
-  }, [router]);
+  }, []);
+
   return useMemo(
     () => ({
       ...router,
       refresh() {
-        callRealRefresh(router);
-        restartNudges();
+        router.refresh();
+        cancelRef.current?.();
+        cancelRef.current = scheduleRefreshNudges(() => {
+          setTick((n) => n + 1);
+        });
       },
     }),
     [router],
