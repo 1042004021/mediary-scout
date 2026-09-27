@@ -3284,8 +3284,16 @@ select.setting-control {
 
 .act-confirm {
   display: inline-flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 6px;
   margin-left: auto;
+}
+
+/* The two buttons move as one when the group wraps (never 「留着」 alone). */
+.act-confirm-buttons {
+  display: inline-flex;
+  gap: 6px;
 }
 
 .act-confirm-yes,
@@ -3296,6 +3304,7 @@ select.setting-control {
   border: 1px solid var(--border);
   background: none;
   cursor: pointer;
+  white-space: nowrap;
 }
 
 .act-confirm-yes {
@@ -3305,6 +3314,15 @@ select.setting-control {
 
 .act-confirm-no {
   color: var(--text-muted);
+}
+
+/* Cancelling a replace run: one muted line saying where the message goes. On a narrow
+   row the confirm group wraps: this line above, the buttons below. */
+.act-confirm-note {
+  align-self: center;
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -2,6 +2,7 @@ import {
   landedSize,
   type MediaType,
   type NotificationReportStatus,
+  type WorkflowKind,
   type WorkflowRepository,
   type WorkflowRunProgress,
 } from "@media-track/workflow";
@@ -16,6 +17,9 @@ export { distinctSeasons, seasonLabelText };
 /** One title currently in the pipeline (queued or running). */
 export interface ActivityActiveRun {
   runId: string;
+  /** What the run does. Cancelling a queued acquisition takes the title out of the
+   *  library; cancelling a replace_request only drops that attempt (the feed says so). */
+  kind: WorkflowKind;
   tmdbId: number;
   title: string;
   year: number | null;
@@ -109,6 +113,7 @@ export async function getActivityView(input: {
     const queueIndex = queuedOrder.indexOf(snapshot.workflowRun.id);
     return {
       runId: snapshot.workflowRun.id,
+      kind: snapshot.workflowRun.kind,
       tmdbId: snapshot.title.tmdbId,
       title: snapshot.title.title,
       year: snapshot.title.year ?? null,

@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { CheckCircle2, ChevronDown, ChevronRight, Clock3, Loader2, RotateCcw, TriangleAlert, X } from "lucide-react";
+import type { WorkflowKind } from "@media-track/workflow";
 import { showHref } from "@media-track/workflow/scope";
 import type {
   ActivityActiveRun,
@@ -214,7 +215,7 @@ function QueuedRow({ run }: { run: ActivityActiveRun }) {
         <span className="act-pill">
           <Clock3 size={12} aria-hidden />第 {run.queuePosition} 位{run.missingCount > 0 ? ` · 缺 ${run.missingCount} 集` : ""}
         </span>
-        <CancelButton runId={run.runId} title={run.title} />
+        <CancelButton runId={run.runId} title={run.title} kind={run.kind} />
       </div>
     </div>
   );
@@ -307,9 +308,19 @@ function RetryButton({ runId, title }: { runId: string; title: string }) {
   );
 }
 
-function CancelButton({ runId, title }: { runId: string; title: string }) {
+/** What the cancel control says. A queued acquisition takes its title out of the
+ *  library with it; a replace run (a user's message) only drops this attempt — the
+ *  library stays, and the message waits for the next patrol. */
+export function cancelCopy(kind: WorkflowKind): { action: string; confirm: string; note: string | null } {
+  return kind === "replace_request"
+    ? { action: "取消这次换源", confirm: "取消这次换源", note: "留言等下次巡检再处理" }
+    : { action: "取消获取", confirm: "取消并移出", note: null };
+}
+
+function CancelButton({ runId, title, kind }: { runId: string; title: string; kind: WorkflowKind }) {
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
+  const copy = cancelCopy(kind);
 
   const cancel = async () => {
     setBusy(true);
@@ -335,13 +346,16 @@ function CancelButton({ runId, title }: { runId: string; title: string }) {
   if (confirming) {
     return (
       <span className="act-confirm">
-        <button type="button" className="act-confirm-yes" onClick={cancel}>取消并移出</button>
-        <button type="button" className="act-confirm-no" onClick={() => setConfirming(false)}>留着</button>
+        {copy.note ? <span className="act-confirm-note">{copy.note}</span> : null}
+        <span className="act-confirm-buttons">
+          <button type="button" className="act-confirm-yes" onClick={cancel}>{copy.confirm}</button>
+          <button type="button" className="act-confirm-no" onClick={() => setConfirming(false)}>留着</button>
+        </span>
       </span>
     );
   }
   return (
-    <button type="button" className="act-cancel" aria-label={`取消获取 ${title}`} onClick={() => setConfirming(true)}>
+    <button type="button" className="act-cancel" aria-label={`${copy.action} ${title}`} onClick={() => setConfirming(true)}>
       <X size={15} aria-hidden />
     </button>
   );
