@@ -425,6 +425,11 @@ export type ScheduledType3Outcome =
       status: "skipped_active";
     }
   | {
+      /** Untracked after the sweep read it: nothing was written, nothing ran. */
+      trackedSeasonId: string;
+      status: "skipped_untracked";
+    }
+  | {
       trackedSeasonId: string;
       status: "ran";
       workflowRunId: string;
@@ -636,10 +641,16 @@ async function patrolTrackedState(args: {
       // The sweep's busy-work filter is not atomic with this reservation: a replace
       // run queued in between (现在处理) would otherwise work the same directories.
       blockIfTitleHasActiveKinds: ["replace_request"],
+      // The state was read when the sweep started (then the drive's deps, a TMDB sync):
+      // a season untracked since must not be tracked again by this reservation.
+      requireTrackedSeason: true,
       ...(staleActiveRunStartedBefore === null
         ? {}
         : { staleActiveRunStartedBefore, staleFinishedAt: startedAt }),
     });
+    if (reservation.status === "not_tracked") {
+      return { trackedSeasonId: season.id, status: "skipped_untracked" };
+    }
     if (reservation.status !== "reserved") {
       return { trackedSeasonId: season.id, status: "skipped_active" };
     }
@@ -817,10 +828,15 @@ async function patrolMovie(args: {
     notifications: [],
     // Same race as the TV patrol: a replace run queued after the sweep's filter.
     blockIfTitleHasActiveKinds: ["replace_request"],
+    // …and an untrack after the sweep read the film.
+    requireTrackedSeason: true,
     ...(staleActiveRunStartedBefore === null
       ? {}
       : { staleActiveRunStartedBefore, staleFinishedAt: startedAt }),
   });
+  if (reservation.status === "not_tracked") {
+    return { trackedSeasonId: state.season.id, status: "skipped_untracked" };
+  }
   if (reservation.status !== "reserved") {
     return { trackedSeasonId: state.season.id, status: "skipped_active" };
   }

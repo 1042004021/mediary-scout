@@ -147,9 +147,9 @@ export interface ReserveWorkflowRunInput extends PersistWorkflowRunSnapshotInput
   /**
    * Refuse — `not_tracked`, nothing written — unless the (season, drive) is still
    * tracked when the reservation decides. For a caller that reserves from states it
-   * read earlier (queueReplaceRequest): the season may have been untracked in between,
-   * and writing the run would track it again. Postgres checks it under the title lock,
-   * which untrackTitle takes too; SQLite and InMemory decide synchronously.
+   * read earlier (queueReplaceRequest, the patrol): the season may have been untracked
+   * in between, and writing the run would track it again. Postgres checks it under the
+   * title lock, which untrackTitle takes too; SQLite and InMemory decide synchronously.
    */
   requireTrackedSeason?: boolean;
   /**

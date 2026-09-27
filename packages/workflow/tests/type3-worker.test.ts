@@ -439,6 +439,82 @@ describe("runScheduledType3Monitoring (V2 engine)", () => {
     expect(await repository.getWorkflowRunSnapshot("run_movie_patrol")).toBeNull();
   });
 
+  it("a show untracked after the sweep read it (before its patrol reservation) stays untracked: the patrol skips it", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    const { title, season } = trackedFixture();
+    // E02 is a real gap, so the patrol would run the agent.
+    await seedTrackedSeason({ repository, title, season, obtainedCodes: ["S01E01"] });
+    const untracked: unknown[] = [];
+    const reserve = repository.reserveWorkflowRun.bind(repository);
+    repository.reserveWorkflowRun = async (input) => {
+      if (input.workflowRun.kind === "type3_monitor") {
+        // The user untracks it while the sweep resolves the drive and syncs TMDB.
+        untracked.push(await repository.untrackTitle(title.tmdbId, { accountId: "acct_default", connectedStorageId: null }, "tv"));
+      }
+      return reserve(input);
+    };
+
+    const outcomes = await runScheduledType3Monitoring({
+      repository,
+      resourceProvider: emptyProvider(),
+      storage: new FakeStorageExecutor(),
+      model: throwingModel(),
+      storageParentDirectoryId: "library_root",
+      now: fixedNow,
+      createWorkflowRunId: () => "run_patrol_untracked",
+    });
+
+    expect(untracked).toEqual([{ status: "untracked", removedSeasons: 1 }]);
+    expect(outcomes).toEqual([{ trackedSeasonId: season.id, status: "skipped_untracked" }]);
+    expect(await repository.listAllTrackedSeasonStates()).toEqual([]);
+    expect(await repository.getWorkflowRunSnapshot("run_patrol_untracked")).toBeNull();
+  });
+
+  it("a film untracked after the sweep read it (before its patrol reservation) stays untracked: the patrol skips it", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    const movie: MediaTitle = {
+      id: "tmdb_movie_872585", tmdbId: 872585, type: "movie", title: "奥本海默", originalTitle: "Oppenheimer", year: 2023, aliases: [],
+    };
+    const season = {
+      id: `${movie.id}_movie`, mediaTitleId: movie.id, seasonNumber: 1, status: "completed" as const, qualityPreference: "4K" as const,
+      storageDirectoryId: "", totalEpisodes: 1, latestAiredEpisode: 1, latestAiredSource: "manual" as const,
+    };
+    await repository.saveWorkflowRunSnapshot({
+      title: movie,
+      season,
+      episodes: createEpisodeStates({ trackedSeasonId: season.id, seasonNumber: 1, totalEpisodes: 1, latestAiredEpisode: 1 }),
+      resourceSnapshots: [],
+      decisions: [],
+      transferAttempts: [],
+      notifications: [],
+      workflowRun: { id: "seed_movie", kind: "movie_init", status: "no_coverage", trackedSeasonId: season.id, startedAt: fixedNow(), finishedAt: fixedNow(), auditEvents: [] },
+    });
+    const untracked: unknown[] = [];
+    const reserve = repository.reserveWorkflowRun.bind(repository);
+    repository.reserveWorkflowRun = async (input) => {
+      if (input.workflowRun.kind === "movie_init") {
+        untracked.push(await repository.untrackTitle(movie.tmdbId, { accountId: "acct_default", connectedStorageId: null }, "movie"));
+      }
+      return reserve(input);
+    };
+
+    const outcomes = await runScheduledType3Monitoring({
+      repository,
+      resourceProvider: emptyProvider(),
+      storage: new FakeStorageExecutor(),
+      model: throwingModel(),
+      storageParentDirectoryId: "tv_root",
+      moviesParentDirectoryId: "movies_root",
+      now: fixedNow,
+      createWorkflowRunId: () => "run_movie_patrol_untracked",
+    });
+
+    expect(untracked).toEqual([{ status: "untracked", removedSeasons: 1 }]);
+    expect(outcomes).toEqual([{ trackedSeasonId: season.id, status: "skipped_untracked" }]);
+    expect(await repository.listAllTrackedSeasonStates()).toEqual([]);
+    expect(await repository.getWorkflowRunSnapshot("run_movie_patrol_untracked")).toBeNull();
+  });
+
   it("does NOT patrol a reserved film whose release date is still in the future (air-time gate)", async () => {
     const repository = new InMemoryWorkflowRepository();
     await reserveMovie({
