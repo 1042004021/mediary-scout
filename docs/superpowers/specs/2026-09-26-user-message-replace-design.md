@@ -116,12 +116,12 @@
   - `replaced` 必须满足：该集本轮 `markObtained` 过；`candidateId` 本轮转存成功过；`fileIds` 指名这集自己的新视频文件，且每个文件都是本轮由这个候选下载的、已经在目标目录（电视剧要 `moveToSeason` 移进季目录，只在暂存里不算）、并且一个文件只能算一集。文件判断归 agent，系统只核对事实，不解析文件名。指名的文件还在暂存里 → 这集记为 `not_found`（移进去后再报可升级）；其它不符 → 工具报错给 agent，整批不记录。
   - 系统删掉待换记录，写 `episode_sources`（先写来源、成功后再删待换，写失败待换保留）。
   - `not_found`：写待换记录。
-  - 留言涉及、agent 却没汇报的集（选集标签或待换集），run 结束时系统按 `not_found` 处理。所有请求集汇报完之前，agent 的 `finish` 会被拒。
+  - 留言涉及、agent 却没汇报的集（选集标签或待换集），run 结束时系统按 `not_found` 处理。所有请求集汇报完之前，agent 的 `finish` 会被拒。剧集留言没带集数标签时，agent 要先从原话里认出是哪几集并对它们 `rejectCurrentSource`（库里没有旧文件的传 `fileIds: []`），一集都没认出来之前 `finish` 同样被拒。
 - **旧文件保护**：replace run 开始时系统记下各目标目录现有的文件（列目录失败就让 run 失败）；本轮删除、移动、重命名、flatten 都不能碰这些文件。
-- **覆盖按集算**：请求集只有被报为 `replaced` 之后才算覆盖；补到别的缺集不会让它「顺带满足」。
+- **覆盖按集算**：请求集只有被报为 `replaced` 之后才算覆盖，也只有这时才作为本轮获取写回库；补到别的缺集不会让它「顺带满足」。只被标记、最后报 `not_found` 的请求集不会变成已获取（原本就已获取的照旧保持）。
 
 ### 4.3 回复
-`reply = { results: [{ episode, outcome, label?, sizeBytes?, note }], oldFiles: [path], runId }`。系统用 `reportReplacement` + 转存记录 + `rejectCurrentSource` 时记下的旧文件路径组装；agent 只给 `note`。run 正常结束（含没换成）→ `finishUserMessages`；run 抛错 → `releaseUserMessages`。
+`reply = { results: [{ episode, outcome, label?, sizeBytes?, note }], oldFiles: [path], runId }`。系统用 `reportReplacement` + 转存记录 + `rejectCurrentSource` 时记下的旧文件路径组装；agent 只给 `note`。run 正常结束（含没换成）→ `finishUserMessages`；run 抛错 → `releaseUserMessages`。剧集留言一集都没认出来时 `results` 为空，回复带 `unidentified: true`，不写待换，UI 请用户选好集数再发；留言照样 done，不退回重跑（重跑还是认不出来）。
 
 ### 4.4 复盘（记忆）
 复盘照旧。事实摘要加一行「本轮处理了用户留言，结果：…」；复盘提示词加一句：用户拒掉的资源系统已经记住，不用写成笔记。
@@ -182,7 +182,7 @@
 ## 10. 评审中补上的约束（PR #279，2026-09-27）
 
 实现过程中的代码审查和 Copilot 评审补了下面这些规则，和上文冲突时以这里为准：
-- **拒绝名单对所有 run 生效**，不只换源 run：搜索结果过滤 + 转存时再查一次（按账号 + 作品）。读名单失败按空名单继续。
+- **拒绝名单对所有 run 生效**，不只换源 run：搜索结果过滤 + 转存时再查一次（按账号 + 作品）。读名单失败按空名单继续。死链名单不一样：读失败时这次搜索直接报错，已知死链不能因为一次读失败又露出来、被再转一遍。
 - **普通 run 也保护换过源的作品**：作品有 `episode_sources` 记录时，之后的普通巡检开工前同样记下目标目录里已有的文件并禁止删除/移动，避免「保留较大的」去重删掉用户想留的那份。读来源记录失败时照样开保护（不点名集数）。
 - **作品级互斥也管巡检**：巡检的预留带 `blockIfTitleHasActiveKinds: ["replace_request"]`；Postgres 在同一把 advisory lock 下判断，两个并发预留只会成功一个。
 - **崩溃与取消**：同一 run 重新认领时收回自己的留言；run 被判失败或取消时释放留言（非紧急，交给巡检，避免 3 秒一轮空转）；处理中的留言在 run 结束 10 分钟后仍无人认领就放回 pending。取消排队中的换源 run 不会拆掉作品的追踪。
