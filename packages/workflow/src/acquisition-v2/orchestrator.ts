@@ -179,6 +179,24 @@ export interface RunAcquisitionV2Result extends AcquisitionAgentResult {
   };
 }
 
+/** Which rejection items become rows. A video is a row; a subtitle (or anything else)
+ *  beside one is not — it can never match a search candidate. A group that names no
+ *  video still records every file, so a rejection is never empty. One place. */
+function rejectionRowItems<T extends { episode: string; isVideo: boolean }>(items: T[]): T[] {
+  const groups = new Map<string, T[]>();
+  for (const item of items) {
+    const group = groups.get(item.episode);
+    if (group) group.push(item);
+    else groups.set(item.episode, [item]);
+  }
+  const rows: T[] = [];
+  for (const group of groups.values()) {
+    const videos = group.filter((item) => item.isVideo);
+    rows.push(...(videos.length > 0 ? videos : group));
+  }
+  return rows;
+}
+
 export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promise<RunAcquisitionV2Result> {
   const registry = new CandidateRegistry();
   // Where the stored rejected list comes from (see rejectedLookup). Absent = no
@@ -341,14 +359,18 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
                 ? [...new Set(userRequest.prompt.rejected.map((r) => r.episode))]
                 : [],
             onReject: async (items) => {
-              // Every file's link first, before anything is recorded: two files can share a
-              // name and size yet come from different resources. A rejection without its link
-              // is the very hole this closes, so an unreadable history refuses the whole call
-              // (fail closed, like the run's other strict reads) and the agent can call again.
+              // Rows only: videos, or every file of a group that has none. oldFiles below
+              // still keeps every path, subtitle included.
+              const recorded = rejectionRowItems(items);
+              // Every recorded file's link first, before anything is recorded: two files can
+              // share a name and size yet come from different resources. A rejection without
+              // its link is the very hole this closes, so an unreadable history refuses the
+              // whole call (fail closed, like the run's other strict reads) and the agent
+              // can call again.
               let landed = new Map<string, string | null>();
               if (userRequest.landingLinkKeys) {
                 try {
-                  landed = new Map(Object.entries(await userRequest.landingLinkKeys([...new Set(items.map((i) => i.fileId))])));
+                  landed = new Map(Object.entries(await userRequest.landingLinkKeys([...new Set(recorded.map((i) => i.fileId))])));
                 } catch (error) {
                   throw new Error(
                     `SANDBOX_REJECT_SOURCE_UNAVAILABLE: could not read which transfer landed these files (${errorText(error)}) — try again in a moment`,
@@ -360,7 +382,7 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
               // each with its own source; null when its link has no key — still that file's
               // own source), else, for a file whose transfer is no longer on record, the
               // episode's recorded source.
-              const rows = items.map((i) => ({
+              const rows = recorded.map((i) => ({
                 episode: i.episode,
                 linkKey: landed.has(i.fileId) ? (landed.get(i.fileId) ?? null) : (userRequest.sourceLinkKeys?.[i.episode] ?? null),
                 label: i.label,

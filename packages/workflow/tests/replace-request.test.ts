@@ -404,9 +404,9 @@ describe("runQueuedReplaceRequest", () => {
           statusDuringRun = (await repository.listUserMessages(WORK))[0]!.status;
           return tool("inspectTargetDir", { season: 1 }, i);
         }
-        if (i === 2) return tool("rejectCurrentSource", { episodes: ["S01E01"], fileIds: ["present_S01E01"], reason: "发蓝" }, i);
+        if (i === 2) return tool("rejectCurrentSource", { rejections: [{ episode: "S01E01", fileIds: ["present_S01E01"] }], reason: "发蓝" }, i);
         // Every requested episode must be rejected before anything transfers.
-        if (i === 3) return tool("rejectCurrentSource", { episodes: ["S01E02"], fileIds: ["present_S01E02"], reason: "发蓝" }, i);
+        if (i === 3) return tool("rejectCurrentSource", { rejections: [{ episode: "S01E02", fileIds: ["present_S01E02"] }], reason: "发蓝" }, i);
         if (i === 4) return tool("searchResources", { keyword: "Show 01" }, i);
         if (i === 5) {
           const search = lastToolOutput(options.prompt, "searchResources");
@@ -517,7 +517,7 @@ describe("runQueuedReplaceRequest", () => {
     const model = new MockLanguageModelV3({
       doGenerate: async (options) => {
         i += 1;
-        if (i === 1) return tool("rejectCurrentSource", { episodes: ["S01E01"], fileIds: ["present_S01E01"], reason: "发蓝" }, i);
+        if (i === 1) return tool("rejectCurrentSource", { rejections: [{ episode: "S01E01", fileIds: ["present_S01E01"] }], reason: "发蓝" }, i);
         if (i === 2) return tool("searchResources", { keyword: "Show S01" }, i);
         if (i === 3) {
           const search = lastToolOutput(options.prompt, "searchResources");
@@ -705,7 +705,7 @@ describe("runQueuedReplaceRequest", () => {
     const model = new MockLanguageModelV3({
       doGenerate: async (options) => {
         i += 1;
-        if (i === 1) return tool("rejectCurrentSource", { episodes: [], fileIds: ["oldfilm"], reason: "假片" }, i);
+        if (i === 1) return tool("rejectCurrentSource", { rejections: [{ fileIds: ["oldfilm"] }], reason: "假片" }, i);
         if (i === 2) return tool("searchResources", { keyword: "Film" }, i);
         if (i === 3) {
           const search = lastToolOutput(options.prompt, "searchResources");
@@ -802,7 +802,7 @@ describe("runQueuedReplaceRequest", () => {
     const model = new MockLanguageModelV3({
       doGenerate: async () => {
         i += 1;
-        if (i === 1) return tool("rejectCurrentSource", { episodes: ["S01E01"], fileIds: ["present_S01E01"], reason: "发蓝" }, i);
+        if (i === 1) return tool("rejectCurrentSource", { rejections: [{ episode: "S01E01", fileIds: ["present_S01E01"] }], reason: "发蓝" }, i);
         return text("done");
       },
     });
@@ -863,7 +863,7 @@ describe("runQueuedReplaceRequest", () => {
         if (i === 2) {
           // Remembered from the pre-search, before the rejection hides it.
           rawRow = /\[(s(\d+)-\d+)\] Show\.01\.WEB-DL\.Another\.Group/.exec(String(lastToolOutput(options.prompt, "viewResourceSnapshot").document));
-          return tool("rejectCurrentSource", { episodes: ["S01E01"], fileIds: ["present_S01E01"], reason: "还是不对" }, i);
+          return tool("rejectCurrentSource", { rejections: [{ episode: "S01E01", fileIds: ["present_S01E01"] }], reason: "还是不对" }, i);
         }
         if (i === 3) return tool("transferCandidate", { snapshotId: `s${rawRow![2]}`, candidateId: rawRow![1] }, i);
         if (i === 4) {
@@ -966,7 +966,7 @@ describe("runQueuedReplaceRequest", () => {
     const model = new MockLanguageModelV3({
       doGenerate: async (options) => {
         i += 1;
-        if (i === 1) return tool("rejectCurrentSource", { episodes: ["S01E01"], fileIds: ["present_S01E01"], reason: "发蓝" }, i);
+        if (i === 1) return tool("rejectCurrentSource", { rejections: [{ episode: "S01E01", fileIds: ["present_S01E01"] }], reason: "发蓝" }, i);
         if (i === 2) return tool("searchResources", { keyword: "Show 01" }, i);
         if (i === 3) {
           const search = lastToolOutput(options.prompt, "searchResources");
@@ -1193,7 +1193,7 @@ describe("runQueuedReplaceRequest — scope, metadata and bookkeeping", () => {
     const model = new MockLanguageModelV3({
       doGenerate: async (options) => {
         i += 1;
-        if (i === 1) return tool("rejectCurrentSource", { episodes: ["S01E01"], fileIds: ["present_S01E01"], reason: "发蓝" }, i);
+        if (i === 1) return tool("rejectCurrentSource", { rejections: [{ episode: "S01E01", fileIds: ["present_S01E01"] }], reason: "发蓝" }, i);
         if (i === 2) return tool("searchResources", { keyword: "Show 01" }, i);
         if (i === 3) {
           const search = lastToolOutput(options.prompt, "searchResources");
@@ -1616,8 +1616,8 @@ describe("runQueuedReplaceRequest — 不换了 while the run works", () => {
     const model = new MockLanguageModelV3({
       doGenerate: async () => {
         i += 1;
-        if (i === 1) return tool("rejectCurrentSource", { episodes: ["S01E24"], fileIds: ["present_S01E24"], reason: "发蓝" }, i);
-        if (i === 2) return tool("rejectCurrentSource", { episodes: ["S01E20"], fileIds: ["present_S01E20"], reason: "口型对不上" }, i);
+        if (i === 1) return tool("rejectCurrentSource", { rejections: [{ episode: "S01E24", fileIds: ["present_S01E24"] }], reason: "发蓝" }, i);
+        if (i === 2) return tool("rejectCurrentSource", { rejections: [{ episode: "S01E20", fileIds: ["present_S01E20"] }], reason: "口型对不上" }, i);
         if (i === 3) {
           await dropPending(repository, ["S01E20", "S01E24"]);
           return tool(
@@ -2087,7 +2087,7 @@ describe("replace_request — an episode identified from an untagged message", (
     const model = new MockLanguageModelV3({
       doGenerate: async () => {
         i += 1;
-        if (i === 1) return tool("rejectCurrentSource", { episodes: ["S01E02"], fileIds: [], reason: "库里没有这集的文件" }, i);
+        if (i === 1) return tool("rejectCurrentSource", { rejections: [{ episode: "S01E02", fileIds: [] }], reason: "库里没有这集的文件" }, i);
         if (i === 2) return tool("reportReplacement", { results: [{ episode: "S01E02", outcome: "not_found", note: "没找到" }] }, i);
         return text("done");
       },
@@ -2148,7 +2148,7 @@ describe("replace_request — a rejection carries the link of the transfer that 
     const model = new MockLanguageModelV3({
       doGenerate: async () => {
         i += 1;
-        if (i === 1) return tool("rejectCurrentSource", { episodes: [], fileIds: ["odyssey_yts"], reason: "假片" }, i);
+        if (i === 1) return tool("rejectCurrentSource", { rejections: [{ fileIds: ["odyssey_yts"] }], reason: "假片" }, i);
         if (i === 2) return tool("reportReplacement", { results: [{ episode: "MOVIE", outcome: "not_found", note: "没有别的版本" }] }, i);
         return text("done");
       },

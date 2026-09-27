@@ -389,7 +389,7 @@ describe("runAcquisitionAgent — the real AI SDK tool-loop over the sandbox", (
       }
     };
     const recoverySteps = [
-      { tool: "rejectCurrentSource", input: { episodes: ["S01E01"], fileIds: [], reason: "音画不同步" } },
+      { tool: "rejectCurrentSource", input: { rejections: [{ episode: "S01E01", fileIds: [] }], reason: "音画不同步" } },
       { tool: "reportReplacement", input: { results: [{ episode: "S01E01", outcome: "not_found", note: "被中断,本轮没换成" }] } },
       { tool: "finish", input: {} },
     ] as const;

@@ -61,7 +61,7 @@ function tvLoopGuidance(options: Pick<TaskAgentPromptOptions, "userRequests">): 
   const [head, ...rest] = LOOP_GUIDANCE.split("\n");
   return [
     head,
-    "0. User request run — FIRST STEP: inspectTargetDir, then rejectCurrentSource for every requested episode (see USER REQUESTS), before step 1. After step 7 (markObtained), call reportReplacement for every requested episode, then do step 8.",
+    "0. User request run — FIRST STEP: inspectTargetDir, then rejectCurrentSource for every requested episode (one group per episode, e.g. rejectCurrentSource({ rejections: [{ episode: \"S01E13\", fileIds: [\"<id of E13's file>\"] }, { episode: \"S01E24\", fileIds: [\"<id>\"] }], reason }); see USER REQUESTS), before step 1. After step 7 (markObtained), call reportReplacement for every requested episode, then do step 8.",
     ...rest,
   ].join("\n");
 }
@@ -77,7 +77,7 @@ function movieLoopEnds(options: Pick<TaskAgentPromptOptions, "userRequests">): {
     };
   }
   return {
-    first: "0. User request run — FIRST STEP: inspectTargetDir, then rejectCurrentSource for the current film (see USER REQUESTS), before step 1.\n",
+    first: "0. User request run — FIRST STEP: inspectTargetDir, then rejectCurrentSource for the current film (one group, episode omitted: rejectCurrentSource({ rejections: [{ fileIds: [...] }], reason }); see USER REQUESTS), before step 1.\n",
     last: `7. markObtained(["MOVIE"]) — only once the NEW film is in place. Not the last call in this run: reportReplacement and finish follow.
 8. reportReplacement for MOVIE — "replaced" naming the new film's fileIds, or "not_found" with one 中文 sentence when no different copy of this film could be landed.
 9. finish() — done. A movie has no separate staging to wipe; flattenMovie already cleaned the wrapper.`,

@@ -237,10 +237,13 @@ export interface TaskSandboxOptions {
      *  stored list). When every requested episode is in here the agent may transfer
      *  without calling rejectCurrentSource again — see assertRejectedFirst. */
     alreadyRejectedEpisodes?: string[];
-    /** One item per (file, episode) rejected: the file's name, size and place, and its id —
-     *  by which the caller finds the link of the transfer that landed it. A throw refuses the
-     *  whole rejection before the sandbox records any of it (the agent may call again). */
-    onReject: (items: Array<{ episode: string; label: string; sizeBytes: number; reason: string; path: string; fileId: string }>) => Promise<void>;
+    /** One item per (file, episode) the agent grouped together: the file's name, size,
+     *  place and id — by which the caller finds the link of the transfer that landed it —
+     *  and whether it is a video. The caller writes a rejected row for each video, or for
+     *  every file of a group that has none (a subtitle beside a video is not a row). A
+     *  throw refuses the whole rejection before the sandbox records any of it (the agent
+     *  may call again). */
+    onReject: (items: Array<{ episode: string; label: string; sizeBytes: number; reason: string; path: string; fileId: string; isVideo: boolean }>) => Promise<void>;
     /** A recorded "replaced" also carries the agent-named fileIds it was verified by, and
      *  the real total size of that episode's named video file(s), read from its target
      *  dir when reporting (a pack's title would give the whole pack's size). */
@@ -377,10 +380,10 @@ export class TaskSandbox {
   private readonly reportedEpisodes = new Map<string, "replaced" | "not_found">();
   /** Episodes the agent rejected via rejectCurrentSource (in order). */
   private readonly rejectedEpisodes: string[] = [];
-  /** Episodes the agent declared have no old file in the library (rejectCurrentSource
-   *  with that episode and fileIds []): nothing to reject, so they pass the
-   *  reject-before-transfer gate without a rejected row. The sandbox has no
-   *  file↔episode map, so this is the agent's call (see assertRejectedFirst). */
+  /** Episodes the agent declared have no old file in the library (a rejectCurrentSource
+   *  group with fileIds []): nothing to reject, so they pass the reject-before-transfer
+   *  gate without a rejected row. The sandbox has no file↔episode map, so this is the
+   *  agent's call (see assertRejectedFirst). */
   private readonly noFileEpisodes: string[] = [];
   /** Candidates that landed this run (reportReplacement's evidence): a succeeded
    *  attempt, or a failed one that still materialized files (quark marks some
@@ -1048,7 +1051,7 @@ export class TaskSandbox {
       const nothingRequested = this.replace.hasMessages && this.replaceEpisodes().length === 0;
       if (nothingRequested || (this.replace.untaggedMessages > 0 && !this.identifiedThisRun())) {
         throw new Error(
-          "SANDBOX_NO_EPISODE_IDENTIFIED: work out from the user's words which episode(s) they mean, call rejectCurrentSource for them (fileIds [] for an episode with no file), then reportReplacement",
+          "SANDBOX_NO_EPISODE_IDENTIFIED: work out from the user's words which episode(s) they mean, call rejectCurrentSource for them (a group with fileIds: [] for an episode with no file), then reportReplacement",
         );
       }
       const unreported = this.unreportedReplaceEpisodes();
@@ -1220,9 +1223,9 @@ export class TaskSandbox {
    *  reject anything, and transfer tools carry no episode — so a gate opened by one
    *  rejection would let a model reject E13 and re-land the very E24 the user
    *  complained about. A requested episode is covered when it was:
-   *  - rejected this run (rejectCurrentSource with its current files);
-   *  - declared to have no old file here (rejectCurrentSource with that episode and
-   *    fileIds []) — the sandbox has no file↔episode map, so this is the agent's call;
+   *  - rejected this run (rejectCurrentSource with that episode's current files);
+   *  - declared to have no old file here (a group with that episode and fileIds []) —
+   *    the sandbox has no file↔episode map, so this is the agent's call;
    *  - in alreadyRejectedEpisodes: a stored rejection from an earlier run (a 待换
    *    re-check — its copies are filtered from search and refused anyway). The caller
    *    (runAcquisitionV2) only fills this in for a PENDING-ONLY re-check (no new
@@ -1247,7 +1250,7 @@ export class TaskSandbox {
     const uncovered = requested.filter((episode) => !covered.has(episode));
     if (uncovered.length === 0) return;
     throw new Error(
-      `SANDBOX_REJECT_FIRST: ${uncovered.join(",")} not rejected yet — call rejectCurrentSource with the current file of every requested episode before transferring (an episode with no file in the library: that episode and fileIds [])`,
+      `SANDBOX_REJECT_FIRST: ${uncovered.join(",")} not rejected yet — call rejectCurrentSource with one group per requested episode (that episode's current file ids; fileIds: [] when it has no file in the library) before transferring`,
     );
   }
 
@@ -1334,55 +1337,78 @@ export class TaskSandbox {
     return undefined;
   }
 
-  /** Reject the current file(s) of the episodes the user complained about: the system
-   *  records name + size (the caller adds the link of the transfer that landed the file,
-   *  or of the episode's recorded source, when known) so every copy is hidden
-   *  from later searches and refused at transfer. The files stay in place. The episodes
-   *  join the need, so one the agent read from the user's words (no tag) can still pass
-   *  the transfer gate. Movie: episodes [] = the film ("MOVIE"); a TV run must list
-   *  its episodes. Only files that were in the library before this run qualify.
-   *  Named episodes with fileIds [] declare "no old file of these here": nothing is
-   *  recorded as rejected, the episodes just pass the transfer gate. */
+  /** Reject the current file(s) of the episodes the user complained about. Each group
+   *  names one episode and THAT episode's file ids (a TV call may carry every episode;
+   *  a movie is one group, episode omitted or "MOVIE"). A file is recorded only under
+   *  the episode it is grouped with. The caller adds the link and decides which items
+   *  become rows. The files stay in place. The episodes join the need, so one the agent
+   *  read from the user's words (no tag) can still pass the transfer gate. A TV group
+   *  must name its episode. Only files that were in the library before this run qualify.
+   *  A group with fileIds [] declares "no old file of this episode here": nothing is
+   *  recorded as rejected, the episode just passes the transfer gate. */
   async rejectCurrentSource(
-    input: { episodes: string[]; fileIds: string[]; reason: string },
+    input: { rejections: Array<{ episode?: string; fileIds: string[] }>; reason: string },
   ): Promise<{ rejected: number; declaredNoFile?: string[] }> {
     if (!this.replace || !this.storage) throw new Error("SANDBOX_NO_REPLACE: this run has no user request");
-    if (input.fileIds.length === 0 && input.episodes.length === 0) {
-      throw new Error("SANDBOX_NO_FILES: pass the fileIds of the current copy (from inspectTargetDir)");
+    const groups = input.rejections ?? [];
+    if (groups.length === 0) {
+      throw new Error("SANDBOX_NO_FILES: pass rejections, each with the fileIds of that episode's current copy (from inspectTargetDir)");
     }
     const movieRun = this.isMovieRun();
-    if (!movieRun && input.episodes.length === 0) {
-      throw new Error("SANDBOX_EPISODES_REQUIRED: list every episode the user named (e.g. S01E13) — [] is only for a movie");
-    }
-    this.assertEpisodeTokens(input.episodes);
-    if (input.fileIds.length === 0) {
-      for (const episode of input.episodes) {
-        if (!this.need.includes(episode)) this.need.push(episode);
-        if (!this.noFileEpisodes.includes(episode)) this.noFileEpisodes.push(episode);
+    const normalized: Array<{ episode: string; fileIds: string[] }> = [];
+    for (const group of groups) {
+      const named = group.episode;
+      const fileIds = group.fileIds ?? [];
+      if (movieRun && (named === undefined || named === "MOVIE")) {
+        normalized.push({ episode: "MOVIE", fileIds });
+        continue;
       }
-      return { rejected: 0, declaredNoFile: [...new Set(input.episodes)] };
+      if (!named) {
+        throw new Error(
+          "SANDBOX_EPISODES_REQUIRED: every TV group names its episode (e.g. S01E13) — omitting episode is only for a movie",
+        );
+      }
+      this.assertEpisodeTokens([named]);
+      normalized.push({ episode: named, fileIds });
     }
-    const missing = input.fileIds.filter((id) => !this.protectedFiles.has(id));
+    const withFiles = normalized.filter((group) => group.fileIds.length > 0);
+    const noFile = normalized.filter((group) => group.fileIds.length === 0);
+    const missing = [...new Set(withFiles.flatMap((group) => group.fileIds.filter((id) => !this.protectedFiles.has(id))))];
     if (missing.length > 0) {
       throw new Error(
         `SANDBOX_FILES_NOT_IN_TARGET: ${missing.join(",")} — only a file that was in the library before this run can be rejected`,
       );
     }
-    const episodes = input.episodes.length > 0 ? input.episodes : ["MOVIE"];
     const reason = input.reason.slice(0, 200);
-    const items = input.fileIds.flatMap((id) => {
-      const { file, dirLabel: dir } = this.protectedFiles.get(id)!;
-      const path = dir ? `${dir}/${file.path}` : file.path;
-      const label = file.path.split("/").pop()!;
-      return episodes.map((episode) => ({ episode, label, sizeBytes: file.sizeBytes, reason, path, fileId: id }));
-    });
-    await this.replace.onReject(items);
-    for (const episode of episodes) {
-      if (!this.need.includes(episode)) this.need.push(episode);
-      if (!this.rejectedEpisodes.includes(episode)) this.rejectedEpisodes.push(episode);
+    const items = withFiles.flatMap((group) =>
+      group.fileIds.map((id) => {
+        const { file, dirLabel: dir } = this.protectedFiles.get(id)!;
+        const path = dir ? `${dir}/${file.path}` : file.path;
+        return {
+          episode: group.episode,
+          label: file.path.split("/").pop()!,
+          sizeBytes: file.sizeBytes,
+          reason,
+          path,
+          fileId: id,
+          isVideo: file.isVideo,
+        };
+      }),
+    );
+    // onReject first: a throw (unreadable landing history) records nothing, including
+    // a no-file declaration that rode in the same call.
+    if (items.length > 0) await this.replace.onReject(items);
+    for (const group of withFiles) {
+      if (!this.need.includes(group.episode)) this.need.push(group.episode);
+      if (!this.rejectedEpisodes.includes(group.episode)) this.rejectedEpisodes.push(group.episode);
     }
-    await this.refilterCachedSnapshots();
-    return { rejected: items.length };
+    for (const group of noFile) {
+      if (!this.need.includes(group.episode)) this.need.push(group.episode);
+      if (!this.noFileEpisodes.includes(group.episode)) this.noFileEpisodes.push(group.episode);
+    }
+    if (items.length > 0) await this.refilterCachedSnapshots();
+    const declared = [...new Set(noFile.map((group) => group.episode))];
+    return { rejected: items.length, ...(declared.length > 0 ? { declaredNoFile: declared } : {}) };
   }
 
   /** Per-episode outcome of the request. Every episode must be requested or rejected

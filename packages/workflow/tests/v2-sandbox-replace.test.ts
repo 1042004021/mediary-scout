@@ -52,38 +52,93 @@ async function setup(
   await sandbox.captureProtectedFiles();
   /** Rejects the current file of the requested episode the test is not about, so the
    *  reject-before-transfer gate (every requested episode) opens. */
-  const rejectE24 = () => sandbox.rejectCurrentSource({ episodes: ["S01E24"], fileIds: [old24], reason: "发蓝" });
+  const rejectE24 = () => sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E24", fileIds: [old24] }], reason: "发蓝" });
   return { sandbox, storage, season, staging, rejected, results, old13, old24, rejectE24, oldPaths: oldFiles.map((f) => f.path) };
 }
 
 describe("TaskSandbox — replace", () => {
+  it("one call groups each file under its own episode (no cross product)", async () => {
+    const { sandbox, rejected, old13, old24, oldPaths } = await setup();
+    await sandbox.rejectCurrentSource({
+      rejections: [
+        { episode: "S01E13", fileIds: [old13] },
+        { episode: "S01E24", fileIds: [old24] },
+      ],
+      reason: "发蓝",
+    });
+    const pathOf = (needle: string) => oldPaths.find((p) => p.includes(needle))!;
+    expect(rejected).toEqual([
+      { episode: "S01E13", label: "Show - 13 [CR 1080p].mkv", sizeBytes: 1_400_000_000, reason: "发蓝", path: `Season 01/${pathOf("13")}`, fileId: old13, isVideo: true },
+      { episode: "S01E24", label: "Show - 24 [CR 1080p].mkv", sizeBytes: 1_400_000_000, reason: "发蓝", path: `Season 01/${pathOf("24")}`, fileId: old24, isVideo: true },
+    ]);
+  });
+
+  it("a group with fileIds [] declares that episode has no old file, and records nothing", async () => {
+    const { sandbox, rejected } = await setup();
+    await expect(
+      sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E24", fileIds: [] }], reason: "库里没有这一集" }),
+    ).resolves.toEqual({ rejected: 0, declaredNoFile: ["S01E24"] });
+    expect(rejected).toEqual([]);
+    expect((await sandbox.finish()).missing).toContain("S01E24");
+  });
+
+  it("a file that was not in the library is refused and nothing is recorded", async () => {
+    const { sandbox, rejected, old13 } = await setup();
+    await expect(
+      sandbox.rejectCurrentSource({
+        rejections: [
+          { episode: "S01E13", fileIds: [old13] },
+          { episode: "S01E24", fileIds: ["nope"] },
+        ],
+        reason: "发蓝",
+      }),
+    ).rejects.toThrow(/SANDBOX_FILES_NOT_IN_TARGET/);
+    expect(rejected).toEqual([]);
+    expect(sandbox.identifiedThisRun()).toBe(false);
+  });
+
+  it("the same file grouped under two episodes is recorded under both (only when the agent groups it so)", async () => {
+    const { sandbox, rejected, old13 } = await setup();
+    await sandbox.rejectCurrentSource({
+      rejections: [
+        { episode: "S01E13", fileIds: [old13] },
+        { episode: "S01E24", fileIds: [old13] },
+      ],
+      reason: "连播",
+    });
+    expect(rejected.map((item) => (item as { episode: string; fileId: string }).episode + ":" + (item as { fileId: string }).fileId)).toEqual([
+      `S01E13:${old13}`,
+      `S01E24:${old13}`,
+    ]);
+  });
+
   it("rejectCurrentSource records name+size of files that are really in the season, and adds the episodes to the need", async () => {
     const { sandbox, rejected, old13, oldPaths } = await setup();
-    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E13", fileIds: [old13] }], reason: "发蓝" });
     const path13 = oldPaths.find((p) => p.includes("13"))!; // the pack may nest files in a wrapper dir
-    expect(rejected).toEqual([{ episode: "S01E13", label: "Show - 13 [CR 1080p].mkv", sizeBytes: 1_400_000_000, reason: "发蓝", path: `Season 01/${path13}`, fileId: old13 }]);
+    expect(rejected).toEqual([{ episode: "S01E13", label: "Show - 13 [CR 1080p].mkv", sizeBytes: 1_400_000_000, reason: "发蓝", path: `Season 01/${path13}`, fileId: old13, isVideo: true }]);
     expect((await sandbox.finish()).missing).toContain("S01E13");
-    await expect(sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: ["nope"], reason: "x" })).rejects.toThrow(/NOT_IN_TARGET/);
+    await expect(sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E13", fileIds: ["nope"] }], reason: "x" })).rejects.toThrow(/NOT_IN_TARGET/);
   });
 
   it("rejectCurrentSource needs at least one current file, and refuses outside a replace run", async () => {
     const { sandbox } = await setup();
-    // No episodes and no files: nothing to act on. (Episodes with fileIds [] is the
+    // An empty rejections list: nothing to act on. (A group with fileIds [] is the
     // no-old-file declaration — see the reject-before-transfer tests.)
-    await expect(sandbox.rejectCurrentSource({ episodes: [], fileIds: [], reason: "x" })).rejects.toThrow(/NO_FILES/);
+    await expect(sandbox.rejectCurrentSource({ rejections: [], reason: "x" })).rejects.toThrow(/NO_FILES/);
     const plain = new TaskSandbox({ provider: new FakeResourceProviderV2() });
     expect(plain.hasReplace()).toBe(false);
-    await expect(plain.rejectCurrentSource({ episodes: [], fileIds: ["x"], reason: "x" })).rejects.toThrow(/NO_REPLACE/);
+    await expect(plain.rejectCurrentSource({ rejections: [{ fileIds: ["x"] }], reason: "x" })).rejects.toThrow(/NO_REPLACE/);
     await expect(plain.reportReplacement({ results: [] })).rejects.toThrow(/NO_REPLACE/);
   });
 
   it("rejectCurrentSource on a TV run needs episode codes in this run's seasons", async () => {
     const { sandbox, old13 } = await setup();
-    await expect(sandbox.rejectCurrentSource({ episodes: [], fileIds: [old13], reason: "x" })).rejects.toThrow(
+    await expect(sandbox.rejectCurrentSource({ rejections: [{ fileIds: [old13] }], reason: "x" })).rejects.toThrow(
       /SANDBOX_EPISODES_REQUIRED/,
     );
     for (const bad of ["MOVIE", "13", "S1E13", "S02E13"]) {
-      await expect(sandbox.rejectCurrentSource({ episodes: [bad], fileIds: [old13], reason: "x" })).rejects.toThrow(
+      await expect(sandbox.rejectCurrentSource({ rejections: [{ episode: bad, fileIds: [old13] }], reason: "x" })).rejects.toThrow(
         `SANDBOX_EPISODE_OUT_OF_SCOPE: ${bad}`,
       );
     }
@@ -94,14 +149,14 @@ describe("TaskSandbox — replace", () => {
     const { sandbox, storage, season, old13 } = await setup();
     await storage.transferCandidate({ candidateId: "cand_new13", intoDirectoryId: season });
     const landed = (await storage.listTree({ directoryId: season })).find((f) => f.path.includes("Nekomoe"))!.id;
-    await expect(sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [landed], reason: "x" })).rejects.toThrow(
+    await expect(sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E13", fileIds: [landed] }], reason: "x" })).rejects.toThrow(
       /SANDBOX_FILES_NOT_IN_TARGET/,
     );
     // The pre-run map is the source of truth: no listTree call at reject time.
     let listed = 0;
     const listTree = storage.listTree.bind(storage);
     storage.listTree = async (input) => { listed += 1; return listTree(input); };
-    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E13", fileIds: [old13] }], reason: "发蓝" });
     expect(listed).toBe(0);
   });
 
@@ -113,7 +168,7 @@ describe("TaskSandbox — replace", () => {
     await expect(sandbox.reportReplacement({ results: [{ episode: "S01E25", outcome: "not_found", note: "" }] })).rejects.toThrow(
       /SANDBOX_EPISODE_NOT_REQUESTED/,
     );
-    await sandbox.rejectCurrentSource({ episodes: ["S01E25"], fileIds: [old24], reason: "x" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E25", fileIds: [old24] }], reason: "x" });
     await sandbox.reportReplacement({ results: [{ episode: "S01E25", outcome: "not_found", note: "没找到" }] });
     expect(results).toMatchObject([{ episode: "S01E25", outcome: "not_found" }]);
   });
@@ -142,7 +197,7 @@ describe("TaskSandbox — replace", () => {
   it("reportReplacement: an earlier not_found can be upgraded to replaced; other repeats are ignored and listed", async () => {
     const { sandbox, results, old13, rejectE24 } = await setup();
     await sandbox.reportReplacement({ results: [{ episode: "S01E13", outcome: "not_found", note: "还没找到" }] });
-    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E13", fileIds: [old13] }], reason: "发蓝" });
     await rejectE24();
     const snap = (await sandbox.searchResources("Show")).snapshot!;
     const out = await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_new13" });
@@ -167,13 +222,13 @@ describe("TaskSandbox — replace", () => {
     const { sandbox, old13, old24, rejectE24 } = await setup();
     await expect(sandbox.markObtained({ codes: ["S01E13"] })).rejects.toThrow(/SANDBOX_REPLACEMENT_NOT_LANDED: S01E13/);
     // Rejected (not requested) episodes are guarded too; the whole call is refused.
-    await sandbox.rejectCurrentSource({ episodes: ["S01E25"], fileIds: [old24], reason: "x" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E25", fileIds: [old24] }], reason: "x" });
     await expect(sandbox.markObtained({ codes: ["S01E01", "S01E25"] })).rejects.toThrow(/SANDBOX_REPLACEMENT_NOT_LANDED: S01E25/);
     expect((await sandbox.finish()).obtained).toEqual([]);
     // An episode nobody asked about can still be marked.
     await sandbox.markObtained({ codes: ["S01E01"] });
     // After a successful transfer the requested episode can be marked.
-    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "x" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E13", fileIds: [old13] }], reason: "x" });
     await rejectE24();
     const snap = (await sandbox.searchResources("Show")).snapshot!;
     await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_new13" });
@@ -185,10 +240,10 @@ describe("TaskSandbox — replace", () => {
     // Not requested yet → the mark is accepted...
     await sandbox.markObtained({ codes: ["S01E25"] });
     // ...then the agent rejects its current file: it joins the need as a guarded episode.
-    await sandbox.rejectCurrentSource({ episodes: ["S01E25"], fileIds: [old24], reason: "x" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E25", fileIds: [old24] }], reason: "x" });
     expect(sandbox.isCoverageMet()).toBe(false);
     expect((await sandbox.finish()).missing).toEqual(["S01E25"]);
-    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "x" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E13", fileIds: [old13] }], reason: "x" });
     await rejectE24();
     const snap = (await sandbox.searchResources("Show")).snapshot!;
     const out = await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_new13" });
@@ -226,7 +281,7 @@ describe("TaskSandbox — replace", () => {
       replace: { requestedEpisodes: ["S01E13"], hasMessages: true, untaggedMessages: 0, onReject: async () => {}, onReport: async () => {} },
     });
     await sandbox.captureProtectedFiles();
-    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E13", fileIds: [old13] }], reason: "发蓝" });
     const snap = (await sandbox.searchResources("Show")).snapshot!;
     await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_e14" });
     // Something landed, so the marks are accepted — but E13's is still the old file.
@@ -273,9 +328,9 @@ describe("TaskSandbox — replace", () => {
       replace: { requestedEpisodes: ["S01E13"], hasMessages: true, untaggedMessages: 0, onReject: async () => {}, onReport: async () => {} },
     });
     await sandbox.captureProtectedFiles();
-    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E13", fileIds: [old13] }], reason: "发蓝" });
     // E24 has no file in the library: declared, not rejected — guarded all the same.
-    await sandbox.rejectCurrentSource({ episodes: ["S01E24"], fileIds: [], reason: "24 集也要换" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E24", fileIds: [] }], reason: "24 集也要换" });
     const snap = (await sandbox.searchResources("Show")).snapshot!;
     const new13 = (await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_new13" })).attempt.materializedFileIds;
     const e14 = (await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_e14" })).attempt.materializedFileIds;
@@ -314,7 +369,7 @@ describe("TaskSandbox — replace", () => {
     await expect(
       sandbox.reportReplacement({ results: [{ episode: "S01E13", outcome: "replaced", candidateId: "cand_new13", note: "换好了" }] }),
     ).rejects.toThrow(/NOT_MARKED/);
-    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E13", fileIds: [old13] }], reason: "发蓝" });
     await rejectE24();
     // FakeResourceProviderV2 ids are passed through as-is (no alias layer): use its own ids.
     const snap = (await sandbox.searchResources("Show")).snapshot!;
@@ -335,7 +390,7 @@ describe("TaskSandbox — replace", () => {
 
   it("reportReplacement refuses a replaced episode whose candidate never landed this run", async () => {
     const { sandbox, old13, rejectE24 } = await setup();
-    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E13", fileIds: [old13] }], reason: "发蓝" });
     await rejectE24();
     // Another candidate landed (so the mark is allowed), but not the one reported.
     const snap = (await sandbox.searchResources("Show")).snapshot!;
@@ -351,7 +406,7 @@ describe("TaskSandbox — replace", () => {
 
   it("finish (the agent's tool) is refused while a requested or rejected episode is unreported; the summary stays readable", async () => {
     const { sandbox, old24 } = await setup();
-    await sandbox.rejectCurrentSource({ episodes: ["S01E25"], fileIds: [old24], reason: "x" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E25", fileIds: [old24] }], reason: "x" });
     await expect(sandbox.declareFinish()).rejects.toThrow("SANDBOX_REPORT_REQUIRED: S01E13,S01E24,S01E25");
     await sandbox.reportReplacement({ results: [{ episode: "S01E13", outcome: "not_found", note: "没有" }] });
     await expect(sandbox.declareFinish()).rejects.toThrow("SANDBOX_REPORT_REQUIRED: S01E24,S01E25");
@@ -384,7 +439,7 @@ describe("TaskSandbox — replace", () => {
     const { sandbox, results, old24 } = await setup();
     // S01E24 is requested; the agent also rejects its file under an episode it read
     // from the message text (S01E25 has no tag) and then reports nothing.
-    await sandbox.rejectCurrentSource({ episodes: ["S01E25"], fileIds: [old24], reason: "音画不同步" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E25", fileIds: [old24] }], reason: "音画不同步" });
     await sandbox.reportReplacement({ results: [{ episode: "S01E13", outcome: "not_found", note: "没找到" }] });
     await sandbox.finalizeReplacement();
     expect(results).toMatchObject([
@@ -403,7 +458,7 @@ describe("TaskSandbox — replace", () => {
       },
     });
     const snap = (await sandbox.searchResources("Show")).snapshot!;
-    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E13", fileIds: [old13] }], reason: "发蓝" });
     await rejectE24();
     await expect(sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_cr13" })).rejects.toThrow(
       /SANDBOX_CANDIDATE_REJECTED/,
@@ -416,7 +471,7 @@ describe("TaskSandbox — replace", () => {
 
 describe("TaskSandbox — replace: finish needs an identified episode when the run carries a message", () => {
   const NO_EPISODE_IDENTIFIED =
-    "SANDBOX_NO_EPISODE_IDENTIFIED: work out from the user's words which episode(s) they mean, call rejectCurrentSource for them (fileIds [] for an episode with no file), then reportReplacement";
+    "SANDBOX_NO_EPISODE_IDENTIFIED: work out from the user's words which episode(s) they mean, call rejectCurrentSource for them (a group with fileIds: [] for an episode with no file), then reportReplacement";
 
   /** A TV replace run on a season that holds the user's current E13. */
   async function tvRun(replace: { requestedEpisodes: string[]; hasMessages: boolean; untaggedMessages: number }) {
@@ -441,7 +496,7 @@ describe("TaskSandbox — replace: finish needs an identified episode when the r
     // The workflow's own end-of-run summary is never gated.
     await expect(sandbox.finish()).resolves.toMatchObject({ obtained: [], missing: [] });
     // The agent reads "第 5 集" from the words; there is no file of it here.
-    await sandbox.rejectCurrentSource({ episodes: ["S01E05"], fileIds: [], reason: "第 5 集没字幕" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E05", fileIds: [] }], reason: "第 5 集没字幕" });
     await expect(sandbox.declareFinish()).rejects.toThrow("SANDBOX_REPORT_REQUIRED: S01E05");
     await sandbox.reportReplacement({ results: [{ episode: "S01E05", outcome: "not_found", note: "没找到" }] });
     await expect(sandbox.declareFinish()).resolves.toMatchObject({ coverageMet: false, missing: ["S01E05"] });
@@ -454,7 +509,7 @@ describe("TaskSandbox — replace: finish needs an identified episode when the r
     await expect(sandbox.declareFinish()).rejects.toThrow(NO_EPISODE_IDENTIFIED);
     expect(sandbox.identifiedThisRun()).toBe(false);
     // The agent reads "第 5 集" from the new message; there is no file of it here.
-    await sandbox.rejectCurrentSource({ episodes: ["S01E05"], fileIds: [], reason: "第 5 集也发蓝" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E05", fileIds: [] }], reason: "第 5 集也发蓝" });
     expect(sandbox.identifiedThisRun()).toBe(true);
     await expect(sandbox.declareFinish()).rejects.toThrow("SANDBOX_REPORT_REQUIRED: S01E05");
     await sandbox.reportReplacement({ results: [{ episode: "S01E05", outcome: "not_found", note: "没找到" }] });
@@ -463,7 +518,7 @@ describe("TaskSandbox — replace: finish needs an identified episode when the r
 
   it("any episode identified this run lifts it — rejecting the 待换 episode's current file too (which message an episode came from is the agent's call)", async () => {
     const { sandbox, old13 } = await tvRun({ requestedEpisodes: ["S01E13"], hasMessages: true, untaggedMessages: 1 });
-    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "还是发蓝" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E13", fileIds: [old13] }], reason: "还是发蓝" });
     await sandbox.reportReplacement({ results: [{ episode: "S01E13", outcome: "not_found", note: "没找到" }] });
     await expect(sandbox.declareFinish()).resolves.toMatchObject({ coverageMet: false });
   });
@@ -503,7 +558,7 @@ describe("TaskSandbox — replace: reject before transfer", () => {
     const snap = (await sandbox.searchResources("Show")).snapshot!;
     await expect(sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_new13" })).rejects.toThrow(/SANDBOX_REJECT_FIRST/);
     expect(await storage.listTree({ directoryId: staging })).toEqual([]);
-    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E13", fileIds: [old13] }], reason: "发蓝" });
     await rejectE24();
     const ok = await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_new13" });
     expect(ok.attempt.status).toBe("succeeded");
@@ -512,7 +567,7 @@ describe("TaskSandbox — replace: reject before transfer", () => {
   it("rejecting only one of two requested episodes keeps the gate closed and names the other", async () => {
     const { sandbox, storage, staging, old13 } = await setup();
     const snap = (await sandbox.searchResources("Show")).snapshot!;
-    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E13", fileIds: [old13] }], reason: "发蓝" });
     await expect(sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_new13" })).rejects.toThrow(
       /SANDBOX_REJECT_FIRST: S01E24 not rejected yet/,
     );
@@ -521,14 +576,14 @@ describe("TaskSandbox — replace: reject before transfer", () => {
 
   it("rejecting both requested episodes (one call each, or one call for both) opens the gate", async () => {
     const one = await setup();
-    await one.sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [one.old13], reason: "发蓝" });
-    await one.sandbox.rejectCurrentSource({ episodes: ["S01E24"], fileIds: [one.old24], reason: "发蓝" });
+    await one.sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E13", fileIds: [one.old13] }], reason: "发蓝" });
+    await one.sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E24", fileIds: [one.old24] }], reason: "发蓝" });
     const snap1 = (await one.sandbox.searchResources("Show")).snapshot!;
     await expect(one.sandbox.transferCandidate({ snapshotId: snap1.id, candidateId: "cand_new13" })).resolves.toMatchObject({
       attempt: { status: "succeeded" },
     });
     const both = await setup();
-    await both.sandbox.rejectCurrentSource({ episodes: ["S01E13", "S01E24"], fileIds: [both.old13, both.old24], reason: "发蓝" });
+    await both.sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E13", fileIds: [both.old13] }, { episode: "S01E24", fileIds: [both.old24] }], reason: "发蓝" });
     const snap2 = (await both.sandbox.searchResources("Show")).snapshot!;
     await expect(both.sandbox.transferCandidate({ snapshotId: snap2.id, candidateId: "cand_new13" })).resolves.toMatchObject({
       attempt: { status: "succeeded" },
@@ -537,8 +592,8 @@ describe("TaskSandbox — replace: reject before transfer", () => {
 
   it("an episode declared to have no old file here (fileIds []) is covered without writing a rejection", async () => {
     const { sandbox, rejected, results, old13 } = await setup();
-    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
-    await expect(sandbox.rejectCurrentSource({ episodes: ["S01E24"], fileIds: [], reason: "库里没有这一集" })).resolves.toEqual({
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E13", fileIds: [old13] }], reason: "发蓝" });
+    await expect(sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E24", fileIds: [] }], reason: "库里没有这一集" })).resolves.toEqual({
       rejected: 0,
       declaredNoFile: ["S01E24"],
     });
@@ -556,13 +611,13 @@ describe("TaskSandbox — replace: reject before transfer", () => {
 
   it("an episode read from the words (not requested) can be declared file-less and then reported", async () => {
     const { sandbox, old13, old24 } = await setup();
-    await sandbox.rejectCurrentSource({ episodes: ["S01E13", "S01E24"], fileIds: [old13, old24], reason: "发蓝" });
-    await sandbox.rejectCurrentSource({ episodes: ["S01E05"], fileIds: [], reason: "库里没有" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E13", fileIds: [old13] }, { episode: "S01E24", fileIds: [old24] }], reason: "发蓝" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E05", fileIds: [] }], reason: "库里没有" });
     await expect(sandbox.reportReplacement({ results: [{ episode: "S01E05", outcome: "not_found", note: "没找到" }] })).resolves.toEqual({
       recorded: 1,
       ignored: [],
     });
-    await expect(sandbox.rejectCurrentSource({ episodes: ["S02E01"], fileIds: [], reason: "x" })).rejects.toThrow(
+    await expect(sandbox.rejectCurrentSource({ rejections: [{ episode: "S02E01", fileIds: [] }], reason: "x" })).rejects.toThrow(
       /SANDBOX_EPISODE_OUT_OF_SCOPE/,
     );
   });
@@ -586,7 +641,7 @@ describe("TaskSandbox — replace: reject before transfer", () => {
     await sandbox.captureProtectedFiles();
     const snap = (await sandbox.searchResources("Show")).snapshot!;
     await expect(sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_new13" })).rejects.toThrow(/SANDBOX_REJECT_FIRST/);
-    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E13", fileIds: [old13] }], reason: "发蓝" });
     await expect(sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_new13" })).resolves.toMatchObject({
       attempt: { status: "succeeded" },
     });
@@ -598,7 +653,7 @@ describe("TaskSandbox — replace: reject before transfer", () => {
     await expect(sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_new13" })).rejects.toThrow(
       /SANDBOX_REJECT_FIRST: S01E24 not rejected yet/,
     );
-    await sandbox.rejectCurrentSource({ episodes: ["S01E24"], fileIds: [old24], reason: "发蓝" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E24", fileIds: [old24] }], reason: "发蓝" });
     await expect(sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_new13" })).resolves.toMatchObject({
       attempt: { status: "succeeded" },
     });
@@ -650,7 +705,7 @@ describe("TaskSandbox — replace: reject before transfer", () => {
     await sandbox.searchResources("film");
     await expect(sandbox.transferUntilLanded({ candidateIds: ["good_share"] })).rejects.toThrow(/SANDBOX_REJECT_FIRST/);
     const old = (await storage.listTree({ directoryId: movieDir }))[0]!;
-    await sandbox.rejectCurrentSource({ episodes: [], fileIds: [old.id], reason: "假片" });
+    await sandbox.rejectCurrentSource({ rejections: [{ fileIds: [old.id] }], reason: "假片" });
     await expect(sandbox.transferUntilLanded({ candidateIds: ["good_share"] })).resolves.toMatchObject({ transferredCandidateId: "good_share" });
   });
 
@@ -674,7 +729,7 @@ describe("TaskSandbox — replace: reject before transfer", () => {
     expect(sandbox.viewResourceSnapshot().document).toContain("cand_cr13");
     const rawId = (await sandbox.searchResources("Show")).snapshot!.id;
     rejectedNow = true; // the store now holds the rejection (what onReject writes)
-    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E13", fileIds: [old13] }], reason: "发蓝" });
     await rejectE24();
     const view = sandbox.viewResourceSnapshot();
     expect(view.document).not.toContain("cand_cr13");
@@ -695,7 +750,7 @@ describe("TaskSandbox — replace: a failed attempt that still landed files", ()
     const { sandbox, storage, old13, results, rejectE24 } = await setup();
     const transfer = storage.transferCandidate.bind(storage);
     storage.transferCandidate = async (input) => ({ ...(await transfer(input)), status: "failed" as const, providerMessage: "partial" });
-    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E13", fileIds: [old13] }], reason: "发蓝" });
     await rejectE24();
     const snap = (await sandbox.searchResources("Show")).snapshot!;
     const out = await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_new13" });
@@ -712,7 +767,7 @@ describe("TaskSandbox — replace: a failed attempt that still landed files", ()
   it("a failed attempt that landed nothing still does not count", async () => {
     const { sandbox, storage, old13, rejectE24 } = await setup();
     storage.transferCandidate = async (input) => ({ candidateId: input.candidateId, status: "failed" as const, materializedFileIds: [], providerMessage: "dead" });
-    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E13", fileIds: [old13] }], reason: "发蓝" });
     await rejectE24();
     const snap = (await sandbox.searchResources("Show")).snapshot!;
     await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_new13" });
@@ -734,7 +789,7 @@ describe("TaskSandbox — replace: a failed attempt that still landed files", ()
     });
     await sandbox.captureProtectedFiles();
     const old = (await storage.listTree({ directoryId: movieDir }))[0]!;
-    await sandbox.rejectCurrentSource({ episodes: [], fileIds: [old.id], reason: "假片" });
+    await sandbox.rejectCurrentSource({ rejections: [{ fileIds: [old.id] }], reason: "假片" });
     const transfer = storage.transferCandidate.bind(storage);
     storage.transferCandidate = async (input) => ({ ...(await transfer(input)), status: "failed" as const, providerMessage: "partial" });
     await sandbox.searchResources("film");
@@ -750,7 +805,7 @@ describe("TaskSandbox — replace: a failed attempt that still landed files", ()
 describe("TaskSandbox — replace: a replaced needs the NEW file in a target dir, not just staging", () => {
   it("TV: transfer + markObtained + reportReplacement('replaced') WITHOUT moveToSeason is recorded not_found (stays 待换)", async () => {
     const { sandbox, results, old13, rejectE24 } = await setup();
-    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E13", fileIds: [old13] }], reason: "发蓝" });
     await rejectE24();
     const snap = (await sandbox.searchResources("Show")).snapshot!;
     // The new file lands in STAGING only — the agent never moves it into the season dir.
@@ -773,7 +828,7 @@ describe("TaskSandbox — replace: a replaced needs the NEW file in a target dir
 
   it("TV: transfer + moveToSeason + markObtained + reportReplacement('replaced') is accepted", async () => {
     const { sandbox, results, old13, rejectE24 } = await setup();
-    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E13", fileIds: [old13] }], reason: "发蓝" });
     await rejectE24();
     const snap = (await sandbox.searchResources("Show")).snapshot!;
     const out = await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_new13" });
@@ -824,7 +879,7 @@ describe("TaskSandbox — replace: a replaced needs the NEW file in a target dir
       replace: { requestedEpisodes: ["S01E13"], hasMessages: true, untaggedMessages: 0, onReject: async () => {}, onReport: async (r) => { results.push(...r); } },
     });
     await sandbox.captureProtectedFiles();
-    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E13", fileIds: [old13] }], reason: "发蓝" });
     const snap = (await sandbox.searchResources("Show")).snapshot!;
     const out = await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "cand_new13" });
     const [new13] = out.attempt.materializedFileIds;
@@ -893,8 +948,8 @@ describe("TaskSandbox — replace: a replaced names that episode's own new file(
       replace: { requestedEpisodes: ["S01E13", "S01E24"], hasMessages: true, untaggedMessages: 0, onReject: async () => {}, onReport: async (r) => { results.push(...r); } },
     });
     await sandbox.captureProtectedFiles();
-    await sandbox.rejectCurrentSource({ episodes: ["S01E13"], fileIds: [old13], reason: "发蓝" });
-    await sandbox.rejectCurrentSource({ episodes: ["S01E24"], fileIds: [old24], reason: "发蓝" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E13", fileIds: [old13] }], reason: "发蓝" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E24", fileIds: [old24] }], reason: "发蓝" });
     const snap = (await sandbox.searchResources("Show")).snapshot!;
     /** Transfer one candidate into staging; the ids it materialized. */
     const land = async (candidateId: string) => (await sandbox.transferCandidate({ snapshotId: snap.id, candidateId })).attempt.materializedFileIds;
@@ -1213,7 +1268,7 @@ describe("TaskSandbox — replace (movie: the movie dir is also staging)", () =>
 
   it("flattenMovie lifts the new film out of its wrapper but leaves every old file where it was", async () => {
     const { sandbox, storage, movieDir, old } = await movieSetup();
-    await sandbox.rejectCurrentSource({ episodes: [], fileIds: [old.find((f) => f.isVideo)!.id], reason: "x" });
+    await sandbox.rejectCurrentSource({ rejections: [{ fileIds: [old.find((f) => f.isVideo)!.id] }], reason: "x" });
     await sandbox.searchResources("film");
     await sandbox.transferUntilLanded({ candidateIds: ["good_share"] });
     const { movie } = await sandbox.flattenMovie();
@@ -1225,7 +1280,7 @@ describe("TaskSandbox — replace (movie: the movie dir is also staging)", () =>
   it("transferUntilLanded skips a rejected candidate (recorded as a failed attempt) and lands the next one", async () => {
     const { sandbox, old } = await movieSetup(async (candidate) => candidate.id === "rej_share");
     await sandbox.searchResources("film");
-    await sandbox.rejectCurrentSource({ episodes: [], fileIds: [old.find((f) => f.isVideo)!.id], reason: "x" });
+    await sandbox.rejectCurrentSource({ rejections: [{ fileIds: [old.find((f) => f.isVideo)!.id] }], reason: "x" });
     const result = await sandbox.transferUntilLanded({ candidateIds: ["rej_share", "good_share"] });
     expect(result.attempts).toEqual([
       { candidateId: "rej_share", status: "failed", providerMessage: "user rejected" },
@@ -1234,14 +1289,34 @@ describe("TaskSandbox — replace (movie: the movie dir is also staging)", () =>
     expect(result.transferredCandidateId).toBe("good_share");
   });
 
-  it("rejectCurrentSource on a movie run accepts only [] or [\"MOVIE\"]", async () => {
+  it("a movie rejection with episode omitted is recorded as MOVIE", async () => {
+    const storage = new Storage115Simulator({ packs: { old_film: { files: [{ path: "Film.mkv", sizeBytes: 4_000 }] } } });
+    const movieDir = await storage.createDirectory({ name: "Film (2023)", parentId: "root" });
+    await storage.transferCandidate({ candidateId: "old_film", intoDirectoryId: movieDir });
+    const video = (await storage.listTree({ directoryId: movieDir }))[0]!.id;
+    const rejected: Array<{ episode: string; fileId: string }> = [];
+    const sandbox = new TaskSandbox({
+      provider: new FakeResourceProviderV2(),
+      storage, stagingDirectoryId: movieDir, targetMovieDirectoryId: movieDir, need: ["MOVIE"],
+      replace: {
+        requestedEpisodes: ["MOVIE"], hasMessages: true, untaggedMessages: 0,
+        onReject: async (items) => { rejected.push(...items); },
+        onReport: async () => {},
+      },
+    });
+    await sandbox.captureProtectedFiles();
+    await sandbox.rejectCurrentSource({ rejections: [{ fileIds: [video] }], reason: "假片" });
+    expect(rejected).toEqual([expect.objectContaining({ episode: "MOVIE", fileId: video, isVideo: true })]);
+  });
+
+  it("rejectCurrentSource on a movie run accepts only an omitted episode or MOVIE", async () => {
     const { sandbox, old } = await movieSetup();
     const video = old.find((f) => f.isVideo)!.id;
-    await expect(sandbox.rejectCurrentSource({ episodes: ["S01E01"], fileIds: [video], reason: "x" })).rejects.toThrow(
+    await expect(sandbox.rejectCurrentSource({ rejections: [{ episode: "S01E01", fileIds: [video] }], reason: "x" })).rejects.toThrow(
       /SANDBOX_EPISODE_OUT_OF_SCOPE/,
     );
-    await sandbox.rejectCurrentSource({ episodes: ["MOVIE"], fileIds: [video], reason: "x" });
-    await sandbox.rejectCurrentSource({ episodes: [], fileIds: [video], reason: "x" });
+    await sandbox.rejectCurrentSource({ rejections: [{ episode: "MOVIE", fileIds: [video] }], reason: "x" });
+    await sandbox.rejectCurrentSource({ rejections: [{ fileIds: [video] }], reason: "x" });
     await expect(sandbox.reportReplacement({ results: [{ episode: "S01E01", outcome: "not_found", note: "" }] })).rejects.toThrow(
       /SANDBOX_EPISODE_OUT_OF_SCOPE/,
     );
@@ -1249,7 +1324,7 @@ describe("TaskSandbox — replace (movie: the movie dir is also staging)", () =>
 
   it("a succeeded transferUntilLanded candidate counts as landed for reportReplacement", async () => {
     const { sandbox, results, old } = await movieSetup();
-    await sandbox.rejectCurrentSource({ episodes: [], fileIds: [old.find((f) => f.isVideo)!.id], reason: "x" });
+    await sandbox.rejectCurrentSource({ rejections: [{ fileIds: [old.find((f) => f.isVideo)!.id] }], reason: "x" });
     await sandbox.searchResources("film");
     const { landed } = await sandbox.transferUntilLanded({ candidateIds: ["good_share"] });
     const newFilm = landed.find((f) => f.path.endsWith("Film.2023.2160p.REMUX.mkv"))!.id;
@@ -1262,7 +1337,7 @@ describe("TaskSandbox — replace (movie: the movie dir is also staging)", () =>
 
   it("a movie transferCandidate lands straight in the movie dir, so replaced is accepted with no moveToSeason", async () => {
     const { sandbox, results, old } = await movieSetup();
-    await sandbox.rejectCurrentSource({ episodes: [], fileIds: [old.find((f) => f.isVideo)!.id], reason: "假片" });
+    await sandbox.rejectCurrentSource({ rejections: [{ fileIds: [old.find((f) => f.isVideo)!.id] }], reason: "假片" });
     const snap = (await sandbox.searchResources("film")).snapshot!;
     // A movie's staging IS the movie dir, so the materialized file is already in-target.
     const out = await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "good_share" });
@@ -1276,7 +1351,7 @@ describe("TaskSandbox — replace (movie: the movie dir is also staging)", () =>
   it("a movie replaced must name the NEW film: the old film's id is UNKNOWN (it sits in the same dir)", async () => {
     const { sandbox, results, old } = await movieSetup();
     const oldVideo = old.find((f) => f.isVideo)!.id;
-    await sandbox.rejectCurrentSource({ episodes: [], fileIds: [oldVideo], reason: "假片" });
+    await sandbox.rejectCurrentSource({ rejections: [{ fileIds: [oldVideo] }], reason: "假片" });
     const snap = (await sandbox.searchResources("film")).snapshot!;
     const out = await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "good_share" });
     const [newFilm] = out.attempt.materializedFileIds;
@@ -1291,7 +1366,7 @@ describe("TaskSandbox — replace (movie: the movie dir is also staging)", () =>
 
   it("a new film lifted out of its wrapper by flattenMovie is still found when reported", async () => {
     const { sandbox, results, old } = await movieSetup();
-    await sandbox.rejectCurrentSource({ episodes: [], fileIds: [old.find((f) => f.isVideo)!.id], reason: "假片" });
+    await sandbox.rejectCurrentSource({ rejections: [{ fileIds: [old.find((f) => f.isVideo)!.id] }], reason: "假片" });
     await sandbox.searchResources("film");
     const { landed } = await sandbox.transferUntilLanded({ candidateIds: ["good_share"] });
     const newFilm = landed.find((f) => f.path.endsWith("Film.2023.2160p.REMUX.mkv"))!.id;
@@ -1303,7 +1378,7 @@ describe("TaskSandbox — replace (movie: the movie dir is also staging)", () =>
 
   it("a new film deleted again before the report is recorded not_found", async () => {
     const { sandbox, results, old } = await movieSetup();
-    await sandbox.rejectCurrentSource({ episodes: [], fileIds: [old.find((f) => f.isVideo)!.id], reason: "假片" });
+    await sandbox.rejectCurrentSource({ rejections: [{ fileIds: [old.find((f) => f.isVideo)!.id] }], reason: "假片" });
     const snap = (await sandbox.searchResources("film")).snapshot!;
     const [newFilm] = (await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "good_share" })).attempt.materializedFileIds;
     await sandbox.deleteFiles({ directory: "staging", fileIds: [newFilm!] });
@@ -1319,7 +1394,7 @@ describe("TaskSandbox — replace (movie: the movie dir is also staging)", () =>
 
   it("the new film reported as the replacement cannot be deleted afterwards (the movie dir is also staging)", async () => {
     const { sandbox, old } = await movieSetup();
-    await sandbox.rejectCurrentSource({ episodes: [], fileIds: [old.find((f) => f.isVideo)!.id], reason: "假片" });
+    await sandbox.rejectCurrentSource({ rejections: [{ fileIds: [old.find((f) => f.isVideo)!.id] }], reason: "假片" });
     const snap = (await sandbox.searchResources("film")).snapshot!;
     const [newFilm] = (await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "good_share" })).attempt.materializedFileIds;
     await sandbox.markObtained({ codes: ["MOVIE"] });
@@ -1332,7 +1407,7 @@ describe("TaskSandbox — replace (movie: the movie dir is also staging)", () =>
   it("the old (rejected) film sitting in the movie dir is no transfer evidence for the content-filter recovery; an attempted transfer is", async () => {
     const { sandbox, old } = await movieSetup();
     expect(await sandbox.hasTransferEvidence()).toBe(false);
-    await sandbox.rejectCurrentSource({ episodes: [], fileIds: [old.find((f) => f.isVideo)!.id], reason: "假片" });
+    await sandbox.rejectCurrentSource({ rejections: [{ fileIds: [old.find((f) => f.isVideo)!.id] }], reason: "假片" });
     const snap = (await sandbox.searchResources("film")).snapshot!;
     await sandbox.transferCandidate({ snapshotId: snap.id, candidateId: "good_share" });
     expect(await sandbox.hasTransferEvidence()).toBe(true);
@@ -1401,7 +1476,7 @@ describe("TaskSandbox — replace: the transfer-time rejection check behind the 
     });
     await sandbox.captureProtectedFiles();
     const old = (await storage.listTree({ directoryId: movieDir }))[0]!;
-    await sandbox.rejectCurrentSource({ episodes: [], fileIds: [old.id], reason: "假片" });
+    await sandbox.rejectCurrentSource({ rejections: [{ fileIds: [old.id] }], reason: "假片" });
     return { sandbox, seen };
   }
 

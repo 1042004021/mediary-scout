@@ -458,13 +458,14 @@ describe("user request block", () => {
     const text = userRequestBlock({ userRequests: base });
     expect(text.indexOf("<user_requests>")).toBe(text.indexOf("\n<user_requests>\n") + 1);
     expect(text).toMatch(/reject the current file of EVERY requested episode \(for a TV work list them all/);
-    expect(text).toMatch(/episodes \[\] is only for a movie/);
-    expect(text).toMatch(/For an episode with no file in the library, call rejectCurrentSource with that episode and fileIds \[\]/);
+    expect(text).toMatch(/rejectCurrentSource\(\{ rejections: \[\{ episode: "S01E13", fileIds: \["<id of E13's file>"\] \}, \{ episode: "S01E24", fileIds: \["<id>"\] \}\], reason \}\)/);
+    expect(text).toMatch(/a movie is one group with episode omitted, e\.g\. rejectCurrentSource\(\{ rejections: \[\{ fileIds: \[\.\.\.\] \}\], reason \}\)/);
+    expect(text).toMatch(/For an episode with no file in the library, that group's fileIds is \[\]/);
   });
   it("asks a TV work to read the episodes of an untagged message from its words in the first step, and says finish waits for it", () => {
     const text = userRequestBlock({ userRequests: base });
     expect(text).toContain(
-      "- A TV message without [episodes: …] tags still means particular episodes: work out from its words which ones, and call rejectCurrentSource for them right after inspectTargetDir, in that FIRST STEP (fileIds [] for an episode with no file). finish is refused until you have done so at least once in this run — the episodes already requested (tagged, or still waiting from earlier requests) do not count.",
+      "- A TV message without [episodes: …] tags still means particular episodes: work out from its words which ones, and call rejectCurrentSource for them right after inspectTargetDir, in that FIRST STEP (a group with fileIds: [] for an episode with no file). finish is refused until you have done so at least once in this run — the episodes already requested (tagged, or still waiting from earlier requests) do not count.",
     );
     // A rule, not user data: above the fence.
     expect(text.indexOf("A TV message without")).toBeLessThan(text.indexOf("\n<user_requests>\n"));
@@ -529,9 +530,9 @@ describe("replace tools registration", () => {
     } as unknown as TaskSandbox;
     const tools = buildSandboxToolSet(fake) as Record<string, ExecutableTool>;
     await expect(
-      tools.rejectCurrentSource!.execute({ episodes: ["S01E13"], fileIds: ["f1"], reason: "发蓝" }, {}),
+      tools.rejectCurrentSource!.execute({ rejections: [{ episode: "S01E13", fileIds: ["f1"] }], reason: "发蓝" }, {}),
     ).resolves.toEqual({ rejected: 1 });
-    expect(calls).toEqual([["reject", { episodes: ["S01E13"], fileIds: ["f1"], reason: "发蓝" }]]);
+    expect(calls).toEqual([["reject", { rejections: [{ episode: "S01E13", fileIds: ["f1"] }], reason: "发蓝" }]]);
     // A guard refusal comes back as evidence, not a crash.
     await expect(
       tools.reportReplacement!.execute({ results: [{ episode: "S01E13", outcome: "replaced", candidateId: "c", fileIds: ["f2"], note: "" }] }, {}),
@@ -553,7 +554,7 @@ describe("replace tools registration", () => {
     ) as Record<string, DescribedTool>;
     expect(replace.finish?.description).toContain("refused until every requested episode has a reportReplacement");
     expect(replace.finish?.description).toContain(
-      "for a message that names no episode, until you have worked out from its words which episode(s) the user means and passed them to rejectCurrentSource (fileIds [] for an episode with no file)",
+      "for a message that names no episode, until you have worked out from its words which episode(s) the user means and passed them to rejectCurrentSource (a group with fileIds: [] for an episode with no file)",
     );
     expect(plain.finish?.description).not.toContain("names no episode");
   });

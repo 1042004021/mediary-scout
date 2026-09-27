@@ -213,7 +213,7 @@ export function buildSandboxToolSet(
         "Declare the task done. Returns the honest coverage summary (what is obtained, what remains). TERMINAL: a successful finish ENDS the task immediately — do all clean-up BEFORE calling it, and never call it twice." +
         // `?.` like the replace tools below: partial test doubles typed as TaskSandbox.
         (sandbox.hasReplace?.()
-          ? " User request run: refused until every requested episode has a reportReplacement — and, for a message that names no episode, until you have worked out from its words which episode(s) the user means and passed them to rejectCurrentSource (fileIds [] for an episode with no file)."
+          ? " User request run: refused until every requested episode has a reportReplacement — and, for a message that names no episode, until you have worked out from its words which episode(s) the user means and passed them to rejectCurrentSource (a group with fileIds: [] for an episode with no file)."
           : ""),
       inputSchema: z.object({}),
       execute: () => asEvidence(() => sandbox.declareFinish()),
@@ -238,9 +238,12 @@ export function buildSandboxToolSet(
   if (sandbox.hasReplace?.()) {
     tools["rejectCurrentSource"] = {
       description:
-        "User request run only. Reject the CURRENT file(s) of the episodes the user complained about: pass the episode codes (movie: []) and the fileIds you saw in inspectTargetDir. The system records name+size (+link when known) and from then on hides every copy of it from your searches and refuses to transfer one. The files stay in place — never delete them. Transfers stay refused until EVERY requested episode is rejected; for an episode that has no file in the library, call this with that episode and fileIds [] (nothing is rejected, the episode is just cleared for transfer).",
-      inputSchema: z.object({ episodes: z.array(z.string()), fileIds: z.array(z.string()), reason: z.string() }),
-      execute: (args: { episodes: string[]; fileIds: string[]; reason: string }) =>
+        "User request run only. Reject the CURRENT file(s) of the episodes the user complained about, one group per episode: rejectCurrentSource({ rejections: [{ episode: \"S01E13\", fileIds: [\"<id of E13's file>\"] }, { episode: \"S01E24\", fileIds: [\"<id>\"] }], reason }) — each fileIds list is THAT episode's ids from inspectTargetDir. A movie is one group with episode omitted or \"MOVIE\": rejectCurrentSource({ rejections: [{ fileIds: [...] }], reason }). The system records name+size (+link when known) of each video (a subtitle beside a video is left in place but not recorded; a group with no video still records its files) and from then on hides every copy of it from your searches and refuses to transfer one. The files stay in place — never delete them. Transfers stay refused until EVERY requested episode is rejected; for an episode that has no file in the library, that group's fileIds is [] (nothing is rejected, the episode is just cleared for transfer).",
+      inputSchema: z.object({
+        rejections: z.array(z.object({ episode: z.string().optional(), fileIds: z.array(z.string()) })),
+        reason: z.string(),
+      }),
+      execute: (args: { rejections: Array<{ episode?: string; fileIds: string[] }>; reason: string }) =>
         asEvidence(() => sandbox.rejectCurrentSource(args)),
     };
     tools["reportReplacement"] = {

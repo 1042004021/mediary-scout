@@ -291,7 +291,7 @@ describe("runAcquisitionV2Workflow — user request (replace_request run)", () =
         if (seen.calls === 1) {
           seen.system = JSON.stringify(options.prompt.find((m) => m.role === "system") ?? "");
           seen.tools = (options.tools ?? []).map((t) => t.name);
-          return tool("rejectCurrentSource", { episodes: ["S01E13"], fileIds: ["old13"], reason: "发蓝" });
+          return tool("rejectCurrentSource", { rejections: [{ episode: "S01E13", fileIds: ["old13"] }], reason: "发蓝" });
         }
         if (seen.calls === 2) return tool("reportReplacement", { results: [{ episode: "S01E13", outcome: "not_found", note: "只找到同一版本" }] });
         return { content: [{ type: "text" as const, text: "done" }], finishReason: { unified: "stop" as const, raw: "stop" as const }, usage: USAGE, warnings: [] };
@@ -371,9 +371,9 @@ describe("runAcquisitionV2Workflow — user request (replace_request run)", () =
     const model = new MockLanguageModelV3({
       doGenerate: async () => {
         calls += 1;
-        if (calls === 1) return tool("rejectCurrentSource", { episodes: ["S01E13"], fileIds: ["old13"], reason: "发蓝" });
+        if (calls === 1) return tool("rejectCurrentSource", { rejections: [{ episode: "S01E13", fileIds: ["old13"] }], reason: "发蓝" });
         // E24 was never obtained — no file to reject, declared instead.
-        if (calls === 2) return tool("rejectCurrentSource", { episodes: ["S01E24"], fileIds: [], reason: "24 也要" });
+        if (calls === 2) return tool("rejectCurrentSource", { rejections: [{ episode: "S01E24", fileIds: [] }], reason: "24 也要" });
         // The raw pre-search is the first snapshot the agent sees (s1).
         if (calls === 3) return tool("transferCandidate", { snapshotId: "s1", candidateId: "s1-1" });
         if (calls === 4) return tool("moveToSeason", { moves: [{ season: 1, fileIds: ["new13"] }] });
