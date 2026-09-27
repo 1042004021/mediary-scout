@@ -3,7 +3,6 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { CheckCircle2, ChevronDown, ChevronRight, Clock3, Loader2, RotateCcw, TriangleAlert, X } from "lucide-react";
-import type { WorkflowKind } from "@media-track/workflow";
 import { showHref } from "@media-track/workflow/scope";
 import type {
   ActivityActiveRun,
@@ -11,6 +10,10 @@ import type {
   ActivityView,
   RetryRefusalReason,
 } from "../lib/activity-view";
+// The run kind via the view type, NOT the workflow root barrel: the barrel `export *`s
+// ./postgres.js (pg), and a type-only barrel import can drag pg into this client bundle
+// (see request-track-button.tsx).
+type RunKind = ActivityActiveRun["kind"];
 import { activeRunLabel } from "../lib/activity-season-label";
 import { isDemoModeClient } from "../lib/demo-mode";
 import { demoCompletedItems, demoInProgressActivityItems } from "../lib/demo-session";
@@ -313,13 +316,13 @@ function RetryButton({ runId, title }: { runId: string; title: string }) {
  *  library with it; a replace run only drops this attempt — the library stays, and the
  *  swap waits for the next patrol (a patrol-queued replace run may carry only 待换
  *  episodes and no message, so the note speaks of the swap). */
-export function cancelCopy(kind: WorkflowKind): { action: string; confirm: string; note: string | null } {
+export function cancelCopy(kind: RunKind): { action: string; confirm: string; note: string | null } {
   return kind === "replace_request"
     ? { action: "取消这次换源", confirm: "取消这次换源", note: "等下次巡检再换" }
     : { action: "取消获取", confirm: "取消并移出", note: null };
 }
 
-function CancelButton({ runId, title, kind }: { runId: string; title: string; kind: WorkflowKind }) {
+function CancelButton({ runId, title, kind }: { runId: string; title: string; kind: RunKind }) {
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
   const copy = cancelCopy(kind);

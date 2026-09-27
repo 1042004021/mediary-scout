@@ -5,7 +5,10 @@
  * Design: docs/superpowers/specs/2026-09-26-user-message-replace-design.md · pixel standard:
  * docs/superpowers/design/2026-09-26-user-message-mockup.html.
  */
-import type { PendingReplacement, UserMessage, UserMessageReply } from "@media-track/workflow";
+// The narrow subpath, NOT the root barrel: client components import this module, and
+// the barrel `export *`s ./postgres.js (pg) — see request-track-button.tsx. user-requests
+// has no imports at all, so nothing can carry pg in.
+import type { PendingReplacement, UserMessage, UserMessageReply } from "@media-track/workflow/user-requests";
 import { relativeDayLabel } from "./relative-day";
 
 /** What the card gets of each message. */

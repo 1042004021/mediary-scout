@@ -136,8 +136,6 @@ const SHOW_EPISODE_CODE = /^S(\d{2,})E\d{2,}$/;
 const MESSAGE_ID = /^msg_[\w-]{1,80}$/;
 /** A time as the store writes it (toISOString), or with an offset instead of Z. */
 const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
-/** How far a row's time may run ahead of this server's clock (another process wrote it). */
-const ROW_CLOCK_SKEW_MS = 5 * 60_000;
 
 /** The rows as they will be written back, or null when any is malformed or not this kind
  *  of work's episode. Checked before any lookup. */
@@ -173,7 +171,9 @@ export async function pendingRowsFitWork(input: {
   const seasons = new Set(
     states.filter((s) => s.title.id === work.titleKey && userMessageDrive(s.connectedStorageId) === work.drive).map((s) => s.season.seasonNumber),
   );
-  const latest = input.now.getTime() + ROW_CLOCK_SKEW_MS;
+  // The rows come back from this same server (web and worker share its clock), written
+  // in the past — a time later than now is forged.
+  const latest = input.now.getTime();
   const isEpisode = (episode: string) => {
     if (input.mediaType === "movie") return episode === "MOVIE";
     const code = SHOW_EPISODE_CODE.exec(episode);

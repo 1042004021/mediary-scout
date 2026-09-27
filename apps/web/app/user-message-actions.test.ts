@@ -414,20 +414,20 @@ describe("user message actions", () => {
     expect(await repo.listPendingReplacements(primaryWork)).toEqual([]);
   });
 
-  it("撤销 refuses a time later than now, beyond a few minutes of clock skew", async () => {
+  it("撤销 refuses a time later than now: the rows it restores were written in the past by this same server", async () => {
     await track(repo, "acct_default", "cs_primary");
     const m = await repo.createUserMessage({ ...primaryWork, body: "换", episodeTags: [], now: NOW });
     const later = (minutes: number) => new Date(Date.now() + minutes * 60_000).toISOString();
 
     expect(await actions.restoreEpisodesToPendingAction({ ...onPrimary, episodes: [{ episode: "S01E01", messageId: m.id, requestedAt: later(10) }] })).toEqual(mismatch);
+    expect(await actions.restoreEpisodesToPendingAction({ ...onPrimary, episodes: [{ episode: "S01E01", messageId: m.id, requestedAt: later(2) }] })).toEqual(mismatch);
     expect(await repo.listPendingReplacements(primaryWork)).toEqual([]);
 
-    // The server's clock and the one that wrote the row may differ a little.
-    const skewed = later(2);
-    expect(await actions.restoreEpisodesToPendingAction({ ...onPrimary, episodes: [{ episode: "S01E01", messageId: m.id, requestedAt: skewed }] })).toEqual({
+    const earlier = new Date(Date.now() - 60_000).toISOString();
+    expect(await actions.restoreEpisodesToPendingAction({ ...onPrimary, episodes: [{ episode: "S01E01", messageId: m.id, requestedAt: earlier }] })).toEqual({
       success: true,
     });
-    expect(await repo.listPendingReplacements(primaryWork)).toMatchObject([{ episode: "S01E01", messageId: m.id, requestedAt: skewed }]);
+    expect(await repo.listPendingReplacements(primaryWork)).toMatchObject([{ episode: "S01E01", messageId: m.id, requestedAt: earlier }]);
   });
 
   it("one row that does not fit refuses the whole call: the others are not written either", async () => {
