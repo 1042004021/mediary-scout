@@ -11,6 +11,11 @@ import { relativeDayLabel } from "./relative-day";
 /** What the card gets of each message. */
 export type ThreadMessage = Pick<UserMessage, "id" | "body" | "episodeTags" | "status" | "urgent" | "createdAt" | "processedAt" | "reply">;
 
+/** Why 「不换了」 waits while a replace run of the work is processing: the run's end-of-run
+ *  bookkeeping would put the episode back as 待换 and silently undo the choice. The card's
+ *  disabled button says it, and keepEpisodesAsIsAction answers it when the page was stale. */
+export const KEEP_BUSY_HINT = "处理中，完了再操作";
+
 /** A 待换 row as the card gets it: what 撤销 after 「不换了」 puts back (same message,
  *  same time — the episode is not re-requested). */
 export type PendingRow = Pick<PendingReplacement, "episode" | "messageId" | "requestedAt">;
@@ -259,6 +264,28 @@ export function editorAfterRefresh(
   const typed = { body: editing.body.trim(), tags: editing.tags };
   const changed = !sameWords(typed, editing.original);
   return { kind: message ? "taken" : "gone", typed: changed ? { body: editing.body, tags: editing.tags } : null };
+}
+
+const MOVED_TO_COMPOSER = "改过的内容挪到了输入框里，可以再发一条";
+
+/** The card's line when an editor closed on its own ("taken" / "gone"): why, and where the
+ *  words typed went when there were any. Null when it stays or was closed as asked. */
+export function editorNotice(verdict: EditorVerdict): string | null {
+  if (verdict.kind === "keep" || verdict.kind === "close") return null;
+  const why = verdict.kind === "taken" ? "agent 已经开始处理这条留言了" : "这条留言已经撤回了";
+  return verdict.typed ? `${why}。${MOVED_TO_COMPOSER}` : why;
+}
+
+/** How long a saved editor waits, disabled, for the fresh render that carries its new
+ *  words before it gives the editor back (the refresh was slow, or lost). */
+export const EDIT_SETTLE_MS = 8000;
+
+/** EDIT_SETTLE_MS after 保存 on message `id`, and still no render with the new words: the
+ *  editor is editable again, on the words as stored — from then on an ordinary editor, not
+ *  one stuck disabled. Any other state is returned as it is. */
+export function editorAfterSettleTimeout(editing: EditingMessage | null, id: string): EditingMessage | null {
+  if (!editing || editing.id !== id || !editing.saved) return editing;
+  return { ...editing, original: editing.saved, saved: null };
 }
 
 /** Words from an editor that closed on its own join the composer: they fill an empty

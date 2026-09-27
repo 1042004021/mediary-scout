@@ -18,7 +18,7 @@ function answer() {
 const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
 /** The card around the module: what the page draws, the toast, the error line, the
- *  calls to the two actions, and a clock the test moves by hand. */
+ *  calls to the two actions, where the focus is sent, and a clock the test moves by hand. */
 function harness() {
   const kept = new Set<string>();
   const log: string[] = [];
@@ -27,6 +27,9 @@ function harness() {
   let refreshes = 0;
   const commits: Array<{ episodes: string[]; settle: (message: string | null) => void }> = [];
   const restores: Array<{ rows: PendingRow[]; settle: (message: string | null) => void }> = [];
+  /** Each returnFocus: where to, and whether those rows were drawn 待换 again by then (so
+   *  their 不换了 is on the page to take the focus). */
+  const focus: Array<{ to: string[] | null; rowsBack: boolean }> = [];
   const timers = new Map<number, { fn: () => void; at: number }>();
   let now = 0;
   let nextTimer = 1;
@@ -54,6 +57,9 @@ function harness() {
     refresh: () => {
       refreshes += 1;
     },
+    returnFocus: (episodes) => {
+      focus.push({ to: episodes, rowsBack: episodes !== null && episodes.every((e) => !kept.has(e)) });
+    },
     undoMs: 6000,
     setTimer: (fn, ms) => {
       const id = nextTimer++;
@@ -79,6 +85,7 @@ function harness() {
     log,
     commits,
     restores,
+    focus,
     advance,
     get toast() {
       return toast;
@@ -273,5 +280,97 @@ describe("不换了 and its 撤销 (C10: save at once, undo restores)", () => {
     const h = harness();
     expect(h.keeper.keep({ rows: [], text: "t", busy: false })).toBe(false);
     expect(h.log).toEqual([]);
+  });
+});
+
+// 不换了 moves the focus to 撤销 on the toast; when the toast goes, that button goes with it
+// and the focus would drop to <body>. The keeper says where it should go instead.
+describe("the focus once the undo toast is gone", () => {
+  it("the toast closing on its own sends it to the card: the kept row has no 不换了 any more", async () => {
+    const h = harness();
+    h.keeper.keep({ rows: [E24], text: "t", busy: false });
+    h.commits[0]!.settle(null);
+    await flush();
+    expect(h.focus).toEqual([]);
+
+    h.advance(6000);
+
+    expect(h.focus).toEqual([{ to: null, rowsBack: false }]);
+  });
+
+  it("撤销 sends it to the card at once, then to the row's 不换了 once the row is 待换 again", async () => {
+    const h = harness();
+    h.keeper.keep({ rows: [E24], text: "t", busy: false });
+    h.commits[0]!.settle(null);
+    await flush();
+
+    const undone = h.keeper.undo();
+    expect(h.focus).toEqual([{ to: null, rowsBack: false }]);
+    await flush();
+    h.restores[0]!.settle(null);
+    await undone;
+
+    expect(h.focus).toEqual([
+      { to: null, rowsBack: false },
+      { to: ["S01E24"], rowsBack: true },
+    ]);
+  });
+
+  it("an undo that fails leaves it on the card: the episode stays kept, no 不换了 comes back", async () => {
+    const h = harness();
+    h.keeper.keep({ rows: [E24], text: "t", busy: false });
+    h.commits[0]!.settle(null);
+    await flush();
+
+    const undone = h.keeper.undo();
+    await flush();
+    h.restores[0]!.settle("撤销没成功，先按不换了算。还想换就再留一条");
+    await undone;
+
+    expect(h.focus).toEqual([{ to: null, rowsBack: false }]);
+  });
+
+  it("a keep that fails to save sends it to the row's 不换了, which is back — even after the toast timed out", async () => {
+    const h = harness();
+    h.keeper.keep({ rows: [E24], text: "t", busy: false });
+    h.commits[0]!.settle("「不换了」没保存上，再点一次试试");
+    await flush();
+    expect(h.focus).toEqual([{ to: ["S01E24"], rowsBack: true }]);
+
+    // A save slower than the window: the card first, the row once the save has failed.
+    const slow = harness();
+    slow.keeper.keep({ rows: [E13], text: "t", busy: false });
+    slow.advance(6000);
+    slow.commits[0]!.settle("「不换了」没保存上，再点一次试试");
+    await flush();
+    expect(slow.focus).toEqual([
+      { to: null, rowsBack: false },
+      { to: ["S01E13"], rowsBack: true },
+    ]);
+  });
+
+  it("撤销 while a failing save is in flight: the card, then the row once it is 待换 again", async () => {
+    const h = harness();
+    h.keeper.keep({ rows: [E24], text: "t", busy: false });
+
+    const undone = h.keeper.undo();
+    h.commits[0]!.settle("「不换了」没保存上，再点一次试试");
+    await undone;
+
+    expect(h.focus).toEqual([
+      { to: null, rowsBack: false },
+      { to: ["S01E24"], rowsBack: true },
+    ]);
+  });
+
+  it("a second 不换了 sends it nowhere: the new toast's 撤销 takes it", async () => {
+    const h = harness();
+    h.keeper.keep({ rows: [E24], text: "first", busy: false });
+    h.commits[0]!.settle(null);
+    await flush();
+
+    h.keeper.keep({ rows: [E13], text: "second", busy: false });
+
+    expect(h.focus).toEqual([]);
   });
 });

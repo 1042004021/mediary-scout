@@ -22,11 +22,15 @@ import { relativeDayLabel } from "../lib/relative-day";
 import { runAction } from "../lib/run-action";
 import type { MessageRunView, MessageThreadView } from "../lib/user-message-server";
 import {
+  EDIT_SETTLE_MS,
+  KEEP_BUSY_HINT,
   answeredMeta,
   appendChipText,
   composerPlaceholder,
   draftIsSendable,
   editorAfterRefresh,
+  editorAfterSettleTimeout,
+  editorNotice,
   episodeLabel,
   groupEpisodesBySeason,
   isMultiSeason,
@@ -53,12 +57,7 @@ const COPIED_MS = 2500;
 /** USER_MESSAGE_LIMITS.bodyMax — the card cannot import the workflow package; the
  *  server validates the same limit. */
 const BODY_MAX = 500;
-/** Why 「不换了」 waits while a replace run of the work is processing: the run's end-of-run
- *  bookkeeping would put the episode back as 待换 and silently undo the choice. */
-const KEEP_BUSY_HINT = "处理中，完了再操作";
 const MISSED_EPISODES_HINT = "没看出是哪几集——用「选集数」标出来，再发一次";
-const EDIT_TAKEN = "agent 已经开始处理这条留言了";
-const EDIT_TAKEN_MOVED = "agent 已经开始处理这条留言了。改过的内容挪到了输入框里，可以再发一条";
 
 /** The common ways to say what is wrong (mockup ②): the chip, and what it adds to the draft. */
 const CHIPS = [
@@ -131,6 +130,17 @@ function ThreadForOneWork({ work, view, run, nextPatrol, episodes, now }: UserMe
   // 不换了 and its undo. The episodes are shared with the page (the 待换 cells, the badge).
   const { kept, add: keepOnPage, remove: unkeepOnPage } = useSwapKeep();
   const [toast, setToast] = useState<KeepToast | null>(null);
+  // Where the focus goes once the toast is gone (its 撤销 may hold it, and a vanished button
+  // drops it to <body>): see returnFocus below.
+  const toastRowRef = useRef<HTMLDivElement>(null);
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const sectionRef = useRef<HTMLElement>(null);
+  const movieBarRef = useRef<HTMLDivElement>(null);
+  /** Where the card last put the focus while waiting for the rows' 不换了 to come back. */
+  const focusParked = useRef<HTMLElement | null>(null);
+  /** Asked for by the keeper, done after the next commit (when the page draws the rows). */
+  const focusWanted = useRef<{ episodes: string[] | null } | null>(null);
+  const [focusTick, setFocusTick] = useState(0);
   // Saved at once; 撤销 puts the rows back (lib/keep-undo.ts). Nothing waits for the page
   // to go away: a send from an unmounting page posted to the next route and was lost.
   const [keeper] = useState(() =>
@@ -142,6 +152,18 @@ function ThreadForOneWork({ work, view, run, nextPatrol, episodes, now }: UserMe
       toast: setToast,
       error: setError,
       refresh: () => router.refresh(),
+      // Only a focus that is still ours to move: on the toast (going now), where the card
+      // parked it, or lost to <body> while the card is on screen (Safari does not focus a
+      // clicked button). Not one the user took elsewhere, nor on a page the router hid.
+      returnFocus: (list) => {
+        const active = document.activeElement;
+        const onScreen = (sectionRef.current?.getClientRects().length ?? 0) > 0;
+        const lost = !active || active === document.body;
+        const ours = toastRowRef.current?.contains(active) || active === focusParked.current || (lost && onScreen);
+        if (!ours) return;
+        focusWanted.current = { episodes: list };
+        setFocusTick((n) => n + 1);
+      },
       undoMs: UNDO_MS,
       setTimer: (fn, ms) => setTimeout(fn, ms),
       clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
@@ -194,16 +216,28 @@ function ThreadForOneWork({ work, view, run, nextPatrol, episodes, now }: UserMe
     if (verdict.kind === "keep") return;
     setEditing(null);
     if (verdict.kind === "close") return;
-    // A run took the message (or it left the thread) while its editor was open: what was
-    // typed is not dropped — it moves into the composer.
+    // A run took the message, or it was withdrawn elsewhere, while its editor was open: what
+    // was typed is not dropped — it moves into the composer, and the card says why.
     const typed = verdict.typed;
     if (typed) {
       setDraft((cur) => mergeIntoComposer({ draft: cur, tags: [] }, typed).draft);
       setTags((cur) => mergeIntoComposer({ draft: "", tags: cur }, typed).tags);
     }
-    if (verdict.kind === "taken") setError(typed ? EDIT_TAKEN_MOVED : EDIT_TAKEN);
+    setError(editorNotice(verdict));
     // `editing` is read as of the render that brought this view: only a new view re-runs this.
   }, [view, keeper]);
+
+  // Saved, but the fresh render with the new words is late (a slow or lost refresh): after a
+  // while the editor is given back instead of staying disabled, and the render asked again.
+  const settlingId = editing?.saved ? editing.id : null;
+  useEffect(() => {
+    if (!settlingId) return;
+    const timer = setTimeout(() => {
+      setEditing((cur) => editorAfterSettleTimeout(cur, settlingId));
+      router.refresh();
+    }, EDIT_SETTLE_MS);
+    return () => clearTimeout(timer);
+  }, [settlingId, router]);
 
   // The 不换了 button just went away with its row state: 撤销 takes the focus.
   useEffect(() => {
@@ -212,6 +246,21 @@ function ThreadForOneWork({ work, view, run, nextPatrol, episodes, now }: UserMe
       undoRef.current?.focus({ preventScroll: true });
     }
   }, [toast]);
+
+  // The toast is gone or the rows came back (keeper.returnFocus): the rows' 不换了 when one
+  // is there to take the focus, else the card's heading (the composer when there is none).
+  useEffect(() => {
+    const wanted = focusWanted.current;
+    if (!wanted) return;
+    focusWanted.current = null;
+    const button = wanted.episodes ? keepButtonFor([movieBarRef.current, sectionRef.current], wanted.episodes) : null;
+    const target = button ?? headingRef.current ?? textareaRef.current;
+    if (!target) return;
+    target.focus({ preventScroll: true });
+    // Parked on the heading: a 撤销 still in flight moves it on to the row's 不换了 once
+    // the row is 待换 again. Never parked in the composer: the user may be typing there.
+    focusParked.current = !button && target === headingRef.current ? target : null;
+  }, [focusTick]);
 
   const send = () => {
     if (!draftIsSendable(draft) || sending) return;
@@ -508,13 +557,14 @@ function ThreadForOneWork({ work, view, run, nextPatrol, episodes, now }: UserMe
   return (
     <>
       {movie && pending.has("MOVIE") ? (
-        <div className="um-movie-state">
+        <div className="um-movie-state" ref={movieBarRef}>
           <span>
             <b>还在找别的版本。</b>现在这份先留着，之后每次巡检都会接着找。
           </span>
           <button
             type="button"
             className="um-btn is-outline"
+            data-keep-episode="MOVIE"
             onClick={() => keep(["MOVIE"])}
             disabled={keepBusy}
             title={keepBusy ? KEEP_BUSY_HINT : undefined}
@@ -530,10 +580,13 @@ function ThreadForOneWork({ work, view, run, nextPatrol, episodes, now }: UserMe
           {KEEP_BUSY_HINT}
         </span>
       ) : null}
-      <section className="um-thread" aria-label="给 agent 的留言">
+      <section className="um-thread" aria-label="给 agent 的留言" ref={sectionRef}>
         {view.messages.length > 0 ? (
           <div className="um-thread-head">
-            <h3>给 agent 的留言</h3>
+            {/* Focusable from script only: where the focus lands when the undo toast goes. */}
+            <h3 ref={headingRef} tabIndex={-1}>
+              给 agent 的留言
+            </h3>
             {meta ? <span className="um-meta">{meta}</span> : null}
           </div>
         ) : null}
@@ -639,7 +692,7 @@ function ThreadForOneWork({ work, view, run, nextPatrol, episodes, now }: UserMe
           card is its own stacking context). Hidden with the page when the router keeps it. */}
       {mounted
         ? createPortal(
-            <div className="um-toast-row" role="status" aria-live="polite">
+            <div className="um-toast-row" role="status" aria-live="polite" ref={toastRowRef}>
               {toast ? (
                 <div className="um-toast" key={toast.id}>
                   <span>{toast.text}</span>
@@ -654,6 +707,17 @@ function ThreadForOneWork({ work, view, run, nextPatrol, episodes, now }: UserMe
         : null}
     </>
   );
+}
+
+/** The 不换了 of one of these episodes that can take the focus: enabled, and laid out (not
+ *  in a folded 「之前的留言」). The first in page order — the latest reply's. */
+function keepButtonFor(roots: Array<HTMLElement | null>, episodes: string[]): HTMLButtonElement | null {
+  for (const root of roots) {
+    for (const button of root?.querySelectorAll<HTMLButtonElement>("button[data-keep-episode]") ?? []) {
+      if (episodes.includes(button.dataset.keepEpisode ?? "") && !button.disabled && button.getClientRects().length > 0) return button;
+    }
+  }
+  return null;
 }
 
 /** The reply as a track list (集 / 这次用的资源 / 大小 / 结果). `keepBlockedBy`: the id of the
@@ -710,6 +774,7 @@ function Tracks({
                   <button
                     type="button"
                     className="um-keep"
+                    data-keep-episode={row.episode}
                     onClick={() => onKeep([row.episode])}
                     aria-label={`${row.label} 不换了`}
                     disabled={keepBlockedBy !== null}

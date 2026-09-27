@@ -11,6 +11,13 @@
  * the reply row) through hide/show; once the undo window is over, the next fresh server
  * render takes over. No refresh is asked for while 撤销 is still possible: the page
  * already shows the keep, and a refresh landing after a quick 撤销 would flash it back.
+ *
+ * One gap is left, knowingly (review C10, Minor 1): 撤销 waits for the keep's save to land
+ * before it sends the restore — the delete must never land last. Pressed while that save
+ * is still in flight and followed at once by leaving the page, the restore then goes out
+ * after the navigation: Next forwards the action to the new route, where it fails. The
+ * card says so honestly (KEEP_UNDO_FAILED, seen on coming back to the page) and the
+ * episode stays kept, as the server has it — nothing is lost without a word.
  * Design: docs/superpowers/specs/2026-09-26-user-message-replace-design.md §6.
  */
 import type { PendingRow } from "./user-message-state";
@@ -33,6 +40,10 @@ export interface KeepUndoDeps {
   error(message: string | null): void;
   /** Ask for a fresh server render (router.refresh). */
   refresh(): void;
+  /** The toast went away (its 撤销 may have held the focus) or the rows came back: send the
+   *  focus to the rows' 不换了 when they are 待换 again (`episodes`), else to the card (null).
+   *  The card moves it only while the focus is still where the toast or it left it. */
+  returnFocus(episodes: string[] | null): void;
   undoMs: number;
   setTimer(fn: () => void, ms: number): unknown;
   clearTimer(handle: unknown): void;
@@ -79,8 +90,10 @@ export function createKeepUndo(deps: KeepUndoDeps): KeepUndo {
     deps.refresh();
   };
 
-  const closeWindow = (k: Keep) => {
-    if (!k.open) return;
+  /** Ends k's undo window; true when it was open (its toast was on screen until now —
+   *  only the open keep is `current`). */
+  const closeWindow = (k: Keep): boolean => {
+    if (!k.open) return false;
     k.open = false;
     deps.clearTimer(k.timer);
     if (current === k) {
@@ -88,12 +101,14 @@ export function createKeepUndo(deps: KeepUndoDeps): KeepUndo {
       deps.toast(null);
     }
     if (k.saved === true && !k.undone) settle(k);
+    return true;
   };
 
   return {
     keep({ rows, text, busy }) {
       if (busy || rows.length === 0) return false;
       // One undo at a time: a second 不换了 ends the first one's window (it stays saved).
+      // The focus stays put: the new toast's 撤销 takes it.
       if (current) closeWindow(current);
       const episodes = rows.map((r) => r.episode);
       const k: Keep = {
@@ -110,7 +125,10 @@ export function createKeepUndo(deps: KeepUndoDeps): KeepUndo {
       deps.error(null);
       deps.hide(episodes);
       deps.toast({ id: k.id, episodes, text });
-      k.timer = deps.setTimer(() => closeWindow(k), deps.undoMs);
+      // Timed out: the row stays kept, so it has no 不换了 to go back to.
+      k.timer = deps.setTimer(() => {
+        if (closeWindow(k)) deps.returnFocus(null);
+      }, deps.undoMs);
       void k.answer.then((message) => {
         k.saved = message === null;
         if (message !== null) {
@@ -118,6 +136,7 @@ export function createKeepUndo(deps: KeepUndoDeps): KeepUndo {
           // After 撤销 that is just what was asked for, so no error then.
           closeWindow(k);
           deps.show(episodes);
+          deps.returnFocus(episodes);
           if (!k.undone) deps.error(message);
           return;
         }
@@ -132,11 +151,14 @@ export function createKeepUndo(deps: KeepUndoDeps): KeepUndo {
       if (!k || !k.open) return;
       k.undone = true;
       closeWindow(k);
+      // The card for now; the row's 不换了 once the restore has drawn it 待换 again.
+      deps.returnFocus(null);
       // Never put the rows back before the delete has landed.
       if ((await k.answer) !== null) return;
       const message = await deps.restore(k.rows).catch(() => KEEP_UNDO_FAILED);
       if (message === null) {
         deps.show(k.episodes);
+        deps.returnFocus(k.episodes);
         deps.refresh();
         return;
       }

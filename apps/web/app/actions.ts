@@ -1040,15 +1040,16 @@ interface MessageWorkInput {
   storageId: string | undefined;
 }
 
-/** The caller's work for this title on the page's drive; null when it is not tracked
- *  there. Throws for an unauthenticated caller (→ the action's catch). */
+/** The caller's work for this title on the page's drive (null when it is not tracked
+ *  there), and the page's workspace scope. Throws for an unauthenticated caller (→ the
+ *  action's catch). */
 async function messageWorkFor(input: MessageWorkInput) {
   const { getActiveWorkspaceScope, getWorkflowRepository, requireAuthenticatedAccountId } = await import("../lib/workflow-runtime");
   const { resolveMessageWork } = await import("../lib/user-message-server");
   await requireAuthenticatedAccountId();
   const repo = getWorkflowRepository();
   const scope = await getActiveWorkspaceScope(input.storageId);
-  return { repo, work: await resolveMessageWork({ repo, scope, tmdbId: input.tmdbId, mediaType: input.mediaType }) };
+  return { repo, scope, work: await resolveMessageWork({ repo, scope, tmdbId: input.tmdbId, mediaType: input.mediaType }) };
 }
 
 /** The message as it will be stored (body trimmed), checked before any lookup: the
@@ -1143,18 +1144,25 @@ export async function processMessagesNowAction(
 }
 
 /** 「不换了」: these episodes stay as they are; the patrol stops looking for them. Saved at
- *  once — the card's 撤销 calls restoreEpisodesToPendingAction. */
+ *  once — the card's 撤销 calls restoreEpisodesToPendingAction. Refused while a replace run
+ *  of the work is processing, as the card's button is — checked again here, since the page
+ *  may not have seen the run start. */
 export async function keepEpisodesAsIsAction(
   input: MessageWorkInput & { episodes: string[] },
 ): Promise<PushSettingsActionResult> {
   assertNotDemo();
   try {
     const { USER_MESSAGE_LIMITS } = await import("@media-track/workflow");
-    const { repo, work } = await messageWorkFor(input);
+    const { repo, scope, work } = await messageWorkFor(input);
     if (!work) return { success: false, message: MESSAGE_NOT_TRACKED };
     const { episodes } = input;
     if (!Array.isArray(episodes) || episodes.length > USER_MESSAGE_LIMITS.tagsMax || episodes.some((e) => typeof e !== "string")) {
       return { success: false, message: "集数不对" };
+    }
+    const { keepMustWait } = await import("../lib/user-message-server");
+    if (await keepMustWait({ repo, scope, work })) {
+      const { KEEP_BUSY_HINT } = await import("../lib/user-message-state");
+      return { success: false, message: KEEP_BUSY_HINT };
     }
     await repo.removePendingReplacements({ ...work, episodes });
     return { success: true };
@@ -1170,39 +1178,24 @@ export interface PendingEpisodeInput {
   requestedAt: string;
 }
 
-// The store's episode tag format (validateUserMessageInput): SxxEyy for a show, MOVIE for a film.
-const SHOW_EPISODE = /^S\d{2}E\d{2,4}$/;
-const MESSAGE_ID = /^msg_[\w-]{1,80}$/;
-
-/** The rows as they will be written back, or null when any is malformed or not this
- *  work's kind of episode. Whatever the client sent: checked before any lookup. */
-function checkPendingRows(input: unknown, mediaType: "movie" | "tv", max: number): PendingEpisodeInput[] | null {
-  if (!Array.isArray(input) || input.length === 0 || input.length > max) return null;
-  const rows: PendingEpisodeInput[] = [];
-  for (const row of input as unknown[]) {
-    if (typeof row !== "object" || row === null) return null;
-    const { episode, messageId, requestedAt } = row as Record<string, unknown>;
-    if (typeof episode !== "string" || !(mediaType === "movie" ? episode === "MOVIE" : SHOW_EPISODE.test(episode))) return null;
-    if (typeof messageId !== "string" || !MESSAGE_ID.test(messageId)) return null;
-    if (typeof requestedAt !== "string" || !Number.isFinite(Date.parse(requestedAt))) return null;
-    rows.push({ episode, messageId, requestedAt: new Date(requestedAt).toISOString() });
-  }
-  return rows;
-}
-
 /** 撤销 after 「不换了」: the 待换 rows go back exactly as they were (the message that asked,
  *  and when), so the patrol looks for these episodes again. A row that is somehow still
- *  there is left alone. */
+ *  there is left alone. Only rows this work's own 待换 could have held are taken — its own
+ *  messages, its own episodes, no future time — and one that is not refuses the whole call. */
 export async function restoreEpisodesToPendingAction(
   input: MessageWorkInput & { episodes: PendingEpisodeInput[] },
 ): Promise<PushSettingsActionResult> {
   assertNotDemo();
   try {
     const { USER_MESSAGE_LIMITS } = await import("@media-track/workflow");
-    const rows = checkPendingRows(input.episodes, input.mediaType, USER_MESSAGE_LIMITS.tagsMax);
+    const { parsePendingRows, pendingRowsFitWork } = await import("../lib/user-message-server");
+    const rows = parsePendingRows(input.episodes, input.mediaType, USER_MESSAGE_LIMITS.tagsMax);
     if (!rows) return { success: false, message: "集数不对" };
-    const { repo, work } = await messageWorkFor(input);
+    const { repo, scope, work } = await messageWorkFor(input);
     if (!work) return { success: false, message: MESSAGE_NOT_TRACKED };
+    if (!(await pendingRowsFitWork({ repo, scope, work, mediaType: input.mediaType, rows, now: new Date() }))) {
+      return { success: false, message: "要恢复的集对不上这部作品" };
+    }
     // addPendingReplacements takes one message and one time per call.
     const groups = new Map<string, { messageId: string; requestedAt: string; episodes: string[] }>();
     for (const row of rows) {

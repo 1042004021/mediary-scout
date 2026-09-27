@@ -74,8 +74,13 @@ export async function loadMessageThread(
     })),
     pendingReplacements: pendingRows.map((p) => p.episode),
     pendingRows,
-    busy: messages.some((m) => m.status === "processing"),
+    busy: holdsMessage(messages),
   };
+}
+
+/** A run holds one of these messages right now. */
+function holdsMessage(messages: ReadonlyArray<{ status: string }>): boolean {
+  return messages.some((m) => m.status === "processing");
 }
 
 /** What the work's active run means for its messages. */
@@ -103,6 +108,78 @@ export function messageRunView(
     activity: replaceRunning?.workflowRun.progress?.activity.trim() || null,
     waitsForRun: mine.some((r) => r.workflowRun.kind !== "replace_request" || r.workflowRun.status === "running"),
   };
+}
+
+/**
+ * Whether 「不换了」 must wait, read when it is pressed: the card's keepBusy (a run holds one
+ * of the work's messages, or a replace run of the work is running) worked out the same way
+ * from fresh data. That run's end-of-run bookkeeping would put the episode back as 待换 and
+ * silently undo the choice. The card's gate is only as fresh as its page: a run that started
+ * after the page rendered would slip through it.
+ */
+export async function keepMustWait(input: {
+  repo: Pick<WorkflowRepository, "listUserMessages" | "listActiveWorkflowRuns">;
+  /** The page's workspace scope, as for readTitleMessages. */
+  scope: WorkflowScope;
+  work: UserMessageScope;
+}): Promise<boolean> {
+  const [messages, runs] = await Promise.all([input.repo.listUserMessages(input.work), input.repo.listActiveWorkflowRuns(input.scope)]);
+  return holdsMessage(messages) || messageRunView(runs, input.work).running;
+}
+
+// The 待换 rows 撤销 sends back (restoreEpisodesToPendingAction). The page handed them to the
+// card, but the call comes from the client like any other: unchecked, it could file any
+// episode under any message at any time.
+/** The episode codes the engine writes for a show (replace-request.ts episodeScope): SxxEyy
+ *  with two or more digits in each part. A film's one row is "MOVIE". */
+const SHOW_EPISODE_CODE = /^S(\d{2,})E\d{2,}$/;
+const MESSAGE_ID = /^msg_[\w-]{1,80}$/;
+/** A time as the store writes it (toISOString), or with an offset instead of Z. */
+const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+/** How far a row's time may run ahead of this server's clock (another process wrote it). */
+const ROW_CLOCK_SKEW_MS = 5 * 60_000;
+
+/** The rows as they will be written back, or null when any is malformed or not this kind
+ *  of work's episode. Checked before any lookup. */
+export function parsePendingRows(input: unknown, mediaType: "movie" | "tv", max: number): PendingRow[] | null {
+  if (!Array.isArray(input) || input.length === 0 || input.length > max) return null;
+  const rows: PendingRow[] = [];
+  for (const row of input as unknown[]) {
+    if (typeof row !== "object" || row === null) return null;
+    const { episode, messageId, requestedAt } = row as Record<string, unknown>;
+    if (typeof episode !== "string" || !(mediaType === "movie" ? episode === "MOVIE" : SHOW_EPISODE_CODE.test(episode))) return null;
+    if (typeof messageId !== "string" || !MESSAGE_ID.test(messageId)) return null;
+    if (typeof requestedAt !== "string" || !ISO_TIME.test(requestedAt) || !Number.isFinite(Date.parse(requestedAt))) return null;
+    rows.push({ episode, messageId, requestedAt: new Date(requestedAt).toISOString() });
+  }
+  return rows;
+}
+
+/** Whether every row could be one of this work's own 待换 rows: filed under one of its
+ *  messages, for an episode it has (a show: a season tracked here, on this drive — the
+ *  engine's rule), at a time not later than now. */
+export async function pendingRowsFitWork(input: {
+  repo: Pick<WorkflowRepository, "listUserMessages" | "listTrackedSeasonStates">;
+  /** The page's workspace scope, as for resolveMessageWork. */
+  scope: WorkflowScope;
+  work: UserMessageScope;
+  mediaType: "movie" | "tv";
+  rows: readonly PendingRow[];
+  now: Date;
+}): Promise<boolean> {
+  const { work } = input;
+  const [messages, states] = await Promise.all([input.repo.listUserMessages(work), input.repo.listTrackedSeasonStates(input.scope)]);
+  const messageIds = new Set(messages.map((m) => m.id));
+  const seasons = new Set(
+    states.filter((s) => s.title.id === work.titleKey && userMessageDrive(s.connectedStorageId) === work.drive).map((s) => s.season.seasonNumber),
+  );
+  const latest = input.now.getTime() + ROW_CLOCK_SKEW_MS;
+  const isEpisode = (episode: string) => {
+    if (input.mediaType === "movie") return episode === "MOVIE";
+    const code = SHOW_EPISODE_CODE.exec(episode);
+    return code !== null && seasons.has(Number(code[1]));
+  };
+  return input.rows.every((row) => messageIds.has(row.messageId) && isEpisode(row.episode) && Date.parse(row.requestedAt) <= latest);
 }
 
 export interface TitleMessages {

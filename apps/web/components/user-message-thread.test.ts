@@ -78,7 +78,8 @@ describe("UserMessageThread — the states of the mockup", () => {
 
   it("③ waiting for the patrol: orange pill, 修改 / 撤回 / 现在处理, the pill still there for more", () => {
     const html = render({ messages: [msg({ id: "m1" })] });
-    expect(html).toContain("给 agent 的留言</h3>");
+    // Focusable from script only: where the focus lands when the undo toast goes.
+    expect(html).toContain('<h3 tabindex="-1">给 agent 的留言</h3>');
     expect(html).toContain('<span class="um-status is-wait">等巡检 · 明早 06:00</span>');
     expect(html).toContain('<span class="um-ep-inline">E13</span><span class="um-ep-inline">E24</span>');
     expect(html).toContain("今天 14:02");
@@ -176,6 +177,7 @@ describe("UserMessageThread — the states of the mockup", () => {
     });
     expect(html).toContain('<div class="um-movie-state"><span><b>还在找别的版本。</b>现在这份先留着，之后每次巡检都会接着找。</span>');
     expect(html.match(/不换了<\/button>/g)?.length).toBe(1);
+    expect(html).toMatch(/<button type="button" class="um-btn is-outline" data-keep-episode="MOVIE">不换了<\/button>/);
     expect(html).toContain("这次没找到能换的");
     expect(html).toContain("旧文件还在：");
     expect(html).toContain('class="um-tracks is-movie"');
@@ -230,7 +232,8 @@ describe("UserMessageThread — the states of the mockup", () => {
       { id: "m1", episodeTags: ["S01E24"] },
     );
     const idle = render({ messages: [answered], pending: ["S01E24"] });
-    expect(idle).toMatch(/<button type="button" class="um-keep" aria-label="E24 不换了">不换了<\/button>/);
+    // data-keep-episode: how the card finds the row's 不换了 to hand the focus back after 撤销.
+    expect(idle).toMatch(/<button type="button" class="um-keep" data-keep-episode="S01E24" aria-label="E24 不换了">不换了<\/button>/);
 
     const html = render({ messages: [answered], pending: ["S01E24"], run: { running: true, activity: "正在搜索资源：第 24 集", waitsForRun: true } });
     const button = /<button[^>]*class="um-keep"[^>]*>不换了<\/button>/.exec(html)?.[0] ?? "";

@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { formatBytes, type UserMessageReply } from "@media-track/workflow";
 import {
+  EDIT_SETTLE_MS,
   answeredMeta,
   appendChipText,
   composerPlaceholder,
   draftIsSendable,
   editorAfterRefresh,
+  editorAfterSettleTimeout,
+  editorNotice,
   episodeLabel,
   formatSize,
   groupEpisodesBySeason,
@@ -295,6 +298,57 @@ describe("editorAfterRefresh — a message's editor when a fresh render arrives"
     // Changed again elsewhere, or gone: nothing to wait for.
     expect(editorAfterRefresh(saved, inView({ body: "别的话" }))).toEqual({ kind: "close" });
     expect(editorAfterRefresh(saved, undefined)).toEqual({ kind: "close" });
+  });
+});
+
+describe("editorNotice — what the card says when an open editor closes on its own", () => {
+  const typed = { body: "第 1 集发蓝，换个中字的", tags: ["S01E01"] };
+
+  it("taken by a run: says so, and where the changed words went", () => {
+    expect(editorNotice({ kind: "taken", typed })).toBe("agent 已经开始处理这条留言了。改过的内容挪到了输入框里，可以再发一条");
+    expect(editorNotice({ kind: "taken", typed: null })).toBe("agent 已经开始处理这条留言了");
+  });
+
+  it("withdrawn elsewhere: says so the same way — the words typed are not dropped silently", () => {
+    expect(editorNotice({ kind: "gone", typed })).toBe("这条留言已经撤回了。改过的内容挪到了输入框里，可以再发一条");
+    expect(editorNotice({ kind: "gone", typed: null })).toBe("这条留言已经撤回了");
+  });
+
+  it("an editor that stays, or closes as asked: nothing to say", () => {
+    expect(editorNotice({ kind: "keep" })).toBeNull();
+    expect(editorNotice({ kind: "close" })).toBeNull();
+  });
+});
+
+describe("editorAfterSettleTimeout — a saved editor whose fresh render is late", () => {
+  const original = { body: "第 1 集发蓝", tags: ["S01E01"] };
+  const stored = { body: "第 1 集发蓝，换个中字的", tags: ["S01E01"] };
+  const saved: EditingMessage = { id: "m1", body: stored.body, tags: stored.tags, original, saved: stored };
+  const inView = (over: Partial<ThreadMessage> = {}) => msg({ id: "m1", body: stored.body, episodeTags: stored.tags, ...over });
+
+  it("waits about eight seconds, then the editor is editable again on the words as stored", () => {
+    expect(EDIT_SETTLE_MS).toBe(8000);
+    expect(editorAfterSettleTimeout(saved, "m1")).toEqual({ id: "m1", body: stored.body, tags: stored.tags, original: stored, saved: null });
+  });
+
+  it("from then on it is an ordinary editor on the stored words", () => {
+    const reopened = editorAfterSettleTimeout(saved, "m1")!;
+    // The late render arrives: still waiting for the patrol, so it stays open, editable.
+    expect(editorAfterRefresh(reopened, inView())).toEqual({ kind: "keep" });
+    // Taken by a run without a word typed since: the run has the stored words, nothing moves.
+    expect(editorAfterRefresh(reopened, inView({ status: "processing" }))).toEqual({ kind: "taken", typed: null });
+    // Typed on after it came back: that moves to the composer.
+    expect(editorAfterRefresh({ ...reopened, body: `${stored.body}，要 1080p` }, inView({ status: "processing" }))).toEqual({
+      kind: "taken",
+      typed: { body: `${stored.body}，要 1080p`, tags: stored.tags },
+    });
+  });
+
+  it("leaves anything else alone: another message's editor, one never saved, no editor", () => {
+    expect(editorAfterSettleTimeout(saved, "m2")).toBe(saved);
+    const unsaved: EditingMessage = { ...saved, saved: null };
+    expect(editorAfterSettleTimeout(unsaved, "m1")).toBe(unsaved);
+    expect(editorAfterSettleTimeout(null, "m1")).toBeNull();
   });
 });
 
