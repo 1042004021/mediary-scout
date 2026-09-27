@@ -10,7 +10,7 @@ import {
 } from "./workflow-v2-bridge.js";
 import type { DeadLinkStore } from "./dead-links.js";
 import type { JevJudge } from "../jev-judge.js";
-import { runAcquisitionV2Workflow } from "./workflow-v2.js";
+import { runAcquisitionV2Workflow, type RunAcquisitionV2WorkflowRequest } from "./workflow-v2.js";
 import { getQualityGuidance, getSearchRecipe, searchProfile } from "./search-profile.js";
 import type { AgentToolEvent } from "./activity.js";
 
@@ -52,6 +52,12 @@ export interface RunTvAcquisitionV2Request {
   deadLinkStore?: DeadLinkStore;
   /** Agent memory (see orchestrator.memory). */
   memory?: { store: AgentMemoryStore; accountId: string; drive?: string };
+  /** A replace_request run (see orchestrator.userRequest). */
+  userRequest?: RunAcquisitionV2WorkflowRequest["userRequest"];
+  /** See orchestrator.protectExisting. */
+  protectExisting?: RunAcquisitionV2WorkflowRequest["protectExisting"];
+  /** See orchestrator.rejectedLookup. */
+  rejectedLookup?: RunAcquisitionV2WorkflowRequest["rejectedLookup"];
   onProgress?: (event: AgentToolEvent) => void;
   now?: () => string;
 }
@@ -97,10 +103,13 @@ export async function runTvAcquisitionV2(request: RunTvAcquisitionV2Request): Pr
     ...(request.jevJudge === undefined ? {} : { jevJudge: request.jevJudge }),
     ...(request.deadLinkStore ? { deadLinkStore: request.deadLinkStore } : {}),
     ...(request.memory ? { memory: request.memory } : {}),
+    ...(request.userRequest ? { userRequest: request.userRequest } : {}),
+    ...(request.protectExisting ? { protectExisting: request.protectExisting } : {}),
+    ...(request.rejectedLookup ? { rejectedLookup: request.rejectedLookup } : {}),
     ...(request.onProgress ? { onProgress: request.onProgress } : {}),
   });
 
-  return bridgeV2WorkflowToResult({
+  const bridged = bridgeV2WorkflowToResult({
     title: request.title,
     mode: request.mode,
     seasons: request.seasons,
@@ -108,4 +117,5 @@ export async function runTvAcquisitionV2(request: RunTvAcquisitionV2Request): Pr
     workflowRunId: request.workflowRunId,
     now: request.now ?? defaultNowIso,
   });
+  return v2.replacement ? { ...bridged, replacement: v2.replacement } : bridged;
 }

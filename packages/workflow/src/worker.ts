@@ -32,6 +32,10 @@ import {
 } from "./runner-v2.js";
 import { syncSeasonAgainstMetadata } from "./season-sync.js";
 import { isBrandStorageAuthError } from "./storage-auth-error.js";
+import { userMessageDrive, type UserMessageScope } from "./user-requests.js";
+// Circular with replace-request.ts (it uses this module's claim helpers); both sides
+// only call the other's functions at run time, never at module evaluation.
+import { queueReplaceRequest } from "./replace-request.js";
 
 async function maybeFreezeOnBrandAuthError(input: {
   connectedStorageId: string | null | undefined;
@@ -57,7 +61,7 @@ async function maybeFreezeOnBrandAuthError(input: {
  * (when configured) so the 动漫 library shelf is a physically separate tree,
  * never intermixed with TV shows; everything else uses the default parent.
  */
-function storageParentForTitle(
+export function storageParentForTitle(
   title: { type: MediaType },
   storageParentDirectoryId: string | undefined,
   animeStorageParentDirectoryId: string | undefined,
@@ -73,7 +77,7 @@ function storageParentForTitle(
  * globally-passed deps. Per-account fields (115 storage + landing CIDs) win;
  * everything else falls through to the base. No resolver → base unchanged.
  */
-async function resolveWorkerDeps(
+export async function resolveWorkerDeps(
   resolve: ResolveAccountWorkerContext | undefined,
   accountId: string,
   connectedStorageId: string | null,
@@ -183,8 +187,11 @@ function failureReport(
 ): NotificationReport {
   return {
     titleName: claimed.title.title,
+    // A replace_request covers every tracked season of the work and is only recorded
+    // on its lowest one (the lock): naming that season would label an S02 request
+    // 「第 1 季」. Title-level, like its success report (buildReplacementReport).
     seasonLabel:
-      claimed.title.type !== "movie" && claimed.season.seasonNumber
+      claimed.title.type !== "movie" && claimed.workflowRun.kind !== "replace_request" && claimed.season.seasonNumber
         ? `第 ${claimed.season.seasonNumber} 季`
         : null,
     status,
@@ -212,6 +219,10 @@ export async function handleWorkflowRunFailure(input: {
   now: () => string;
   /** Freeze the run's connected drive on brand *AuthError (cookie/token dead). */
   onAuthErrorFreeze?: (storageId: string, reason: string) => Promise<void>;
+  /** Trigger stamped on the failure/retry notification. Default "user" (individual push).
+   *  A patrol-origin replace run passes "scheduled" so its failure joins the daily digest,
+   *  matching the success path (stampReplaceNotification). */
+  notificationTrigger?: "user" | "scheduled";
 }): Promise<{ status: "auto_requeued" | "failed"; workflowRunId: string; errorMessage: string }> {
   const { claimed, error, repository } = input;
   const nowIso = input.now();
@@ -262,7 +273,7 @@ export async function handleWorkflowRunFailure(input: {
     title: claimed.title.title,
     body: formatReportPushText(report),
     createdAt: nowIso,
-    trigger: "user",
+    trigger: input.notificationTrigger ?? "user",
     report,
   };
   // One stdout line per failure (console.log — stdout, beside the worker's other
@@ -282,13 +293,16 @@ export async function handleWorkflowRunFailure(input: {
   //  - terminal failure: a failed Type 2 init intentionally clears its initial
   //    episode state so a fresh, never-acquired season doesn't linger as tracked
   //    (see worker.test "clears initial episode state when the agent model dies").
+  //    A replace_request is the exception: it runs on a library that already has
+  //    files, and a failed replace must leave that library exactly as it was.
+  const keepEpisodes = willRetry || claimed.workflowRun.kind === "replace_request";
   await repository.saveWorkflowRunSnapshot({
     accountId: claimed.accountId,
     connectedStorageId: claimed.connectedStorageId,
     title: claimed.title,
     season: claimed.season,
     workflowRun,
-    episodes: willRetry ? claimed.episodes : [],
+    episodes: keepEpisodes ? claimed.episodes : [],
     resourceSnapshots: willRetry ? claimed.resourceSnapshots : [],
     decisions: willRetry ? claimed.decisions : [],
     transferAttempts: willRetry ? claimed.transferAttempts : [],
@@ -411,6 +425,11 @@ export type ScheduledType3Outcome =
       status: "skipped_active";
     }
   | {
+      /** Untracked after the sweep read it: nothing was written, nothing ran. */
+      trackedSeasonId: string;
+      status: "skipped_untracked";
+    }
+  | {
       trackedSeasonId: string;
       status: "ran";
       workflowRunId: string;
@@ -464,6 +483,40 @@ export async function runScheduledType3Monitoring(input: {
   // Cross-account: patrol EVERY user's tracked shows, each under its owner's creds.
   const trackedStates = await input.repository.listAllTrackedSeasonStates();
 
+  // Works with a user message or an unfinished replacement run as ONE replace_request
+  // (it covers every season and includes the gaps), so this sweep skips their seasons.
+  // Queued, not run here: the queue worker claims it right after the sweep.
+  const workKey = (w: UserMessageScope) => JSON.stringify([w.accountId, w.drive, w.titleKey]);
+  const requestWorks = [
+    ...(await input.repository.listWorksWithPendingMessages({ urgentOnly: false })),
+    ...(await input.repository.listWorksWithPendingReplacements()),
+  ];
+  const requestKeys = new Set(requestWorks.map(workKey));
+  for (const key of requestKeys) {
+    const [accountId, drive, titleKey] = JSON.parse(key) as [string, string, string];
+    try {
+      await queueReplaceRequest({ repository: input.repository, work: { accountId, drive, titleKey }, now, origin: "patrol" });
+    } catch (error) {
+      // One work's queueing failure must not abort the whole sweep; the next sweep retries it.
+      console.error(`[user-message] patrol could not queue a replace request for ${titleKey}: ${String(error)}`);
+    }
+  }
+  // Also skip works whose replace run is already in flight: a type3 run beside it
+  // would work the same directories at the same time. This filter is only the cheap
+  // path; a replace run queued after it is caught by the patrol reservation itself
+  // (blockIfTitleHasActiveKinds).
+  const busyKeys = new Set((await input.repository.listWorksWithProcessingMessages()).map(workKey));
+  for (const accountId of new Set(trackedStates.map((s) => s.accountId))) {
+    for (const run of await input.repository.listActiveWorkflowRuns({ accountId, connectedStorageId: null })) {
+      if (run.workflowRun.kind !== "replace_request") continue;
+      busyKeys.add(workKey({ accountId, drive: userMessageDrive(run.connectedStorageId), titleKey: run.title.id }));
+    }
+  }
+  const patrolStates = trackedStates.filter((s) => {
+    const key = workKey({ accountId: s.accountId, drive: userMessageDrive(s.connectedStorageId), titleKey: s.title.id });
+    return !requestKeys.has(key) && !busyKeys.has(key);
+  });
+
   // One drive at a time, several drives side by side (see runKeyedPool). The key
   // is the drive the run will actually land on: a state with no bound drive runs
   // on its account's default drive, so it must share that drive's key, not get
@@ -482,7 +535,7 @@ export async function runScheduledType3Monitoring(input: {
   const driveKeys =
     concurrency > 1
       ? await Promise.all(
-          trackedStates.map(async (state) => {
+          patrolStates.map(async (state) => {
             const drive = state.connectedStorageId ?? (await defaultDriveOf(state.accountId));
             // No drive at all → the process-wide fallback executor (env cookie / fake),
             // which every such account shares: one key for all of them.
@@ -490,12 +543,12 @@ export async function runScheduledType3Monitoring(input: {
           }),
         )
       : [];
-  const keyByState = new Map(trackedStates.map((state, index) => [state, driveKeys[index] ?? ""]));
+  const keyByState = new Map(patrolStates.map((state, index) => [state, driveKeys[index] ?? ""]));
   // A throw from one state's setup (drive client, DB reservation) is an infra
   // failure: it aborts the sweep as the serial loop did, so the caller can release
   // today's claimed slots and retry. Failures inside a run are outcomes, not throws.
   const perState = await runKeyedPool(
-    trackedStates,
+    patrolStates,
     { concurrency, keyOf: (state) => keyByState.get(state)! },
     (state) => patrolTrackedState({ input, state, now }),
   );
@@ -585,10 +638,19 @@ async function patrolTrackedState(args: {
       decisions: [],
       transferAttempts: [],
       notifications: [],
+      // The sweep's busy-work filter is not atomic with this reservation: a replace
+      // run queued in between (现在处理) would otherwise work the same directories.
+      blockIfTitleHasActiveKinds: ["replace_request"],
+      // The state was read when the sweep started (then the drive's deps, a TMDB sync):
+      // a season untracked since must not be tracked again by this reservation.
+      requireTrackedSeason: true,
       ...(staleActiveRunStartedBefore === null
         ? {}
         : { staleActiveRunStartedBefore, staleFinishedAt: startedAt }),
     });
+    if (reservation.status === "not_tracked") {
+      return { trackedSeasonId: season.id, status: "skipped_untracked" };
+    }
     if (reservation.status !== "reserved") {
       return { trackedSeasonId: season.id, status: "skipped_active" };
     }
@@ -764,10 +826,17 @@ async function patrolMovie(args: {
     decisions: [],
     transferAttempts: [],
     notifications: [],
+    // Same race as the TV patrol: a replace run queued after the sweep's filter.
+    blockIfTitleHasActiveKinds: ["replace_request"],
+    // …and an untrack after the sweep read the film.
+    requireTrackedSeason: true,
     ...(staleActiveRunStartedBefore === null
       ? {}
       : { staleActiveRunStartedBefore, staleFinishedAt: startedAt }),
   });
+  if (reservation.status === "not_tracked") {
+    return { trackedSeasonId: state.season.id, status: "skipped_untracked" };
+  }
   if (reservation.status !== "reserved") {
     return { trackedSeasonId: state.season.id, status: "skipped_active" };
   }
@@ -877,7 +946,7 @@ function staleStartedBefore(
  * (Movies/TV/Anime); a missing parent is a misconfiguration, not a silent
  * account-root fallback (fail loud — see acquisition-hard-details).
  */
-function requireCategoryParent(parent: string | undefined): string {
+export function requireCategoryParent(parent: string | undefined): string {
   if (parent === undefined || parent === "") {
     throw new Error(
       "MEDIA_TRACK_CATEGORY_PARENT_REQUIRED: a library category parent (Movies/TV/Anime) is required for directory verify-or-create",

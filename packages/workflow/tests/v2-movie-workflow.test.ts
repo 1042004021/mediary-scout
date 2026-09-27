@@ -271,3 +271,105 @@ describe("runMovieAcquisitionV2 forwards jevJudge to the orchestrator", () => {
     expect(seen[0]!.target).toMatchObject({ kind: "movie", title: "盗梦空间", aliases: ["Inception"] });
   });
 });
+
+describe("runMovieAcquisitionV2 forwards rejectedLookup to the orchestrator", () => {
+  it("an ordinary movie run reads the rejected list on search", async () => {
+    let reads = 0;
+    await runMovieAcquisitionV2({
+      title,
+      resourceProvider: emptyProvider(),
+      storage: new FakeStorageExecutor(),
+      model: scriptModel([
+        { tool: "searchResources", input: { keyword: "盗梦空间 Inception" } },
+        { tool: "reportNoCoverage", input: { reason: "threading test" } },
+      ]),
+      workflowRunId: "run-rejected-movie",
+      moviesParentDirectoryId: "movies_root",
+      rejectedLookup: {
+        list: async () => {
+          reads += 1;
+          return [];
+        },
+      },
+      now: () => "2026-06-14T00:00:00.000Z",
+    });
+    expect(reads).toBeGreaterThan(0);
+  });
+});
+
+describe("runMovieAcquisitionV2 — user request (replace_request run)", () => {
+  it("the old film stays obtained when it is not replaced; the request reaches the prompt and the tools", async () => {
+    const executor = new FakeStorageExecutor();
+    const movieDir = await executor.createDirectory({ name: "盗梦空间 (2010) {tmdb-27205}", parentId: "movies_root" });
+    executor.seedDirectoryFiles(movieDir, [
+      { id: "oldfilm", storageDirectoryId: movieDir, name: "Inception.2010.KnockOff.mkv", sizeBytes: 4_000_000_000, episodeCode: null, providerFileId: "oldfilm" },
+    ]);
+    let system = "";
+    let tools: string[] = [];
+    let calls = 0;
+    const tool = (name: string, input: unknown) => ({
+      content: [{ type: "tool-call" as const, toolCallId: `c${calls}`, toolName: name, input: JSON.stringify(input) }],
+      finishReason: { unified: "tool-calls" as const, raw: "tool-calls" as const },
+      usage: USAGE,
+      warnings: [],
+    });
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        calls += 1;
+        if (calls === 1) {
+          system = JSON.stringify(options.prompt.find((m) => m.role === "system") ?? "");
+          tools = (options.tools ?? []).map((t) => t.name);
+          return tool("rejectCurrentSource", { episodes: [], fileIds: ["oldfilm"], reason: "假片" });
+        }
+        if (calls === 2) return tool("reportReplacement", { results: [{ episode: "MOVIE", outcome: "not_found", note: "没有正版" }] });
+        return { content: [{ type: "text" as const, text: "done" }], finishReason: { unified: "stop" as const, raw: "stop" as const }, usage: USAGE, warnings: [] };
+      },
+    });
+
+    const result = await runMovieAcquisitionV2({
+      title,
+      resourceProvider: emptyProvider(),
+      storage: executor,
+      model,
+      workflowRunId: "run-m-ur",
+      moviesParentDirectoryId: "movies_root",
+      userRequest: {
+        requestedEpisodes: ["MOVIE"],
+        prompt: { messages: [{ body: "这是假片", episodeTags: ["MOVIE"], createdAt: "2026-09-26T08:00:00.000Z" }], rejected: [], pending: [] },
+        rejectedStore: { list: async () => [], add: async () => undefined },
+      },
+      // The film was obtained before this run (the knock-off is in the library).
+      priorObtained: true,
+      now: () => "2026-09-26T08:00:00.000Z",
+    });
+
+    expect(system).toContain("USER REQUESTS");
+    expect(system).toContain("这是假片");
+    expect(tools).toEqual(expect.arrayContaining(["rejectCurrentSource", "reportReplacement"]));
+    expect(result.episodes[0]!.obtained).toBe(true);
+    expect(result.replacement).toEqual({
+      results: [{ episode: "MOVIE", outcome: "not_found", note: "没有正版" }],
+      rejected: [expect.objectContaining({ episode: "MOVIE", label: "Inception.2010.KnockOff.mkv" })],
+      oldFiles: ["Inception.2010.KnockOff.mkv"],
+      identified: true,
+    });
+    expect((await executor.listTree({ directoryId: movieDir })).map((f) => f.providerFileId)).toContain("oldfilm");
+  });
+
+  it("no user request → no replacement on the result", async () => {
+    const result = await runMovieAcquisitionV2({
+      title,
+      resourceProvider: emptyProvider(),
+      storage: new FakeStorageExecutor(),
+      model: scriptModel([
+        { tool: "searchResources", input: { keyword: "盗梦空间" } },
+        { tool: "reportNoCoverage", input: { reason: "no candidates" } },
+      ]),
+      workflowRunId: "run-m-plain",
+      moviesParentDirectoryId: "movies_root",
+      now: () => "2026-09-26T08:00:00.000Z",
+    });
+    expect(result.replacement).toBeUndefined();
+    expect(result.episodes[0]!.obtained).toBe(false);
+  });
+});

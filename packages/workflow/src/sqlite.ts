@@ -27,6 +27,24 @@ import {
   type AgentMemorySummary,
   type AgentMemoryScope,
 } from "./agent-memory.js";
+import {
+  compareUserMessagesCreated,
+  episodeSourceFromRow,
+  pendingReplacementFromRow,
+  rejectedResourceFromRow,
+  userMessageFromRow,
+  type EpisodeSource,
+  type EpisodeSourceRow,
+  type PendingReplacement,
+  type PendingReplacementRow,
+  type RejectedResource,
+  type RejectedResourceRow,
+  type UserMessage,
+  type UserMessageRow,
+  type UserMessageScope,
+  type UserRequestStore,
+  userMessageDrive,
+} from "./user-requests.js";
 import { MAGNET_DEAD_LINK_TTL_MS } from "./acquisition-v2/dead-links.js";
 import type {
   Account,
@@ -47,8 +65,11 @@ import {
   isQueueClaimableKind,
   isStaleActiveWorkflowRun,
   recoverOrphanRunningRun,
+  reservationRequiresTrackedSeason,
+  tearsDownTrackingOnCancel,
   retriedWorkflowRun,
   seasonScopeKey,
+  titleBlockFilter,
   UNSCOPED_STORAGE,
   validateWorkflowRunSnapshot,
   withDerivedEpisodeSummaries,
@@ -165,6 +186,58 @@ export const SQLITE_SCHEMA = `
     source_run_id text,
     UNIQUE (account_id, scope, title_key, name)
   );
+  CREATE TABLE IF NOT EXISTS user_messages (
+    id text PRIMARY KEY,
+    account_id text NOT NULL,
+    drive text NOT NULL DEFAULT '',
+    title_key text NOT NULL,
+    body text NOT NULL,
+    episode_tags text NOT NULL DEFAULT '[]',
+    status text NOT NULL,
+    urgent integer NOT NULL DEFAULT 0,
+    run_id text,
+    reply text,
+    created_at text NOT NULL,
+    updated_at text NOT NULL,
+    processed_at text
+  );
+  CREATE INDEX IF NOT EXISTS user_messages_work ON user_messages (account_id, drive, title_key, status);
+  CREATE INDEX IF NOT EXISTS user_messages_pending ON user_messages (status, urgent);
+  CREATE INDEX IF NOT EXISTS user_messages_run ON user_messages (run_id);
+  CREATE TABLE IF NOT EXISTS pending_replacements (
+    account_id text NOT NULL,
+    drive text NOT NULL DEFAULT '',
+    title_key text NOT NULL,
+    episode text NOT NULL,
+    message_id text NOT NULL,
+    requested_at text NOT NULL,
+    PRIMARY KEY (account_id, drive, title_key, episode)
+  );
+  CREATE TABLE IF NOT EXISTS rejected_resources (
+    id text PRIMARY KEY,
+    account_id text NOT NULL,
+    title_key text NOT NULL,
+    episode text NOT NULL,
+    link_key text,
+    label text NOT NULL,
+    size_bytes integer,
+    reason text NOT NULL,
+    message_id text,
+    created_at text NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS rejected_resources_work ON rejected_resources (account_id, title_key);
+  CREATE TABLE IF NOT EXISTS episode_sources (
+    account_id text NOT NULL,
+    drive text NOT NULL DEFAULT '',
+    title_key text NOT NULL,
+    episode text NOT NULL,
+    link_key text,
+    label text NOT NULL,
+    size_bytes integer,
+    run_id text NOT NULL,
+    recorded_at text NOT NULL,
+    PRIMARY KEY (account_id, drive, title_key, episode)
+  );
   CREATE TABLE IF NOT EXISTS accounts (
     id text PRIMARY KEY,
     username text UNIQUE NOT NULL,
@@ -249,16 +322,27 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
     const accountId = snapshot.accountId ?? DEFAULT_ACCOUNT_ID;
     const connectedStorageId = snapshot.connectedStorageId ?? UNSCOPED_STORAGE;
 
+    const blocksTitle = titleBlockFilter(input);
     return this.db.transaction((): WorkflowRunReservationResult => {
+      // Before anything is written. The transaction is synchronous, so untrackTitle
+      // (also one synchronous transaction) runs wholly before or after this.
+      if (
+        reservationRequiresTrackedSeason(input) &&
+        this.db
+          .prepare("SELECT 1 FROM tracked_seasons WHERE id = ? AND connected_storage_id = ?")
+          .get(snapshot.season.id, connectedStorageId) === undefined
+      ) {
+        return { status: "not_tracked" };
+      }
       this.expireStaleActiveWorkflowRuns(input);
 
-      if (input.blockIfTitleHasActiveRun === true) {
+      if (blocksTitle) {
         const titleActive = this.selectWorkflowRunsForTitle(
           snapshot.season.mediaTitleId,
           accountId,
           connectedStorageId,
         )
-          .filter((workflowRun) => isActiveWorkflowStatus(workflowRun.status))
+          .filter((workflowRun) => isActiveWorkflowStatus(workflowRun.status) && blocksTitle(workflowRun))
           .sort((a, b) => b.startedAt.localeCompare(a.startedAt))[0];
         if (titleActive) {
           const activeSnapshot = this.loadSnapshot(titleActive.id);
@@ -286,6 +370,17 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
       const existingEpisodes = this.selectEpisodeStates(snapshot.season.id, connectedStorageId);
       if (input.blockIfEpisodeStatesExist === true && existingEpisodes.length > 0) {
         return { status: "already_has_episode_state", episodes: existingEpisodes };
+      }
+
+      if (input.keepCurrentEpisodes === true) {
+        // Only the run: the title, season record and episode states are not written at
+        // all (see postgres.ts). The reply is the run as stored, with the season's current state.
+        this.replaceWorkflowRunSnapshot(snapshot, { runOnly: true });
+        const reserved = this.loadSnapshot(snapshot.workflowRun.id);
+        if (!reserved) {
+          throw new Error(`Missing reserved workflow run ${snapshot.workflowRun.id}`);
+        }
+        return { status: "reserved", snapshot: reserved };
       }
 
       this.replaceWorkflowRunSnapshot(snapshot);
@@ -382,7 +477,12 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
     return rows.map((row) => JSON.parse(row.payload) as T);
   }
 
-  private replaceWorkflowRunSnapshot(snapshot: PersistWorkflowRunSnapshotInput): void {
+  private replaceWorkflowRunSnapshot(
+    snapshot: PersistWorkflowRunSnapshotInput,
+    /** runOnly: write the run and its child rows only — the title, season record and
+     *  episode states stay as stored (a keepCurrentEpisodes reservation). */
+    options: { runOnly?: boolean } = {},
+  ): void {
     // A re-persist may omit accountId/connectedStorageId (the worker finalize path
     // doesn't re-thread them). upsertWorkflowRun preserves the stored values on
     // conflict, but the season upsert + episode bucket delete/insert below key on
@@ -398,27 +498,35 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
     const accountId = snapshot.accountId ?? existing?.account_id ?? DEFAULT_ACCOUNT_ID;
     const connectedStorageId =
       snapshot.connectedStorageId ?? existing?.connected_storage_id ?? UNSCOPED_STORAGE;
+    const writeSeasonState = options.runOnly !== true;
 
-    this.db
-      .prepare(
-        "INSERT INTO media_titles (id, payload) VALUES (?, ?) ON CONFLICT (id) DO UPDATE SET payload = excluded.payload",
-      )
-      .run(snapshot.title.id, JSON.stringify(snapshot.title));
-
-    this.upsertTrackedSeason(snapshot.season, accountId, connectedStorageId);
+    if (writeSeasonState) {
+      this.db
+        .prepare(
+          "INSERT INTO media_titles (id, payload) VALUES (?, ?) ON CONFLICT (id) DO UPDATE SET payload = excluded.payload",
+        )
+        .run(snapshot.title.id, JSON.stringify(snapshot.title));
+      this.upsertTrackedSeason(snapshot.season, accountId, connectedStorageId);
+    }
     this.upsertWorkflowRun(snapshot.workflowRun, accountId, connectedStorageId);
-    this.deleteWorkflowRunChildren(snapshot.workflowRun.id, snapshot.season.id, connectedStorageId);
+    this.deleteWorkflowRunChildren(snapshot.workflowRun.id);
 
-    const insertEpisode = this.db.prepare(
-      "INSERT INTO episode_states (tracked_season_id, connected_storage_id, episode_code, payload) VALUES (?, ?, ?, ?)",
-    );
-    for (const episode of snapshot.episodes) {
-      insertEpisode.run(
-        snapshot.season.id,
-        connectedStorageId,
-        episode.episodeCode,
-        JSON.stringify(episode),
+    if (writeSeasonState) {
+      // Scope to THIS drive's episodes — never wipe another drive's episodes for the season.
+      this.db
+        .prepare("DELETE FROM episode_states WHERE tracked_season_id = ? AND connected_storage_id = ?")
+        .run(snapshot.season.id, connectedStorageId);
+      const insertEpisode = this.db.prepare(
+        "INSERT INTO episode_states (tracked_season_id, connected_storage_id, episode_code, payload) VALUES (?, ?, ?, ?)",
       );
+      for (const episode of snapshot.episodes) {
+        insertEpisode.run(
+          snapshot.season.id,
+          connectedStorageId,
+          episode.episodeCode,
+          JSON.stringify(episode),
+        );
+      }
     }
     // Snapshot ids are content-addressed and can legitimately recur; keep
     // persistence idempotent on the id instead of crashing on a duplicate.
@@ -501,21 +609,13 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
       );
   }
 
-  private deleteWorkflowRunChildren(
-    workflowRunId: string,
-    trackedSeasonId: string,
-    connectedStorageId: string,
-  ): void {
+  private deleteWorkflowRunChildren(workflowRunId: string): void {
     this.db.prepare("DELETE FROM notifications WHERE workflow_run_id = ?").run(workflowRunId);
     this.db.prepare("DELETE FROM transfer_attempts WHERE workflow_run_id = ?").run(workflowRunId);
     this.db.prepare("DELETE FROM agent_decisions WHERE workflow_run_id = ?").run(workflowRunId);
     // NOTE: do NOT delete agent_steps here (see postgres.ts) — they're written
     // incrementally by the trace sink and are NOT part of the snapshot.
     this.db.prepare("DELETE FROM resource_snapshots WHERE workflow_run_id = ?").run(workflowRunId);
-    // Scope to THIS drive's episodes — never wipe another drive's episodes for the season.
-    this.db
-      .prepare("DELETE FROM episode_states WHERE tracked_season_id = ? AND connected_storage_id = ?")
-      .run(trackedSeasonId, connectedStorageId);
   }
 
   private expireStaleActiveWorkflowRuns(input: ReserveWorkflowRunInput): void {
@@ -617,6 +717,14 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
         const recovered = recoverOrphanRunningRun(workflowRun, now);
         this.upsertWorkflowRun(recovered.run);
         if (recovered.action === "requeue") requeued += 1;
+        // A replace run that will never run again hands its work back to the patrol: its
+        // messages go back to pending, and none of the work's messages stays urgent (a run
+        // that crashed the worker over and over must not be retried on every idle tick).
+        else if (recovered.run.kind === "replace_request") {
+          this.releaseUserMessagesSync(recovered.run.id, now, false);
+          const work = this.workOfRunSync(recovered.run.id);
+          if (work) this.clearUserMessagesUrgentSync(work, now);
+        }
       }
       return requeued;
     })();
@@ -806,6 +914,26 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
       this.db.prepare("DELETE FROM resource_snapshots WHERE workflow_run_id = ?").run(workflowRunId);
       this.db.prepare("DELETE FROM workflow_runs WHERE id = ?").run(workflowRunId);
 
+      // Only an init run owns its season's tracking; a cancelled replace_request is
+      // just removed, and any messages it held go back to pending.
+      if (!tearsDownTrackingOnCancel(run.kind)) {
+        if (run.kind === "replace_request") {
+          // The user cancelled: nothing of this work stays urgent, or the idle scan would
+          // queue it again within seconds. It waits for the patrol (or 现在处理).
+          const now = new Date().toISOString();
+          this.releaseUserMessagesSync(workflowRunId, now, false);
+          const season = this.db
+            .prepare("SELECT media_title_id FROM tracked_seasons WHERE id = ? AND connected_storage_id = ?")
+            .get(seasonId, storageValue) as { media_title_id: string } | undefined;
+          if (season) {
+            this.clearUserMessagesUrgentSync(
+              { accountId: owner, drive: userMessageDrive(ownerStorage), titleKey: season.media_title_id },
+              now,
+            );
+          }
+        }
+        return { status: "cancelled" as const };
+      }
       // Only tear down the tracking when no OTHER run on the SAME (season, drive)
       // still references it. Scoped to this drive so another drive's tracking survives.
       const others = this.db
@@ -867,6 +995,9 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
     }
     const targetSeasonIds = [...new Set(states.map((state) => state.season.id))];
     const storageValue = scope.connectedStorageId ?? UNSCOPED_STORAGE;
+    const accountId = scope.accountId ?? DEFAULT_ACCOUNT_ID;
+    const drive = userMessageDrive(scope.connectedStorageId);
+    const titleKey = states[0]!.title.id;
 
     return this.db.transaction(
       (): { status: "untracked" | "not_found" | "in_flight"; removedSeasons: number } => {
@@ -874,7 +1005,15 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
         const hasRunning = targetSeasonIds.some((seasonId) =>
           this.selectWorkflowRuns(seasonId, storageValue).some((run) => run.status === "running"),
         );
-        if (hasRunning) {
+        // …and a queued or running replace_request of the work, whichever season it is
+        // recorded on: it covers every season tracked when it starts and writes a record for
+        // each when it ends, so a season untracked in between would be tracked again. It stays
+        // running until its last write (its terminal record comes after the season records and
+        // the request bookkeeping), so once it has ended nothing of it is left to write.
+        const replaceActive = this.selectWorkflowRunsForTitle(titleKey, accountId, storageValue).some(
+          (run) => run.kind === "replace_request" && isActiveWorkflowStatus(run.status),
+        );
+        if (hasRunning || replaceActive) {
           return { status: "in_flight" as const, removedSeasons: 0 };
         }
         // For each season: delete all run children + runs, then tear down the season.
@@ -898,6 +1037,35 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
             .run(seasonId, storageValue);
           this.teardownSeasonScoped(seasonId, storageValue);
         }
+
+        // Clean up this work's pending user-request state too, so it doesn't come
+        // back to haunt a fresh (re-)track: a stale pending message just keeps
+        // producing not_tracked queue attempts, and a stale pending_replacement
+        // would revive an old replace request the moment the title is re-tracked.
+        // episode_sources and rejected_resources stay — they're useful history if
+        // the user re-tracks. Processing messages are untouched (a running run
+        // already refused above; nothing here is mid-flight). Untracking the last
+        // season still tracked on this drive, one season at a time, is the whole work.
+        const workGone = seasonNumber === undefined || this.selectWorkflowRunsForTitle(titleKey, accountId, storageValue).length === 0;
+        if (workGone) {
+          const now = new Date().toISOString();
+          this.db
+            .prepare(
+              "UPDATE user_messages SET status = 'withdrawn', updated_at = ? WHERE account_id = ? AND drive = ? AND title_key = ? AND status = 'pending'",
+            )
+            .run(now, accountId, drive, titleKey);
+          this.db
+            .prepare("DELETE FROM pending_replacements WHERE account_id = ? AND drive = ? AND title_key = ?")
+            .run(accountId, drive, titleKey);
+        } else {
+          const seasonPrefix = `S${String(seasonNumber).padStart(2, "0")}E%`;
+          this.db
+            .prepare(
+              "DELETE FROM pending_replacements WHERE account_id = ? AND drive = ? AND title_key = ? AND episode LIKE ?",
+            )
+            .run(accountId, drive, titleKey, seasonPrefix);
+        }
+
         return { status: "untracked" as const, removedSeasons: targetSeasonIds.length };
       },
     )();
@@ -1605,6 +1773,200 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
   async touchAgentMemories(input: Parameters<AgentMemoryStore["touchAgentMemories"]>[0]): Promise<void> {
     const stmt = this.db.prepare("UPDATE agent_memories SET last_used_at = ? WHERE account_id = ? AND id = ?");
     for (const id of input.ids) stmt.run(input.now, input.accountId, id);
+  }
+
+  // ---- user requests (see user-requests.ts)
+  async createUserMessage(input: Parameters<UserRequestStore["createUserMessage"]>[0]): Promise<UserMessage> {
+    const id = `msg_${globalThis.crypto.randomUUID()}`;
+    // INSERT … VALUES (…, EXISTS (…), …): the "is another message of this work
+    // processing?" read happens inside the INSERT; SQLite has a single writer, so no
+    // claim can land between that read and the write.
+    this.db
+      .prepare(
+        "INSERT INTO user_messages (id, account_id, drive, title_key, body, episode_tags, status, urgent, run_id, reply, created_at, updated_at, processed_at) " +
+          "VALUES (?, ?, ?, ?, ?, ?, 'pending', EXISTS (SELECT 1 FROM user_messages WHERE account_id = ? AND drive = ? AND title_key = ? AND status = 'processing'), NULL, NULL, ?, ?, NULL)",
+      )
+      .run(
+        id, input.accountId, input.drive, input.titleKey, input.body, JSON.stringify(input.episodeTags),
+        input.accountId, input.drive, input.titleKey, input.now, input.now,
+      );
+    return userMessageFromRow(this.db.prepare("SELECT * FROM user_messages WHERE id = ?").get(id) as UserMessageRow);
+  }
+
+  async listUserMessages(scope: UserMessageScope): Promise<UserMessage[]> {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM user_messages WHERE account_id = ? AND drive = ? AND title_key = ? AND status <> 'withdrawn' ORDER BY created_at DESC, id DESC",
+      )
+      .all(scope.accountId, scope.drive, scope.titleKey) as UserMessageRow[];
+    return rows.map(userMessageFromRow);
+  }
+
+  async editUserMessage(input: Parameters<UserRequestStore["editUserMessage"]>[0]): Promise<UserMessage | null> {
+    const row = this.db
+      .prepare(
+        "UPDATE user_messages SET body = ?, episode_tags = ?, updated_at = ? WHERE id = ? AND account_id = ? AND status = 'pending' RETURNING *",
+      )
+      .get(input.body, JSON.stringify(input.episodeTags), input.now, input.id, input.accountId) as UserMessageRow | undefined;
+    return row ? userMessageFromRow(row) : null;
+  }
+
+  async withdrawUserMessage(input: Parameters<UserRequestStore["withdrawUserMessage"]>[0]): Promise<boolean> {
+    const result = this.db
+      .prepare("UPDATE user_messages SET status = 'withdrawn', updated_at = ? WHERE id = ? AND account_id = ? AND status = 'pending'")
+      .run(input.now, input.id, input.accountId);
+    return result.changes > 0;
+  }
+
+  async markUserMessagesUrgent(input: Parameters<UserRequestStore["markUserMessagesUrgent"]>[0]): Promise<number> {
+    return this.db
+      .prepare("UPDATE user_messages SET urgent = 1, updated_at = ? WHERE account_id = ? AND drive = ? AND title_key = ? AND status = 'pending'")
+      .run(input.now, input.accountId, input.drive, input.titleKey).changes;
+  }
+
+  async clearUserMessagesUrgent(input: Parameters<UserRequestStore["clearUserMessagesUrgent"]>[0]): Promise<number> {
+    return this.clearUserMessagesUrgentSync(input, input.now);
+  }
+
+  /** Sync form, for use inside a db.transaction (cancel, crash recovery). */
+  private clearUserMessagesUrgentSync(work: UserMessageScope, now: string): number {
+    return this.db
+      .prepare(
+        "UPDATE user_messages SET urgent = 0, updated_at = ? WHERE account_id = ? AND drive = ? AND title_key = ? AND status = 'pending' AND urgent = 1",
+      )
+      .run(now, work.accountId, work.drive, work.titleKey).changes;
+  }
+
+  /** The work (account, drive, title) of a stored run: its own row plus its season's. */
+  private workOfRunSync(runId: string): UserMessageScope | null {
+    const row = this.db
+      .prepare(
+        "SELECT r.account_id AS account_id, r.connected_storage_id AS connected_storage_id, s.media_title_id AS media_title_id " +
+          "FROM workflow_runs r JOIN tracked_seasons s ON s.id = r.tracked_season_id AND s.connected_storage_id = r.connected_storage_id " +
+          "WHERE r.id = ?",
+      )
+      .get(runId) as { account_id: string | null; connected_storage_id: string | null; media_title_id: string } | undefined;
+    if (!row) return null;
+    const storage = row.connected_storage_id === UNSCOPED_STORAGE ? null : row.connected_storage_id;
+    return { accountId: row.account_id ?? DEFAULT_ACCOUNT_ID, drive: userMessageDrive(storage), titleKey: row.media_title_id };
+  }
+
+  async claimUserMessages(input: Parameters<UserRequestStore["claimUserMessages"]>[0]): Promise<UserMessage[]> {
+    // One UPDATE … RETURNING. Idempotent per run: the rows this run already holds
+    // come back too, so a run requeued after a crash re-claims its own messages.
+    const rows = this.db
+      .prepare(
+        "UPDATE user_messages SET status = 'processing', run_id = ?, updated_at = ? WHERE account_id = ? AND drive = ? AND title_key = ? AND (status = 'pending' OR (status = 'processing' AND run_id = ?)) RETURNING *",
+      )
+      .all(input.runId, input.now, input.accountId, input.drive, input.titleKey, input.runId) as UserMessageRow[];
+    return rows.map(userMessageFromRow).sort(compareUserMessagesCreated);
+  }
+
+  async finishUserMessages(input: Parameters<UserRequestStore["finishUserMessages"]>[0]): Promise<void> {
+    this.db
+      .prepare("UPDATE user_messages SET status = 'done', reply = ?, processed_at = ?, updated_at = ? WHERE run_id = ? AND status = 'processing'")
+      .run(JSON.stringify(input.reply), input.now, input.now, input.runId);
+  }
+
+  async releaseUserMessages(input: Parameters<UserRequestStore["releaseUserMessages"]>[0]): Promise<void> {
+    this.releaseUserMessagesSync(input.runId, input.now, input.urgent ?? true);
+  }
+
+  /** Sync form, for use inside a db.transaction. */
+  private releaseUserMessagesSync(runId: string, now: string, urgent: boolean): void {
+    this.db
+      .prepare("UPDATE user_messages SET status = 'pending', urgent = ?, run_id = NULL, updated_at = ? WHERE run_id = ? AND status = 'processing'")
+      .run(urgent ? 1 : 0, now, runId);
+  }
+
+  async releaseOrphanedUserMessages(input: { now: string; finishedBefore: string }): Promise<number> {
+    // A processing message whose run is gone, or finished before the cutoff: back to
+    // pending for the patrol (not urgent), like every other way a run ends unfinished.
+    return this.db
+      .prepare(
+        "UPDATE user_messages SET status = 'pending', urgent = 0, run_id = NULL, updated_at = ? WHERE status = 'processing' AND NOT EXISTS (" +
+          "SELECT 1 FROM workflow_runs r WHERE r.id = user_messages.run_id AND (json_extract(r.payload, '$.status') IN ('queued', 'running') " +
+          "OR json_extract(r.payload, '$.finishedAt') >= ?))",
+      )
+      .run(input.now, input.finishedBefore).changes;
+  }
+
+  async listWorksWithProcessingMessages(): Promise<UserMessageScope[]> {
+    const rows = this.db
+      .prepare("SELECT DISTINCT account_id, drive, title_key FROM user_messages WHERE status = 'processing' ORDER BY account_id, drive, title_key")
+      .all() as Array<{ account_id: string; drive: string; title_key: string }>;
+    return rows.map((r) => ({ accountId: r.account_id, drive: r.drive, titleKey: r.title_key }));
+  }
+
+  async listWorksWithPendingMessages(input: { urgentOnly: boolean }): Promise<UserMessageScope[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT account_id, drive, title_key FROM user_messages WHERE status = 'pending'${input.urgentOnly ? " AND urgent = 1" : ""} ORDER BY account_id, drive, title_key`,
+      )
+      .all() as Array<{ account_id: string; drive: string; title_key: string }>;
+    return rows.map((r) => ({ accountId: r.account_id, drive: r.drive, titleKey: r.title_key }));
+  }
+
+  async listPendingReplacements(scope: UserMessageScope): Promise<PendingReplacement[]> {
+    const rows = this.db
+      .prepare("SELECT * FROM pending_replacements WHERE account_id = ? AND drive = ? AND title_key = ? ORDER BY episode")
+      .all(scope.accountId, scope.drive, scope.titleKey) as PendingReplacementRow[];
+    return rows.map(pendingReplacementFromRow);
+  }
+
+  async listWorksWithPendingReplacements(): Promise<UserMessageScope[]> {
+    const rows = this.db
+      .prepare("SELECT DISTINCT account_id, drive, title_key FROM pending_replacements ORDER BY account_id, drive, title_key")
+      .all() as Array<{ account_id: string; drive: string; title_key: string }>;
+    return rows.map((r) => ({ accountId: r.account_id, drive: r.drive, titleKey: r.title_key }));
+  }
+
+  async addPendingReplacements(input: Parameters<UserRequestStore["addPendingReplacements"]>[0]): Promise<void> {
+    const insert = this.db.prepare(
+      "INSERT INTO pending_replacements (account_id, drive, title_key, episode, message_id, requested_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+    );
+    this.db.transaction(() => {
+      for (const episode of input.episodes) insert.run(input.accountId, input.drive, input.titleKey, episode, input.messageId, input.now);
+    })();
+  }
+
+  async removePendingReplacements(input: Parameters<UserRequestStore["removePendingReplacements"]>[0]): Promise<number> {
+    const del = this.db.prepare("DELETE FROM pending_replacements WHERE account_id = ? AND drive = ? AND title_key = ? AND episode = ?");
+    return this.db.transaction(() => input.episodes.reduce((n, e) => n + del.run(input.accountId, input.drive, input.titleKey, e).changes, 0))();
+  }
+
+  async addRejectedResources(input: Parameters<UserRequestStore["addRejectedResources"]>[0]): Promise<void> {
+    const insert = this.db.prepare(
+      "INSERT INTO rejected_resources (id, account_id, title_key, episode, link_key, label, size_bytes, reason, message_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    );
+    this.db.transaction(() => {
+      for (const i of input.items) {
+        insert.run(`rej_${globalThis.crypto.randomUUID()}`, input.accountId, input.titleKey, i.episode, i.linkKey, i.label, i.sizeBytes, i.reason, i.messageId, input.now);
+      }
+    })();
+  }
+
+  async listRejectedResources(input: { accountId: string; titleKey: string }): Promise<RejectedResource[]> {
+    const rows = this.db
+      .prepare("SELECT * FROM rejected_resources WHERE account_id = ? AND title_key = ? ORDER BY created_at, id")
+      .all(input.accountId, input.titleKey) as RejectedResourceRow[];
+    return rows.map(rejectedResourceFromRow);
+  }
+
+  async upsertEpisodeSource(input: EpisodeSource): Promise<void> {
+    this.db
+      .prepare(
+        "INSERT INTO episode_sources (account_id, drive, title_key, episode, link_key, label, size_bytes, run_id, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) " +
+          "ON CONFLICT (account_id, drive, title_key, episode) DO UPDATE SET link_key = excluded.link_key, label = excluded.label, size_bytes = excluded.size_bytes, run_id = excluded.run_id, recorded_at = excluded.recorded_at",
+      )
+      .run(input.accountId, input.drive, input.titleKey, input.episode, input.linkKey, input.label, input.sizeBytes, input.runId, input.recordedAt);
+  }
+
+  async listEpisodeSources(scope: UserMessageScope): Promise<EpisodeSource[]> {
+    const rows = this.db
+      .prepare("SELECT * FROM episode_sources WHERE account_id = ? AND drive = ? AND title_key = ? ORDER BY episode")
+      .all(scope.accountId, scope.drive, scope.titleKey) as EpisodeSourceRow[];
+    return rows.map(episodeSourceFromRow);
   }
 
   async listDeadLinkKeys(options?: { now?: string }): Promise<string[]> {

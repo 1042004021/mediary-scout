@@ -136,6 +136,35 @@ describe("RealResourceProviderV2 — pansou → ResourceProviderV2 adapter", () 
     expect(registry.get("dead_magnet")).toBeUndefined();
   });
 
+  it("a failing dead-link read fails the search instead of showing the recorded dead links again (never fails open)", async () => {
+    const snapshotWithDead: ResourceSnapshot = {
+      ...realSnapshot(),
+      candidates: [
+        { ...realSnapshot().candidates[0]!, id: "live", providerPayload: { url: "https://115.com/s/livecode" } },
+        { ...realSnapshot().candidates[0]!, id: "dead_share", providerPayload: { url: "https://115.com/s/deadcode" } },
+      ],
+    };
+    const registry = new CandidateRegistry();
+    const adapter = new RealResourceProviderV2({
+      provider: { search: async () => snapshotWithDead },
+      registry,
+      workflowRunId: "run-1",
+      deadLinkStore: {
+        recordDeadLink: async () => {},
+        listDeadLinkKeys: async () => {
+          throw new Error("db down");
+        },
+      },
+      // The rejected list reads fine: it is the dead-link read that must not fail open.
+      rejectedResources: { list: async () => [] },
+    });
+
+    await expect(adapter.search("k1")).rejects.toThrow("db down");
+    // Nothing of the failed search reached the agent's registry or the persisted snapshots.
+    expect(registry.get("dead_share")).toBeUndefined();
+    expect(adapter.snapshots()).toEqual([]);
+  });
+
   it("carries an unreachable sourceHealth through to the V2 snapshot (Task 9)", async () => {
     const provider: ResourceProvider = {
       search: async () => ({

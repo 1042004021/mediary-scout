@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { MockLanguageModelV3 } from "ai/test";
-import { runAcquisitionV2Workflow } from "../src/acquisition-v2/workflow-v2.js";
+import { runAcquisitionV2Workflow, type RunAcquisitionV2WorkflowRequest } from "../src/acquisition-v2/workflow-v2.js";
+import { runTvAcquisitionV2 } from "../src/acquisition-v2/run-tv-v2.js";
 import { stagingLeaksOf } from "../src/acquisition-v2/directory-lifecycle.js";
 import { FakeStorageExecutor } from "../src/fakes.js";
 import type { ResourceProvider } from "../src/ports.js";
-import type { ResourceSnapshot } from "../src/domain.js";
+import type { MediaTitle, ResourceSnapshot } from "../src/domain.js";
 import type { JevJudge, JevJudgeInput } from "../src/jev-judge.js";
 
 const USAGE = {
@@ -251,5 +252,235 @@ describe("runAcquisitionV2Workflow forwards jevJudge to the orchestrator", () =>
     });
     expect(seen.length).toBeGreaterThan(0);
     expect(seen[0]!.target).toEqual({ kind: "tv", title: "Show", aliases: ["The Show"], year: 2024 });
+  });
+});
+
+describe("runAcquisitionV2Workflow — user request (replace_request run)", () => {
+  const ALL_13 = Array.from({ length: 13 }, (_, n) => `S01E${String(n + 1).padStart(2, "0")}`);
+  const userRequest: NonNullable<RunAcquisitionV2WorkflowRequest["userRequest"]> = {
+    requestedEpisodes: ["S01E13"],
+    prompt: { messages: [{ body: "13 发蓝", episodeTags: ["S01E13"], createdAt: "2026-09-26T08:00:00.000Z" }], rejected: [], pending: [] },
+    rejectedStore: { list: async () => [], add: async () => undefined },
+  };
+
+  /** A library where every aired episode is already in (DB marks) and the season dir
+   *  holds the file the user complains about. */
+  async function seededExecutor() {
+    const executor = new FakeStorageExecutor();
+    const showId = await executor.createDirectory({ name: "Show (2024) {tmdb-42}", parentId: "tv_root" });
+    const seasonId = await executor.createDirectory({ name: "Season 01", parentId: showId });
+    executor.seedDirectoryFiles(seasonId, [
+      { id: "old13", storageDirectoryId: seasonId, name: "Show - 13 [CR 1080p].mkv", sizeBytes: 1_400_000_000, episodeCode: "S01E13", providerFileId: "old13" },
+    ]);
+    return { executor, seasonId };
+  }
+
+  /** Rejects the current E13, finds nothing different, reports not_found. Records
+   *  the first system prompt and tool names it was given. */
+  function rejectThenNotFoundModel() {
+    const seen = { calls: 0, system: "", tools: [] as string[] };
+    const tool = (name: string, input: unknown) => ({
+      content: [{ type: "tool-call" as const, toolCallId: `c${seen.calls}`, toolName: name, input: JSON.stringify(input) }],
+      finishReason: { unified: "tool-calls" as const, raw: "tool-calls" as const },
+      usage: USAGE,
+      warnings: [],
+    });
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        seen.calls += 1;
+        if (seen.calls === 1) {
+          seen.system = JSON.stringify(options.prompt.find((m) => m.role === "system") ?? "");
+          seen.tools = (options.tools ?? []).map((t) => t.name);
+          return tool("rejectCurrentSource", { episodes: ["S01E13"], fileIds: ["old13"], reason: "发蓝" });
+        }
+        if (seen.calls === 2) return tool("reportReplacement", { results: [{ episode: "S01E13", outcome: "not_found", note: "只找到同一版本" }] });
+        return { content: [{ type: "text" as const, text: "done" }], finishReason: { unified: "stop" as const, raw: "stop" as const }, usage: USAGE, warnings: [] };
+      },
+    });
+    return { model, seen };
+  }
+
+  it("user request on a fully obtained show: the agent still runs, and E13 stays obtained when it is not replaced", async () => {
+    const { executor, seasonId } = await seededExecutor();
+    const { model, seen } = rejectThenNotFoundModel();
+    const result = await runAcquisitionV2Workflow({
+      provider: emptyProvider(),
+      executor,
+      model,
+      workflowRunId: "run-ur",
+      title: { name: "Show", year: 2024, aliases: [], tmdbId: 42 },
+      categoryParentId: "tv_root",
+      seasons: [{ seasonNumber: 1, latestAiredEpisode: 13 }],
+      qualityPreference: "1080p",
+      priorObtained: ALL_13,
+      userRequest,
+    });
+
+    expect(seen.calls).toBeGreaterThan(0);
+    // The request reached the prompt and the replace tools were registered.
+    expect(seen.system).toContain("USER REQUESTS");
+    expect(seen.system).toContain("13 发蓝");
+    expect(seen.tools).toEqual(expect.arrayContaining(["rejectCurrentSource", "reportReplacement"]));
+    // The old file is still there, so E13 never falls back to missing.
+    expect(result.missingBefore).toEqual([]);
+    expect(result.obtained).toContain("S01E13");
+    expect(result.stillMissing).toEqual([]);
+    expect(result.replacement).toEqual({
+      results: [{ episode: "S01E13", outcome: "not_found", note: "只找到同一版本" }],
+      rejected: [expect.objectContaining({ episode: "S01E13", label: "Show - 13 [CR 1080p].mkv" })],
+      oldFiles: ["Season 01/Show - 13 [CR 1080p].mkv"],
+      identified: true,
+    });
+    expect((await executor.listTree({ directoryId: seasonId })).map((f) => f.providerFileId)).toContain("old13");
+  });
+
+  it("an episode declared file-less, marked after another episode's transfer and reported not_found, is not reconciled as obtained", async () => {
+    const executor = new FakeStorageExecutor({
+      transferOutcomes: {
+        cand_new13: {
+          status: "succeeded",
+          providerMessage: "ok",
+          files: [{ id: "new13", storageDirectoryId: "staging", name: "[Nekomoe] Show 13.mkv", sizeBytes: 1_000_000_000, episodeCode: "S01E13", providerFileId: "new13" }],
+        },
+      },
+    });
+    const showId = await executor.createDirectory({ name: "Show (2024) {tmdb-42}", parentId: "tv_root" });
+    const seasonId = await executor.createDirectory({ name: "Season 01", parentId: showId });
+    executor.seedDirectoryFiles(seasonId, [
+      { id: "old13", storageDirectoryId: seasonId, name: "Show - 13 [CR 1080p].mkv", sizeBytes: 1_400_000_000, episodeCode: "S01E13", providerFileId: "old13" },
+    ]);
+    // Every search (the raw pre-search "Show" included) returns the one new E13 release.
+    const provider: ResourceProvider = {
+      search: async ({ keyword }) => ({
+        id: `snap_${keyword}`,
+        provider: "pansou",
+        keyword,
+        createdAt: "2026-09-26T08:00:00.000Z",
+        candidates: [
+          { id: "cand_new13", snapshotId: `snap_${keyword}`, index: 0, title: "[Nekomoe] Show 13 [1.0G]", type: "magnet", source: "pansou", providerPayload: { url: `magnet:?xt=urn:btih:${"b".repeat(40)}` } },
+        ],
+      }),
+    };
+    let calls = 0;
+    const tool = (name: string, input: unknown) => ({
+      content: [{ type: "tool-call" as const, toolCallId: `c${calls}`, toolName: name, input: JSON.stringify(input) }],
+      finishReason: { unified: "tool-calls" as const, raw: "tool-calls" as const },
+      usage: USAGE,
+      warnings: [],
+    });
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => {
+        calls += 1;
+        if (calls === 1) return tool("rejectCurrentSource", { episodes: ["S01E13"], fileIds: ["old13"], reason: "发蓝" });
+        // E24 was never obtained — no file to reject, declared instead.
+        if (calls === 2) return tool("rejectCurrentSource", { episodes: ["S01E24"], fileIds: [], reason: "24 也要" });
+        // The raw pre-search is the first snapshot the agent sees (s1).
+        if (calls === 3) return tool("transferCandidate", { snapshotId: "s1", candidateId: "s1-1" });
+        if (calls === 4) return tool("moveToSeason", { moves: [{ season: 1, fileIds: ["new13"] }] });
+        // Something landed, so the marks are accepted — E24's too, though only E13 landed.
+        if (calls === 5) return tool("markObtained", { codes: ["S01E13", "S01E24"] });
+        if (calls === 6) {
+          return tool("reportReplacement", {
+            results: [
+              { episode: "S01E13", outcome: "replaced", candidateId: "s1-1", fileIds: ["new13"], note: "喵萌版" },
+              { episode: "S01E24", outcome: "not_found", note: "没找到" },
+            ],
+          });
+        }
+        if (calls === 7) return tool("finish", {});
+        return { content: [{ type: "text" as const, text: "done" }], finishReason: { unified: "stop" as const, raw: "stop" as const }, usage: USAGE, warnings: [] };
+      },
+    });
+    const ALL_BUT_24 = Array.from({ length: 23 }, (_, n) => `S01E${String(n + 1).padStart(2, "0")}`);
+
+    const result = await runAcquisitionV2Workflow({
+      provider,
+      executor,
+      model,
+      workflowRunId: "run-ur-e24",
+      title: { name: "Show", year: 2024, aliases: [], tmdbId: 42 },
+      categoryParentId: "tv_root",
+      seasons: [{ seasonNumber: 1, latestAiredEpisode: 24 }],
+      qualityPreference: "1080p",
+      priorObtained: ALL_BUT_24,
+      userRequest,
+    });
+
+    expect(result.missingBefore).toEqual(["S01E24"]);
+    expect(result.replacement?.results).toEqual([
+      expect.objectContaining({ episode: "S01E13", outcome: "replaced", candidateId: "cand_new13" }),
+      { episode: "S01E24", outcome: "not_found", note: "没找到" },
+    ]);
+    // E13 was obtained before and was replaced; E24 got only a mark, never a replacement.
+    expect(result.obtained).toContain("S01E13");
+    expect(result.obtained).not.toContain("S01E24");
+    expect(result.stillMissing).toEqual(["S01E24"]);
+  });
+
+  it("a replace run skips the landed-size read: old + new files would add up to a meaningless size, and the notification drops it anyway", async () => {
+    const { executor } = await seededExecutor();
+    const { model } = rejectThenNotFoundModel();
+    const result = await runAcquisitionV2Workflow({
+      provider: emptyProvider(),
+      executor,
+      model,
+      workflowRunId: "run-ur-size",
+      title: { name: "Show", year: 2024, aliases: [], tmdbId: 42 },
+      categoryParentId: "tv_root",
+      seasons: [{ seasonNumber: 1, latestAiredEpisode: 13 }],
+      qualityPreference: "1080p",
+      priorObtained: ALL_13,
+      userRequest,
+    });
+
+    // The season dir holds the old E13 video, so an unconditional read would report it.
+    expect(result.landedFileCount).toBeUndefined();
+    expect(result.landedBytes).toBeUndefined();
+  });
+
+  it("no user request on a fully obtained show: the no-op short-circuit still skips the agent", async () => {
+    const { executor } = await seededExecutor();
+    let calls = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => {
+        calls += 1;
+        throw new Error("model should not be called on a no-op run");
+      },
+    });
+    const result = await runAcquisitionV2Workflow({
+      provider: emptyProvider(),
+      executor,
+      model,
+      workflowRunId: "run-noop",
+      title: { name: "Show", year: 2024, aliases: [], tmdbId: 42 },
+      categoryParentId: "tv_root",
+      seasons: [{ seasonNumber: 1, latestAiredEpisode: 13 }],
+      qualityPreference: "1080p",
+      priorObtained: ALL_13,
+    });
+    expect(calls).toBe(0);
+    expect(result.replacement).toBeUndefined();
+  });
+
+  it("runTvAcquisitionV2 forwards the user request and hands the replacement back with the bridged result", async () => {
+    const { executor } = await seededExecutor();
+    const { model, seen } = rejectThenNotFoundModel();
+    const title = { id: "tmdb_tv_42", tmdbId: 42, type: "tv", title: "Show", year: 2024, aliases: [] } as unknown as MediaTitle;
+    const result = await runTvAcquisitionV2({
+      title,
+      mode: "type3",
+      seasons: [{ seasonNumber: 1, totalEpisodes: 13, latestAiredEpisode: 13, qualityPreference: "1080p" }],
+      categoryParentId: "tv_root",
+      resourceProvider: emptyProvider(),
+      storage: executor,
+      model,
+      workflowRunId: "run-ur-tv",
+      priorObtained: ALL_13,
+      userRequest,
+      now: () => "2026-09-26T08:00:00.000Z",
+    });
+    expect(seen.tools).toContain("rejectCurrentSource");
+    expect(result.replacement?.results).toEqual([{ episode: "S01E13", outcome: "not_found", note: "只找到同一版本" }]);
+    expect(result.seasons[0]!.episodes.find((e) => e.episodeCode === "S01E13")?.obtained).toBe(true);
   });
 });

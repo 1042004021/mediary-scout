@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>给 agent 留言 · 设计稿 v2</title>
+<style>
+/* Hallmark · component: detail-page message thread · genre: modern-minimal
+ * theme: studied-DNA (source: awesome-design-md/spotify + Mediary Scout globals.css tokens)
+ * states: resting · composing · picking-episodes · pending · processing · done · keep-as-is(undo) · movie
+ * pre-emit critique: P5 H4 E4 S5 R4 V4 */
+:root {
+  --bg-base: #121212; --bg-surface: #181818; --bg-raised: #1f1f1f; --bg-card: #252525; --bg-card-alt: #272727;
+  --accent: #1ed760; --accent-press: #169c46; --on-accent: #000000;
+  --text: #ffffff; --text-muted: #b3b3b3; --text-soft: #cbcbcb; --text-faint: #8f8f8f;
+  --negative: #f3727f; --warning: #ffa42b; --info: #539df5;
+  --border: #4d4d4d; --border-soft: #7c7c7c; --divider: #2a2a2a;
+  --radius-pill: 9999px; --radius-card: 8px; --radius-sm: 6px;
+  --shadow-heavy: rgba(0,0,0,.5) 0 8px 24px; --shadow-mid: rgba(0,0,0,.3) 0 8px 8px;
+  --inset-border: rgb(18,18,18) 0 1px 0, rgb(124,124,124) 0 0 0 1px inset;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1); --ease-in: cubic-bezier(0.7, 0, 0.84, 0);
+  --font: "CircularSp","Circular","Inter","PingFang SC","Microsoft YaHei",sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg-base); color: var(--text); font-family: var(--font); overflow-x: clip; }
+button { font: inherit; color: inherit; }
+
+.doc { max-width: 1040px; margin: 0 auto; padding: 32px 24px 96px; }
+.doc > h1 { font-size: 24px; font-weight: 700; margin: 0 0 6px; }
+.doc > p.lead { color: var(--text-muted); font-size: 14px; line-height: 1.6; margin: 0 0 36px; max-width: 760px; }
+.stage { margin: 0 0 52px; }
+.stage-cap { margin: 0 0 12px; }
+.stage-cap b { display: block; font-size: 16px; font-weight: 700; }
+.stage-cap span { display: block; color: var(--text-muted); font-size: 13px; margin-top: 3px; line-height: 1.5; }
+.frame { background: var(--bg-base); border-radius: 12px; padding: 20px 20px 24px; box-shadow: 0 0 0 1px var(--divider); }
+
+/* hero strip */
+.hero { display: flex; gap: 16px; align-items: flex-end; margin-bottom: 18px; }
+.poster { width: 64px; height: 92px; border-radius: 4px; flex: none; box-shadow: var(--shadow-heavy); background: linear-gradient(160deg,#3a2a55 10%,#8b1f2d 90%); }
+.poster.movie { background: linear-gradient(160deg,#1d3348 10%,#6b5a2c 90%); }
+.hero h2 { margin: 6px 0 0; font-size: 26px; font-weight: 700; }
+.hero h2 small { color: var(--text-muted); font-weight: 400; }
+.hero .sub { font-size: 12.5px; color: var(--text-muted); margin-top: 6px; }
+.badge { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 600; padding: 2px 9px; border-radius: var(--radius-pill); }
+.badge.ok { color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.badge.swap { color: var(--negative); background: color-mix(in srgb, var(--negative) 16%, transparent); }
+
+/* season */
+.season { background: var(--bg-surface); border-radius: var(--radius-card); padding: 14px 16px 16px; }
+.season-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; font-size: 13px; }
+.season-head b { font-size: 14px; }
+.bar { flex: 1; height: 4px; border-radius: 2px; background: var(--bg-card); overflow: hidden; }
+.bar i { display: block; height: 100%; background: var(--accent); }
+.count { color: var(--text-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.grid { display: grid; grid-template-columns: repeat(12, minmax(0,1fr)); gap: 6px; }
+.ep { position: relative; display: flex; flex-direction: column; align-items: center; gap: 1px; padding: 7px 2px; border-radius: var(--radius-sm); border: 1px solid; font-size: 12px; font-weight: 700; background: none; cursor: default; }
+.ep span { font-size: 9.5px; font-weight: 400; }
+.ep.got { background: rgba(30,215,96,.12); border-color: rgba(30,215,96,.55); }
+.ep.got span { color: var(--accent); }
+.ep.swap { background: rgba(243,114,127,.14); border-color: var(--negative); }
+.ep.swap span { color: var(--negative); }
+.ep.swap::after { content: ""; position: absolute; top: 4px; right: 4px; width: 5px; height: 5px; border-radius: 50%; background: var(--negative); }
+/* picking mode */
+.grid.picking .ep { cursor: pointer; transition: background-color 150ms var(--ease-out), border-color 150ms var(--ease-out); }
+.grid.picking .ep:hover { border-color: var(--text); }
+.grid.picking .ep:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.grid.picking .ep[aria-pressed="true"] { background: color-mix(in srgb, var(--info) 22%, transparent); border-color: var(--info); color: var(--text); }
+.grid.picking .ep[aria-pressed="true"] span { color: var(--info); }
+.pick-bar { display: flex; align-items: center; gap: 10px; margin-top: 12px; font-size: 12.5px; color: var(--text-muted); }
+.pick-bar .grow { flex: 1; }
+
+/* thread card */
+.thread { margin-top: 12px; background: var(--bg-surface); border-radius: var(--radius-card); padding: 16px; }
+.thread-head { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+.thread-head h3 { margin: 0; font-size: 14px; font-weight: 700; }
+.thread-head .meta { font-size: 12px; color: var(--text-faint); }
+.thread-head .grow { flex: 1; }
+
+/* resting composer = search-pill DNA */
+.composer { display: flex; align-items: center; gap: 8px; background: var(--bg-raised); border-radius: var(--radius-pill); padding: 6px 6px 6px 18px; box-shadow: var(--inset-border); transition: box-shadow 150ms var(--ease-out); }
+.composer:focus-within { box-shadow: 0 0 0 2px var(--text) inset; }
+.composer input { flex: 1; min-width: 0; background: none; border: 0; color: var(--text); font: 14px var(--font); padding: 8px 0; }
+.composer input:focus { outline: none; }
+.composer input::placeholder { color: var(--text-faint); }
+.composer.open { border-radius: 16px; flex-wrap: wrap; padding: 12px 12px 10px 16px; align-items: flex-end; }
+.composer.open textarea { flex: 1 1 100%; min-height: 58px; resize: none; background: none; border: 0; color: var(--text); font: 14px/1.55 var(--font); padding: 2px 0 8px; }
+.composer.open textarea:focus { outline: none; }
+.composer .tools { display: flex; align-items: center; gap: 6px; flex: 1; flex-wrap: wrap; }
+
+/* chips (Spotify filter-pill DNA) */
+.chips { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.chip { border: 0; background: var(--bg-card); color: var(--text); border-radius: var(--radius-pill); padding: 6px 12px; font-size: 12.5px; cursor: pointer; white-space: nowrap; transition: background-color 150ms var(--ease-out); }
+.chip:hover { background: #2e2e2e; }
+.chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.chip:active { transform: translateY(1px); }
+.chip.ep-tag { background: var(--accent); color: var(--on-accent); font-weight: 700; padding: 4px 6px 4px 10px; display: inline-flex; align-items: center; gap: 4px; }
+.chip.ep-tag b { display: grid; place-items: center; width: 16px; height: 16px; border-radius: 50%; font-size: 10px; background: rgba(0,0,0,.12); }
+
+/* buttons */
+.btn { display: inline-flex; align-items: center; gap: 6px; border-radius: var(--radius-pill); padding: 8px 16px; font-size: 13px; font-weight: 700; border: 0; cursor: pointer; white-space: nowrap; transition: background-color 150ms var(--ease-out), transform 100ms var(--ease-out); }
+.btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.btn:active { transform: scale(.98); }
+.btn.outline { background: transparent; box-shadow: 0 0 0 1px var(--border-soft) inset; }
+.btn.outline:hover { box-shadow: 0 0 0 1px var(--text) inset; }
+.btn.ghost { background: transparent; color: var(--text-muted); padding: 8px 10px; }
+.btn.ghost:hover { color: var(--text); }
+.btn.white { background: var(--accent); color: var(--on-accent); }
+.btn.white:hover { background: #3be477; }
+.btn.white:active { background: var(--accent-press); }
+.btn:disabled { opacity: .4; cursor: not-allowed; transform: none; }
+/* round green "go" = play-button DNA */
+.go { flex: none; width: 36px; height: 36px; border-radius: 50%; border: 0; display: grid; place-items: center; background: var(--accent); color: var(--on-accent); cursor: pointer; transition: transform 100ms var(--ease-out), background-color 150ms var(--ease-out); }
+.go:hover { transform: scale(1.04); background: #3be477; }
+.go:active { transform: scale(.96); background: var(--accent-press); }
+.go:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
+.go:disabled { background: var(--bg-card); color: var(--text-faint); cursor: not-allowed; transform: none; }
+.go svg { width: 16px; height: 16px; }
+.go.lg { width: 44px; height: 44px; }
+.go.lg svg { width: 18px; height: 18px; }
+
+/* message rows */
+.msg { display: grid; grid-template-columns: 32px minmax(0,1fr); gap: 12px; }
+.msg + .msg { margin-top: 14px; }
+.av { width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; font-size: 13px; font-weight: 700; }
+.av.me { background: #535353; }
+.av.agent { background: var(--bg-card); color: var(--accent); }
+.av.agent svg { width: 16px; height: 16px; }
+.who { font-size: 12.5px; color: var(--text-muted); margin-bottom: 4px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.who b { color: var(--text); font-weight: 700; }
+.body { font-size: 14px; line-height: 1.55; }
+.body .ep-inline { display: inline-block; font-size: 12px; font-weight: 700; padding: 0 7px; border-radius: 4px; background: var(--bg-card); margin: 0 1px; }
+.status { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; font-weight: 600; padding: 2px 9px; border-radius: var(--radius-pill); }
+.status.wait { color: var(--warning); background: color-mix(in srgb, var(--warning) 14%, transparent); }
+.status.run { color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.status.done { color: var(--text-muted); background: var(--bg-card); }
+.msg-actions { display: flex; align-items: center; gap: 2px; margin-top: 8px; margin-left: -10px; flex-wrap: wrap; }
+.msg-actions .grow { flex: 1; }
+
+/* now-playing equalizer (Spotify DNA) */
+.eq { display: inline-flex; align-items: flex-end; gap: 2px; width: 12px; height: 11px; }
+.eq i { width: 2px; background: currentColor; border-radius: 1px; animation: eq 900ms var(--ease-out) infinite alternate; }
+.eq i:nth-child(1) { height: 40%; animation-delay: -300ms; }
+.eq i:nth-child(2) { height: 100%; animation-delay: -600ms; }
+.eq i:nth-child(3) { height: 60%; animation-delay: -150ms; }
+@keyframes eq { from { transform: scaleY(.3); } to { transform: scaleY(1); } }
+.eq i { transform-origin: bottom; }
+@media (prefers-reduced-motion: reduce) { .eq i { animation: none; } }
+.ticker { margin-top: 8px; background: var(--bg-raised); border-radius: var(--radius-sm); padding: 10px 12px; font-size: 13px; color: var(--text-soft); display: flex; gap: 10px; align-items: center; }
+.ticker .step { color: var(--text-faint); font-size: 12px; font-variant-numeric: tabular-nums; margin-left: auto; white-space: nowrap; }
+
+/* reply tracklist (playlist-table DNA) */
+.tracks { margin-top: 8px; border-radius: var(--radius-sm); overflow: hidden; }
+.tracks-head, .track { display: grid; grid-template-columns: 44px minmax(0,1fr) 72px 128px; gap: 12px; align-items: center; padding: 0 12px; }
+.tracks-head { font-size: 11.5px; color: var(--text-faint); height: 32px; border-bottom: 1px solid var(--divider); }
+.track { min-height: 56px; border-radius: var(--radius-sm); transition: background-color 150ms var(--ease-out); }
+.track:hover { background: var(--bg-raised); }
+.track .no { font-size: 13px; font-weight: 700; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.track .res { min-width: 0; }
+.track .res b { display: block; font-size: 13.5px; font-weight: 400; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.track .res small { display: block; font-size: 12px; color: var(--text-faint); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.track.fail .res b { color: var(--text-muted); }
+.track .size { font-size: 12.5px; color: var(--text-muted); font-variant-numeric: tabular-nums; text-align: right; }
+.track .out { display: flex; justify-content: flex-end; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 600; }
+.track .out.ok { color: var(--accent); }
+.track .out.bad { color: var(--negative); }
+.track .out svg { width: 14px; height: 14px; flex: none; }
+.keep { display: none; }
+.track.fail:hover .keep, .track.fail:focus-within .keep { display: inline-flex; }
+.track.fail:hover .out-label, .track.fail:focus-within .out-label { display: none; }
+.keep { border: 0; background: transparent; box-shadow: 0 0 0 1px var(--border-soft) inset; color: var(--text); border-radius: var(--radius-pill); font-size: 12px; font-weight: 700; padding: 5px 12px; cursor: pointer; white-space: nowrap; }
+.keep:hover { box-shadow: 0 0 0 1px var(--text) inset; }
+.keep:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.oldfile { margin-top: 10px; display: flex; align-items: center; gap: 10px; padding: 10px 12px; background: var(--bg-raised); border-radius: var(--radius-sm); font-size: 12.5px; color: var(--text-muted); }
+.oldfile code { font: 12px var(--mono); color: var(--text-soft); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.copy { border: 0; background: none; color: var(--text-muted); cursor: pointer; font-size: 12px; font-weight: 700; padding: 4px 8px; border-radius: var(--radius-pill); white-space: nowrap; }
+.copy:hover { color: var(--text); }
+.copy:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.copy[data-state="copied"] { color: var(--accent); }
+
+.reply-foot { display: flex; align-items: center; gap: 10px; margin-top: 12px; font-size: 12px; color: var(--text-faint); flex-wrap: wrap; }
+.reply-foot .grow { flex: 1; }
+
+/* toast (Spotify: white pill, bottom) */
+.toast { display: inline-flex; align-items: center; gap: 14px; background: var(--text); color: #121212; font-size: 13px; font-weight: 600; border-radius: var(--radius-sm); padding: 10px 10px 10px 16px; box-shadow: var(--shadow-heavy); }
+.toast button { border: 0; background: none; color: #121212; font-weight: 700; font-size: 13px; cursor: pointer; padding: 4px 8px; border-radius: 4px; text-decoration: underline; text-underline-offset: 3px; }
+.toast button:focus-visible { outline: 2px solid #121212; }
+.toast-row { margin-top: 14px; display: flex; justify-content: center; }
+
+/* movie keep bar */
+.movie-state { display: flex; align-items: center; gap: 12px; margin-top: 12px; padding: 12px 14px; border-radius: var(--radius-sm); background: color-mix(in srgb, var(--negative) 9%, var(--bg-surface)); box-shadow: 0 0 0 1px color-mix(in srgb, var(--negative) 35%, transparent) inset; font-size: 13px; line-height: 1.5; flex-wrap: wrap; }
+.movie-state .grow { flex: 1; min-width: 200px; }
+.movie-state b { color: var(--negative); }
+
+.earlier { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--divider); font-size: 12.5px; color: var(--text-muted); display: flex; align-items: center; gap: 8px; }
+.earlier::after { content: "▸"; color: var(--text-faint); margin-left: auto; }
+
+.why { margin: 12px 0 0; font-size: 12.5px; color: var(--text-muted); line-height: 1.6; padding-left: 12px; border-left: 2px solid var(--divider); }
+
+.hidden { display: none !important; }
+
+@media (max-width: 720px) {
+  .grid { grid-template-columns: repeat(6, minmax(0,1fr)); }
+  .tracks-head { display: none; }
+  .track { grid-template-columns: 36px minmax(0,1fr); padding: 8px 10px; }
+  .track .size { grid-column: 2; text-align: left; margin-top: -6px; }
+  .track .out { grid-column: 2; justify-content: flex-start; }
+  .track.fail .keep { display: inline-flex; }
+  .oldfile { flex-wrap: wrap; }
+  .oldfile code { flex: 1 1 100%; order: 3; white-space: normal; overflow-wrap: anywhere; }
+  .hero h2 { font-size: 22px; }
+}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-send" viewBox="0 0 16 16"><path d="M2 8h10M8.5 4.5 12 8l-3.5 3.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-play" viewBox="0 0 16 16"><path d="M4.5 2.8v10.4L13 8z" fill="currentColor"/></symbol>
+  <symbol id="i-agent" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="8" cy="8" r="2.2" fill="currentColor"/></symbol>
+  <symbol id="i-check" viewBox="0 0 16 16"><path d="M3 8.5 6.5 12 13 4.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-retry" viewBox="0 0 16 16"><path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.5V5h-2.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+</svg>
+
+<div class="doc">
+  <h1>给 agent 留言 · 详情页设计稿 v2</h1>
+  <p class="lead">照 Spotify 的设计语言重做：留言框平时收成一条搜索栏那样的胶囊，发送是绿色圆钮；agent 干活时亮 Spotify「正在播放」的跳动音柱；回复写成歌单那样的逐集列表。下面几块都能点，在「②」里可以直接在格子上点选集数。</p>
+
+  <!-- ① resting -->
+  <section class="stage">
+    <div class="stage-cap"><b>① 平时</b><span>季进度下面只有一条胶囊，一句话提示能干什么。不占地方，也不会让人不知道写什么。</span></div>
+    <div class="frame">
+      <div class="hero"><div class="poster"></div><div><span class="badge ok">已全部入库</span><h2>黄泉的使者 <small>(2026)</small></h2><div class="sub">123 网盘 · 1 季 · 24 集</div></div></div>
+      <div class="season">
+        <div class="season-head"><b>第 1 季</b><span class="badge ok">已完结</span><div class="bar"><i style="width:100%"></i></div><span class="count">24/24</span></div>
+        <div class="grid" data-grid="static"></div>
+      </div>
+      <div class="thread">
+        <label class="composer" for="rest-input">
+          <input id="rest-input" placeholder="哪一集有问题？告诉 agent，下次巡检它会换一个" autocomplete="off">
+          <button class="go" disabled aria-label="发送"><svg><use href="#i-send"/></svg></button>
+        </label>
+      </div>
+    </div>
+  </section>
+
+  <!-- ② composing -->
+  <section class="stage">
+    <div class="stage-cap"><b>② 写留言</b><span>点开后下面出现常见说法，点一下就填进去；也可以点「选集数」，直接在上面的格子里点要换的集，点到的会变蓝、变成留言里的绿色标签。写什么都行，agent 读的是整句话。</span></div>
+    <div class="frame">
+      <div class="season">
+        <div class="season-head"><b>第 1 季</b><span class="badge ok">已完结</span><div class="bar"><i style="width:100%"></i></div><span class="count">24/24</span></div>
+        <div class="grid picking" id="pick-grid" role="group" aria-label="选要换的集"></div>
+        <div class="pick-bar"><span id="pick-count">在格子上点要换的集</span><span class="grow"></span><button class="btn ghost" id="pick-clear">清空</button></div>
+      </div>
+      <div class="thread">
+        <div class="composer open">
+          <textarea id="draft" aria-label="留言内容" placeholder="说说哪里不对，想换成什么样">画面发蓝，换个别的版本</textarea>
+          <div class="tools" id="tags"></div>
+          <button class="btn ghost" id="pick-toggle" aria-pressed="true">选集数</button>
+          <button class="go" aria-label="发送"><svg><use href="#i-send"/></svg></button>
+        </div>
+        <div class="chips" aria-label="常见说法">
+          <button class="chip" data-fill="画面发蓝 / 偏色">画面偏色</button>
+          <button class="chip" data-fill="是假片，不是这部">假片 / 不是这部</button>
+          <button class="chip" data-fill="没有中文字幕">没有中字</button>
+          <button class="chip" data-fill="画质太差，想要 1080p 以上">画质太差</button>
+          <button class="chip" data-fill="音画不同步">音画不同步</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ③ pending -->
+  <section class="stage">
+    <div class="stage-cap"><b>③ 发出去了，等巡检</b><span>留言挂着，下次巡检前随时能改、能撤回。不想等就点绿色圆钮，马上排队处理。选到的集这时还不变色，agent 还没看过。</span></div>
+    <div class="frame">
+      <div class="thread">
+        <div class="thread-head"><h3>给 agent 的留言</h3><span class="grow"></span></div>
+        <div class="msg">
+          <div class="av me">我</div>
+          <div>
+            <div class="who"><b>你</b><span>今天 14:02</span><span class="status wait">等巡检 · 明早 06:00</span></div>
+            <div class="body"><span class="ep-inline">E13</span><span class="ep-inline">E24</span> 画面发蓝，换个别的版本</div>
+            <div class="msg-actions">
+              <button class="btn ghost">修改</button>
+              <button class="btn ghost">撤回</button>
+              <span class="grow"></span>
+              <button class="btn white"><svg width="14" height="14"><use href="#i-play"/></svg>现在处理</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ④ processing -->
+  <section class="stage">
+    <div class="stage-cap"><b>④ agent 正在处理</b><span>留言锁住。agent 这一行亮起 Spotify「正在播放」的跳动音柱，下面实时滚它正在做的事，和活动页是同一路数据。</span></div>
+    <div class="frame">
+      <div class="thread">
+        <div class="thread-head"><h3>给 agent 的留言</h3></div>
+        <div class="msg">
+          <div class="av me">我</div>
+          <div>
+            <div class="who"><b>你</b><span>今天 14:02</span><span class="status done">已锁定</span></div>
+            <div class="body" style="color:var(--text-soft)"><span class="ep-inline">E13</span><span class="ep-inline">E24</span> 画面发蓝，换个别的版本</div>
+          </div>
+        </div>
+        <div class="msg">
+          <div class="av agent"><svg><use href="#i-agent"/></svg></div>
+          <div>
+            <div class="who"><b>agent</b><span class="status run"><span class="eq" aria-hidden="true"><i></i><i></i><i></i></span>正在处理</span></div>
+            <div class="ticker" role="status" aria-live="polite"><span>正在搜索资源：黄泉のツガイ 13</span><span class="step">第 6 步</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ④b follow-up while processing -->
+  <section class="stage">
+    <div class="stage-cap"><b>④+ 处理中又想加几集</b><span>正在处理的那条已经锁住，但输入框一直在。新写的留言排在后面，显示「排队中」，照样能改、能撤回；这次一结束就接着处理，不用等下一次巡检。同一部作品同一时间只跑一个任务，系统本来就是这样保证的。</span></div>
+    <div class="frame">
+      <div class="thread">
+        <div class="thread-head"><h3>给 agent 的留言</h3></div>
+        <div class="msg">
+          <div class="av me">我</div>
+          <div>
+            <div class="who"><b>你</b><span>今天 14:02</span><span class="status done">已锁定</span></div>
+            <div class="body" style="color:var(--text-soft)"><span class="ep-inline">E13</span><span class="ep-inline">E24</span> 画面发蓝，换个别的版本</div>
+          </div>
+        </div>
+        <div class="msg">
+          <div class="av agent"><svg><use href="#i-agent"/></svg></div>
+          <div>
+            <div class="who"><b>agent</b><span class="status run"><span class="eq" aria-hidden="true"><i></i><i></i><i></i></span>正在处理</span></div>
+            <div class="ticker"><span>正在转存：[喵萌奶茶屋] 黄泉的使者 13</span><span class="step">第 9 步</span></div>
+          </div>
+        </div>
+        <div class="msg">
+          <div class="av me">我</div>
+          <div>
+            <div class="who"><b>你</b><span>今天 14:20</span><span class="status wait">排队中 · 这次处理完接着处理</span></div>
+            <div class="body"><span class="ep-inline">E07</span><span class="ep-inline">E08</span> 这两集也是蓝的，一起换</div>
+            <div class="msg-actions"><button class="btn ghost">修改</button><button class="btn ghost">撤回</button></div>
+          </div>
+        </div>
+        <div style="margin-top:14px">
+          <label class="composer" for="q-input">
+            <input id="q-input" placeholder="还有别的？写在这里，排在上面这条后面" autocomplete="off">
+            <button class="go" disabled aria-label="发送"><svg><use href="#i-send"/></svg></button>
+          </label>
+        </div>
+      </div>
+      <p class="why">巡检前连发了几条，agent 开工时会一次读完所有还没处理的留言，一起回复；开工之后才写的，留给下一轮。</p>
+    </div>
+  </section>
+
+  <!-- ⑤ done -->
+  <section class="stage">
+    <div class="stage-cap"><b>⑤ 处理完：一集换好，一集没找到</b><span>回复是一张逐集列表。没换成的那集格子变红、右上角一个红点，标题旁显示「1 集待换」，之后每次巡检都接着找。鼠标移到那一行，右边出现「不换了」；点了立刻恢复成已获取，底部给 6 秒撤销。</span></div>
+    <div class="frame">
+      <div class="hero"><div class="poster"></div><div><span class="badge swap">1 集待换</span><h2>黄泉的使者 <small>(2026)</small></h2><div class="sub">123 网盘 · 1 季 · 24 集</div></div></div>
+      <div class="season">
+        <div class="season-head"><b>第 1 季</b><span class="badge ok">已完结</span><div class="bar"><i style="width:100%"></i></div><span class="count">24/24</span></div>
+        <div class="grid" data-grid="swap24"></div>
+      </div>
+      <div class="thread">
+        <div class="thread-head"><h3>给 agent 的留言</h3><span class="grow"></span><span class="meta">今天 14:31 处理完</span></div>
+        <div class="msg">
+          <div class="av me">我</div>
+          <div>
+            <div class="who"><b>你</b><span>今天 14:02</span></div>
+            <div class="body" style="color:var(--text-soft)"><span class="ep-inline">E13</span><span class="ep-inline">E24</span> 画面发蓝，换个别的版本</div>
+          </div>
+        </div>
+        <div class="msg">
+          <div class="av agent"><svg><use href="#i-agent"/></svg></div>
+          <div>
+            <div class="who"><b>agent</b><span>换好 1 集，1 集还在找</span></div>
+            <div class="tracks">
+              <div class="tracks-head"><span>集</span><span>这次用的资源</span><span style="text-align:right">大小</span><span style="text-align:right">结果</span></div>
+              <div class="track">
+                <span class="no">E13</span>
+                <span class="res"><b>[喵萌奶茶屋] 黄泉的使者 13 [1080p][简日双语]</b><small>换掉了原来的 CR 版，新文件和旧文件放在同一个季目录</small></span>
+                <span class="size">1.1 GB</span>
+                <span class="out ok"><svg><use href="#i-check"/></svg>换好了</span>
+              </div>
+              <div class="track fail" id="row-e24" tabindex="0">
+                <span class="no">E24</span>
+                <span class="res"><b>没有找到别的版本</b><small>搜到的 4 个都是原来那份 CR 版，只是链接不同，没有转</small></span>
+                <span class="size">—</span>
+                <span class="out bad"><span class="out-label" style="display:inline-flex;gap:6px;align-items:center"><svg><use href="#i-retry"/></svg>继续找</span><button class="keep" data-keep="e24">不换了</button></span>
+              </div>
+            </div>
+            <div class="oldfile"><span>旧文件还在，确认新的能看再删：</span><code>Season 01/Yomi no Tsugai - 13 [CR 1080p].mkv</code><button class="copy" data-copy>复制路径</button></div>
+            <div class="reply-foot"><span>换好的那集按原来的名字放在一起，播放器里会看到两个 E13。</span><span class="grow"></span><button class="btn outline">再留一条</button></div>
+          </div>
+        </div>
+        <div class="earlier">之前的留言 · 2 条</div>
+      </div>
+      <div class="toast-row hidden" id="undo-toast"><div class="toast" role="status">E24 不换了，恢复成已获取<button id="undo">撤销</button></div></div>
+    </div>
+  </section>
+
+  <!-- ⑥ movie -->
+  <section class="stage">
+    <div class="stage-cap"><b>⑥ 电影：奥德赛是假片</b><span>电影只有一个文件，没有格子，「待换资源」直接挂在标题上，下面一条红底提示带「不换了」。agent 把这部山寨片按名字和大小记下，别人换个链接分享同一份，也不会再转。</span></div>
+    <div class="frame">
+      <div class="hero"><div class="poster movie"></div><div><span class="badge swap">待换资源</span><h2>奥德赛 <small>(2026)</small></h2><div class="sub">115 网盘 · 电影</div></div></div>
+      <div class="movie-state"><span class="grow"><b>还在找正片。</b>你说现在这份是山寨片，之后每次巡检都会接着找诺兰那部。</span><button class="btn outline">不换了</button></div>
+      <div class="thread">
+        <div class="thread-head"><h3>给 agent 的留言</h3><span class="grow"></span><span class="meta">今天 14:35 处理完</span></div>
+        <div class="msg">
+          <div class="av me">我</div>
+          <div>
+            <div class="who"><b>你</b><span>今天 14:10</span></div>
+            <div class="body" style="color:var(--text-soft)">这部是假的，是山寨公司拍的同名片，换成诺兰那部</div>
+          </div>
+        </div>
+        <div class="msg">
+          <div class="av agent"><svg><use href="#i-agent"/></svg></div>
+          <div>
+            <div class="who"><b>agent</b><span>这次没找到能换的</span></div>
+            <div class="tracks">
+              <div class="track fail" tabindex="0" style="grid-template-columns:minmax(0,1fr) 72px 128px">
+                <span class="res"><b>The.Odyssey.2026.1080p.WEB-DL（山寨同名片）</b><small>搜到 11 个结果：4 个是这部山寨片（名字、大小都一样，只是链接不同），其余是预告片和影评</small></span>
+                <span class="size">2.3 GB</span>
+                <span class="out bad"><svg><use href="#i-retry"/></svg>继续找</span>
+              </div>
+            </div>
+            <div class="oldfile"><span>旧文件还在：</span><code>Movies/奥德赛 (2026)/The.Odyssey.2026.1080p.WEB-DL.mkv</code><button class="copy" data-copy>复制路径</button></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script>
+// Build grids
+const eps = Array.from({ length: 24 }, (_, i) => `E${String(i + 1).padStart(2, "0")}`);
+document.querySelectorAll("[data-grid]").forEach((g) => {
+  const swap = g.dataset.grid === "swap24";
+  g.innerHTML = eps.map((e) => swap && e === "E24"
+    ? `<div class="ep swap" id="cell-e24" title="你要求换 · 巡检会继续找">${e}<span>待换</span></div>`
+    : `<div class="ep got">${e}<span>已获取</span></div>`).join("");
+});
+// Picking grid
+const pick = document.getElementById("pick-grid");
+const picked = new Set(["E13", "E24"]);
+const tags = document.getElementById("tags");
+const count = document.getElementById("pick-count");
+function renderPick() {
+  pick.innerHTML = eps.map((e) => `<button type="button" class="ep got" aria-pressed="${picked.has(e)}">${e}<span>${picked.has(e) ? "要换" : "已获取"}</span></button>`).join("");
+  tags.innerHTML = [...picked].sort().map((e) => `<span class="chip ep-tag">${e}<b aria-hidden="true">×</b></span>`).join("");
+  count.textContent = picked.size ? `选了 ${picked.size} 集` : "在格子上点要换的集";
+}
+pick.addEventListener("click", (ev) => {
+  const b = ev.target.closest("button"); if (!b) return;
+  const e = b.firstChild.textContent.trim();
+  picked.has(e) ? picked.delete(e) : picked.add(e); renderPick();
+});
+document.getElementById("pick-clear").onclick = () => { picked.clear(); renderPick(); };
+document.getElementById("pick-toggle").onclick = (ev) => {
+  const on = ev.currentTarget.getAttribute("aria-pressed") !== "true";
+  ev.currentTarget.setAttribute("aria-pressed", on);
+  pick.classList.toggle("picking", on);
+};
+renderPick();
+// Chips fill the draft
+document.querySelectorAll("[data-fill]").forEach((c) => c.onclick = () => {
+  const d = document.getElementById("draft"); d.value = c.dataset.fill; d.focus();
+});
+// Keep-as-is + undo
+let undoTimer;
+document.querySelector("[data-keep]").onclick = () => {
+  const row = document.getElementById("row-e24"), cell = document.getElementById("cell-e24");
+  row.classList.add("hidden");
+  cell.className = "ep got"; cell.innerHTML = "E24<span>已获取</span>";
+  document.querySelector(".badge.swap").classList.add("hidden");
+  const t = document.getElementById("undo-toast"); t.classList.remove("hidden");
+  clearTimeout(undoTimer); undoTimer = setTimeout(() => t.classList.add("hidden"), 6000);
+};
+document.getElementById("undo").onclick = () => {
+  document.getElementById("row-e24").classList.remove("hidden");
+  const cell = document.getElementById("cell-e24"); cell.className = "ep swap"; cell.innerHTML = "E24<span>待换</span>";
+  document.querySelector(".badge.swap").classList.remove("hidden");
+  document.getElementById("undo-toast").classList.add("hidden");
+};
+// Copy path (label swap, no toast)
+document.querySelectorAll("[data-copy]").forEach((b) => b.onclick = () => {
+  b.dataset.state = "copied"; b.textContent = "已复制";
+  setTimeout(() => { delete b.dataset.state; b.textContent = "复制路径"; }, 2500);
+});
+</script>
+</body>
+</html>

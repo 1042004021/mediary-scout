@@ -24,6 +24,16 @@ import {
   type AgentMemoryStore,
   type AgentMemorySummary,
 } from "./agent-memory.js";
+import {
+  compareUserMessagesCreated,
+  type EpisodeSource,
+  type PendingReplacement,
+  type RejectedResource,
+  type UserMessage,
+  type UserMessageScope,
+  type UserRequestStore,
+  userMessageDrive,
+} from "./user-requests.js";
 import type {
   Account,
   ConnectedStorage,
@@ -51,6 +61,25 @@ export const UNSCOPED_STORAGE = "__unscoped__";
  */
 export function seasonScopeKey(seasonId: string, connectedStorageId: string | null | undefined): string {
   return `${seasonId}\u0000${connectedStorageId ?? UNSCOPED_STORAGE}`;
+}
+
+/** Which active runs of the same title refuse a reservation, or null when the
+ *  reservation is not title-exclusive at all (see ReserveWorkflowRunInput). */
+export function titleBlockFilter(
+  input: Pick<ReserveWorkflowRunInput, "blockIfTitleHasActiveRun" | "blockIfTitleHasActiveKinds">,
+): ((run: Pick<WorkflowRun, "kind">) => boolean) | null {
+  if (input.blockIfTitleHasActiveRun === true) return () => true;
+  const kinds = input.blockIfTitleHasActiveKinds;
+  if (kinds && kinds.length > 0) return (run) => kinds.includes(run.kind);
+  return null;
+}
+
+/** Whether the reservation refuses (`not_tracked`) a (season, drive) that is no longer
+ *  tracked: asked for directly, or implied by keepCurrentEpisodes (nothing to keep). */
+export function reservationRequiresTrackedSeason(
+  input: Pick<ReserveWorkflowRunInput, "requireTrackedSeason" | "keepCurrentEpisodes">,
+): boolean {
+  return input.requireTrackedSeason === true || input.keepCurrentEpisodes === true;
 }
 
 export interface PersistWorkflowRunSnapshotInput {
@@ -107,6 +136,31 @@ export interface ReserveWorkflowRunInput extends PersistWorkflowRunSnapshotInput
    * spawn overlapping writers on the same title.
    */
   blockIfTitleHasActiveRun?: boolean;
+  /**
+   * Narrower title-level exclusion: refuse only if an active run of one of these
+   * kinds exists for the same (account, drive, title). The patrol sets
+   * ["replace_request"]: a replace run works every season's directory, so a patrol
+   * run beside it would race it, while patrol runs of other seasons must not block
+   * each other. Checked under the same lock as blockIfTitleHasActiveRun.
+   */
+  blockIfTitleHasActiveKinds?: WorkflowKind[];
+  /**
+   * Refuse — `not_tracked`, nothing written — unless the (season, drive) is still
+   * tracked when the reservation decides. For a caller that reserves from states it
+   * read earlier (queueReplaceRequest, the patrol): the season may have been untracked
+   * in between, and writing the run would track it again. Postgres checks it under the
+   * title lock, which untrackTitle takes too; SQLite and InMemory decide synchronously.
+   */
+  requireTrackedSeason?: boolean;
+  /**
+   * Write ONLY the new run: the title, the season record and its episode states stay
+   * exactly as stored when the reservation decides (the passed copies are not written).
+   * For a caller that reserves from states it read earlier (queueReplaceRequest): a run
+   * of that season that saved in between (an episode landed) must not be rolled back to
+   * the stale copy. Decided in the same atomic section as the other checks. Implies
+   * requireTrackedSeason: a season that is not tracked has nothing to keep.
+   */
+  keepCurrentEpisodes?: boolean;
   staleActiveRunStartedBefore?: string;
   staleFinishedAt?: string;
 }
@@ -123,9 +177,13 @@ export type WorkflowRunReservationResult =
   | {
       status: "already_has_episode_state";
       episodes: EpisodeState[];
+    }
+  | {
+      /** requireTrackedSeason was set and the (season, drive) is no longer tracked. */
+      status: "not_tracked";
     };
 
-export interface WorkflowRepository extends DeadLinkStore, AgentMemoryStore {
+export interface WorkflowRepository extends DeadLinkStore, AgentMemoryStore, UserRequestStore {
   saveWorkflowRunSnapshot(input: PersistWorkflowRunSnapshotInput): Promise<void>;
   reserveWorkflowRun(input: ReserveWorkflowRunInput): Promise<WorkflowRunReservationResult>;
   /** (account, storage)-scoped: returns null if the run belongs to a different
@@ -189,6 +247,10 @@ export interface WorkflowRepository extends DeadLinkStore, AgentMemoryStore {
    * 获取 click never happened. Refuses (not_cancellable) once the worker has
    * claimed it (running) or it is otherwise non-queued; that race is expected.
    * Pure DB: a queued run has created no 115 directories yet.
+   *
+   * A replace_request owns no tracking: only the run goes, and every pending message
+   * of its work (those it held included) ends up pending and NOT urgent, so the idle
+   * scan does not queue it right back — it waits for the patrol.
    */
   cancelQueuedWorkflowRun(
     workflowRunId: string,
@@ -198,7 +260,11 @@ export interface WorkflowRepository extends DeadLinkStore, AgentMemoryStore {
    *  runs/子表/episodes/season,条件删全局 title)。`mediaKind` 区分 TMDB 的
    *  movie/tv id 命名空间(同一数字 id 可同时是 movie 和 tv);"tv" 同时覆盖 tv 与
    *  anime(同一 tv 命名空间)。seasonNumber 给定=只删该季。任一目标季有 running run
-   *  时拒绝(in_flight)。不碰网盘文件。 */
+   *  时拒绝(in_flight);这部作品在本盘有排队中或进行中的 replace_request 时也拒绝
+   *  (它记在最低一季上,结束时会给覆盖到的每一季写记录,中途取消的季会被写回来)。
+   *  与换源预留互斥(Postgres 共用作品锁;预留带 requireTrackedSeason 复核季仍在追踪):
+   *  先预留的让这里 in_flight,先取消的让预留 not_tracked,不会两边都成功。
+   *  不碰网盘文件。 */
   untrackTitle(
     tmdbId: number,
     scope: WorkflowScope,
@@ -319,6 +385,10 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
   private readonly deadLinks = new Map<string, DeadLink>();
   private readonly agentSteps = new Map<string, AgentStep[]>();
   private readonly agentMemories = new Map<string, AgentMemory>();
+  private readonly userMessages = new Map<string, UserMessage>();
+  private readonly pendingReplacements = new Map<string, PendingReplacement>();
+  private readonly rejectedResources: RejectedResource[] = [];
+  private readonly episodeSources = new Map<string, EpisodeSource>();
 
   async getSetting(key: string): Promise<string | null> {
     return this.settings.get(key) ?? null;
@@ -671,6 +741,176 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     }
   }
 
+  // ---- user requests (see user-requests.ts). No await between read and write → atomic.
+  async createUserMessage(input: Parameters<UserRequestStore["createUserMessage"]>[0]): Promise<UserMessage> {
+    const busy = [...this.userMessages.values()].some((m) => sameWork(m, input) && m.status === "processing");
+    const row: UserMessage = {
+      id: `msg_${globalThis.crypto.randomUUID()}`,
+      accountId: input.accountId, drive: input.drive, titleKey: input.titleKey,
+      body: input.body, episodeTags: [...input.episodeTags],
+      status: "pending", urgent: busy, runId: null, reply: null,
+      createdAt: input.now, updatedAt: input.now, processedAt: null,
+    };
+    this.userMessages.set(row.id, row);
+    return structuredClone(row);
+  }
+
+  async listUserMessages(scope: UserMessageScope): Promise<UserMessage[]> {
+    return [...this.userMessages.values()]
+      .filter((m) => sameWork(m, scope) && m.status !== "withdrawn")
+      .sort((a, b) => -compareUserMessagesCreated(a, b))
+      .map((m) => structuredClone(m));
+  }
+
+  async editUserMessage(input: Parameters<UserRequestStore["editUserMessage"]>[0]): Promise<UserMessage | null> {
+    const m = this.userMessages.get(input.id);
+    if (!m || m.accountId !== input.accountId || m.status !== "pending") return null;
+    Object.assign(m, { body: input.body, episodeTags: [...input.episodeTags], updatedAt: input.now });
+    return structuredClone(m);
+  }
+
+  async withdrawUserMessage(input: Parameters<UserRequestStore["withdrawUserMessage"]>[0]): Promise<boolean> {
+    const m = this.userMessages.get(input.id);
+    if (!m || m.accountId !== input.accountId || m.status !== "pending") return false;
+    Object.assign(m, { status: "withdrawn", updatedAt: input.now });
+    return true;
+  }
+
+  async markUserMessagesUrgent(input: Parameters<UserRequestStore["markUserMessagesUrgent"]>[0]): Promise<number> {
+    let n = 0;
+    for (const m of this.userMessages.values()) {
+      if (sameWork(m, input) && m.status === "pending") {
+        Object.assign(m, { urgent: true, updatedAt: input.now });
+        n += 1;
+      }
+    }
+    return n;
+  }
+
+  async clearUserMessagesUrgent(input: Parameters<UserRequestStore["clearUserMessagesUrgent"]>[0]): Promise<number> {
+    return this.clearUserMessagesUrgentSync(input, input.now);
+  }
+
+  /** Sync form: cancel and crash recovery run it with no await in between. */
+  private clearUserMessagesUrgentSync(work: UserMessageScope, now: string): number {
+    let n = 0;
+    for (const m of this.userMessages.values()) {
+      if (sameWork(m, work) && m.status === "pending" && m.urgent) {
+        Object.assign(m, { urgent: false, updatedAt: now });
+        n += 1;
+      }
+    }
+    return n;
+  }
+
+  async claimUserMessages(input: Parameters<UserRequestStore["claimUserMessages"]>[0]): Promise<UserMessage[]> {
+    const claimed: UserMessage[] = [];
+    for (const m of this.userMessages.values()) {
+      // Idempotent per run: a run requeued after a crash gets its own messages back.
+      if (sameWork(m, input) && (m.status === "pending" || (m.status === "processing" && m.runId === input.runId))) {
+        Object.assign(m, { status: "processing", runId: input.runId, updatedAt: input.now });
+        claimed.push(structuredClone(m));
+      }
+    }
+    return claimed.sort(compareUserMessagesCreated);
+  }
+
+  async finishUserMessages(input: Parameters<UserRequestStore["finishUserMessages"]>[0]): Promise<void> {
+    for (const m of this.userMessages.values()) {
+      if (m.status === "processing" && m.runId === input.runId) {
+        Object.assign(m, { status: "done", reply: structuredClone(input.reply), processedAt: input.now, updatedAt: input.now });
+      }
+    }
+  }
+
+  async releaseUserMessages(input: Parameters<UserRequestStore["releaseUserMessages"]>[0]): Promise<void> {
+    for (const m of this.userMessages.values()) {
+      if (m.status === "processing" && m.runId === input.runId) {
+        Object.assign(m, { status: "pending", urgent: input.urgent ?? true, runId: null, updatedAt: input.now });
+      }
+    }
+  }
+
+  async releaseOrphanedUserMessages(input: { now: string; finishedBefore: string }): Promise<number> {
+    let n = 0;
+    for (const m of this.userMessages.values()) {
+      if (m.status !== "processing") continue;
+      const run = m.runId === null ? undefined : this.workflowRuns.get(m.runId);
+      if (run && isActiveWorkflowStatus(run.workflowRun.status)) continue;
+      const finishedAt = run?.workflowRun.finishedAt;
+      if (run && finishedAt && finishedAt >= input.finishedBefore) continue;
+      Object.assign(m, { status: "pending", urgent: false, runId: null, updatedAt: input.now });
+      n += 1;
+    }
+    return n;
+  }
+
+  async listWorksWithPendingMessages(input: { urgentOnly: boolean }): Promise<UserMessageScope[]> {
+    return uniqueWorks(
+      [...this.userMessages.values()].filter((m) => m.status === "pending" && (!input.urgentOnly || m.urgent)),
+    );
+  }
+
+  async listWorksWithProcessingMessages(): Promise<UserMessageScope[]> {
+    return uniqueWorks([...this.userMessages.values()].filter((m) => m.status === "processing"));
+  }
+
+  async listPendingReplacements(scope: UserMessageScope): Promise<PendingReplacement[]> {
+    return [...this.pendingReplacements.values()]
+      .filter((p) => sameWork(p, scope))
+      .sort((a, b) => a.episode.localeCompare(b.episode))
+      .map((p) => ({ ...p }));
+  }
+
+  async listWorksWithPendingReplacements(): Promise<UserMessageScope[]> {
+    return uniqueWorks([...this.pendingReplacements.values()]);
+  }
+
+  async addPendingReplacements(input: Parameters<UserRequestStore["addPendingReplacements"]>[0]): Promise<void> {
+    for (const episode of input.episodes) {
+      const key = workKey(input, episode);
+      if (!this.pendingReplacements.has(key)) {
+        this.pendingReplacements.set(key, {
+          accountId: input.accountId, drive: input.drive, titleKey: input.titleKey,
+          episode, messageId: input.messageId, requestedAt: input.now,
+        });
+      }
+    }
+  }
+
+  async removePendingReplacements(input: Parameters<UserRequestStore["removePendingReplacements"]>[0]): Promise<number> {
+    let n = 0;
+    for (const episode of new Set(input.episodes)) if (this.pendingReplacements.delete(workKey(input, episode))) n += 1;
+    return n;
+  }
+
+  async addRejectedResources(input: Parameters<UserRequestStore["addRejectedResources"]>[0]): Promise<void> {
+    for (const item of input.items) {
+      this.rejectedResources.push({
+        ...item, id: `rej_${globalThis.crypto.randomUUID()}`,
+        accountId: input.accountId, titleKey: input.titleKey, createdAt: input.now,
+      });
+    }
+  }
+
+  async listRejectedResources(input: { accountId: string; titleKey: string }): Promise<RejectedResource[]> {
+    return this.rejectedResources
+      .filter((r) => r.accountId === input.accountId && r.titleKey === input.titleKey)
+      .sort(compareUserMessagesCreated)
+      .map((r) => ({ ...r }));
+  }
+
+  async upsertEpisodeSource(input: EpisodeSource): Promise<void> {
+    this.episodeSources.set(workKey(input, input.episode), { ...input });
+  }
+
+  async listEpisodeSources(scope: UserMessageScope): Promise<EpisodeSource[]> {
+    return [...this.episodeSources.values()]
+      .filter((s) => sameWork(s, scope))
+      .sort((a, b) => a.episode.localeCompare(b.episode))
+      .map((s) => ({ ...s }));
+  }
+
   async saveWorkflowRunSnapshot(input: PersistWorkflowRunSnapshotInput): Promise<void> {
     validateWorkflowRunSnapshot(input);
 
@@ -693,6 +933,11 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
   async reserveWorkflowRun(input: ReserveWorkflowRunInput): Promise<WorkflowRunReservationResult> {
     const snapshot = workflowSnapshotFromReservation(input);
     validateWorkflowRunSnapshot(snapshot);
+    // Before anything is written (the stale-run expiry included) and, like the checks
+    // below, with no await between it and the write.
+    if (reservationRequiresTrackedSeason(input) && !this.isSeasonTracked(snapshot.season.id, snapshot.connectedStorageId)) {
+      return { status: "not_tracked" };
+    }
     this.expireStaleActiveWorkflowRuns(input);
 
     const reservingScope = {
@@ -703,7 +948,8 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     // constraint, so legacy/null stays null for backfill to pin later); the
     // episode bucket key collapses null→sentinel via seasonScopeKey.
     const storageValue = snapshot.connectedStorageId ?? null;
-    if (input.blockIfTitleHasActiveRun === true) {
+    const blocksTitle = titleBlockFilter(input);
+    if (blocksTitle) {
       const titleActive = Array.from(this.workflowRuns.values())
         .filter(
           (stored) =>
@@ -711,7 +957,8 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
             // different drives may each track the same title independently.
             scopeMatches(reservingScope, stored.accountId, stored.connectedStorageId) &&
             stored.season.mediaTitleId === snapshot.season.mediaTitleId &&
-            isActiveWorkflowStatus(stored.workflowRun.status),
+            isActiveWorkflowStatus(stored.workflowRun.status) &&
+            blocksTitle(stored.workflowRun),
         )
         .sort((a, b) => b.workflowRun.startedAt.localeCompare(a.workflowRun.startedAt))[0];
       if (titleActive) {
@@ -722,7 +969,9 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
       }
     }
 
-    const activeRun = await this.findActiveWorkflowRun({
+    // Synchronous on purpose: an await between the title check above and the set
+    // below would let two concurrent reservations both pass the check.
+    const activeRun = this.findActiveWorkflowRunSync({
       trackedSeasonId: snapshot.season.id,
       kind: snapshot.workflowRun.kind,
       accountId: reservingScope.accountId,
@@ -748,11 +997,21 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     const cloned = cloneWorkflowValue(snapshot);
     cloned.accountId = cloned.accountId ?? DEFAULT_ACCOUNT_ID;
     cloned.connectedStorageId = storageValue;
-    this.workflowRuns.set(cloned.workflowRun.id, cloned);
-    this.episodesBySeason.set(
-      seasonScopeKey(cloned.season.id, storageValue),
-      cloneWorkflowValue(cloned.episodes),
-    );
+    const bucketKey = seasonScopeKey(cloned.season.id, storageValue);
+    if (input.keepCurrentEpisodes === true) {
+      // Tracking here is the latest run record of the (season, drive) plus its episode
+      // bucket: this run's record carries the CURRENT title, season and episodes (not the
+      // copies it was handed) and the bucket is left alone, so the season reads exactly
+      // as before. The tracked check above guarantees a record exists.
+      const current = this.latestSeasonRecordSync(cloned.season.id, storageValue)!;
+      cloned.title = cloneWorkflowValue(current.title);
+      cloned.season = cloneWorkflowValue(current.season);
+      cloned.episodes = cloneWorkflowValue(this.episodesBySeason.get(bucketKey) ?? current.episodes);
+      this.workflowRuns.set(cloned.workflowRun.id, cloned);
+    } else {
+      this.workflowRuns.set(cloned.workflowRun.id, cloned);
+      this.episodesBySeason.set(bucketKey, cloneWorkflowValue(cloned.episodes));
+    }
 
     return {
       status: "reserved",
@@ -805,6 +1064,13 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
         workflowRun: recovered.run,
       });
       if (recovered.action === "requeue") requeued += 1;
+      // A replace run that will never run again hands its work back to the patrol: its
+      // messages go back to pending, and none of the work's messages stays urgent (a run
+      // that crashed the worker over and over must not be retried on every idle tick).
+      else if (recovered.run.kind === "replace_request") {
+        await this.releaseUserMessages({ runId: id, now, urgent: false });
+        this.clearUserMessagesUrgentSync(workOfRun(snapshot), now);
+      }
     }
     return requeued;
   }
@@ -826,6 +1092,15 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     accountId?: string;
     connectedStorageId?: string | null;
   }): Promise<PersistedWorkflowRunSnapshot | null> {
+    return this.findActiveWorkflowRunSync(input);
+  }
+
+  private findActiveWorkflowRunSync(input: {
+    trackedSeasonId: string;
+    kind: WorkflowKind;
+    accountId?: string;
+    connectedStorageId?: string | null;
+  }): PersistedWorkflowRunSnapshot | null {
     const scope = normalizeScope(
       input.accountId === undefined
         ? undefined
@@ -842,6 +1117,27 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
       .sort((a, b) => b.workflowRun.startedAt.localeCompare(a.workflowRun.startedAt));
     const latest = activeRuns[0];
     return latest ? withDerivedEpisodeSummaries(cloneWorkflowValue(latest)) : null;
+  }
+
+  /** Whether the (season, drive) is tracked. InMemory derives tracking from the run
+   *  records themselves, which untrackTitle deletes. */
+  private isSeasonTracked(seasonId: string, connectedStorageId: string | null | undefined): boolean {
+    const key = seasonScopeKey(seasonId, connectedStorageId);
+    return Array.from(this.workflowRuns.values()).some(
+      (stored) => seasonScopeKey(stored.season.id, stored.connectedStorageId) === key,
+    );
+  }
+
+  /** The run record the (season, drive)'s tracking is read from — the latest one, as in
+   *  listTrackedSeasonStates — or undefined when it is not tracked. */
+  private latestSeasonRecordSync(
+    seasonId: string,
+    connectedStorageId: string | null | undefined,
+  ): PersistWorkflowRunSnapshotInput | undefined {
+    const key = seasonScopeKey(seasonId, connectedStorageId);
+    return Array.from(this.workflowRuns.values())
+      .filter((stored) => seasonScopeKey(stored.season.id, stored.connectedStorageId) === key)
+      .sort((a, b) => b.workflowRun.startedAt.localeCompare(a.workflowRun.startedAt))[0];
   }
 
   async listActiveWorkflowRuns(
@@ -910,6 +1206,19 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     const storageValue = stored.connectedStorageId ?? UNSCOPED_STORAGE;
     this.workflowRuns.delete(workflowRunId);
     this.agentSteps.delete(workflowRunId);
+    // Only an init run owns its season's tracking. Anything else (a replace_request
+    // on a library that already has files) is just removed — plus, for a replace
+    // run, any messages it held go back to pending.
+    if (!tearsDownTrackingOnCancel(stored.workflowRun.kind)) {
+      if (stored.workflowRun.kind === "replace_request") {
+        // The user cancelled: nothing of this work stays urgent, or the idle scan would
+        // queue it again within seconds. It waits for the patrol (or 现在处理).
+        const now = new Date().toISOString();
+        await this.releaseUserMessages({ runId: workflowRunId, now, urgent: false });
+        this.clearUserMessagesUrgentSync(workOfRun(stored), now);
+      }
+      return { status: "cancelled" };
+    }
     // Only drop THIS drive's episode bucket, and only if no run on the same
     // (season, drive) still references it — never touch another drive's episodes.
     const seasonStillReferenced = Array.from(this.workflowRuns.values()).some(
@@ -945,6 +1254,7 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     }
     const targetSeasonIds = new Set(states.map((state) => state.season.id));
     const storageValue = scope.connectedStorageId ?? UNSCOPED_STORAGE;
+    const work = { accountId: scope.accountId ?? DEFAULT_ACCOUNT_ID, drive: userMessageDrive(scope.connectedStorageId), titleKey: states[0]!.title.id };
 
     // In-flight guard: a running run on any target season → refuse, delete nothing.
     const hasRunning = Array.from(this.workflowRuns.values()).some(
@@ -953,7 +1263,19 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
         scopeMatches(scope, snapshot.accountId, snapshot.connectedStorageId) &&
         snapshot.workflowRun.status === "running",
     );
-    if (hasRunning) {
+    // …and a queued or running replace_request of the work, whichever season it is recorded
+    // on: it covers every season tracked when it starts and writes a record for each when it
+    // ends (`${runId}_s<n>` beside the lock season's), so a season untracked in between would
+    // be tracked again. Refuse until it has ended (or is cancelled). It stays running until its
+    // last write (its terminal record comes after the season records and the request
+    // bookkeeping), so once it has ended nothing of it is left to write.
+    const replaceActive = Array.from(this.workflowRuns.values()).some(
+      (snapshot) =>
+        snapshot.workflowRun.kind === "replace_request" &&
+        isActiveWorkflowStatus(snapshot.workflowRun.status) &&
+        sameWork(workOfRun(snapshot), work),
+    );
+    if (hasRunning || replaceActive) {
       return { status: "in_flight", removedSeasons: 0 };
     }
 
@@ -972,6 +1294,33 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     for (const seasonId of targetSeasonIds) {
       this.episodesBySeason.delete(seasonScopeKey(seasonId, storageValue));
     }
+
+    // Clean up this work's pending user-request state too, so it doesn't come
+    // back to haunt a fresh (re-)track: a stale pending message just keeps
+    // producing not_tracked queue attempts, and a stale pending_replacement
+    // would revive an old replace request the moment the title is re-tracked.
+    // episode_sources and rejected_resources stay — they're useful history if
+    // the user re-tracks. Processing messages are untouched (a running run
+    // already refused above; nothing here is mid-flight). Untracking the last
+    // season still tracked on this drive, one season at a time, is the whole work.
+    const workGone =
+      seasonNumber === undefined ||
+      !Array.from(this.workflowRuns.values()).some((snapshot) => sameWork(workOfRun(snapshot), work));
+    if (workGone) {
+      const now = new Date().toISOString();
+      for (const m of this.userMessages.values()) {
+        if (sameWork(m, work) && m.status === "pending") Object.assign(m, { status: "withdrawn", updatedAt: now });
+      }
+      for (const [key, p] of this.pendingReplacements) {
+        if (sameWork(p, work)) this.pendingReplacements.delete(key);
+      }
+    } else {
+      const seasonPrefix = `S${String(seasonNumber).padStart(2, "0")}E`;
+      for (const [key, p] of this.pendingReplacements) {
+        if (sameWork(p, work) && p.episode.startsWith(seasonPrefix)) this.pendingReplacements.delete(key);
+      }
+    }
+
     return { status: "untracked", removedSeasons: targetSeasonIds.size };
   }
 
@@ -1279,6 +1628,8 @@ export function isActiveWorkflowStatus(status: WorkflowStatus): boolean {
 export function workflowSnapshotFromReservation(input: ReserveWorkflowRunInput): PersistWorkflowRunSnapshotInput {
   const {
     blockIfEpisodeStatesExist: _blockIfEpisodeStatesExist,
+    requireTrackedSeason: _requireTrackedSeason,
+    keepCurrentEpisodes: _keepCurrentEpisodes,
     staleActiveRunStartedBefore: _staleActiveRunStartedBefore,
     staleFinishedAt: _staleFinishedAt,
     ...snapshot
@@ -1362,7 +1713,24 @@ const KIND_HAS_QUEUE_CLAIMER: Record<WorkflowKind, boolean> = {
   type2_init: true,
   movie_init: true,
   type3_monitor: false,
+  replace_request: true,
 };
+
+/** Whether cancelling a queued run of this kind tears down its season's tracking.
+ *  Only an init run owns the season (cancelling it = "never mind, don't track");
+ *  a replace_request runs on a library that already has files and must never take
+ *  the tracking down with it. `=== true` for the same reason as isQueueClaimableKind. */
+const KIND_OWNS_TRACKING: Record<WorkflowKind, boolean> = {
+  type1_package_init: true,
+  type2_init: true,
+  movie_init: true,
+  type3_monitor: false,
+  replace_request: false,
+};
+
+export function tearsDownTrackingOnCancel(kind: WorkflowKind): boolean {
+  return KIND_OWNS_TRACKING[kind] === true;
+}
 
 /** True when a `queued` run of this kind will actually be picked up by a worker.
  *
@@ -1569,5 +1937,30 @@ export function compareTrackedSeasonStates(a: TrackedSeasonState, b: TrackedSeas
     a.title.title.localeCompare(b.title.title) ||
     a.season.seasonNumber - b.season.seasonNumber ||
     a.season.id.localeCompare(b.season.id)
+  );
+}
+
+function sameWork(a: UserMessageScope, b: UserMessageScope): boolean {
+  return a.accountId === b.accountId && a.drive === b.drive && a.titleKey === b.titleKey;
+}
+
+/** The work (account, drive, title) a run belongs to — the key of its user messages. */
+function workOfRun(snapshot: Pick<PersistWorkflowRunSnapshotInput, "accountId" | "connectedStorageId" | "title">): UserMessageScope {
+  return {
+    accountId: snapshot.accountId ?? DEFAULT_ACCOUNT_ID,
+    drive: userMessageDrive(snapshot.connectedStorageId),
+    titleKey: snapshot.title.id,
+  };
+}
+
+function workKey(scope: UserMessageScope, episode: string): string {
+  return JSON.stringify([scope.accountId, scope.drive, scope.titleKey, episode]);
+}
+
+function uniqueWorks(rows: UserMessageScope[]): UserMessageScope[] {
+  const seen = new Map<string, UserMessageScope>();
+  for (const r of rows) seen.set(workKey(r, ""), { accountId: r.accountId, drive: r.drive, titleKey: r.titleKey });
+  return [...seen.values()].sort(
+    (a, b) => a.accountId.localeCompare(b.accountId) || a.drive.localeCompare(b.drive) || a.titleKey.localeCompare(b.titleKey),
   );
 }

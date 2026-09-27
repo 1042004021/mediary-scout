@@ -1,5 +1,6 @@
 import type { ResourceSnapshot } from "../domain.js";
 import type { ResourceProvider } from "../ports.js";
+import { resourceFingerprintMatches } from "../user-requests.js";
 import type { CandidateRegistry } from "./candidate-registry.js";
 import { deadLinkKey, type DeadLinkStore } from "./dead-links.js";
 import type { ResourceProviderV2, ResourceSnapshotV2 } from "./fake-provider.js";
@@ -23,8 +24,16 @@ export interface RealResourceProviderV2Options {
   workflowRunId: string;
   /** When set, candidates whose link is known-dead are dropped BEFORE the agent
    *  sees them (and never recorded/persisted), so it never re-transfers a dead
-   *  resource (#15). */
+   *  resource (#15). A failing read fails the search: it never fails open. */
   deadLinkStore?: DeadLinkStore;
+  /** The work's rejected resources (user said "not this one"), re-read on every search
+   *  so a rejection made earlier in THIS run applies at once. Matching candidates are
+   *  dropped like dead links. A failing read filters nothing — unless `strict` (a user
+   *  replace run), where it fails the search instead. */
+  rejectedResources?: {
+    list: () => Promise<Array<{ linkKey: string | null; label: string; sizeBytes: number | null }>>;
+    strict?: boolean;
+  };
 }
 
 export class RealResourceProviderV2 implements ResourceProviderV2 {
@@ -32,6 +41,7 @@ export class RealResourceProviderV2 implements ResourceProviderV2 {
   private readonly registry: CandidateRegistry;
   private readonly workflowRunId: string;
   private readonly deadLinkStore: DeadLinkStore | undefined;
+  private readonly rejectedResources: RealResourceProviderV2Options["rejectedResources"];
   private readonly observedSnapshots = new Map<string, ResourceSnapshot>();
   /** real snapshot id → `sN`. Content-addressed providers repeat a snapshot id
    *  across keywords; the same snapshot keeps the same alias. */
@@ -42,6 +52,7 @@ export class RealResourceProviderV2 implements ResourceProviderV2 {
     this.registry = options.registry;
     this.workflowRunId = options.workflowRunId;
     this.deadLinkStore = options.deadLinkStore;
+    this.rejectedResources = options.rejectedResources;
   }
 
   /** The domain snapshots observed this run (deduped by id — content-addressed
@@ -52,23 +63,47 @@ export class RealResourceProviderV2 implements ResourceProviderV2 {
 
   async search(keyword: string): Promise<ResourceSnapshotV2> {
     const snapshot = await this.provider.search({ keyword, workflowRunId: this.workflowRunId });
-    const deadKeys = this.deadLinkStore ? new Set(await this.deadLinkStore.listDeadLinkKeys()) : null;
-    const kept = deadKeys
-      ? snapshot.candidates.filter((candidate) => {
-          const identity = deadLinkKey(String(candidate.providerPayload?.["url"] ?? ""));
-          return !(identity && deadKeys.has(identity.key));
-        })
-      : snapshot.candidates;
-    const dropped = snapshot.candidates.length - kept.length;
-    if (dropped > 0) {
-      console.log(`[dead-link] filtered ${dropped} known-dead candidate(s) from search ${JSON.stringify(keyword)}`);
+    // A dead-link read error fails the search. Filtering nothing instead would show
+    // every link already proven dead — and let the agent transfer it again. Only the
+    // rejected list below fails open (best effort by design).
+    const deadKeys = this.deadLinkStore ? new Set(await this.deadLinkStore.listDeadLinkKeys()) : new Set<string>();
+    const rejected = await this.readRejected();
+    const rejectedKeys = new Set(rejected.map((r) => r.linkKey).filter((k): k is string => k !== null));
+    let deadDropped = 0;
+    let rejectedDropped = 0;
+    const kept = snapshot.candidates.filter((candidate) => {
+      const identity = deadLinkKey(String(candidate.providerPayload?.["url"] ?? ""));
+      if (identity && deadKeys.has(identity.key)) {
+        deadDropped++;
+        return false;
+      }
+      if (
+        (identity && rejectedKeys.has(identity.key)) ||
+        rejected.some((r) => resourceFingerprintMatches(candidate.title, r))
+      ) {
+        rejectedDropped++;
+        return false;
+      }
+      return true;
+    });
+    if (deadDropped > 0) {
+      console.log(`[dead-link] filtered ${deadDropped} known-dead candidate(s) from search ${JSON.stringify(keyword)}`);
     }
-    // Persist + record only the filtered view — the agent never sees, transfers,
-    // or has persisted the dead candidates.
-    const filteredSnapshot: ResourceSnapshot = { ...snapshot, candidates: kept };
-    if (!this.observedSnapshots.has(snapshot.id)) {
-      this.observedSnapshots.set(snapshot.id, filteredSnapshot);
+    if (rejectedDropped > 0) {
+      console.log(`[user-message] filtered ${rejectedDropped} user-rejected candidate(s) from search ${JSON.stringify(keyword)}`);
     }
+    // Persist the UNION of every candidate ever observed under this snapshot id,
+    // not just this call's filtered view: a candidate the agent already transferred
+    // in an earlier search must stay in the persisted snapshot even if a later
+    // rejection or dead-link filters it out of what the agent sees NOW — otherwise
+    // persist throws "Transfer attempt … referenced an unknown candidate"
+    // (validateWorkflowRunSnapshot in repository.ts). Invariant: every candidate the
+    // agent could ever have transferred appears in some persisted snapshot.
+    const prior = this.observedSnapshots.get(snapshot.id);
+    const merged = prior
+      ? [...new Map([...prior.candidates, ...kept].map((c) => [c.id, c])).values()].sort((a, b) => a.index - b.index)
+      : kept;
+    this.observedSnapshots.set(snapshot.id, { ...snapshot, candidates: merged });
     let snapshotAlias = this.snapshotAliases.get(snapshot.id);
     if (snapshotAlias === undefined) {
       snapshotAlias = `s${this.snapshotAliases.size + 1}`;
@@ -77,6 +112,7 @@ export class RealResourceProviderV2 implements ResourceProviderV2 {
     // Numbered by position in the provider's own list, so a candidate keeps its
     // alias when dead-link filtering removes a neighbour.
     const aliasOf = new Map(snapshot.candidates.map((candidate, index) => [candidate.id, `${snapshotAlias}-${index + 1}`]));
+    const keptIds = new Set(kept.map((candidate) => candidate.id));
     for (const candidate of kept) {
       this.registry.record(candidate, aliasOf.get(candidate.id));
     }
@@ -96,6 +132,7 @@ export class RealResourceProviderV2 implements ResourceProviderV2 {
         ? {
             prefilterScores: Object.fromEntries(
               Object.entries(snapshot.prefilter.scores).flatMap(([id, score]) => {
+                if (!keptIds.has(id)) return [];
                 const alias = aliasOf.get(id);
                 return alias === undefined ? [] : [[alias, score]];
               }),
@@ -107,4 +144,24 @@ export class RealResourceProviderV2 implements ResourceProviderV2 {
         : {}),
     };
   }
+
+  private async readRejected(): Promise<Array<{ linkKey: string | null; label: string; sizeBytes: number | null }>> {
+    if (!this.rejectedResources) return [];
+    // A user replace run reads strictly: showing what the user rejected is worse than a
+    // failed search (the agent sees the error and can search again).
+    if (this.rejectedResources.strict) return this.rejectedResources.list();
+    try {
+      return await this.rejectedResources.list();
+    } catch (error) {
+      console.log(`[user-message] rejected list read failed (not filtering): ${truncateErrorMessage(error)}`);
+      return [];
+    }
+  }
+}
+
+/** Caps a read-failure message logged in the hot search path — some providers'
+ *  errors carry huge payloads (stack traces, full response bodies). */
+function truncateErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.length > 160 ? `${message.slice(0, 160)}…` : message;
 }

@@ -21,10 +21,13 @@ import {
   compareTrackedSeasonStates,
   expireWorkflowRun,
   recoverOrphanRunningRun,
+  tearsDownTrackingOnCancel,
   retriedWorkflowRun,
   isActiveWorkflowStatus,
   isQueueClaimableKind,
   isStaleActiveWorkflowRun,
+  reservationRequiresTrackedSeason,
+  titleBlockFilter,
   type PersistedWorkflowRunSnapshot,
   type PersistWorkflowRunSnapshotInput,
   type ReserveWorkflowRunInput,
@@ -57,6 +60,24 @@ import {
   type AgentMemorySummary,
   type AgentMemoryScope,
 } from "./agent-memory.js";
+import {
+  compareUserMessagesCreated,
+  episodeSourceFromRow,
+  pendingReplacementFromRow,
+  rejectedResourceFromRow,
+  userMessageFromRow,
+  type EpisodeSource,
+  type EpisodeSourceRow,
+  type PendingReplacement,
+  type PendingReplacementRow,
+  type RejectedResource,
+  type RejectedResourceRow,
+  type UserMessage,
+  type UserMessageRow,
+  type UserMessageScope,
+  type UserRequestStore,
+  userMessageDrive,
+} from "./user-requests.js";
 
 type Queryable = Pool | PoolClient;
 
@@ -174,6 +195,58 @@ const SCHEMA = `
     source_run_id text,
     UNIQUE (account_id, scope, title_key, name)
   );
+  CREATE TABLE IF NOT EXISTS user_messages (
+    id text PRIMARY KEY,
+    account_id text NOT NULL,
+    drive text NOT NULL DEFAULT '',
+    title_key text NOT NULL,
+    body text NOT NULL,
+    episode_tags text NOT NULL DEFAULT '[]',
+    status text NOT NULL,
+    urgent boolean NOT NULL DEFAULT false,
+    run_id text,
+    reply text,
+    created_at text NOT NULL,
+    updated_at text NOT NULL,
+    processed_at text
+  );
+  CREATE INDEX IF NOT EXISTS user_messages_work ON user_messages (account_id, drive, title_key, status);
+  CREATE INDEX IF NOT EXISTS user_messages_pending ON user_messages (status, urgent);
+  CREATE INDEX IF NOT EXISTS user_messages_run ON user_messages (run_id);
+  CREATE TABLE IF NOT EXISTS pending_replacements (
+    account_id text NOT NULL,
+    drive text NOT NULL DEFAULT '',
+    title_key text NOT NULL,
+    episode text NOT NULL,
+    message_id text NOT NULL,
+    requested_at text NOT NULL,
+    PRIMARY KEY (account_id, drive, title_key, episode)
+  );
+  CREATE TABLE IF NOT EXISTS rejected_resources (
+    id text PRIMARY KEY,
+    account_id text NOT NULL,
+    title_key text NOT NULL,
+    episode text NOT NULL,
+    link_key text,
+    label text NOT NULL,
+    size_bytes bigint,
+    reason text NOT NULL,
+    message_id text,
+    created_at text NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS rejected_resources_work ON rejected_resources (account_id, title_key);
+  CREATE TABLE IF NOT EXISTS episode_sources (
+    account_id text NOT NULL,
+    drive text NOT NULL DEFAULT '',
+    title_key text NOT NULL,
+    episode text NOT NULL,
+    link_key text,
+    label text NOT NULL,
+    size_bytes bigint,
+    run_id text NOT NULL,
+    recorded_at text NOT NULL,
+    PRIMARY KEY (account_id, drive, title_key, episode)
+  );
   CREATE TABLE IF NOT EXISTS account_settings (
     account_id text NOT NULL,
     key text NOT NULL,
@@ -289,6 +362,13 @@ const PERMANENT_SCHEMA_INIT_SQLSTATES = new Set<string>([
   "3D000", // invalid_catalog_name (database does not exist)
 ]);
 
+/** connected_storage_id is NOT NULL and holds UNSCOPED_STORAGE for unbound works; the
+ *  sentinel is internal, so every reader hands callers null instead. */
+function storageFromColumn(raw: unknown): string | null {
+  const value = (raw as string | null | undefined) ?? null;
+  return value === UNSCOPED_STORAGE ? null : value;
+}
+
 function isPermanentSchemaInitError(error: unknown): boolean {
   const code = (error as { code?: unknown } | null | undefined)?.code;
   return typeof code === "string" && PERMANENT_SCHEMA_INIT_SQLSTATES.has(code);
@@ -386,12 +466,35 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
     const accountId = snapshot.accountId ?? DEFAULT_ACCOUNT_ID;
     const connectedStorageId = snapshot.connectedStorageId ?? UNSCOPED_STORAGE;
 
+    const blocksTitle = titleBlockFilter(input);
+    const requireTracked = reservationRequiresTrackedSeason(input);
     return this.withTransaction(async (client) => {
+      if (blocksTitle || requireTracked) {
+        // READ COMMITTED alone lets two concurrent reservations both see no active
+        // run for the title and both insert. Serialize them per (account, drive,
+        // title) for the rest of this transaction; untrackTitle takes the same lock.
+        await lockWorkflowTitle(client, accountId, snapshot.connectedStorageId, snapshot.season.mediaTitleId);
+      }
+
+      // Under that lock and before anything is written: a season untracked since the
+      // caller read it stays untracked. FOR KEY SHARE also holds off a teardown that does
+      // not take the title lock (cancelling a queued init run) until this commits; one
+      // already under way is waited for, and then the row is gone.
+      if (requireTracked) {
+        const tracked = await client.query(
+          "SELECT 1 FROM tracked_seasons WHERE id = $1 AND connected_storage_id = $2 FOR KEY SHARE",
+          [snapshot.season.id, connectedStorageId],
+        );
+        if ((tracked.rowCount ?? 0) === 0) {
+          return { status: "not_tracked" };
+        }
+      }
+
       await this.expireStaleActiveWorkflowRuns(client, input);
 
-      if (input.blockIfTitleHasActiveRun === true) {
+      if (blocksTitle) {
         const titleActive = (await this.selectWorkflowRunsForTitle(client, snapshot.season.mediaTitleId, accountId, connectedStorageId))
-          .filter((workflowRun) => isActiveWorkflowStatus(workflowRun.status))
+          .filter((workflowRun) => isActiveWorkflowStatus(workflowRun.status) && blocksTitle(workflowRun))
           .sort((a, b) => b.startedAt.localeCompare(a.startedAt))[0];
         if (titleActive) {
           const activeSnapshot = await this.loadWorkflowRunSnapshot(client, titleActive.id);
@@ -419,6 +522,18 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       const existingEpisodes = await this.selectEpisodeStates(client, snapshot.season.id, connectedStorageId);
       if (input.blockIfEpisodeStatesExist === true && existingEpisodes.length > 0) {
         return { status: "already_has_episode_state", episodes: existingEpisodes };
+      }
+
+      if (input.keepCurrentEpisodes === true) {
+        // Only the run: the title, season record and episode states are not written at
+        // all, so a run that saved them since the caller read them keeps what it saved.
+        // The reply is the run as stored, with the season's current state.
+        await this.replaceWorkflowRunSnapshot(client, snapshot, { runOnly: true });
+        const reserved = await this.loadWorkflowRunSnapshot(client, snapshot.workflowRun.id);
+        if (!reserved) {
+          throw new Error(`Missing reserved workflow run ${snapshot.workflowRun.id}`);
+        }
+        return { status: "reserved", snapshot: reserved };
       }
 
       await this.replaceWorkflowRunSnapshot(client, snapshot);
@@ -483,6 +598,14 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
         const recovered = recoverOrphanRunningRun(workflowRun, now);
         await this.upsertWorkflowRun(client, recovered.run);
         if (recovered.action === "requeue") requeued += 1;
+        // A replace run that will never run again hands its work back to the patrol: its
+        // messages go back to pending, and none of the work's messages stays urgent (a run
+        // that crashed the worker over and over must not be retried on every idle tick).
+        else if (recovered.run.kind === "replace_request") {
+          await releaseUserMessagesWith(client, recovered.run.id, now, false);
+          const work = await workOfRunWith(client, recovered.run.id);
+          if (work) await clearUserMessagesUrgentWith(client, work, now);
+        }
       }
       return requeued;
     });
@@ -627,8 +750,7 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       return false;
     }
     const ownerAccount = (owner.account_id as string | undefined) ?? DEFAULT_ACCOUNT_ID;
-    const ownerStorage = (owner.connected_storage_id as string | null | undefined) ?? null;
-    return scopeMatches(scope, ownerAccount, ownerStorage);
+    return scopeMatches(scope, ownerAccount, storageFromColumn(owner.connected_storage_id));
   }
 
   async clearAgentSteps(workflowRunId: string): Promise<void> {
@@ -669,6 +791,29 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       await client.query("DELETE FROM resource_snapshots WHERE workflow_run_id = $1", [workflowRunId]);
       await client.query("DELETE FROM workflow_runs WHERE id = $1", [workflowRunId]);
 
+      // Only an init run owns its season's tracking; a cancelled replace_request is
+      // just removed, and any messages it held go back to pending.
+      if (!tearsDownTrackingOnCancel(run.kind)) {
+        if (run.kind === "replace_request") {
+          // The user cancelled: nothing of this work stays urgent, or the idle scan would
+          // queue it again within seconds. It waits for the patrol (or 现在处理).
+          const now = new Date().toISOString();
+          await releaseUserMessagesWith(client, workflowRunId, now, false);
+          const season = await client.query("SELECT media_title_id FROM tracked_seasons WHERE id = $1 AND connected_storage_id = $2", [
+            seasonId,
+            storageValue,
+          ]);
+          const titleKey = season.rows[0]?.media_title_id as string | undefined;
+          if (titleKey !== undefined) {
+            await clearUserMessagesUrgentWith(
+              client,
+              { accountId: owner, drive: userMessageDrive(ownerStorage === UNSCOPED_STORAGE ? null : ownerStorage), titleKey },
+              now,
+            );
+          }
+        }
+        return { status: "cancelled" as const };
+      }
       // Only tear down the tracking when no OTHER run on the SAME (season, drive)
       // still references it (a queued init is the sole run for its fresh season →
       // torn down, vanishing from the library; a re-queued run beside acquired
@@ -739,16 +884,33 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
     }
     const targetSeasonIds = states.map((state) => state.season.id);
     const storageValue = scope.connectedStorageId ?? UNSCOPED_STORAGE;
+    const workScope = {
+      accountId: scope.accountId ?? DEFAULT_ACCOUNT_ID,
+      drive: userMessageDrive(scope.connectedStorageId),
+      titleKey: states[0]!.title.id,
+    };
 
     return this.withTransaction(async (client) => {
       await this.ensureSchema();
+      // First the lock a replace reservation takes: one reserved from states read before
+      // this untrack has either committed (and is seen below → in_flight) or waits, then
+      // finds the season gone (not_tracked) instead of tracking it again.
+      await lockWorkflowTitle(client, workScope.accountId, scope.connectedStorageId, workScope.titleKey);
       // In-flight guard: a running run on any target season → refuse, delete nothing.
       const running = await client.query(
         "SELECT 1 FROM workflow_runs WHERE tracked_season_id = ANY($1) AND connected_storage_id = $2 " +
           "AND payload->>'status' = 'running' LIMIT 1",
         [targetSeasonIds, storageValue],
       );
-      if ((running.rowCount ?? 0) > 0) {
+      // …and a queued or running replace_request of the work, whichever season it is
+      // recorded on: it covers every season tracked when it starts and writes a record for
+      // each when it ends, so a season untracked in between would be tracked again. It stays
+      // running until its last write (its terminal record comes after the season records and
+      // the request bookkeeping), so once it has ended nothing of it is left to write.
+      const replaceActive = (await this.selectWorkflowRunsForTitle(client, workScope.titleKey, workScope.accountId, storageValue)).some(
+        (run) => run.kind === "replace_request" && isActiveWorkflowStatus(run.status),
+      );
+      if ((running.rowCount ?? 0) > 0 || replaceActive) {
         return { status: "in_flight" as const, removedSeasons: 0 };
       }
       // For each season: delete all run children + runs, then tear down the season.
@@ -781,6 +943,37 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
         );
         await this.teardownSeasonScoped(client, seasonId, storageValue);
       }
+
+      // Clean up this work's pending user-request state too, so it doesn't come
+      // back to haunt a fresh (re-)track: a stale pending message just keeps
+      // producing not_tracked queue attempts, and a stale pending_replacement
+      // would revive an old replace request the moment the title is re-tracked.
+      // episode_sources and rejected_resources stay — they're useful history if
+      // the user re-tracks. Processing messages are untouched (a running run
+      // already refused above; nothing here is mid-flight). Untracking the last
+      // season still tracked on this drive, one season at a time, is the whole work.
+      await lockUserMessageWork(client, workScope);
+      const workGone =
+        seasonNumber === undefined ||
+        (await this.selectWorkflowRunsForTitle(client, workScope.titleKey, workScope.accountId, storageValue)).length === 0;
+      if (workGone) {
+        const now = new Date().toISOString();
+        await client.query(
+          "UPDATE user_messages SET status = 'withdrawn', updated_at = $1 WHERE account_id = $2 AND drive = $3 AND title_key = $4 AND status = 'pending'",
+          [now, workScope.accountId, workScope.drive, workScope.titleKey],
+        );
+        await client.query(
+          "DELETE FROM pending_replacements WHERE account_id = $1 AND drive = $2 AND title_key = $3",
+          [workScope.accountId, workScope.drive, workScope.titleKey],
+        );
+      } else {
+        const seasonPrefix = `S${String(seasonNumber).padStart(2, "0")}E%`;
+        await client.query(
+          "DELETE FROM pending_replacements WHERE account_id = $1 AND drive = $2 AND title_key = $3 AND episode LIKE $4",
+          [workScope.accountId, workScope.drive, workScope.titleKey, seasonPrefix],
+        );
+      }
+
       return { status: "untracked" as const, removedSeasons: targetSeasonIds.length };
     });
   }
@@ -835,7 +1028,7 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
     const title = await this.requireTitle(this.pool, season);
     return {
       accountId: scope.accountId,
-      connectedStorageId: (row.connected_storage_id as string | null | undefined) ?? null,
+      connectedStorageId: storageFromColumn(row.connected_storage_id),
       title,
       season,
       episodes: await this.selectEpisodeStates(this.pool, season.id, (row.connected_storage_id as string | null) ?? UNSCOPED_STORAGE),
@@ -857,7 +1050,7 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       const season = row.payload as TrackedSeason;
       states.push({
         accountId: scope.accountId,
-        connectedStorageId: (row.connected_storage_id as string | null | undefined) ?? null,
+        connectedStorageId: storageFromColumn(row.connected_storage_id),
         title: await this.requireTitle(this.pool, season),
         season,
         episodes: await this.selectEpisodeStates(this.pool, season.id, (row.connected_storage_id as string | null) ?? UNSCOPED_STORAGE),
@@ -877,7 +1070,7 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       const accountId = (row.account_id as string | undefined) ?? DEFAULT_ACCOUNT_ID;
       states.push({
         accountId,
-        connectedStorageId: (row.connected_storage_id as string | null | undefined) ?? null,
+        connectedStorageId: storageFromColumn(row.connected_storage_id),
         title: await this.requireTitle(this.pool, season),
         season,
         episodes: await this.selectEpisodeStates(this.pool, season.id, (row.connected_storage_id as string | null) ?? UNSCOPED_STORAGE),
@@ -1413,6 +1606,195 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
     ]);
   }
 
+  // ---- user requests (see user-requests.ts)
+  async createUserMessage(input: Parameters<UserRequestStore["createUserMessage"]>[0]): Promise<UserMessage> {
+    return this.withTransaction(async (client) => {
+      // The EXISTS sees only the statement snapshot, so on its own a claim committing
+      // concurrently could leave this message non-urgent (harmless: it would wait for
+      // the patrol). The work lock, shared with claimUserMessages, makes urgent exact.
+      await lockUserMessageWork(client, input);
+      const result = await client.query<UserMessageRow>(
+        "INSERT INTO user_messages (id, account_id, drive, title_key, body, episode_tags, status, urgent, run_id, reply, created_at, updated_at, processed_at) " +
+          "VALUES ($1, $2, $3, $4, $5, $6, 'pending', EXISTS (SELECT 1 FROM user_messages WHERE account_id = $2 AND drive = $3 AND title_key = $4 AND status = 'processing'), NULL, NULL, $7, $7, NULL) RETURNING *",
+        [`msg_${globalThis.crypto.randomUUID()}`, input.accountId, input.drive, input.titleKey, input.body, JSON.stringify(input.episodeTags), input.now],
+      );
+      return userMessageFromRow(result.rows[0]!);
+    });
+  }
+
+  async listUserMessages(scope: UserMessageScope): Promise<UserMessage[]> {
+    await this.ensureSchema();
+    const result = await this.pool.query<UserMessageRow>(
+      "SELECT * FROM user_messages WHERE account_id = $1 AND drive = $2 AND title_key = $3 AND status <> 'withdrawn' ORDER BY created_at DESC, id DESC",
+      [scope.accountId, scope.drive, scope.titleKey],
+    );
+    return result.rows.map(userMessageFromRow);
+  }
+
+  async editUserMessage(input: Parameters<UserRequestStore["editUserMessage"]>[0]): Promise<UserMessage | null> {
+    await this.ensureSchema();
+    const result = await this.pool.query<UserMessageRow>(
+      "UPDATE user_messages SET body = $1, episode_tags = $2, updated_at = $3 WHERE id = $4 AND account_id = $5 AND status = 'pending' RETURNING *",
+      [input.body, JSON.stringify(input.episodeTags), input.now, input.id, input.accountId],
+    );
+    return result.rows[0] ? userMessageFromRow(result.rows[0]) : null;
+  }
+
+  async withdrawUserMessage(input: Parameters<UserRequestStore["withdrawUserMessage"]>[0]): Promise<boolean> {
+    await this.ensureSchema();
+    const result = await this.pool.query(
+      "UPDATE user_messages SET status = 'withdrawn', updated_at = $1 WHERE id = $2 AND account_id = $3 AND status = 'pending'",
+      [input.now, input.id, input.accountId],
+    );
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  async markUserMessagesUrgent(input: Parameters<UserRequestStore["markUserMessagesUrgent"]>[0]): Promise<number> {
+    await this.ensureSchema();
+    const result = await this.pool.query(
+      "UPDATE user_messages SET urgent = true, updated_at = $1 WHERE account_id = $2 AND drive = $3 AND title_key = $4 AND status = 'pending'",
+      [input.now, input.accountId, input.drive, input.titleKey],
+    );
+    return result.rowCount ?? 0;
+  }
+
+  async clearUserMessagesUrgent(input: Parameters<UserRequestStore["clearUserMessagesUrgent"]>[0]): Promise<number> {
+    await this.ensureSchema();
+    return clearUserMessagesUrgentWith(this.pool, input, input.now);
+  }
+
+  async claimUserMessages(input: Parameters<UserRequestStore["claimUserMessages"]>[0]): Promise<UserMessage[]> {
+    return this.withTransaction(async (client) => {
+      // Same lock as createUserMessage, so a create overlapping this claim sees it.
+      await lockUserMessageWork(client, input);
+      // One UPDATE … RETURNING: a concurrent edit/withdraw either lands before (and is
+      // claimed as edited) or finds status <> 'pending' and does nothing.
+      const result = await client.query<UserMessageRow>(
+        // Idempotent per run: a run requeued after a crash re-claims its own messages.
+        "UPDATE user_messages SET status = 'processing', run_id = $1, updated_at = $2 WHERE account_id = $3 AND drive = $4 AND title_key = $5 AND (status = 'pending' OR (status = 'processing' AND run_id = $1)) RETURNING *",
+        [input.runId, input.now, input.accountId, input.drive, input.titleKey],
+      );
+      return result.rows.map(userMessageFromRow).sort(compareUserMessagesCreated);
+    });
+  }
+
+  async finishUserMessages(input: Parameters<UserRequestStore["finishUserMessages"]>[0]): Promise<void> {
+    await this.ensureSchema();
+    await this.pool.query(
+      "UPDATE user_messages SET status = 'done', reply = $1, processed_at = $2, updated_at = $2 WHERE run_id = $3 AND status = 'processing'",
+      [JSON.stringify(input.reply), input.now, input.runId],
+    );
+  }
+
+  async releaseUserMessages(input: Parameters<UserRequestStore["releaseUserMessages"]>[0]): Promise<void> {
+    await this.ensureSchema();
+    await releaseUserMessagesWith(this.pool, input.runId, input.now, input.urgent ?? true);
+  }
+
+  async releaseOrphanedUserMessages(input: { now: string; finishedBefore: string }): Promise<number> {
+    await this.ensureSchema();
+    // A processing message whose run is gone, or finished before the cutoff: back to
+    // pending for the patrol (not urgent), like every other way a run ends unfinished.
+    const result = await this.pool.query(
+      "UPDATE user_messages SET status = 'pending', urgent = false, run_id = NULL, updated_at = $1 WHERE status = 'processing' AND NOT EXISTS (" +
+        "SELECT 1 FROM workflow_runs r WHERE r.id = user_messages.run_id AND (r.payload->>'status' IN ('queued', 'running') " +
+        "OR r.payload->>'finishedAt' >= $2))",
+      [input.now, input.finishedBefore],
+    );
+    return result.rowCount ?? 0;
+  }
+
+  async listWorksWithProcessingMessages(): Promise<UserMessageScope[]> {
+    await this.ensureSchema();
+    const result = await this.pool.query<{ account_id: string; drive: string; title_key: string }>(
+      "SELECT DISTINCT account_id, drive, title_key FROM user_messages WHERE status = 'processing' ORDER BY account_id, drive, title_key",
+    );
+    return result.rows.map((r) => ({ accountId: r.account_id, drive: r.drive, titleKey: r.title_key }));
+  }
+
+  async listWorksWithPendingMessages(input: { urgentOnly: boolean }): Promise<UserMessageScope[]> {
+    await this.ensureSchema();
+    const result = await this.pool.query<{ account_id: string; drive: string; title_key: string }>(
+      `SELECT DISTINCT account_id, drive, title_key FROM user_messages WHERE status = 'pending'${input.urgentOnly ? " AND urgent" : ""} ORDER BY account_id, drive, title_key`,
+    );
+    return result.rows.map((r) => ({ accountId: r.account_id, drive: r.drive, titleKey: r.title_key }));
+  }
+
+  async listPendingReplacements(scope: UserMessageScope): Promise<PendingReplacement[]> {
+    await this.ensureSchema();
+    const result = await this.pool.query<PendingReplacementRow>(
+      "SELECT * FROM pending_replacements WHERE account_id = $1 AND drive = $2 AND title_key = $3 ORDER BY episode",
+      [scope.accountId, scope.drive, scope.titleKey],
+    );
+    return result.rows.map(pendingReplacementFromRow);
+  }
+
+  async listWorksWithPendingReplacements(): Promise<UserMessageScope[]> {
+    await this.ensureSchema();
+    const result = await this.pool.query<{ account_id: string; drive: string; title_key: string }>(
+      "SELECT DISTINCT account_id, drive, title_key FROM pending_replacements ORDER BY account_id, drive, title_key",
+    );
+    return result.rows.map((r) => ({ accountId: r.account_id, drive: r.drive, titleKey: r.title_key }));
+  }
+
+  async addPendingReplacements(input: Parameters<UserRequestStore["addPendingReplacements"]>[0]): Promise<void> {
+    await this.ensureSchema();
+    if (input.episodes.length === 0) return;
+    await this.pool.query(
+      "INSERT INTO pending_replacements (account_id, drive, title_key, episode, message_id, requested_at) " +
+        "SELECT $1, $2, $3, e, $5, $6 FROM unnest($4::text[]) AS e ON CONFLICT DO NOTHING",
+      [input.accountId, input.drive, input.titleKey, input.episodes, input.messageId, input.now],
+    );
+  }
+
+  async removePendingReplacements(input: Parameters<UserRequestStore["removePendingReplacements"]>[0]): Promise<number> {
+    await this.ensureSchema();
+    const result = await this.pool.query(
+      "DELETE FROM pending_replacements WHERE account_id = $1 AND drive = $2 AND title_key = $3 AND episode = ANY($4::text[])",
+      [input.accountId, input.drive, input.titleKey, input.episodes],
+    );
+    return result.rowCount ?? 0;
+  }
+
+  async addRejectedResources(input: Parameters<UserRequestStore["addRejectedResources"]>[0]): Promise<void> {
+    await this.ensureSchema();
+    await this.withTransaction(async (client) => {
+      for (const i of input.items) {
+        await client.query(
+          "INSERT INTO rejected_resources (id, account_id, title_key, episode, link_key, label, size_bytes, reason, message_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+          [`rej_${globalThis.crypto.randomUUID()}`, input.accountId, input.titleKey, i.episode, i.linkKey, i.label, i.sizeBytes, i.reason, i.messageId, input.now],
+        );
+      }
+    });
+  }
+
+  async listRejectedResources(input: { accountId: string; titleKey: string }): Promise<RejectedResource[]> {
+    await this.ensureSchema();
+    const result = await this.pool.query<RejectedResourceRow>(
+      "SELECT * FROM rejected_resources WHERE account_id = $1 AND title_key = $2 ORDER BY created_at, id",
+      [input.accountId, input.titleKey],
+    );
+    return result.rows.map(rejectedResourceFromRow);
+  }
+
+  async upsertEpisodeSource(input: EpisodeSource): Promise<void> {
+    await this.ensureSchema();
+    await this.pool.query(
+      "INSERT INTO episode_sources (account_id, drive, title_key, episode, link_key, label, size_bytes, run_id, recorded_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) " +
+        "ON CONFLICT (account_id, drive, title_key, episode) DO UPDATE SET link_key = EXCLUDED.link_key, label = EXCLUDED.label, size_bytes = EXCLUDED.size_bytes, run_id = EXCLUDED.run_id, recorded_at = EXCLUDED.recorded_at",
+      [input.accountId, input.drive, input.titleKey, input.episode, input.linkKey, input.label, input.sizeBytes, input.runId, input.recordedAt],
+    );
+  }
+
+  async listEpisodeSources(scope: UserMessageScope): Promise<EpisodeSource[]> {
+    await this.ensureSchema();
+    const result = await this.pool.query<EpisodeSourceRow>(
+      "SELECT * FROM episode_sources WHERE account_id = $1 AND drive = $2 AND title_key = $3 ORDER BY episode",
+      [scope.accountId, scope.drive, scope.titleKey],
+    );
+    return result.rows.map(episodeSourceFromRow);
+  }
+
   // ---- private ----
 
   private async withTransaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
@@ -1497,6 +1879,9 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
   private async replaceWorkflowRunSnapshot(
     client: PoolClient,
     snapshot: PersistWorkflowRunSnapshotInput,
+    /** runOnly: write the run and its child rows only — the title, season record and
+     *  episode states stay as stored (a keepCurrentEpisodes reservation). */
+    options: { runOnly?: boolean } = {},
   ): Promise<void> {
     // A re-persist may omit accountId/connectedStorageId (the worker finalize path
     // doesn't re-thread them). upsertWorkflowRun preserves the stored values on
@@ -1514,17 +1899,26 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       snapshot.accountId ?? existing.rows[0]?.account_id ?? DEFAULT_ACCOUNT_ID;
     const connectedStorageId =
       snapshot.connectedStorageId ?? existing.rows[0]?.connected_storage_id ?? UNSCOPED_STORAGE;
-    await this.upsert(client, "media_titles", "(id, payload)", [snapshot.title.id, json(snapshot.title)], "$1, $2::jsonb");
-    await this.upsertTrackedSeason(client, snapshot.season, accountId, connectedStorageId);
+    const writeSeasonState = options.runOnly !== true;
+    if (writeSeasonState) {
+      await this.upsert(client, "media_titles", "(id, payload)", [snapshot.title.id, json(snapshot.title)], "$1, $2::jsonb");
+      await this.upsertTrackedSeason(client, snapshot.season, accountId, connectedStorageId);
+    }
     await this.upsertWorkflowRun(client, snapshot.workflowRun, accountId, connectedStorageId);
-    await this.deleteWorkflowRunChildren(client, snapshot.workflowRun.id, snapshot.season.id, connectedStorageId);
+    await this.deleteWorkflowRunChildren(client, snapshot.workflowRun.id);
 
-    for (const [ordinal, episode] of snapshot.episodes.entries()) {
-      void ordinal;
+    if (writeSeasonState) {
+      // Scope to THIS drive's episodes — never wipe another drive's episodes for the same season.
       await client.query(
-        "INSERT INTO episode_states (tracked_season_id, connected_storage_id, episode_code, payload) VALUES ($1, $2, $3, $4::jsonb)",
-        [snapshot.season.id, connectedStorageId, episode.episodeCode, json(episode)],
+        "DELETE FROM episode_states WHERE tracked_season_id = $1 AND connected_storage_id = $2",
+        [snapshot.season.id, connectedStorageId],
       );
+      for (const episode of snapshot.episodes) {
+        await client.query(
+          "INSERT INTO episode_states (tracked_season_id, connected_storage_id, episode_code, payload) VALUES ($1, $2, $3, $4::jsonb)",
+          [snapshot.season.id, connectedStorageId, episode.episodeCode, json(episode)],
+        );
+      }
     }
     // Snapshot ids are content-addressed and can legitimately recur; keep
     // persistence idempotent on the id instead of crashing on a duplicate.
@@ -1600,8 +1994,6 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
   private async deleteWorkflowRunChildren(
     client: PoolClient,
     workflowRunId: string,
-    trackedSeasonId: string,
-    connectedStorageId: string,
   ): Promise<void> {
     await client.query("DELETE FROM notifications WHERE workflow_run_id = $1", [workflowRunId]);
     await client.query("DELETE FROM transfer_attempts WHERE workflow_run_id = $1", [workflowRunId]);
@@ -1612,11 +2004,6 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
     // would wipe a completed run's trace at finalize. Cross-attempt clearing is handled
     // by clearAgentSteps (sink start); true teardown is in cancel/untrack.
     await client.query("DELETE FROM resource_snapshots WHERE workflow_run_id = $1", [workflowRunId]);
-    // Scope to THIS drive's episodes — never wipe another drive's episodes for the same season.
-    await client.query(
-      "DELETE FROM episode_states WHERE tracked_season_id = $1 AND connected_storage_id = $2",
-      [trackedSeasonId, connectedStorageId],
-    );
   }
 
   private async expireStaleActiveWorkflowRuns(
@@ -1760,4 +2147,56 @@ function connectedStorageFromRow(row: Record<string, unknown>): ConnectedStorage
     frozenAt: (row.frozen_at as string | null | undefined) ?? null,
     createdAt: String(row.created_at),
   };
+}
+
+/** processing(runId) → pending (urgent or not), on the pool or inside a transaction. */
+async function releaseUserMessagesWith(db: Pick<PoolClient, "query">, runId: string, now: string, urgent: boolean): Promise<void> {
+  await db.query(
+    "UPDATE user_messages SET status = 'pending', urgent = $3, run_id = NULL, updated_at = $1 WHERE run_id = $2 AND status = 'processing'",
+    [now, runId, urgent],
+  );
+}
+
+/** Transaction-scoped lock on one work's user messages (create vs claim). */
+async function lockUserMessageWork(client: PoolClient, scope: UserMessageScope): Promise<void> {
+  await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
+    `user_messages:${scope.accountId}:${scope.drive}:${scope.titleKey}`,
+  ]);
+}
+
+/** Transaction-scoped lock on one title's runs on one drive, taken first by a
+ *  title-exclusive (or requireTrackedSeason) reservation and by untrackTitle, so
+ *  neither decides on rows the other is changing. A null drive and the unscoped
+ *  sentinel are the same rows, so they are the same lock. */
+async function lockWorkflowTitle(
+  client: PoolClient,
+  accountId: string,
+  connectedStorageId: string | null | undefined,
+  mediaTitleId: string,
+): Promise<void> {
+  const drive = connectedStorageId === UNSCOPED_STORAGE ? "" : (connectedStorageId ?? "");
+  await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`workflow_title:${accountId}:${drive}:${mediaTitleId}`]);
+}
+
+/** This work's pending messages → not urgent (they wait for the patrol), on the pool or
+ *  inside a transaction. Returns how many changed. */
+async function clearUserMessagesUrgentWith(db: Pick<PoolClient, "query">, work: UserMessageScope, now: string): Promise<number> {
+  const result = await db.query(
+    "UPDATE user_messages SET urgent = false, updated_at = $1 WHERE account_id = $2 AND drive = $3 AND title_key = $4 AND status = 'pending' AND urgent",
+    [now, work.accountId, work.drive, work.titleKey],
+  );
+  return result.rowCount ?? 0;
+}
+
+/** The work (account, drive, title) of a stored run: its own row plus its season's. */
+async function workOfRunWith(db: Pick<PoolClient, "query">, runId: string): Promise<UserMessageScope | null> {
+  const result = await db.query<{ account_id: string | null; connected_storage_id: string | null; media_title_id: string }>(
+    "SELECT r.account_id, r.connected_storage_id, s.media_title_id FROM workflow_runs r " +
+      "JOIN tracked_seasons s ON s.id = r.tracked_season_id AND s.connected_storage_id = r.connected_storage_id WHERE r.id = $1",
+    [runId],
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  const storage = row.connected_storage_id === UNSCOPED_STORAGE ? null : row.connected_storage_id;
+  return { accountId: row.account_id ?? DEFAULT_ACCOUNT_ID, drive: userMessageDrive(storage), titleKey: row.media_title_id };
 }

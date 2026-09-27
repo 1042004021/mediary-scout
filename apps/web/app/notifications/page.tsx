@@ -12,6 +12,7 @@ import {
   Film,
   Layers,
   PartyPopper,
+  Repeat,
   RotateCcw,
   TriangleAlert,
   XCircle,
@@ -45,6 +46,7 @@ const kindIcon: Record<string, { tone: string; icon: typeof Bell }> = {
   already_current: { tone: "muted", icon: CheckCircle2 },
   no_coverage: { tone: "amber", icon: CircleSlash },
   transfer_failed: { tone: "amber", icon: XCircle },
+  replacement_done: { tone: "indigo", icon: Repeat },
   foreign_work_detected: { tone: "amber", icon: Film },
 };
 
@@ -56,6 +58,7 @@ const statusMeta: Record<NotificationReportStatus, { label: string; tone: string
   no_coverage: { label: "暂无资源", tone: "amber", icon: CircleSlash },
   failed: { label: "获取失败", tone: "amber", icon: XCircle },
   retrying: { label: "重试中", tone: "indigo", icon: RotateCcw },
+  replaced: { label: "已换源", tone: "green", icon: Repeat },
 };
 
 // `searchParams` (the active drive `?w`) is a dynamic input + a DB read; reading it

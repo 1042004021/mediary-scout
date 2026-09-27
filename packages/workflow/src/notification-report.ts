@@ -5,6 +5,7 @@ import type {
   NotificationEvent,
   NotificationReport,
   NotificationReportStatus,
+  NotificationTrigger,
   TrackedSeason,
 } from "./domain.js";
 
@@ -263,6 +264,96 @@ export function buildSeriesReport(input: {
   };
 }
 
+/**
+ * The report of a replace_request run (a user asked for a different resource). Never
+ * "入库/获取完成": the old files are still there, so the only news is which episodes
+ * got a new version and which are still being looked for. No landed size either —
+ * the directories now hold old + new files, so a size would double-count.
+ */
+export function buildReplacementReport(input: {
+  titleName: string;
+  movie: boolean;
+  results: Array<{ episode: string; outcome: "replaced" | "not_found" }>;
+  /** Episodes that were plain gaps and landed in the same run (TV only). */
+  newlyObtained?: string[];
+  transferBlockReason?: string | null;
+  searchSourceFaultReason?: string | null;
+  meta?: NotificationTitleMeta;
+}): NotificationReport {
+  const replaced = input.results.filter((r) => r.outcome === "replaced").map((r) => r.episode);
+  const pending = input.results.filter((r) => r.outcome === "not_found").map((r) => r.episode);
+  // An episode the user asked for that had no old file was a gap before the run, so it
+  // also shows up as newly obtained — it is news once, as 换好, never also as 新增.
+  const newlyObtained = (input.newlyObtained ?? []).filter((code) => !replaced.includes(code));
+  const base = {
+    titleName: input.titleName,
+    seasonLabel: null,
+    newlyObtained,
+    realMissing: [],
+    ...(input.meta ?? {}),
+  };
+  if (replaced.length === 0 && newlyObtained.length === 0) {
+    // Nothing new landed: an honest block/source-fault reason beats "not found".
+    const outcome = emptyRunOutcome(input.transferBlockReason, input.searchSourceFaultReason);
+    if (outcome.status === "failed") return { ...base, ...outcome };
+    return {
+      ...base,
+      status: "no_coverage",
+      lines: [input.results.length === 0 ? "这次没有换任何文件" : "还没找到可以换的版本 · 巡检时接着找"],
+    };
+  }
+  if (input.movie) {
+    return { ...base, status: "replaced", lines: ["已换成新版本"] };
+  }
+  // "E13" when every episode is in one season (the card names the show); full codes otherwise.
+  const seasons = new Set([...replaced, ...pending, ...newlyObtained].map((code) => code.replace(/E\d+$/, "")));
+  const label = (codes: string[]) => codes.map((code) => (seasons.size === 1 ? shortCode(code) : code)).join("、");
+  const stillLooking = pending.length > 0 ? `${pending.length} 集还在找（${label(pending)}）` : null;
+  const added = newlyObtained.length > 0 ? `新增 ${label(newlyObtained)}` : null;
+  if (replaced.length === 0) {
+    // A work with 待换 episodes is patrolled only through this run, so a newly aired
+    // gap lands here: that is news, never "还没找到". Nothing was replaced, though,
+    // so the status is the ordinary "new episodes landed" one, not "replaced".
+    return { ...base, status: "airing", lines: [added!, ...(stillLooking ? [stillLooking] : [])] };
+  }
+  const line = `换好 ${replaced.length} 集（${label(replaced)}）` + (stillLooking ? `，${stillLooking}` : "");
+  return { ...base, status: "replaced", lines: [line, ...(added ? [added] : [])] };
+}
+
+/**
+ * How a replace run's notification is pushed, set by who queued it. A run the
+ * patrol queued reports into the daily digest (`scheduled`) instead of pushing on
+ * its own every sweep; one the user asked for (现在处理, the urgent scan) stays
+ * `user`. A patrol re-check of 待换 episodes with no new message that replaced
+ * nothing is routine (`already_current`): the notification page folds it into the
+ * 例行巡检 card and the digest lists it under 其余已是最新. Failures, actual
+ * replacements and newly landed episodes are never downgraded.
+ */
+export function stampReplaceNotification(
+  notification: NotificationEvent,
+  notice: { trigger: NotificationTrigger; routineIfNothingReplaced: boolean },
+): NotificationEvent {
+  const report = notification.report;
+  const routine =
+    notice.routineIfNothingReplaced && report?.status === "no_coverage" && report.newlyObtained.length === 0;
+  return { ...notification, trigger: notice.trigger, ...(routine ? { kind: "already_current" } : {}) };
+}
+
+/**
+ * The scheduled notifications that make up one digest push. The sweep always
+ * sends its digest (even "本次巡检无更新"). A queue drain runs patrol-queued replace
+ * runs one by one after the sweep: a digest there that would only say "nothing
+ * changed" is skipped, else every such run would push a lone 每日巡检.
+ */
+export function scheduledDigestItems(
+  notifications: NotificationEvent[],
+  opts: { skipIfOnlyRoutine: boolean },
+): NotificationEvent[] {
+  const scheduled = notifications.filter((notification) => notification.trigger === "scheduled");
+  if (opts.skipIfOnlyRoutine && scheduled.every((notification) => notification.kind === "already_current")) return [];
+  return scheduled;
+}
+
 /** Title metadata for richer pushes (poster image + tap-through link). */
 export interface NotificationTitleMeta {
   posterPath?: string | null;
@@ -300,6 +391,7 @@ const STATUS_EMOJI: Record<NotificationReportStatus, string> = {
   no_coverage: "🔍",
   failed: "❌",
   retrying: "⚠️",
+  replaced: "🔁",
 };
 
 /**

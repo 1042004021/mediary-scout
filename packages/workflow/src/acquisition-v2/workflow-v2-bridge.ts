@@ -14,7 +14,7 @@ import {
   type TransferAttempt,
   type WorkflowStatus,
 } from "../domain.js";
-import { buildSeasonReport, buildSeriesReport, formatReportPushText } from "../notification-report.js";
+import { buildReplacementReport, buildSeasonReport, buildSeriesReport, formatReportPushText } from "../notification-report.js";
 import { classifyTransferBlock } from "./transfer-block.js";
 import { classifySearchSourceFault } from "./search-source-fault.js";
 import type { RunAcquisitionV2WorkflowResult } from "./workflow-v2.js";
@@ -41,7 +41,9 @@ function sizeInput(input: { fileCount?: number; totalBytes?: number }): {
     : {};
 }
 
-export type V2BridgeMode = "type2" | "series" | "type3";
+/** `replace` = a replace_request run (user message): multi-season like `series`, but
+ *  its notification reports what was replaced, never "入库". */
+export type V2BridgeMode = "type2" | "series" | "type3" | "replace";
 
 export interface V2BridgeSeasonIntent {
   seasonNumber: number;
@@ -69,6 +71,8 @@ export interface BridgedV2Result {
   notification: NotificationEvent;
   notifications: NotificationEvent[];
   auditEvents: AuditEvent[];
+  /** Present only on a replace_request run (attached by runTvAcquisitionV2). */
+  replacement?: RunAcquisitionV2WorkflowResult["replacement"];
 }
 
 export function bridgeV2WorkflowToResult(input: {
@@ -97,12 +101,15 @@ export function bridgeV2WorkflowToResult(input: {
   // 下载配额不足 / 登录过期 / 非 VIP), report an honest "转存失败:<原因>" instead of
   // "暂未找到资源" — the resource exists, the account is blocked.
   const transferBlock = classifyTransferBlock(v2.outcome.transferAttempts);
-  const transferBlockReason = status === "no_coverage" && transferBlock ? transferBlock.reason : null;
+  // A replace run over a complete library is never "no_coverage" by episode count, yet
+  // a blocked transfer is still the honest reason nothing new landed.
+  const nothingLanded = status === "no_coverage" || input.mode === "replace";
+  const transferBlockReason = nothingLanded && transferBlock ? transferBlock.reason : null;
   // 同一条教义在更早一层:搜索源本轮全程故障时,一个候选都取不回来,集数算术
   // 于是判 no_coverage、用户读到「暂未找到可用资源」—— 真实案例里这样持续了
   // 6 天。判定读 sandbox 写下的结构化审计事件,不猜(见 classifySearchSourceFault)。
   const sourceFault = classifySearchSourceFault(v2.auditEvents);
-  const searchSourceFaultReason = status === "no_coverage" && sourceFault ? sourceFault.reason : null;
+  const searchSourceFaultReason = nothingLanded && sourceFault ? sourceFault.reason : null;
 
   const notification = buildNotification({
     title,
@@ -114,7 +121,9 @@ export function bridgeV2WorkflowToResult(input: {
     newlyObtainedCodes,
     workflowRunId,
     now: input.now,
-    ...(v2.landedFileCount !== undefined && v2.landedBytes !== undefined
+    ...(v2.replacement ? { replacementResults: v2.replacement.results } : {}),
+    // A replace run's directories hold old + new files: a landed size would double-count.
+    ...(input.mode !== "replace" && v2.landedFileCount !== undefined && v2.landedBytes !== undefined
       ? { fileCount: v2.landedFileCount, totalBytes: v2.landedBytes }
       : {}),
   });
@@ -241,10 +250,34 @@ function buildNotification(input: {
   now: () => string;
   fileCount?: number;
   totalBytes?: number;
+  /** replace mode: the per-episode outcome of the user's request. */
+  replacementResults?: Array<{ episode: string; outcome: "replaced" | "not_found" }>;
 }): NotificationEvent {
   const { title, mode, seasons, status, workflowRunId } = input;
   const noCoverage = status === "no_coverage";
   const titleMeta = { posterPath: title.posterPath ?? null, tmdbId: title.tmdbId, mediaType: title.type, year: title.year };
+
+  if (mode === "replace") {
+    const report = buildReplacementReport({
+      titleName: title.title,
+      movie: false,
+      results: input.replacementResults ?? [],
+      newlyObtained: input.newlyObtainedCodes,
+      transferBlockReason: input.transferBlockReason ?? null,
+      searchSourceFaultReason: input.searchSourceFaultReason ?? null,
+      meta: titleMeta,
+    });
+    return {
+      id: `notification_${workflowRunId}`,
+      workflowRunId,
+      kind: report.status === "failed" ? "transfer_failed" : "replacement_done",
+      title: report.titleName,
+      body: formatReportPushText(report),
+      createdAt: input.now(),
+      trigger: "user",
+      report,
+    };
+  }
 
   if (mode === "series") {
     const report = buildSeriesReport({

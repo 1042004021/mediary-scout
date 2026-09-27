@@ -5,6 +5,9 @@ import type { TaskSandbox } from "./sandbox.js";
 import { skillIndexForAgent } from "./skill.js";
 import { getStorageBrand } from "../storage-brands.js";
 import { stripMemoryFence, type AgentMemory } from "../agent-memory.js";
+import { hasUserRequests, userRequestBlock, type UserRequestPromptInput } from "./user-request-block.js";
+
+export { userRequestBlock, type UserRequestPromptInput } from "./user-request-block.js";
 
 /**
  * The 字字泣血 mandate: the agent MUST read its skill manual before acting and
@@ -50,6 +53,37 @@ Hard-won rules:
 - A foreign / different work bundled into a pack (e.g. El Camino inside a Breaking Bad pack) is NEVER moved into a season and NEVER mapped to an episode — leave it in staging and discardStaging wipes it with the rest. Do NOT isolate it for separate review or hand-classify it.
 - Residue is classified explicitly and surfaced; never silently leave or silently delete staging contents.`;
 
+/** The TV loop. A user request run gets one more line up front: its first step (the one
+ *  USER REQUESTS names) comes before the loop's search, and its report comes after the
+ *  mark. Outside a replace run the loop is unchanged. */
+function tvLoopGuidance(options: Pick<TaskAgentPromptOptions, "userRequests">): string {
+  if (!hasUserRequests(options)) return LOOP_GUIDANCE;
+  const [head, ...rest] = LOOP_GUIDANCE.split("\n");
+  return [
+    head,
+    "0. User request run — FIRST STEP: inspectTargetDir, then rejectCurrentSource for every requested episode (see USER REQUESTS), before step 1. After step 7 (markObtained), call reportReplacement for every requested episode, then do step 8.",
+    ...rest,
+  ].join("\n");
+}
+
+/** The movie loop's first and last steps; a user request run starts with its first step
+ *  and ends mark → report → finish (markObtained is not the last call there). */
+function movieLoopEnds(options: Pick<TaskAgentPromptOptions, "userRequests">): { first: string; last: string } {
+  if (!hasUserRequests(options)) {
+    return {
+      first: "",
+      last: `7. markObtained(["MOVIE"]) — the LAST step, only once the film is in place.
+8. finish() — done. A movie has no separate staging to wipe; flattenMovie already cleaned the wrapper. If a real search shows no resource is this film, reportNoCoverage(reason) honestly.`,
+    };
+  }
+  return {
+    first: "0. User request run — FIRST STEP: inspectTargetDir, then rejectCurrentSource for the current film (see USER REQUESTS), before step 1.\n",
+    last: `7. markObtained(["MOVIE"]) — only once the NEW film is in place. Not the last call in this run: reportReplacement and finish follow.
+8. reportReplacement for MOVIE — "replaced" naming the new film's fileIds, or "not_found" with one 中文 sentence when no different copy of this film could be landed.
+9. finish() — done. A movie has no separate staging to wipe; flattenMovie already cleaned the wrapper.`,
+  };
+}
+
 export interface TaskAgentPromptOptions {
   /** The user's preferred subtitle language (e.g. "中文"), standing context. */
   preferredLanguage?: string;
@@ -90,6 +124,23 @@ export interface TaskAgentPromptOptions {
     /** Its brand: older notes were tagged with the brand and count as this drive's. */
     currentBrand?: string;
   };
+  /** A replace_request run: the user's messages, this work's rejected resources and
+   *  the episodes still pending a replacement. Absent/empty = no block. */
+  userRequests?: UserRequestPromptInput;
+  /** Episodes an earlier replace run gave a second copy (old + replacement, both
+   *  kept on purpose); "unknown" = they could not be read, the existing files are
+   *  protected anyway. Absent/empty = no line. */
+  protectExisting?: { episodes: string[] | "unknown" };
+}
+
+/** The kept old + replacement copies, so keep-larger dedup does not undo a replacement. */
+function protectExistingLine(options: Pick<TaskAgentPromptOptions, "protectExisting">): string {
+  const episodes = options.protectExisting?.episodes ?? [];
+  if (episodes === "unknown") {
+    return `\n♻️ The files already in the target folders (the season folders; for a film, its folder) are protected this run — do not delete or move them. The system refuses to delete, move or rename them.\n`;
+  }
+  if (episodes.length === 0) return "";
+  return `\n♻️ Episodes with intentionally kept duplicates (old + replacement) — do not dedup or delete them: ${episodes.join(", ")}. The files that were already here are protected (the system refuses to delete, move or rename them).\n`;
 }
 
 /** A brand-specific transfer-model note. 夸克/天翼 = 转存分享链 only; 光鸭 and
@@ -208,6 +259,11 @@ function rawSnapshotPointer(options: TaskAgentPromptOptions): string {
   if (options.prefetchedCandidateCount === undefined || options.prefetchedCandidateCount === 0) {
     return "";
   }
+  // A user request run has one first step, and it is not this: the copies it rejects are
+  // hidden from the snapshot afterwards anyway.
+  if (hasUserRequests(options)) {
+    return `\n📋 RAW SNAPSHOT (活期文档): The system has already pre-searched the raw keyword (bare title) for you and found ${options.prefetchedCandidateCount} candidates. Right after the FIRST STEP in USER REQUESTS (inspectTargetDir, then rejectCurrentSource), call viewResourceSnapshot() to view this live document — it's free, read-only, contains all the raw candidates (id + title), and no longer shows the copies you rejected. Do NOT use searchResources to re-search the raw keyword; searchResources is ONLY for 繁体/英文/原名 upgrades when the raw snapshot is insufficient.\n`;
+  }
   return `\n📋 RAW SNAPSHOT (活期文档): The system has already pre-searched the raw keyword (bare title) for you and found ${options.prefetchedCandidateCount} candidates. Your FIRST step: call viewResourceSnapshot() to view this live document — it's free, read-only, and contains all the raw candidates (id + title). Do NOT use searchResources to re-search the raw keyword; searchResources is ONLY for 繁体/英文/原名 upgrades when the raw snapshot is insufficient.\n`;
 }
 
@@ -226,7 +282,7 @@ export function buildTvAnimeSystemPrompt(options: TaskAgentPromptOptions): strin
   return `${SANDBOX_BOUNDARY}
 
 ${skillMandate("tv")}
-${memoryBlock(options)}${rawSnapshotPointer(options)}${subtitleSnapshotPointer(options)}
+${memoryBlock(options)}${userRequestBlock(options)}${protectExistingLine(options)}${rawSnapshotPointer(options)}${subtitleSnapshotPointer(options)}
 You own the COMPLETE acquisition judgment for one OR MORE seasons of a TV/anime title in scope: keyword strategy, target matching, season/episode coverage, package recognition + normalization, provider-ahead reasoning, staging→season extraction, residue classification, same-episode dedup grouping, and marking. It is ONE deliberation, not separate filters. The need is simply "应有 vs 实有 = which episodes are still missing"; it may span several seasons.
 
 Target matching:
@@ -251,14 +307,15 @@ ${languageLine(options)}
 ${transferModelLine(options)}
 ${searchHintsBlock(options)}
 ${qualityGuidanceBlock(options)}
-${LOOP_GUIDANCE}`;
+${tvLoopGuidance(options)}`;
 }
 
 export function buildMovieSystemPrompt(options: TaskAgentPromptOptions): string {
+  const loopEnds = movieLoopEnds(options);
   return `${SANDBOX_BOUNDARY}
 
 ${skillMandate("movie")}
-${memoryBlock(options)}${rawSnapshotPointer(options)}${subtitleSnapshotPointer(options)}
+${memoryBlock(options)}${userRequestBlock(options)}${protectExistingLine(options)}${rawSnapshotPointer(options)}${subtitleSnapshotPointer(options)}
 You own the COMPLETE acquisition judgment for ONE movie: target正片 identification (guard against remakes/wrong films — cross-check BOTH title AND year), main-file selection, quality tradeoff, rejection of extras/trailers/foreign works, import cleanup, and marking. A movie is a SINGLE video file — there are no seasons or episodes; its one synthetic coverage token is "MOVIE".
 
 Identity (the hard part): the candidate must be THIS film, not a remake, sequel, prequel, or same-IP different film. Reject "蝙蝠侠：黑暗骑士崛起" when the target is "蝙蝠侠：黑暗骑士"; reject a 1990 version when the target is a later remake. When identity is unclear, do not transfer speculatively.
@@ -272,14 +329,13 @@ ${transferModelLine(options)}
 ${searchHintsBlock(options)}
 ${qualityGuidanceBlock(options)}
 Your loop (you drive it; the system only orchestrates the tool calls). A MOVIE is simple — there is NO season distribution and NO separate staging to discard (the film lands in the movie directory and flattenMovie cleans the wrapper in place). At EVERY decision point lay out Evidence → Facts → Decision (read your skill's "protocol" section); once a transfer has LANDED, do NOT keep searching/transferring — verify and finish.
-1. searchResources — bare title first; re-keyword (add the original/English name or "全集") only if weak. Stop the moment you can identify the one correct film.
+${loopEnds.first}1. searchResources — bare title first; re-keyword (add the original/English name or "全集") only if weak. Stop the moment you can identify the one correct film.
 2. Decide the ONE correct film (right title AND year, not a remake / same-IP other film / a same-keyword different work) and RANK its candidate links best-first.
 3. Transfer it: transferUntilLanded over your ranked shares (it burns through the dead ones), or transferCandidate for a single share / a magnet.
 4. inspectStaging — read the TRUE landed files and confirm it IS the film.
 5. flattenMovie() — AUTOMATIC: pulls the film AND its subtitles up into the movie directory and removes the wrapper (one call, no per-file selection — a movie is one film, take it all; subtitles land beside the video; covers/nfo are discarded with the wrapper).
 6. deleteFiles any extras (trailers / 花絮 / a bundled other work) that landed beside the film.
-7. markObtained(["MOVIE"]) — the LAST step, only once the film is in place.
-8. finish() — done. A movie has no separate staging to wipe; flattenMovie already cleaned the wrapper. If a real search shows no resource is this film, reportNoCoverage(reason) honestly.`;
+${loopEnds.last}`;
 }
 
 /** Coverage tokens for a TV/anime task — exactly the missing episode codes. */
@@ -344,9 +400,19 @@ export async function runTvAnimeTaskAgent(request: RunTvAnimeRequest): Promise<A
   const { sandbox, model, target, maxSteps, onProgress, apiCallCount, budgetSoftAt, ...promptOptions } = request;
   const seasonsLabel =
     target.seasons.length === 1 ? `season ${target.seasons[0]}` : `seasons ${target.seasons.join(", ")}`;
+  // A user request on a complete library has nothing missing: say so, instead of an
+  // empty list that reads as "nothing to do" (the requested episodes' OLD files are there).
+  const missingLine =
+    target.missingEpisodes.length === 0 && promptOptions.userRequests
+      ? "(none — this run is for the USER REQUESTS in your instructions)"
+      : target.missingEpisodes.join(", ");
   const prompt = `Acquire the missing episodes for "${target.title}"${target.aliases.length ? ` (aliases: ${target.aliases.join(", ")})` : ""}, ${seasonsLabel}.
-Missing episodes (the coverage need — may span multiple seasons): ${target.missingEpisodes.join(", ")}.
-If one pack covers multiple seasons, distribute its files in ONE plan with a move per season (moveToSeason({moves:[{season,fileIds}]})) and take only still-missing episodes — never recopy a season already present. Cover every missing episode with the fewest reliable transfers, keep each season directory clean, mark what truly landed, then finish.`;
+Missing episodes (the coverage need — may span multiple seasons): ${missingLine}.
+If one pack covers multiple seasons, distribute its files in ONE plan with a move per season (moveToSeason({moves:[{season,fileIds}]})) and take only still-missing episodes — never recopy a season already present. Cover every missing episode with the fewest reliable transfers, keep each season directory clean, mark what truly landed, then finish.${
+    promptOptions.userRequests
+      ? "\nUser requests: before you finish, call reportReplacement for every requested episode, then finish (finish is refused until they are all reported — and, for a message without episode tags, until you have identified its episodes with rejectCurrentSource)."
+      : ""
+  }`;
   return runAcquisitionAgent({
     sandbox,
     model,
@@ -363,9 +429,17 @@ If one pack covers multiple seasons, distribute its files in ONE plan with a mov
 
 export async function runMovieTaskAgent(request: RunMovieRequest): Promise<AcquisitionAgentResult> {
   const { sandbox, model, target, maxSteps, onProgress, apiCallCount, budgetSoftAt, ...promptOptions } = request;
+  // Only a film that was obtained before this run is known to be in the library.
+  const requestLine = promptOptions.userRequests
+    ? `\n${
+        promptOptions.userRequests.filmObtained === true
+          ? "The film is already in the library: this run is for the USER REQUESTS in your instructions — land a DIFFERENT copy"
+          : "Whatever the movie directory holds now, this run is for the USER REQUESTS in your instructions — land a copy the user has not rejected"
+      }, and do not mark MOVIE until the new file is in place. Then call reportReplacement for MOVIE, then finish (finish is refused until it is reported).`
+    : "";
   const prompt = `Acquire the movie "${target.title}" (${target.year})${target.aliases.length ? ` (aliases: ${target.aliases.join(", ")})` : ""}.
 This is the coverage need: the single MOVIE token. Cross-check title AND year so you do not grab a remake or same-IP different film.
-Find the one correct film, transfer it, keep the directory clean, mark it present, then finish.`;
+Find the one correct film, transfer it, keep the directory clean, mark it present, then finish.${requestLine}`;
   return runAcquisitionAgent({
     sandbox,
     model,

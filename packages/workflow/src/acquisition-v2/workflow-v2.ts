@@ -12,7 +12,7 @@ import {
 import type { DeadLinkStore } from "./dead-links.js";
 import { readLandedSize } from "./landed-size.js";
 import type { AgentToolEvent } from "./activity.js";
-import { runAcquisitionV2, type AcquisitionV2Outcome } from "./orchestrator.js";
+import { runAcquisitionV2, type AcquisitionV2Outcome, type RunAcquisitionV2Request, type RunAcquisitionV2Result } from "./orchestrator.js";
 import type { JevJudge } from "../jev-judge.js";
 import { syncSeasonNeed } from "./sync-need.js";
 import type { SearchProfile } from "./search-profile.js";
@@ -65,6 +65,13 @@ export interface RunAcquisitionV2WorkflowRequest {
   deadLinkStore?: DeadLinkStore;
   /** Agent memory (see orchestrator.memory). */
   memory?: { store: AgentMemoryStore; accountId: string; drive?: string };
+  /** A replace_request run (see orchestrator.userRequest). Its episodes join the
+   *  agent's need, and the run goes ahead even when nothing is missing. */
+  userRequest?: RunAcquisitionV2Request["userRequest"];
+  /** See orchestrator.protectExisting. */
+  protectExisting?: RunAcquisitionV2Request["protectExisting"];
+  /** See orchestrator.rejectedLookup. */
+  rejectedLookup?: RunAcquisitionV2Request["rejectedLookup"];
   onProgress?: (event: AgentToolEvent) => void;
 }
 
@@ -83,6 +90,8 @@ export interface RunAcquisitionV2WorkflowResult {
   landedFileCount?: number;
   landedBytes?: number;
   auditEvents: AuditEvent[];
+  /** Present only on a replace_request run (see orchestrator). */
+  replacement?: RunAcquisitionV2Result["replacement"];
 }
 
 const EMPTY_OUTCOME: AcquisitionV2Outcome = { resourceSnapshots: [], decisions: [], transferAttempts: [] };
@@ -125,7 +134,9 @@ export async function runAcquisitionV2Workflow(
 
   // 7b — sync the need from the DB marks (应有 − 实有). No 115 scan, no parser.
   const before = syncSeasonNeed({ seasons: seasonsForSync, obtained: priorObtained });
-  if (before.missing.length === 0) {
+  // A user request runs the agent even on a complete library: the episodes to
+  // replace are obtained (the old file is there), so they are never "missing".
+  if (before.missing.length === 0 && !request.userRequest) {
     // Already current — no agent run, no side effects (the type-3 no-op path).
     return {
       directories,
@@ -151,6 +162,8 @@ export async function runAcquisitionV2Workflow(
       aliases: request.title.aliases,
       year: request.title.year,
       seasons: request.seasons.map((season) => season.seasonNumber),
+      // Only the truly missing ones: episodes to replace join the need inside the
+      // orchestrator and are described separately in the USER REQUESTS block.
       missingEpisodes: before.missing,
       qualityPreference: request.qualityPreference,
       ...(request.title.tmdbId ? { tmdbId: request.title.tmdbId } : {}),
@@ -169,11 +182,18 @@ export async function runAcquisitionV2Workflow(
     ...(request.jevJudge === undefined ? {} : { jevJudge: request.jevJudge }),
     ...(request.deadLinkStore ? { deadLinkStore: request.deadLinkStore } : {}),
     ...(request.memory ? { memory: request.memory } : {}),
+    ...(request.userRequest ? { userRequest: request.userRequest } : {}),
+    ...(request.protectExisting ? { protectExisting: request.protectExisting } : {}),
+    ...(request.rejectedLookup ? { rejectedLookup: request.rejectedLookup } : {}),
     ...(request.onProgress ? { onProgress: request.onProgress } : {}),
   });
 
   // Reconcile from the AGENT'S coverage (its markObtained), NOT a 115 re-scan:
   // 实有 after = prior DB marks ∪ what the agent marked this run (§1.13/§7b).
+  // An episode the user asked to replace is in priorObtained, so it stays obtained
+  // whether or not the replacement landed. The agent's side carries such an episode
+  // only once it was reported replaced (sandbox finish): one declared file-less and
+  // reported not_found never becomes obtained on a bare mark.
   const after = syncSeasonNeed({
     seasons: seasonsForSync,
     obtained: [...priorObtained, ...v2.coverage.obtained],
@@ -183,10 +203,11 @@ export async function runAcquisitionV2Workflow(
   // not a claimed quality). Reads AFTER the acquisition succeeded; on the heavy
   // run where the 115 call budget is spent this returns undefined rather than
   // throwing, so the size is simply omitted — never failing a good run.
-  const landed = await readLandedSize(
-    request.executor,
-    Object.values(directories.seasonDirectoryIds),
-  );
+  // A replace run skips it (like the movie path): its season dirs hold the old
+  // AND the new copies, and the replace notification drops the size anyway.
+  const landed = request.userRequest
+    ? undefined
+    : await readLandedSize(request.executor, Object.values(directories.seasonDirectoryIds));
 
   return {
     directories,
@@ -198,6 +219,7 @@ export async function runAcquisitionV2Workflow(
     providerAhead: after.providerAhead,
     auditEvents: v2.auditEvents,
     ...(landed ? { landedFileCount: landed.fileCount, landedBytes: landed.totalBytes } : {}),
+    ...(v2.replacement ? { replacement: v2.replacement } : {}),
   };
     },
   );

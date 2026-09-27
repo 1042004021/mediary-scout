@@ -1,7 +1,13 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { DuplicateUsernameError, type WorkflowRepository } from "../src/repository.js";
+import {
+  DuplicateUsernameError,
+  type ReserveWorkflowRunInput,
+  type TrackedSeasonState,
+  type WorkflowRepository,
+} from "../src/repository.js";
 import type { Account } from "../src/account-credentials.js";
 import { workflowPersistenceFixture } from "./workflow-fixtures.js";
+import { queueReplaceRequest } from "../src/replace-request.js";
 
 /** A factory that yields a FRESH, empty repository and a teardown. Postgres/SQLite
  *  return async; InMemory is sync — accept both. */
@@ -52,6 +58,261 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         expect(await repo.getAccountSetting("acct_a", "llm_key")).toBe("A");
         expect(await repo.getAccountSetting("acct_b", "llm_key")).toBe("B");
         expect(await repo.getAccountSetting("acct_a", "missing")).toBeNull();
+      });
+    });
+
+    describe("user requests", () => {
+      const scope = { accountId: "acct_a", drive: "cs_1", titleKey: "tmdb_tv_1" };
+      const t0 = "2026-09-26T00:00:00.000Z";
+      const t1 = "2026-09-26T00:01:00.000Z";
+
+      it("creates, lists newest-first, edits and withdraws only while pending", async () => {
+        const repo = await fresh();
+        const a = await repo.createUserMessage({ ...scope, body: "E13 发蓝", episodeTags: ["S01E13"], now: t0 });
+        const b = await repo.createUserMessage({ ...scope, body: "E24 也是", episodeTags: [], now: t1 });
+        expect((await repo.listUserMessages(scope)).map((m) => m.id)).toEqual([b.id, a.id]);
+        expect(a).toMatchObject({ status: "pending", urgent: false, episodeTags: ["S01E13"], runId: null, reply: null });
+
+        const edited = await repo.editUserMessage({ accountId: "acct_a", id: a.id, body: "E13 偏蓝", episodeTags: ["S01E13", "S01E14"], now: t1 });
+        expect(edited).toMatchObject({ body: "E13 偏蓝", episodeTags: ["S01E13", "S01E14"], updatedAt: t1 });
+        expect(await repo.withdrawUserMessage({ accountId: "acct_a", id: b.id, now: t1 })).toBe(true);
+        expect((await repo.listUserMessages(scope)).map((m) => m.id)).toEqual([a.id]);
+
+        await repo.claimUserMessages({ ...scope, runId: "run_1", now: t1 });
+        expect(await repo.editUserMessage({ accountId: "acct_a", id: a.id, body: "x", episodeTags: [], now: t1 })).toBeNull();
+        expect(await repo.withdrawUserMessage({ accountId: "acct_a", id: a.id, now: t1 })).toBe(false);
+      });
+
+      it("never lets another account touch a message", async () => {
+        const repo = await fresh();
+        const a = await repo.createUserMessage({ ...scope, body: "hi", episodeTags: [], now: t0 });
+        expect(await repo.editUserMessage({ accountId: "acct_b", id: a.id, body: "x", episodeTags: [], now: t1 })).toBeNull();
+        expect(await repo.withdrawUserMessage({ accountId: "acct_b", id: a.id, now: t1 })).toBe(false);
+        expect(await repo.listUserMessages({ ...scope, accountId: "acct_b" })).toEqual([]);
+        const [still] = await repo.listUserMessages(scope);
+        expect(still).toMatchObject({ id: a.id, body: "hi", status: "pending", updatedAt: t0 });
+      });
+
+      it("isolates drives: urgency, claims and pending replacements never cross drives", async () => {
+        const repo = await fresh();
+        const other = { ...scope, drive: "cs_2" };
+        await repo.createUserMessage({ ...scope, body: "on cs_1", episodeTags: [], now: t0 });
+        await repo.claimUserMessages({ ...scope, runId: "run_1", now: t0 });
+        const onOther = await repo.createUserMessage({ ...other, body: "on cs_2", episodeTags: [], now: t1 });
+        expect(onOther.urgent).toBe(false);
+        expect(await repo.claimUserMessages({ ...scope, runId: "run_2", now: t1 })).toEqual([]);
+        expect((await repo.listUserMessages(other)).map((m) => [m.id, m.status])).toEqual([[onOther.id, "pending"]]);
+
+        await repo.addPendingReplacements({ ...scope, episodes: ["S01E13"], messageId: "m1", now: t0 });
+        expect(await repo.listPendingReplacements(other)).toEqual([]);
+        expect(await repo.removePendingReplacements({ ...other, episodes: ["S01E13"] })).toBe(0);
+        expect((await repo.listPendingReplacements(scope)).map((p) => p.episode)).toEqual(["S01E13"]);
+      });
+
+      it("does not claim a withdrawn message", async () => {
+        const repo = await fresh();
+        const a = await repo.createUserMessage({ ...scope, body: "gone", episodeTags: [], now: t0 });
+        const b = await repo.createUserMessage({ ...scope, body: "kept", episodeTags: [], now: t1 });
+        expect(await repo.withdrawUserMessage({ accountId: "acct_a", id: a.id, now: t1 })).toBe(true);
+        expect((await repo.claimUserMessages({ ...scope, runId: "run_1", now: t1 })).map((m) => m.id)).toEqual([b.id]);
+      });
+
+      it("finish/release only touch their own run; release after finish keeps done", async () => {
+        const repo = await fresh();
+        const a = await repo.createUserMessage({ ...scope, body: "a", episodeTags: [], now: t0 });
+        const b = await repo.createUserMessage({ ...scope, titleKey: "tmdb_tv_2", body: "b", episodeTags: [], now: t0 });
+        await repo.claimUserMessages({ ...scope, runId: "run_1", now: t0 });
+        await repo.claimUserMessages({ ...scope, titleKey: "tmdb_tv_2", runId: "run_2", now: t0 });
+        const reply = { results: [], oldFiles: [], runId: "run_x" };
+
+        await repo.finishUserMessages({ runId: "run_other", reply, now: t1 });
+        await repo.releaseUserMessages({ runId: "run_other", now: t1 });
+        expect((await repo.listUserMessages(scope))[0]).toMatchObject({ id: a.id, status: "processing", runId: "run_1", reply: null });
+
+        await repo.finishUserMessages({ runId: "run_1", reply: { ...reply, runId: "run_1" }, now: t1 });
+        await repo.releaseUserMessages({ runId: "run_1", now: t1 });
+        expect((await repo.listUserMessages(scope))[0]).toMatchObject({ id: a.id, status: "done", runId: "run_1", urgent: false, processedAt: t1 });
+        expect((await repo.listUserMessages({ ...scope, titleKey: "tmdb_tv_2" }))[0]).toMatchObject({
+          id: b.id, status: "processing", runId: "run_2", reply: null, processedAt: null,
+        });
+      });
+
+      it("a message written while another is processing is urgent; claim takes only what is pending", async () => {
+        const repo = await fresh();
+        const a = await repo.createUserMessage({ ...scope, body: "first", episodeTags: [], now: t0 });
+        const claimed = await repo.claimUserMessages({ ...scope, runId: "run_1", now: t0 });
+        expect(claimed.map((m) => m.id)).toEqual([a.id]);
+        expect(claimed[0]).toMatchObject({ status: "processing", runId: "run_1" });
+        const b = await repo.createUserMessage({ ...scope, body: "second", episodeTags: [], now: t1 });
+        expect(b.urgent).toBe(true);
+        expect(await repo.claimUserMessages({ ...scope, runId: "run_2", now: t1 })).toHaveLength(1);
+        expect(await repo.claimUserMessages({ ...scope, runId: "run_3", now: t1 })).toHaveLength(0);
+      });
+
+      it("finish writes the reply; release puts processing back to pending+urgent", async () => {
+        const repo = await fresh();
+        await repo.createUserMessage({ ...scope, body: "a", episodeTags: [], now: t0 });
+        await repo.claimUserMessages({ ...scope, runId: "run_1", now: t0 });
+        await repo.releaseUserMessages({ runId: "run_1", now: t1 });
+        let [m] = await repo.listUserMessages(scope);
+        expect(m).toMatchObject({ status: "pending", urgent: true, runId: null });
+        await repo.claimUserMessages({ ...scope, runId: "run_1b", now: t1 });
+        await repo.releaseUserMessages({ runId: "run_1b", now: t1, urgent: false });
+        [m] = await repo.listUserMessages(scope);
+        expect(m).toMatchObject({ status: "pending", urgent: false, runId: null });
+
+        await repo.claimUserMessages({ ...scope, runId: "run_2", now: t1 });
+        const reply = { results: [{ episode: "S01E13", outcome: "replaced" as const, label: "x", sizeBytes: 1, note: "ok" }], oldFiles: ["Season 01/a.mkv"], runId: "run_2" };
+        await repo.finishUserMessages({ runId: "run_2", reply, now: t1 });
+        [m] = await repo.listUserMessages(scope);
+        expect(m).toMatchObject({ status: "done", processedAt: t1, reply });
+      });
+
+      it("claim is idempotent per run: the same run gets its processing messages back, another run does not", async () => {
+        const repo = await fresh();
+        const a = await repo.createUserMessage({ ...scope, body: "a", episodeTags: [], now: t0 });
+        expect((await repo.claimUserMessages({ ...scope, runId: "run_1", now: t0 })).map((m) => m.id)).toEqual([a.id]);
+        const b = await repo.createUserMessage({ ...scope, body: "b", episodeTags: [], now: t1 });
+        // The crashed-and-requeued run_1 re-claims a (still its own) and the new pending b.
+        const again = await repo.claimUserMessages({ ...scope, runId: "run_1", now: t1 });
+        expect(again.map((m) => [m.id, m.status, m.runId])).toEqual([[a.id, "processing", "run_1"], [b.id, "processing", "run_1"]]);
+        expect(await repo.claimUserMessages({ ...scope, runId: "run_2", now: t1 })).toEqual([]);
+        expect(await repo.listWorksWithProcessingMessages()).toEqual([scope]);
+      });
+
+      it("releaseOrphanedUserMessages releases processing messages whose run is gone or finished, keeps live ones", async () => {
+        const repo = await fresh();
+        const base = workflowPersistenceFixture();
+        const run = (id: string, status: "queued" | "running" | "failed", seasonId: string) => ({
+          ...base,
+          accountId: "acct_a",
+          connectedStorageId: "cs_1",
+          season: { ...base.season, id: seasonId },
+          workflowRun: { ...base.workflowRun, id, kind: "replace_request" as const, status, trackedSeasonId: seasonId, finishedAt: status === "failed" ? t0 : null },
+          episodes: [],
+          resourceSnapshots: [],
+          decisions: [],
+          transferAttempts: [],
+          notifications: [],
+        });
+        await repo.saveWorkflowRunSnapshot(run("run_live", "running", "season_live"));
+        await repo.saveWorkflowRunSnapshot(run("run_dead", "failed", "season_dead"));
+        // Just saved its final status; its bookkeeping (finishUserMessages) is still to come.
+        const fresh_ = run("run_just_done", "failed", "season_just");
+        await repo.saveWorkflowRunSnapshot({ ...fresh_, workflowRun: { ...fresh_.workflowRun, finishedAt: t1 } });
+        const works = ["tmdb_tv_live", "tmdb_tv_just", "tmdb_tv_dead", "tmdb_tv_gone"].map((titleKey) => ({ ...scope, titleKey }));
+        for (const work of works) await repo.createUserMessage({ ...work, body: "x", episodeTags: [], now: t0 });
+        await repo.claimUserMessages({ ...works[0]!, runId: "run_live", now: t0 });
+        await repo.claimUserMessages({ ...works[1]!, runId: "run_just_done", now: t0 });
+        await repo.claimUserMessages({ ...works[2]!, runId: "run_dead", now: t0 });
+        await repo.claimUserMessages({ ...works[3]!, runId: "run_never_saved", now: t0 });
+
+        expect(await repo.releaseOrphanedUserMessages({ now: t1, finishedBefore: t1 })).toBe(2);
+        expect((await repo.listUserMessages(works[0]!))[0]).toMatchObject({ status: "processing", runId: "run_live" });
+        expect((await repo.listUserMessages(works[1]!))[0]).toMatchObject({ status: "processing", runId: "run_just_done" });
+        // Handed to the patrol, like every other way a run ends without finishing its messages.
+        for (const work of works.slice(2)) {
+          expect((await repo.listUserMessages(work))[0]).toMatchObject({ status: "pending", urgent: false, runId: null, updatedAt: t1 });
+        }
+        expect(await repo.releaseOrphanedUserMessages({ now: t1, finishedBefore: t1 })).toBe(0);
+      });
+
+      it("clearUserMessagesUrgent hands this work's pending messages to the patrol, and only them", async () => {
+        const repo = await fresh();
+        const otherTitle = { ...scope, titleKey: "tmdb_tv_2" };
+        const otherDrive = { ...scope, drive: "cs_2" };
+        const held = await repo.createUserMessage({ ...scope, body: "held by a run", episodeTags: [], now: t0 });
+        await repo.claimUserMessages({ ...scope, runId: "run_1", now: t0 });
+        // Written while the first one is processing: urgent.
+        const later = await repo.createUserMessage({ ...scope, body: "written mid-run", episodeTags: [], now: "2026-09-26T00:00:30.000Z" });
+        expect(later.urgent).toBe(true);
+        for (const work of [otherTitle, otherDrive]) {
+          await repo.createUserMessage({ ...work, body: "someone else", episodeTags: [], now: t0 });
+          await repo.markUserMessagesUrgent({ ...work, now: t0 });
+        }
+
+        expect(await repo.clearUserMessagesUrgent({ ...scope, now: t1 })).toBe(1);
+
+        expect((await repo.listUserMessages(scope)).map((m) => [m.id, m.status, m.urgent, m.updatedAt])).toEqual([
+          [later.id, "pending", false, t1],
+          [held.id, "processing", false, t0],
+        ]);
+        const urgentWorks = await repo.listWorksWithPendingMessages({ urgentOnly: true });
+        expect(urgentWorks).toHaveLength(2);
+        expect(urgentWorks).toEqual(expect.arrayContaining([otherTitle, otherDrive]));
+        expect(await repo.clearUserMessagesUrgent({ ...scope, now: t1 })).toBe(0);
+      });
+
+      it("markUserMessagesUrgent and listWorksWithPendingMessages", async () => {
+        const repo = await fresh();
+        await repo.createUserMessage({ ...scope, body: "a", episodeTags: [], now: t0 });
+        await repo.createUserMessage({ ...scope, titleKey: "tmdb_tv_2", body: "b", episodeTags: [], now: t0 });
+        expect(await repo.listWorksWithPendingMessages({ urgentOnly: true })).toEqual([]);
+        expect(await repo.markUserMessagesUrgent({ ...scope, now: t1 })).toBe(1);
+        expect(await repo.listWorksWithPendingMessages({ urgentOnly: true })).toEqual([scope]);
+        const all = await repo.listWorksWithPendingMessages({ urgentOnly: false });
+        expect(all.map((w) => w.titleKey).sort()).toEqual(["tmdb_tv_1", "tmdb_tv_2"]);
+      });
+
+      it("pending replacements add idempotently and remove by episode", async () => {
+        const repo = await fresh();
+        await repo.addPendingReplacements({ ...scope, episodes: ["S01E13", "S01E24"], messageId: "m1", now: t0 });
+        await repo.addPendingReplacements({ ...scope, episodes: ["S01E24"], messageId: "m2", now: t1 });
+        expect((await repo.listPendingReplacements(scope)).map((p) => p.episode).sort()).toEqual(["S01E13", "S01E24"]);
+        expect(await repo.listWorksWithPendingReplacements()).toEqual([scope]);
+        expect(await repo.removePendingReplacements({ ...scope, episodes: ["S01E13", "S01E99"] })).toBe(1);
+        expect((await repo.listPendingReplacements(scope)).map((p) => p.episode)).toEqual(["S01E24"]);
+        expect(await repo.removePendingReplacements({ ...scope, episodes: ["S01E24", "S01E24"] })).toBe(1);
+        expect(await repo.listPendingReplacements(scope)).toEqual([]);
+      });
+
+      it("rejected resources are scoped by account + work, across drives", async () => {
+        const repo = await fresh();
+        await repo.addRejectedResources({
+          accountId: "acct_a", titleKey: "tmdb_movie_9", now: t0,
+          items: [{ episode: "MOVIE", linkKey: "115:abc", label: "The.Odyssey.2026.mkv", sizeBytes: 100, reason: "假片", messageId: "m1" }],
+        });
+        const list = await repo.listRejectedResources({ accountId: "acct_a", titleKey: "tmdb_movie_9" });
+        expect(list).toHaveLength(1);
+        expect(list[0]).toMatchObject({ episode: "MOVIE", linkKey: "115:abc", sizeBytes: 100, reason: "假片" });
+        expect(await repo.listRejectedResources({ accountId: "acct_b", titleKey: "tmdb_movie_9" })).toEqual([]);
+      });
+
+      it("rejected resources round-trip null link/size and sizes beyond 32 bits", async () => {
+        const repo = await fresh();
+        const big = 60 * 1024 ** 3;
+        await repo.addRejectedResources({
+          accountId: "acct_a", titleKey: "tmdb_movie_9", now: t0,
+          items: [{ episode: "MOVIE", linkKey: null, label: "unknown.mkv", sizeBytes: null, reason: "假片", messageId: null }],
+        });
+        await repo.addRejectedResources({
+          accountId: "acct_a", titleKey: "tmdb_movie_9", now: t1,
+          items: [{ episode: "MOVIE", linkKey: "magnet:bb", label: "remux.mkv", sizeBytes: big, reason: "发蓝", messageId: "m2" }],
+        });
+        const list = await repo.listRejectedResources({ accountId: "acct_a", titleKey: "tmdb_movie_9" });
+        expect(list.map((r) => ({ linkKey: r.linkKey, sizeBytes: r.sizeBytes, messageId: r.messageId, createdAt: r.createdAt }))).toEqual([
+          { linkKey: null, sizeBytes: null, messageId: null, createdAt: t0 },
+          { linkKey: "magnet:bb", sizeBytes: big, messageId: "m2", createdAt: t1 },
+        ]);
+      });
+
+      it("episode sources upsert per episode", async () => {
+        const repo = await fresh();
+        const base = { ...scope, episode: "S01E13", linkKey: "magnet:aa", label: "old", sizeBytes: 1, runId: "r1", recordedAt: t0 };
+        await repo.upsertEpisodeSource(base);
+        await repo.upsertEpisodeSource({ ...base, label: "new", runId: "r2", recordedAt: t1 });
+        expect(await repo.listEpisodeSources(scope)).toEqual([{ ...base, label: "new", runId: "r2", recordedAt: t1 }]);
+      });
+
+      it("episode sources round-trip null link/size and sizes beyond 32 bits", async () => {
+        const repo = await fresh();
+        const big = 60 * 1024 ** 3;
+        const unknown = { ...scope, episode: "S01E01", linkKey: null, label: "a.mkv", sizeBytes: null, runId: "r1", recordedAt: t0 };
+        const large = { ...scope, episode: "S01E02", linkKey: "115:cc", label: "b.mkv", sizeBytes: big, runId: "r1", recordedAt: t0 };
+        await repo.upsertEpisodeSource(unknown);
+        await repo.upsertEpisodeSource(large);
+        expect(await repo.listEpisodeSources(scope)).toEqual([unknown, large]);
+        expect(await repo.listEpisodeSources({ ...scope, drive: "cs_2" })).toEqual([]);
       });
     });
 
@@ -389,6 +650,67 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         expect(again.status).toBe("already_active");
       });
 
+      it("two concurrent title-locked reservations for the same title: exactly one is reserved", async () => {
+        const repo = await fresh();
+        // Different seasons AND kinds, so only the title lock (not the per-season+kind
+        // check) can keep the second one out. Postgres runs both transactions at once.
+        const base = workflowPersistenceFixture();
+        const reserveFor = (id: string, seasonId: string, kind: "type2_init" | "replace_request") =>
+          repo.reserveWorkflowRun(
+            reIded(id, {
+              season: { ...base.season, id: seasonId, seasonNumber: seasonId === "season_x1" ? 1 : 2 },
+              workflowRun: { ...base.workflowRun, id, kind, status: "queued" as const, trackedSeasonId: seasonId, finishedAt: null },
+              episodes: [],
+              connectedStorageId: "cs_lock",
+              blockIfTitleHasActiveRun: true,
+            }),
+          );
+        for (let round = 0; round < 5; round++) {
+          const results = await Promise.all([
+            reserveFor(`run_c1_${round}`, "season_x1", "type2_init"),
+            reserveFor(`run_c2_${round}`, "season_x2", "replace_request"),
+          ]);
+          expect(results.map((r) => r.status).sort()).toEqual(["already_active", "reserved"]);
+          // Clear the winner so the next round races again from an idle title.
+          const winner = results.find((r) => r.status === "reserved") as { snapshot: { workflowRun: { id: string } } };
+          const done = await repo.getWorkflowRunSnapshot(winner.snapshot.workflowRun.id);
+          await repo.saveWorkflowRunSnapshot({ ...done!, workflowRun: { ...done!.workflowRun, status: "succeeded", finishedAt: "2026-06-11T03:00:00.000Z" } });
+        }
+      });
+
+      it("blockIfTitleHasActiveKinds refuses only while a run of those kinds is active for the title", async () => {
+        const repo = await fresh();
+        const base = workflowPersistenceFixture();
+        const forSeason = (id: string, seasonNumber: number, kind: "type3_monitor" | "replace_request", over: Record<string, unknown> = {}) =>
+          reIded(id, {
+            season: { ...base.season, id: `season_k${seasonNumber}`, seasonNumber },
+            workflowRun: { ...base.workflowRun, id, kind, status: "queued" as const, trackedSeasonId: `season_k${seasonNumber}`, finishedAt: null },
+            episodes: [],
+            connectedStorageId: "cs_kinds",
+            ...over,
+          });
+        // A type3 run on season 1 does not block type3 on season 2.
+        expect((await repo.reserveWorkflowRun(forSeason("run_k1", 1, "type3_monitor"))).status).toBe("reserved");
+        expect(
+          (await repo.reserveWorkflowRun(forSeason("run_k2", 2, "type3_monitor", { blockIfTitleHasActiveKinds: ["replace_request"] }))).status,
+        ).toBe("reserved");
+        // An active replace_request (on season 1) blocks type3 on season 3 with the option...
+        expect((await repo.reserveWorkflowRun(forSeason("run_rr", 1, "replace_request"))).status).toBe("reserved");
+        const blocked = await repo.reserveWorkflowRun(
+          forSeason("run_k3", 3, "type3_monitor", { blockIfTitleHasActiveKinds: ["replace_request"] }),
+        );
+        expect(blocked.status).toBe("already_active");
+        expect((blocked as { snapshot: { workflowRun: { id: string } } }).snapshot.workflowRun.id).toBe("run_rr");
+        // ...and not without it.
+        expect((await repo.reserveWorkflowRun(forSeason("run_k3", 3, "type3_monitor"))).status).toBe("reserved");
+        // Another drive's replace_request does not block.
+        expect(
+          (await repo.reserveWorkflowRun(
+            forSeason("run_k4", 4, "type3_monitor", { connectedStorageId: "cs_other", blockIfTitleHasActiveKinds: ["replace_request"] }),
+          )).status,
+        ).toBe("reserved");
+      });
+
       it("blockIfEpisodeStatesExist returns already_has_episode_state when the scoped bucket is non-empty", async () => {
         const repo = await fresh();
         // Seed episode states via a TERMINAL (succeeded) run so the active-run check
@@ -559,6 +881,52 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         expect(
           failed?.workflowRun.auditEvents.some((event) => event.type === "orphan_requeue_capped"),
         ).toBe(true);
+      });
+
+      it("requeueRunningWorkflowRuns: a replace run at the cap is failed and hands its messages back; a requeued one keeps them", async () => {
+        const repo = await fresh();
+        const work = { accountId: "acct_default", drive: "cs_rr", titleKey: "tmdb_tv_rr" };
+        for (const [id, count] of [["rr_capped", 5], ["rr_requeued", 0]] as const) {
+          const snap = queued(id, { startedAt: "2026-06-11T00:00:00.000Z", connectedStorageId: "cs_rr" });
+          await repo.saveWorkflowRunSnapshot({
+            ...snap,
+            workflowRun: { ...snap.workflowRun, id, kind: "replace_request", status: "running", finishedAt: null, orphanRequeueCount: count },
+          });
+          const titleKey = `${work.titleKey}_${id}`;
+          await repo.createUserMessage({ ...work, titleKey, body: id, episodeTags: [], now: "2026-06-11T00:00:00.000Z" });
+          await repo.claimUserMessages({ ...work, titleKey, runId: id, now: "2026-06-11T00:00:00.000Z" });
+        }
+
+        expect(await repo.requeueRunningWorkflowRuns("2026-06-11T03:00:00.000Z")).toBe(1);
+        expect((await repo.getWorkflowRunSnapshot("rr_capped", { accountId: "acct_default", connectedStorageId: "cs_rr" }))?.workflowRun.status).toBe("failed");
+        // Not urgent: a run that crashed the worker five times waits for the patrol or 现在处理.
+        expect((await repo.listUserMessages({ ...work, titleKey: `${work.titleKey}_rr_capped` }))[0]).toMatchObject({ status: "pending", urgent: false, runId: null });
+        expect((await repo.listUserMessages({ ...work, titleKey: `${work.titleKey}_rr_requeued` }))[0]).toMatchObject({ status: "processing", runId: "rr_requeued" });
+      });
+
+      it("requeueRunningWorkflowRuns: a replace run failed at the cap also takes the urgency off the rest of its work's pending messages", async () => {
+        const repo = await fresh();
+        const snap = queued("rr_cap_work", { startedAt: "2026-06-11T00:00:00.000Z", connectedStorageId: "cs_rw" });
+        await repo.saveWorkflowRunSnapshot({
+          ...snap,
+          workflowRun: { ...snap.workflowRun, kind: "replace_request", status: "running", finishedAt: null, orphanRequeueCount: 5 },
+        });
+        // The run's own work: its title on its drive.
+        const work = { accountId: "acct_default", drive: "cs_rw", titleKey: snap.title.id };
+        const other = { ...work, titleKey: "title_untouched" };
+        await repo.createUserMessage({ ...work, body: "claimed", episodeTags: [], now: "2026-06-11T00:00:00.000Z" });
+        await repo.claimUserMessages({ ...work, runId: "rr_cap_work", now: "2026-06-11T00:00:00.000Z" });
+        await repo.createUserMessage({ ...work, body: "written mid-run", episodeTags: [], now: "2026-06-11T00:00:05.000Z" });
+        await repo.createUserMessage({ ...other, body: "another work", episodeTags: [], now: "2026-06-11T00:00:00.000Z" });
+        await repo.markUserMessagesUrgent({ ...other, now: "2026-06-11T00:00:00.000Z" });
+
+        expect(await repo.requeueRunningWorkflowRuns("2026-06-11T03:00:00.000Z")).toBe(0);
+
+        expect((await repo.listUserMessages(work)).map((m) => [m.body, m.status, m.urgent])).toEqual([
+          ["written mid-run", "pending", false],
+          ["claimed", "pending", false],
+        ]);
+        expect(await repo.listWorksWithPendingMessages({ urgentOnly: true })).toEqual([other]);
       });
 
       it("requeueRunningWorkflowRuns terminates an orphaned type3_monitor instead of queueing it", async () => {
@@ -1093,6 +1461,72 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         expect(await repo.listActiveWorkflowRuns(scope)).toHaveLength(0);
       });
 
+      it("cancelQueuedWorkflowRun of a replace_request only removes the run: the season stays tracked, its messages go back to pending", async () => {
+        const repo = await fresh();
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_rc" };
+        // A tracked, acquired season…
+        await repo.saveWorkflowRunSnapshot(queuedRun({ id: "rc", status: "succeeded", connectedStorageId: "cs_rc" }));
+        const tracked = await repo.getTrackedSeasonState("season_rc", scope);
+        expect(tracked?.episodes.length).toBeGreaterThan(0);
+        // …with a queued replace_request on it (sole active run) holding a message.
+        const base = queuedRun({ id: "rc", connectedStorageId: "cs_rc" });
+        await repo.saveWorkflowRunSnapshot({
+          ...base,
+          workflowRun: { ...base.workflowRun, id: "rc_replace", kind: "replace_request", startedAt: "2026-06-12T00:00:00.000Z" },
+          episodes: tracked!.episodes,
+        });
+        const work = { accountId: "acct_default", drive: "cs_rc", titleKey: "title_rc" };
+        await repo.createUserMessage({ ...work, body: "换", episodeTags: [], now: "2026-06-12T00:00:00.000Z" });
+        await repo.claimUserMessages({ ...work, runId: "rc_replace", now: "2026-06-12T00:00:00.000Z" });
+
+        expect((await repo.cancelQueuedWorkflowRun("rc_replace", scope)).status).toBe("cancelled");
+        expect(await repo.getWorkflowRunSnapshot("rc_replace", scope)).toBeNull();
+        const after = await repo.getTrackedSeasonState("season_rc", scope);
+        expect(after?.episodes).toEqual(tracked!.episodes);
+        expect(await repo.listTrackedSeasonStates(scope)).toHaveLength(1);
+        // Back to pending but NOT urgent: the idle scan would re-queue it within seconds.
+        expect((await repo.listUserMessages(work))[0]).toMatchObject({ status: "pending", urgent: false, runId: null });
+      });
+
+      it("cancelling a queued replace_request sticks: the work's urgent pending messages wait for the patrol", async () => {
+        const repo = await fresh();
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_rs" };
+        await repo.saveWorkflowRunSnapshot(queuedRun({ id: "rs", status: "succeeded", connectedStorageId: "cs_rs" }));
+        const base = queuedRun({ id: "rs", connectedStorageId: "cs_rs" });
+        await repo.saveWorkflowRunSnapshot({
+          ...base,
+          workflowRun: { ...base.workflowRun, id: "rs_replace", kind: "replace_request", startedAt: "2026-06-12T00:00:00.000Z" },
+        });
+        const work = { accountId: "acct_default", drive: "cs_rs", titleKey: "title_rs" };
+        const other = { ...work, titleKey: "title_other" };
+        // 现在处理 was pressed (urgent), and one more message came in after it.
+        await repo.createUserMessage({ ...work, body: "换 1", episodeTags: [], now: "2026-06-12T00:00:00.000Z" });
+        await repo.markUserMessagesUrgent({ ...work, now: "2026-06-12T00:00:01.000Z" });
+        await repo.createUserMessage({ ...work, body: "也换 2", episodeTags: [], now: "2026-06-12T00:00:02.000Z" });
+        await repo.markUserMessagesUrgent({ ...work, now: "2026-06-12T00:00:03.000Z" });
+        // Another work's urgent message is not the user's cancel.
+        await repo.createUserMessage({ ...other, body: "别动我", episodeTags: [], now: "2026-06-12T00:00:00.000Z" });
+        await repo.markUserMessagesUrgent({ ...other, now: "2026-06-12T00:00:01.000Z" });
+
+        expect((await repo.cancelQueuedWorkflowRun("rs_replace", scope)).status).toBe("cancelled");
+
+        expect((await repo.listUserMessages(work)).map((m) => [m.status, m.urgent])).toEqual([
+          ["pending", false],
+          ["pending", false],
+        ]);
+        expect(await repo.listWorksWithPendingMessages({ urgentOnly: true })).toEqual([other]);
+        expect(await repo.listWorksWithPendingMessages({ urgentOnly: false })).toEqual(expect.arrayContaining([work, other]));
+      });
+
+      it("cancelQueuedWorkflowRun of the ONLY run of a replace_request season still leaves the tracking", async () => {
+        const repo = await fresh();
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_rc2" };
+        const base = queuedRun({ id: "rc2", connectedStorageId: "cs_rc2" });
+        await repo.saveWorkflowRunSnapshot({ ...base, workflowRun: { ...base.workflowRun, kind: "replace_request" } });
+        expect((await repo.cancelQueuedWorkflowRun("rc2", scope)).status).toBe("cancelled");
+        expect((await repo.listEpisodeStates("season_rc2", scope)).length).toBeGreaterThan(0);
+      });
+
       it("cancelQueuedWorkflowRun refuses a non-queued (succeeded) run", async () => {
         const repo = await fresh();
         await repo.saveWorkflowRunSnapshot(
@@ -1141,6 +1575,330 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
           removedSeasons: 0,
         });
         expect(await repo.listTrackedSeasonStates(scope)).toHaveLength(1);
+      });
+
+      it("untrackTitle refuses (in_flight) every season of a title while a replace_request of it on that drive is queued or running — also a season the run is not recorded on", async () => {
+        const repo = await fresh();
+        const base = queuedRun({ id: "ur1", status: "succeeded", connectedStorageId: "cs_ur", tmdbId: 876, type: "tv", seasonNumber: 1 });
+        await repo.saveWorkflowRunSnapshot(base);
+        await repo.saveWorkflowRunSnapshot({
+          ...base,
+          season: { ...base.season, id: "season_ur2", seasonNumber: 2 },
+          workflowRun: { ...base.workflowRun, id: "ur2", trackedSeasonId: "season_ur2" },
+          episodes: base.episodes.map((e) => ({ ...e, trackedSeasonId: "season_ur2" })),
+        });
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_ur" };
+        const work = { accountId: "acct_default", drive: "cs_ur", titleKey: "title_ur1" };
+        // Reserved on the lowest season (the lock); it covers S2 too and writes S2's record when it ends.
+        expect(await queueReplaceRequest({ repository: repo, work, now: () => "2026-09-27T00:00:00.000Z", createWorkflowRunId: () => "ur_replace" })).toEqual({
+          status: "queued",
+          workflowRunId: "ur_replace",
+        });
+
+        expect(await repo.untrackTitle(876, scope, "tv", 2)).toEqual({ status: "in_flight", removedSeasons: 0 });
+        await repo.claimNextQueuedWorkflowRun({ kind: "replace_request", now: "2026-09-27T00:00:01.000Z" });
+        expect(await repo.untrackTitle(876, scope, "tv", 2)).toEqual({ status: "in_flight", removedSeasons: 0 });
+        expect(await repo.untrackTitle(876, scope, "tv")).toEqual({ status: "in_flight", removedSeasons: 0 });
+        expect((await repo.listTrackedSeasonStates(scope)).map((s) => s.season.seasonNumber)).toEqual([1, 2]);
+
+        // Once it has ended, the season can go.
+        const running = await repo.getWorkflowRunSnapshot("ur_replace", scope);
+        await repo.saveWorkflowRunSnapshot({
+          ...running!,
+          workflowRun: { ...running!.workflowRun, status: "succeeded", finishedAt: "2026-09-27T00:05:00.000Z" },
+        });
+        expect(await repo.untrackTitle(876, scope, "tv", 2)).toEqual({ status: "untracked", removedSeasons: 1 });
+        expect((await repo.listTrackedSeasonStates(scope)).map((s) => s.season.seasonNumber)).toEqual([1]);
+      });
+
+      it("a replace_request of the same title on ANOTHER drive does not hold back untracking it here", async () => {
+        const repo = await fresh();
+        const here = queuedRun({ id: "ux1", status: "succeeded", connectedStorageId: "cs_ux_here", tmdbId: 765, type: "tv" });
+        await repo.saveWorkflowRunSnapshot(here);
+        await repo.saveWorkflowRunSnapshot({ ...here, connectedStorageId: "cs_ux_there", workflowRun: { ...here.workflowRun, id: "ux1_there" } });
+        const there = { accountId: "acct_default", drive: "cs_ux_there", titleKey: "title_ux1" };
+        expect((await queueReplaceRequest({ repository: repo, work: there, now: () => "2026-09-27T00:00:00.000Z", createWorkflowRunId: () => "ux_replace" })).status).toBe("queued");
+
+        expect(await repo.untrackTitle(765, { accountId: "acct_default", connectedStorageId: "cs_ux_here" }, "tv")).toEqual({
+          status: "untracked",
+          removedSeasons: 1,
+        });
+      });
+
+      it("a replace run saved running with its evidence, then terminal with its notification, keeps one copy of each — and untracking waits for the terminal save", async () => {
+        const repo = await fresh();
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_hold" };
+        const evidence = workflowPersistenceFixture();
+        const seed = queuedRun({ id: "hold_seed", status: "succeeded", connectedStorageId: "cs_hold", tmdbId: 654, type: "tv" });
+        await repo.saveWorkflowRunSnapshot(seed);
+        // The replace run's lock record, held open: episodes and evidence, no notification yet.
+        const held = {
+          ...seed,
+          workflowRun: { ...seed.workflowRun, id: "hold_run", kind: "replace_request" as const, status: "running" as const, finishedAt: null },
+          resourceSnapshots: evidence.resourceSnapshots,
+          decisions: evidence.decisions,
+          transferAttempts: evidence.transferAttempts.map((a) => ({ ...a, workflowRunId: "hold_run" })),
+          notifications: [],
+        };
+        await repo.saveWorkflowRunSnapshot(held);
+        expect(await repo.untrackTitle(654, scope, "tv")).toEqual({ status: "in_flight", removedSeasons: 0 });
+
+        await repo.saveWorkflowRunSnapshot({
+          ...held,
+          workflowRun: { ...held.workflowRun, status: "succeeded" as const, finishedAt: "2026-09-27T00:05:00.000Z" },
+          notifications: evidence.notifications.map((n) => ({ ...n, workflowRunId: "hold_run" })),
+        });
+        const saved = await repo.getWorkflowRunSnapshot("hold_run", scope);
+        expect(saved?.workflowRun).toMatchObject({ status: "succeeded", finishedAt: "2026-09-27T00:05:00.000Z" });
+        expect(saved?.resourceSnapshots.map((s) => s.id)).toEqual(["snapshot_1"]);
+        expect(saved?.decisions).toHaveLength(1);
+        expect(saved?.transferAttempts.map((a) => a.id)).toEqual(["transfer_1"]);
+        expect(saved?.notifications.map((n) => n.id)).toEqual(["notification_1"]);
+        expect(await repo.untrackTitle(654, scope, "tv")).toEqual({ status: "untracked", removedSeasons: 1 });
+      });
+
+      it("untrackTitle (whole title) withdraws pending messages and drops pending replacements for that work only", async () => {
+        const repo = await fresh();
+        await repo.saveWorkflowRunSnapshot(
+          queuedRun({ id: "uw", status: "succeeded", connectedStorageId: "cs_uw", tmdbId: 321, type: "tv" }),
+        );
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_uw" };
+        const work = { accountId: "acct_default", drive: "cs_uw", titleKey: "title_uw" };
+        const t0 = "2026-09-26T00:00:00.000Z";
+        const pending = await repo.createUserMessage({ ...work, body: "还在等", episodeTags: [], now: t0 });
+        await repo.claimUserMessages({ ...work, runId: "run_x", now: t0 });
+        await repo.releaseUserMessages({ runId: "run_x", now: t0 });
+        await repo.addPendingReplacements({ ...work, episodes: ["S01E01"], messageId: pending.id, now: t0 });
+        await repo.upsertEpisodeSource({ ...work, episode: "S01E01", linkKey: "115:aa", label: "a.mkv", sizeBytes: 1, runId: "run_x", recordedAt: t0 });
+        await repo.addRejectedResources({
+          accountId: "acct_default", titleKey: "title_uw", now: t0,
+          items: [{ episode: "S01E01", linkKey: "115:bb", label: "b.mkv", sizeBytes: 1, reason: "假", messageId: null }],
+        });
+
+        // Another drive's work with the same title id must be untouched.
+        const otherDriveWork = { accountId: "acct_default", drive: "cs_other", titleKey: "title_uw" };
+        await repo.createUserMessage({ ...otherDriveWork, body: "别的盘", episodeTags: [], now: t0 });
+        await repo.addPendingReplacements({ ...otherDriveWork, episodes: ["S01E02"], messageId: "m_other", now: t0 });
+        // Another title on the same drive must be untouched.
+        const otherTitleWork = { ...work, titleKey: "title_other" };
+        await repo.createUserMessage({ ...otherTitleWork, body: "别的剧", episodeTags: [], now: t0 });
+        await repo.addPendingReplacements({ ...otherTitleWork, episodes: ["S01E03"], messageId: "m_other2", now: t0 });
+
+        const result = await repo.untrackTitle(321, scope, "tv");
+        expect(result).toEqual({ status: "untracked", removedSeasons: 1 });
+
+        // listUserMessages excludes withdrawn rows by design, so "gone from here" IS
+        // the withdrawn assertion.
+        expect(await repo.listUserMessages(work)).toEqual([]);
+        expect(await repo.listPendingReplacements(work)).toEqual([]);
+        expect(await repo.listEpisodeSources(work)).toHaveLength(1);
+        expect(await repo.listRejectedResources({ accountId: "acct_default", titleKey: "title_uw" })).toHaveLength(1);
+
+        expect((await repo.listUserMessages(otherDriveWork))[0]).toMatchObject({ status: "pending" });
+        expect(await repo.listPendingReplacements(otherDriveWork)).toHaveLength(1);
+        expect((await repo.listUserMessages(otherTitleWork))[0]).toMatchObject({ status: "pending" });
+        expect(await repo.listPendingReplacements(otherTitleWork)).toHaveLength(1);
+      });
+
+      it("untrackTitle (single season) removes only that season's pending replacements, leaves messages alone", async () => {
+        const repo = await fresh();
+        // Two seasons of the SAME title (shared title.id, distinct season.id) —
+        // mirrors how one tv title tracks multiple seasons in production.
+        const base = queuedRun({ id: "us1", status: "succeeded", connectedStorageId: "cs_us", tmdbId: 654, type: "tv", seasonNumber: 1 });
+        await repo.saveWorkflowRunSnapshot(base);
+        await repo.saveWorkflowRunSnapshot({
+          ...base,
+          season: { ...base.season, id: "season_us2", seasonNumber: 2 },
+          workflowRun: { ...base.workflowRun, id: "us2", trackedSeasonId: "season_us2" },
+          episodes: base.episodes.map((e) => ({ ...e, trackedSeasonId: "season_us2" })),
+        });
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_us" };
+        const work = { accountId: "acct_default", drive: "cs_us", titleKey: "title_us1" };
+        const t0 = "2026-09-26T00:00:00.000Z";
+        const pending = await repo.createUserMessage({ ...work, body: "留着", episodeTags: [], now: t0 });
+        await repo.addPendingReplacements({ ...work, episodes: ["S01E01", "S02E01"], messageId: pending.id, now: t0 });
+
+        const result = await repo.untrackTitle(654, scope, "tv", 1);
+        expect(result).toEqual({ status: "untracked", removedSeasons: 1 });
+
+        expect((await repo.listPendingReplacements(work)).map((p) => p.episode)).toEqual(["S02E01"]);
+        const [msg] = await repo.listUserMessages(work);
+        expect(msg).toMatchObject({ status: "pending", id: pending.id });
+      });
+
+      it("untrackTitle (single season) of the LAST season tracked on that drive withdraws the work's pending messages and all its 待换 rows, like a whole-title untrack", async () => {
+        const repo = await fresh();
+        const base = queuedRun({ id: "ul1", status: "succeeded", connectedStorageId: "cs_ul", tmdbId: 987, type: "tv", seasonNumber: 1 });
+        await repo.saveWorkflowRunSnapshot(base);
+        await repo.saveWorkflowRunSnapshot({
+          ...base,
+          season: { ...base.season, id: "season_ul2", seasonNumber: 2 },
+          workflowRun: { ...base.workflowRun, id: "ul2", trackedSeasonId: "season_ul2" },
+          episodes: base.episodes.map((e) => ({ ...e, trackedSeasonId: "season_ul2" })),
+        });
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_ul" };
+        const work = { accountId: "acct_default", drive: "cs_ul", titleKey: "title_ul1" };
+        const t0 = "2026-09-26T00:00:00.000Z";
+        const msg = await repo.createUserMessage({ ...work, body: "换", episodeTags: [], now: t0 });
+        await repo.markUserMessagesUrgent({ ...work, now: t0 });
+        // S03 was never tracked here: a stale row that only a whole-work cleanup removes.
+        await repo.addPendingReplacements({ ...work, episodes: ["S01E01", "S02E01", "S03E01"], messageId: msg.id, now: t0 });
+        // The same title on another drive is another work.
+        const otherDrive = { ...work, drive: "cs_ul_other" };
+        await repo.createUserMessage({ ...otherDrive, body: "别的盘", episodeTags: [], now: t0 });
+
+        // One season at a time: S02 is still tracked, so the message stays.
+        expect(await repo.untrackTitle(987, scope, "tv", 1)).toEqual({ status: "untracked", removedSeasons: 1 });
+        expect((await repo.listUserMessages(work))[0]).toMatchObject({ id: msg.id, status: "pending" });
+        // The last one: nothing of the title is tracked on this drive any more.
+        expect(await repo.untrackTitle(987, scope, "tv", 2)).toEqual({ status: "untracked", removedSeasons: 1 });
+
+        expect(await repo.listUserMessages(work)).toEqual([]);
+        expect(await repo.listPendingReplacements(work)).toEqual([]);
+        expect(await repo.listWorksWithPendingMessages({ urgentOnly: true })).toEqual([]);
+        expect((await repo.listUserMessages(otherDrive))[0]).toMatchObject({ status: "pending" });
+      });
+
+      /** The reservation queueReplaceRequest makes from the states it read earlier. */
+      const replaceReservationFrom = (
+        state: TrackedSeasonState,
+        id: string,
+        over: Partial<ReserveWorkflowRunInput> = {},
+      ): ReserveWorkflowRunInput => ({
+        accountId: state.accountId,
+        ...(state.connectedStorageId != null ? { connectedStorageId: state.connectedStorageId } : {}),
+        title: state.title,
+        season: state.season,
+        workflowRun: {
+          id,
+          kind: "replace_request",
+          status: "queued",
+          trackedSeasonId: state.season.id,
+          startedAt: "2026-09-27T00:00:00.000Z",
+          finishedAt: null,
+          auditEvents: [],
+        },
+        episodes: state.episodes,
+        resourceSnapshots: [],
+        decisions: [],
+        transferAttempts: [],
+        notifications: [],
+        blockIfTitleHasActiveRun: true,
+        ...over,
+      });
+
+      it("requireTrackedSeason: a reservation from states read before the season was untracked is not_tracked and writes nothing; without it the reservation goes through as before", async () => {
+        const repo = await fresh();
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_rt" };
+        await repo.saveWorkflowRunSnapshot(queuedRun({ id: "rt", status: "succeeded", connectedStorageId: "cs_rt", tmdbId: 4321, type: "tv" }));
+        // What queueReplaceRequest read; then the user untracks the work before it reserves.
+        const [read] = await repo.listTrackedSeasonStates(scope);
+        expect(await repo.untrackTitle(4321, scope, "tv")).toEqual({ status: "untracked", removedSeasons: 1 });
+
+        expect(await repo.reserveWorkflowRun(replaceReservationFrom(read!, "rt_replace", { requireTrackedSeason: true }))).toEqual({
+          status: "not_tracked",
+        });
+
+        expect(await repo.listTrackedSeasonStates(scope)).toEqual([]);
+        expect(await repo.listActiveWorkflowRuns(scope)).toEqual([]);
+        expect(await repo.getWorkflowRunSnapshot("rt_replace", scope)).toBeNull();
+        // Without the option the same reservation still creates the tracking (how init
+        // runs start tracking a season).
+        expect((await repo.reserveWorkflowRun(replaceReservationFrom(read!, "rt_plain"))).status).toBe("reserved");
+        expect((await repo.listTrackedSeasonStates(scope)).map((s) => s.season.id)).toEqual(["season_rt"]);
+      });
+
+      it("untrackTitle racing a requireTrackedSeason replace reservation: never both — the untrack is in_flight or the reservation is not_tracked", async () => {
+        const repo = await fresh();
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_race" };
+        for (let round = 0; round < 10; round++) {
+          const tmdbId = 9100 + round;
+          const tracked = queuedRun({ id: `race${round}`, status: "succeeded", connectedStorageId: "cs_race", tmdbId, type: "tv" });
+          await repo.saveWorkflowRunSnapshot(tracked);
+          const read = (await repo.listTrackedSeasonStates(scope)).find((s) => s.title.id === tracked.title.id)!;
+          const replaceId = `race${round}_replace`;
+          const untrack = () => repo.untrackTitle(tmdbId, scope, "tv");
+          const reserve = () => repo.reserveWorkflowRun(replaceReservationFrom(read, replaceId, { requireTrackedSeason: true }));
+          // Alternate which one starts first (Postgres runs both transactions at once).
+          const [untrackResult, reservation] =
+            round % 2 === 0
+              ? await Promise.all([untrack(), reserve()])
+              : await Promise.all([reserve(), untrack()]).then(([r, u]) => [u, r] as const);
+
+          const stillTracked = (await repo.listTrackedSeasonStates(scope)).some((s) => s.title.id === tracked.title.id);
+          const replaceActive = (await repo.listActiveWorkflowRuns(scope)).some((run) => run.workflowRun.id === replaceId);
+          if (reservation.status === "reserved") {
+            expect(untrackResult).toEqual({ status: "in_flight", removedSeasons: 0 });
+            expect({ stillTracked, replaceActive }).toEqual({ stillTracked: true, replaceActive: true });
+          } else {
+            expect(reservation).toEqual({ status: "not_tracked" });
+            expect(untrackResult).toEqual({ status: "untracked", removedSeasons: 1 });
+            expect({ stillTracked, replaceActive }).toEqual({ stillTracked: false, replaceActive: false });
+          }
+        }
+      });
+
+      it("keepCurrentEpisodes: a replace reservation from a stale read writes only the run — what a run persisted in between stays; without it the reservation writes what it was handed, as before", async () => {
+        const repo = await fresh();
+        /** Track a season, read it (S01E02 missing), let a patrol run of it finish (S01E02
+         *  lands, the season and title records change), then reserve from the stale read. */
+        const reserveFromStaleRead = async (id: string, tmdbId: number, over: Partial<ReserveWorkflowRunInput>) => {
+          const scope = { accountId: "acct_default", connectedStorageId: `cs_${id}` };
+          const tracked = queuedRun({ id, status: "succeeded", tmdbId, type: "tv" });
+          await repo.saveWorkflowRunSnapshot(tracked);
+          const [read] = await repo.listTrackedSeasonStates(scope);
+          expect(read!.episodes.map((e) => [e.episodeCode, e.obtained])).toEqual([["S01E01", true], ["S01E02", false]]);
+          await repo.saveWorkflowRunSnapshot({
+            ...tracked,
+            title: { ...tracked.title, aliases: ["Alias learned later"] },
+            season: { ...tracked.season, latestAiredEpisode: 2 },
+            workflowRun: {
+              ...tracked.workflowRun,
+              id: `${id}_patrol`,
+              kind: "type3_monitor",
+              startedAt: "2026-09-26T00:00:00.000Z",
+              finishedAt: "2026-09-26T00:10:00.000Z",
+            },
+            episodes: tracked.episodes.map((e) => ({ ...e, airStatus: "aired" as const, obtained: true, verifiedFileIds: [`file_${e.episodeCode}`] })),
+          });
+          const current = (await repo.getTrackedSeasonState(`season_${id}`, scope))!;
+          expect(current.episodes.map((e) => [e.episodeCode, e.obtained])).toEqual([["S01E01", true], ["S01E02", true]]);
+          const reservation = await repo.reserveWorkflowRun(replaceReservationFrom(read!, `${id}_replace`, over));
+          const after = (await repo.getTrackedSeasonState(`season_${id}`, scope))!;
+          const active = (await repo.listActiveWorkflowRuns(scope)).map((run) => run.workflowRun.id);
+          return { read: read!, current, reservation, after, active };
+        };
+
+        const kept = await reserveFromStaleRead("kc_keep", 5101, { requireTrackedSeason: true, keepCurrentEpisodes: true });
+        expect(kept.reservation.status).toBe("reserved");
+        expect(kept.active).toEqual(["kc_keep_replace"]);
+        // The season record, its episode states and the title are exactly what was stored.
+        expect(kept.after).toEqual(kept.current);
+        // The reservation reports what it kept, not the stale copy it was handed.
+        expect(kept.reservation.status === "reserved" && {
+          title: kept.reservation.snapshot.title,
+          season: kept.reservation.snapshot.season,
+          episodes: kept.reservation.snapshot.episodes,
+        }).toEqual({ title: kept.current.title, season: kept.current.season, episodes: kept.current.episodes });
+
+        // Without the option the handed copy is written wholesale (how init and patrol
+        // reservations set a season's state).
+        const plain = await reserveFromStaleRead("kc_plain", 5102, { requireTrackedSeason: true });
+        expect(plain.reservation.status).toBe("reserved");
+        expect(plain.after.season).toEqual(plain.read.season);
+        expect(plain.after.episodes).toEqual(plain.read.episodes);
+
+        // There is nothing current to keep for a season that is not tracked: refused, nothing written.
+        const untrackedScope = { accountId: "acct_default", connectedStorageId: "cs_kc_gone" };
+        const gone = queuedRun({ id: "kc_gone", status: "succeeded", tmdbId: 5103, type: "tv" });
+        await repo.saveWorkflowRunSnapshot(gone);
+        const [goneRead] = await repo.listTrackedSeasonStates(untrackedScope);
+        expect(await repo.untrackTitle(5103, untrackedScope, "tv")).toEqual({ status: "untracked", removedSeasons: 1 });
+        expect(await repo.reserveWorkflowRun(replaceReservationFrom(goneRead!, "kc_gone_replace", { keepCurrentEpisodes: true }))).toEqual({
+          status: "not_tracked",
+        });
+        expect(await repo.listTrackedSeasonStates(untrackedScope)).toEqual([]);
+        expect(await repo.getWorkflowRunSnapshot("kc_gone_replace", untrackedScope)).toBeNull();
       });
 
       it("retryFailedWorkflowRun requeues a failed run so it becomes claimable", async () => {
@@ -1216,6 +1974,35 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         const snap = await repo.getWorkflowRunSnapshot("run_1");
         // The domain contract says the sentinel must surface as null, never leak "__unscoped__".
         expect(snap?.connectedStorageId).toBeNull();
+      });
+
+      it("tracked-season readers list an unbound season with connectedStorageId=null", async () => {
+        const repo = await fresh();
+        await repo.saveWorkflowRunSnapshot({
+          ...workflowPersistenceFixture(),
+          accountId: "acct_default",
+          transferAttempts: [],
+          notifications: [],
+        });
+        const seasonId = workflowPersistenceFixture().season.id;
+        const scoped = await repo.listTrackedSeasonStates({ accountId: "acct_default", connectedStorageId: null });
+        expect(scoped.map((state) => [state.season.id, state.connectedStorageId])).toEqual([[seasonId, null]]);
+        expect(scoped[0]?.episodes.length).toBeGreaterThan(0);
+        const all = await repo.listAllTrackedSeasonStates();
+        expect(all.map((state) => [state.season.id, state.connectedStorageId])).toEqual([[seasonId, null]]);
+        expect(all[0]?.episodes.length).toBeGreaterThan(0);
+        const one = await repo.getTrackedSeasonState(seasonId, { accountId: "acct_default", connectedStorageId: null });
+        expect(one?.connectedStorageId).toBeNull();
+        expect(one?.episodes.length).toBeGreaterThan(0);
+      });
+
+      it("an unbound work's replace request is found by its message drive ('') and queued", async () => {
+        const repo = await fresh();
+        const fixture = workflowPersistenceFixture();
+        await repo.saveWorkflowRunSnapshot({ ...fixture, accountId: "acct_default", transferAttempts: [], notifications: [] });
+        const work = { accountId: "acct_default", drive: "", titleKey: fixture.title.id };
+        const result = await queueReplaceRequest({ repository: repo, work, createWorkflowRunId: () => "run_rr_unbound" });
+        expect(result).toEqual({ status: "queued", workflowRunId: "run_rr_unbound" });
       });
     });
 

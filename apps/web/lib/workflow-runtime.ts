@@ -28,6 +28,7 @@ import {
   createStubAcquisitionModel,
   llmConfigError,
   formatDailyDigestPushText,
+  scheduledDigestItems,
   getTrackedSeasonStatusView,
   importForeignWorkAsMovie,
   assertWorkflowAgentAdapterPolicy,
@@ -38,7 +39,9 @@ import {
   queueSeriesInitialization,
   queueTrackingInitialization,
   reserveMovie,
+  enqueueUrgentReplaceRequests,
   runQueuedMovieAcquisition,
+  runQueuedReplaceRequest,
   runQueuedSeriesInitialization,
   runQueuedType2Workflow,
   resolveDriveSourceLabels,
@@ -993,6 +996,13 @@ export async function runNextQueuedWorkflow() {
   const resolveAccountContext = buildAccountContextResolver();
   const startedAt = new Date().toISOString();
   const onAuthErrorFreeze = (id: string, reason: string) => freezeConnectedStorage(id, reason);
+  // Urgent user messages ("现在处理", written mid-run, or retry after a failure) get a
+  // replace_request as soon as the queue is free — never waiting for the patrol.
+  try {
+    await enqueueUrgentReplaceRequests({ repository });
+  } catch (error) {
+    console.error(`[user-message] urgent scan failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
   const type2 = await runQueuedType2Workflow({
     repository,
     resourceProvider: await getWorkerResourceProvider(),
@@ -1038,8 +1048,27 @@ export async function runNextQueuedWorkflow() {
   });
   if (movie.status !== "idle") {
     await pushNotificationsSince(repository, startedAt);
+    return movie;
   }
-  return movie;
+  const replace = await runQueuedReplaceRequest({
+    repository,
+    resourceProvider: await getWorkerResourceProvider(),
+    storage,
+    model,
+    ...language,
+    ...quality,
+    storageParentDirectoryId: parents.tv,
+    animeStorageParentDirectoryId: parents.anime,
+    moviesParentDirectoryId: parents.movies,
+    resolveAccountContext,
+    onAuthErrorFreeze,
+    // A work with 待换 episodes skips the patrol, where TMDB sync normally happens.
+    ...syncOption(),
+  });
+  if (replace.status !== "idle") {
+    await pushNotificationsSince(repository, startedAt);
+  }
+  return replace;
 }
 
 /** The user's preferred subtitle language for acquisition search, or undefined
@@ -1465,6 +1494,9 @@ export async function reserveCandidate(
 async function pushNotificationsSince(
   targetRepository: WorkflowRepository,
   sinceIso: string,
+  /** The sweep always sends its digest; a queue drain (a patrol-queued replace run)
+   *  skips one that would only say nothing changed (see scheduledDigestItems). */
+  opts: { sweep?: boolean } = {},
 ): Promise<void> {
   try {
     // Cross-account: the drain/sweep may have completed runs for several accounts.
@@ -1500,7 +1532,7 @@ async function pushNotificationsSince(
       const notifications = entries.map((entry) => entry.notification);
       // A scheduled sweep touches many shows; collapse this account's into ONE
       // digest. User-triggered events stay per-resource — each its own message.
-      const scheduled = notifications.filter((notification) => notification.trigger === "scheduled");
+      const scheduled = scheduledDigestItems(notifications, { skipIfOnlyRoutine: opts.sweep !== true });
       const individual = notifications.filter((notification) => notification.trigger !== "scheduled");
 
       for (const notification of individual) {
@@ -1751,7 +1783,7 @@ export async function runScheduledType3(options?: {
       ...(sync ? { syncSeasonMetadata: sync } : {}),
     });
     await repository.setSetting(LAST_SWEEP_COMPLETED_AT_SETTING_KEY, new Date().toISOString());
-    await pushNotificationsSince(repository, startedAt);
+    await pushNotificationsSince(repository, startedAt, { sweep: true });
     return { outcomes: result };
   } catch (error) {
     // The sweep failed before completing — release THIS call's claims (keep the
@@ -1778,6 +1810,11 @@ export async function runScheduledType3(options?: {
  * after tracking began. Returns undefined when TMDB isn't configured, leaving
  * the sweep on stored counts.
  */
+function syncOption(): { syncSeasonMetadata?: SeasonMetadataSync } {
+  const sync = tmdbSeasonMetadataSync();
+  return sync ? { syncSeasonMetadata: sync } : {};
+}
+
 function tmdbSeasonMetadataSync(): SeasonMetadataSync | undefined {
   if (process.env.MEDIA_TRACK_SEARCH_PROVIDER !== "tmdb") {
     return undefined;

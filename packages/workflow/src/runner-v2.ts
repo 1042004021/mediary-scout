@@ -3,21 +3,26 @@ import type { AgentMemoryStore } from "./agent-memory.js";
 import type { LanguageModel } from "ai";
 import type {
   AcquisitionSeasonScope,
+  AuditEvent,
   EpisodeState,
   MediaTitle,
-  MovieWorkflowResult,
+  NotificationEvent,
   TrackedSeason,
   WorkflowKind,
+  WorkflowRun,
   WorkflowRunMetadata,
+  WorkflowStatus,
 } from "./domain.js";
-import { runTvAcquisitionV2 } from "./acquisition-v2/run-tv-v2.js";
+import { runTvAcquisitionV2, type RunTvAcquisitionV2Request } from "./acquisition-v2/run-tv-v2.js";
 import type { BridgedV2Result } from "./acquisition-v2/workflow-v2-bridge.js";
 import { makeProgressSink } from "./acquisition-v2/progress-sink.js";
 import { makeAgentTraceSink, combineToolEventSinks } from "./acquisition-v2/agent-trace-sink.js";
-import { runMovieAcquisitionV2 } from "./movie-workflow-v2.js";
+import { runMovieAcquisitionV2, type MovieAcquisitionV2Result, type RunMovieAcquisitionV2Request } from "./movie-workflow-v2.js";
 import type { JevJudge } from "./jev-judge.js";
 import type { ResourceProvider, StorageExecutor } from "./ports.js";
-import type { WorkflowRepository } from "./repository.js";
+import type { PersistWorkflowRunSnapshotInput, WorkflowRepository } from "./repository.js";
+import { userMessageDrive } from "./user-requests.js";
+import { stampReplaceNotification } from "./notification-report.js";
 
 /**
  * Phase 7d — production persist wrappers on the V2 engine. These mirror the old
@@ -111,6 +116,59 @@ function memoryOption(input: {
   return { memory: { store: input.repository, accountId: input.accountId ?? DEFAULT_ACCOUNT_ID, ...(drive ? { drive } : {}) } };
 }
 
+/** Episodes of this work (on this drive) that hold an old + replacement copy on
+ *  purpose — every run of it protects its existing files and says so to the agent,
+ *  so a later keep-larger dedup cannot undo a replacement. A failed read fails
+ *  CLOSED: it is logged and the run still protects its existing files, only without
+ *  naming episodes (it must never fail a patrol, nor let one delete a kept copy). */
+async function protectExistingOption(input: {
+  repository: WorkflowRepository;
+  accountId?: string;
+  connectedStorageId?: string | null;
+  title: MediaTitle;
+}): Promise<{ protectExisting?: NonNullable<RunTvAcquisitionV2Request["protectExisting"]> }> {
+  try {
+    const sources = await input.repository.listEpisodeSources({
+      accountId: input.accountId ?? DEFAULT_ACCOUNT_ID,
+      drive: userMessageDrive(input.connectedStorageId),
+      titleKey: input.title.id,
+    });
+    return sources.length > 0 ? { protectExisting: { episodes: sources.map((s) => s.episode) } } : {};
+  } catch (error) {
+    console.error(`[user-message] could not read episode sources of ${input.title.id}: ${String(error).slice(0, 300)}`);
+    return { protectExisting: { episodes: "unknown" } };
+  }
+}
+
+/** This work's rejected resources (account + work scoped), for every run of it: the
+ *  search filter and the transfer-time guard keep a patrol from landing what the
+ *  user rejected. Read lazily on every search/transfer; a failing read is logged and
+ *  treated as an empty list (fail open — it must never fail a patrol). */
+function rejectedLookupOption(input: {
+  repository: WorkflowRepository;
+  accountId?: string;
+  title: MediaTitle;
+}): { rejectedLookup: NonNullable<RunTvAcquisitionV2Request["rejectedLookup"]> } {
+  const accountId = input.accountId ?? DEFAULT_ACCOUNT_ID;
+  return {
+    rejectedLookup: {
+      list: async () => {
+        try {
+          return (await input.repository.listRejectedResources({ accountId, titleKey: input.title.id })).map((r) => ({
+            episode: r.episode,
+            linkKey: r.linkKey,
+            label: r.label,
+            sizeBytes: r.sizeBytes,
+          }));
+        } catch (error) {
+          console.error(`[user-message] could not read rejected resources of ${input.title.id}: ${String(error).slice(0, 300)}`);
+          return [];
+        }
+      },
+    },
+  };
+}
+
 /** The run's onProgress: live activity progress (for the activity page) AND the
  *  durable per-step trace (for post-mortem复盘), combined + isolated so one can't
  *  break the other. `apiCallCount` surfaces the 115 budget burn per step (real 115
@@ -197,6 +255,8 @@ export async function runType2InitializationV2AndPersist(
       storage: input.storage,
     }),
     ...passthrough(input),
+    ...(await protectExistingOption(input)),
+    ...rejectedLookupOption(input),
   });
 
   await persistSingleSeason({
@@ -245,6 +305,8 @@ export async function runType3MonitoringV2AndPersist(
       storage: input.storage,
     }),
     ...passthrough(input),
+    ...(await protectExistingOption(input)),
+    ...rejectedLookupOption(input),
   });
 
   await persistSingleSeason({
@@ -294,6 +356,8 @@ export async function runSeriesInitializationV2AndPersist(
       storage: input.storage,
     }),
     ...passthrough(input),
+    ...(await protectExistingOption(input)),
+    ...rejectedLookupOption(input),
   });
 
   // Stamp completion AFTER the run; one finishedAt shared across all season
@@ -338,6 +402,196 @@ export async function runSeriesInitializationV2AndPersist(
   return bridged;
 }
 
+/**
+ * A replace_request run on a show (user message): the same resource-sync workflow
+ * over EVERY tracked season of the work on this drive, with the user's request
+ * threaded to the agent. The episodes to replace stay obtained (the old files are
+ * still there), gaps found on the way are filled too.
+ *
+ * Persistence: every other season gets a bare `${runId}_s${n}` record with its episode
+ * states only; then the claimed lock run itself becomes the lock season's record and
+ * carries the run's evidence + the replacement notification (so the activity page,
+ * which follows the lock run id, sees it finish). With holdLockOpen the lock record is
+ * saved `running` and the caller writes the terminal one last (see HeldLockRun).
+ */
+export async function runReplaceRequestV2AndPersist(
+  input: TvV2Common & {
+    seasons: Array<{ season: TrackedSeason; episodes: EpisodeState[] }>;
+    /** The claimed lock run's season and audit trail (queued/claimed events are kept). */
+    lockSeasonNumber: number;
+    lockAuditEvents: AuditEvent[];
+    // Declared, not spread: see the ⚠ above passthrough.
+    userRequest: NonNullable<RunTvAcquisitionV2Request["userRequest"]>;
+    /** How the replacement notification is pushed (see stampReplaceNotification). */
+    notice?: ReplaceNotice;
+    /** See HeldLockRun. */
+    holdLockOpen?: boolean;
+  },
+): Promise<BridgedV2Result & Partial<HeldLockRun>> {
+  const now = resolveNow(input);
+  const priorObtained = input.seasons.flatMap((entry) =>
+    entry.episodes.filter((episode) => episode.obtained).map((episode) => episode.episodeCode),
+  );
+  const missing = input.seasons.reduce(
+    (sum, entry) => sum + entry.episodes.filter((episode) => episode.airStatus === "aired" && !episode.obtained).length,
+    0,
+  );
+  const bridged = await runTvAcquisitionV2({
+    title: input.title,
+    mode: "replace",
+    seasons: input.seasons.map(({ season }) => ({
+      seasonNumber: season.seasonNumber,
+      totalEpisodes: season.totalEpisodes,
+      latestAiredEpisode: season.latestAiredEpisode,
+      qualityPreference: season.qualityPreference,
+      status: season.status,
+    })),
+    categoryParentId: input.categoryParentId,
+    resourceProvider: input.resourceProvider,
+    storage: input.storage,
+    deadLinkStore: input.repository,
+    model: input.model,
+    workflowRunId: input.workflowRun.id,
+    priorObtained,
+    userRequest: input.userRequest,
+    now,
+    onProgress: progressAndTraceSink({
+      repository: input.repository,
+      workflowRunId: input.workflowRun.id,
+      neededHint: Math.max(1, missing + input.userRequest.requestedEpisodes.length),
+      storage: input.storage,
+    }),
+    ...passthrough(input),
+    ...(await protectExistingOption(input)),
+    ...rejectedLookupOption(input),
+  });
+
+  const lock = bridged.seasons.find((entry) => entry.season.seasonNumber === input.lockSeasonNumber);
+  if (!lock) {
+    // Without it the claimed run would never get a record of its own and stay running.
+    throw new Error(`REPLACE_LOCK_SEASON_MISSING: season ${input.lockSeasonNumber} is not among the run's seasons`);
+  }
+  const owner = {
+    ...(input.accountId ? { accountId: input.accountId } : {}),
+    ...(input.connectedStorageId != null ? { connectedStorageId: input.connectedStorageId } : {}),
+  };
+  const finishedAt = now();
+  for (const seasonResult of bridged.seasons) {
+    if (seasonResult === lock) continue;
+    const runId = `${input.workflowRun.id}_s${seasonResult.season.seasonNumber}`;
+    await input.repository.saveWorkflowRunSnapshot({
+      ...owner,
+      title: input.title,
+      season: seasonResult.season,
+      workflowRun: {
+        id: runId,
+        kind: "replace_request",
+        status: bridged.status,
+        trackedSeasonId: seasonResult.season.id,
+        startedAt: input.workflowRun.startedAt,
+        finishedAt,
+        auditEvents: [],
+      },
+      episodes: seasonResult.episodes,
+      resourceSnapshots: [],
+      decisions: [],
+      transferAttempts: [],
+      notifications: [],
+    });
+  }
+  const held = await saveRunRecord(
+    { ...input, now },
+    bridged.status,
+    stampNotifications(bridged.notifications, input.notice),
+    (run, notifications) => ({
+      ...owner,
+      title: input.title,
+      season: lock.season,
+      workflowRun: {
+        ...run,
+        id: input.workflowRun.id,
+        kind: "replace_request",
+        trackedSeasonId: lock.season.id,
+        startedAt: input.workflowRun.startedAt,
+        auditEvents: [...input.lockAuditEvents, ...bridged.auditEvents],
+      },
+      episodes: lock.episodes,
+      resourceSnapshots: bridged.resourceSnapshots,
+      decisions: bridged.decisions,
+      transferAttempts: bridged.transferAttempts,
+      notifications,
+    }),
+  );
+  return { ...bridged, ...held };
+}
+
+/**
+ * holdLockOpen (replace runs): the run's own record is saved with status `running` —
+ * episodes and evidence written, no notification — and finishLockRun writes the
+ * terminal record (status, finishedAt, notification). The caller makes that its very
+ * last write, after the request bookkeeping: while a replace run is active, untracking
+ * its work is refused (in_flight), so nothing the run still has to write can land on a
+ * work the user has just untracked.
+ */
+export interface HeldLockRun {
+  finishLockRun: () => Promise<void>;
+}
+
+/** The run fields a record builder fills in; the builder adds the run's identity. */
+type RunRecordFields = Partial<WorkflowRun> & Pick<WorkflowRun, "status" | "finishedAt">;
+
+/** Saves a run's own record: terminal now, or — holdLockOpen — `running`, with a
+ *  finishLockRun for the terminal one (see HeldLockRun). */
+async function saveRunRecord(
+  input: {
+    repository: WorkflowRepository;
+    accountId?: string;
+    connectedStorageId?: string | null;
+    workflowRun: WorkflowRunMetadata;
+    holdLockOpen?: boolean;
+    now: () => string;
+  },
+  status: WorkflowStatus,
+  notifications: NotificationEvent[],
+  record: (run: RunRecordFields, notifications: NotificationEvent[]) => PersistWorkflowRunSnapshotInput,
+): Promise<Partial<HeldLockRun>> {
+  const terminal = () => input.repository.saveWorkflowRunSnapshot(record({ status, finishedAt: input.now() }, notifications));
+  if (!input.holdLockOpen) {
+    await terminal();
+    return {};
+  }
+  // Saved over the live run: what the claim and the run left on it stay — the
+  // crash-recovery count (the poison-run cap) and the progress the activity page shows.
+  await input.repository.saveWorkflowRunSnapshot(record({ ...(await liveRun(input)), status: "running", finishedAt: null }, []));
+  return { finishLockRun: terminal };
+}
+
+/** The run as stored now. Best-effort: a failed read only loses the fields it would keep. */
+async function liveRun(input: {
+  repository: WorkflowRepository;
+  accountId?: string;
+  connectedStorageId?: string | null;
+  workflowRun: WorkflowRunMetadata;
+}): Promise<Partial<WorkflowRun>> {
+  try {
+    const stored = await input.repository.getWorkflowRunSnapshot(input.workflowRun.id, {
+      accountId: input.accountId ?? DEFAULT_ACCOUNT_ID,
+      connectedStorageId: input.connectedStorageId ?? null,
+    });
+    return stored?.workflowRun ?? {};
+  } catch (error) {
+    console.error(`[user-message] run ${input.workflowRun.id} could not read its live record: ${String(error).slice(0, 300)}`);
+    return {};
+  }
+}
+
+/** See stampReplaceNotification. */
+export type ReplaceNotice = Parameters<typeof stampReplaceNotification>[1];
+
+function stampNotifications<T extends NotificationEvent>(notifications: T[], notice: ReplaceNotice | undefined): NotificationEvent[] {
+  return notice ? notifications.map((n) => stampReplaceNotification(n, notice)) : notifications;
+}
+
 export async function runMovieAcquisitionV2AndPersist(input: {
   title: MediaTitle;
   categoryParentId: string;
@@ -363,9 +617,17 @@ export async function runMovieAcquisitionV2AndPersist(input: {
   jevJudge?: JevJudge;
   /** See TvV2Common.agentMemory. */
   agentMemory?: boolean;
+  /** A replace_request run (user message): persisted under kind replace_request. */
+  userRequest?: RunMovieAcquisitionV2Request["userRequest"];
+  /** Replace runs: whether the film was obtained before (see RunMovieAcquisitionV2Request). */
+  priorObtained?: boolean;
+  /** Replace runs: how the notification is pushed (see stampReplaceNotification). */
+  notice?: ReplaceNotice;
+  /** Replace runs: see HeldLockRun. */
+  holdLockOpen?: boolean;
   /** See TvV2Common.now — finishedAt is stamped post-run from this clock. */
   now?: () => string;
-}): Promise<MovieWorkflowResult> {
+}): Promise<MovieAcquisitionV2Result & Partial<HeldLockRun>> {
   const now = resolveNow(input);
   const result = await runMovieAcquisitionV2({
     title: input.title,
@@ -389,28 +651,31 @@ export async function runMovieAcquisitionV2AndPersist(input: {
     ...(input.storageProvider === undefined ? {} : { storageProvider: input.storageProvider }),
     ...(input.assrtToken === undefined ? {} : { assrtToken: input.assrtToken }),
     ...(input.jevJudge === undefined ? {} : { jevJudge: input.jevJudge }),
+    ...(input.userRequest === undefined ? {} : { userRequest: input.userRequest }),
+    ...(input.priorObtained === undefined ? {} : { priorObtained: input.priorObtained }),
+    ...(await protectExistingOption(input)),
+    ...rejectedLookupOption(input),
     ...memoryOption(input),
   });
 
-  await input.repository.saveWorkflowRunSnapshot({
+  const held = await saveRunRecord({ ...input, now }, result.status, stampNotifications(result.notifications, input.notice), (run, notifications) => ({
     ...(input.accountId ? { accountId: input.accountId } : {}),
     ...(input.connectedStorageId != null ? { connectedStorageId: input.connectedStorageId } : {}),
     title: input.title,
     season: result.season,
     workflowRun: {
+      ...run,
       id: input.workflowRun.id,
-      kind: "movie_init",
-      status: result.status,
+      kind: input.userRequest ? "replace_request" : "movie_init",
       trackedSeasonId: result.season.id,
       startedAt: input.workflowRun.startedAt,
-      finishedAt: now(),
       auditEvents: result.auditEvents,
     },
     episodes: result.episodes,
     resourceSnapshots: result.resourceSnapshots,
     decisions: result.decisions,
     transferAttempts: result.transferAttempts,
-    notifications: result.notifications,
-  });
-  return result;
+    notifications,
+  }));
+  return { ...result, ...held };
 }

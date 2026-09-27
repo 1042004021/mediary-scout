@@ -6,7 +6,9 @@ import type { ResourceProvider, StorageExecutor } from "../ports.js";
 import type { AcquisitionAgentResult } from "./agent-loop.js";
 import type { AgentToolEvent } from "./activity.js";
 import { CandidateRegistry } from "./candidate-registry.js";
-import type { DeadLinkStore } from "./dead-links.js";
+import { deadLinkKey, type DeadLinkStore } from "./dead-links.js";
+import { resourceFingerprintMatches } from "../user-requests.js";
+import type { UserRequestPromptInput } from "./user-request-block.js";
 import { RealResourceProviderV2 } from "./real-provider-adapter.js";
 import { RealStorageV2 } from "./real-storage-adapter.js";
 import { budgetSoftThreshold } from "./agent-loop-guards.js";
@@ -94,6 +96,36 @@ export interface RunAcquisitionV2Request {
     drive?: string;
     now?: () => string;
   };
+  /** Episodes of this work that carry an old + replacement copy on purpose (the
+   *  episode_sources rows). Present = the files already in the target dirs are
+   *  protected for the whole run, so keep-larger dedup never undoes a replacement;
+   *  the episodes are named in the prompt. "unknown" = the rows could not be read:
+   *  protection stays on (fail closed), the prompt names no episode. */
+  protectExisting?: { episodes: string[] | "unknown" };
+  /** This work's rejected resources (account + work scoped: the user said "not this
+   *  one", on any drive). Read on every search to filter them out, and again at every
+   *  transfer — in EVERY run of the work, not only replace runs, so a patrol never
+   *  lands what the user rejected. A failing read fails open (logged). On a replace
+   *  run userRequest.rejectedStore is the source instead (same rows). */
+  rejectedLookup?: {
+    list: () => Promise<Array<{ episode?: string; linkKey: string | null; label: string; sizeBytes: number | null }>>;
+  };
+  /** A replace_request run (user message). See docs/superpowers/specs/2026-09-26-user-message-replace-design.md. */
+  userRequest?: {
+    /** Episodes the user named or that are still pending (movie: ["MOVIE"]). Added to the need. */
+    requestedEpisodes: string[];
+    prompt: UserRequestPromptInput;
+    /** Episode → link key of the copy an earlier replace run put in place (the
+     *  episode_sources rows). A rejection of that episode carries the link, so the same
+     *  resource is refused under any name: in the store, and for the rest of this run
+     *  even when the store write fails. */
+    sourceLinkKeys?: Record<string, string>;
+    rejectedStore: {
+      /** `episode` lets a repeated rejection be skipped (see onReject). */
+      list: () => Promise<Array<{ episode?: string; linkKey: string | null; label: string; sizeBytes: number | null }>>;
+      add: (rows: Array<{ episode: string; linkKey: string | null; label: string; sizeBytes: number | null; reason: string }>) => Promise<void>;
+    };
+  };
 }
 
 /** The persistable trace of a V2 run, in the same shape the old serial path
@@ -107,10 +139,44 @@ export interface AcquisitionV2Outcome {
 export interface RunAcquisitionV2Result extends AcquisitionAgentResult {
   outcome: AcquisitionV2Outcome;
   auditEvents: AuditEvent[];
+  /** Present only on a replace_request run. */
+  replacement?: {
+    /** One entry per episode (the last report wins). candidateId here is the
+     *  PROVIDER's real id (mapped back from the agent's alias), with the title and
+     *  link identity of the resource that landed. sizeBytes (replaced only) is the real
+     *  total size of the episode's named video file(s) in its target dir — the title of
+     *  a season pack would carry the whole pack's size. */
+    results: Array<{
+      episode: string;
+      outcome: "replaced" | "not_found";
+      candidateId?: string;
+      label?: string;
+      linkKey?: string | null;
+      sizeBytes?: number;
+      note: string;
+    }>;
+    /** linkKey: the episode's recorded source link it was rejected by too (null = none known). */
+    rejected: Array<{ episode: string; label: string; sizeBytes: number | null; linkKey: string | null; reason: string }>;
+    /** Paths (relative to the library dir) of the rejected files, still in place. */
+    oldFiles: string[];
+    /** Whether the agent identified an episode in this run (a successful
+     *  rejectCurrentSource, a no-file declaration included). False with a TV message
+     *  without tags = no episode came out of its words (see UserMessageReply.unidentified). */
+    identified: boolean;
+    /** The rejected list could not be saved: this run still honoured it, the next
+     *  run will not know it (the reply says so). */
+    rejectedPersistFailed?: boolean;
+  };
 }
 
 export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promise<RunAcquisitionV2Result> {
   const registry = new CandidateRegistry();
+  // Where the stored rejected list comes from (see rejectedLookup). Absent = no
+  // rejection filtering at all (callers that do not know the work).
+  const rejectedSource: RunAcquisitionV2Request["rejectedLookup"] = request.userRequest?.rejectedStore ?? request.rejectedLookup;
+  // A user replace run reads the rejected list strictly (fail closed): its whole point
+  // is that a rejected source never comes back. Ordinary runs read it best-effort.
+  const strictRejected = request.userRequest !== undefined;
   // Wrapping HERE (not at the call site) is what makes the pre-warm and every agent
   // searchResources go through the same filter — they all funnel through this adapter.
   const searchProvider = request.jevJudge
@@ -121,6 +187,9 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
     registry,
     workflowRunId: request.workflowRunId,
     ...(request.deadLinkStore ? { deadLinkStore: request.deadLinkStore } : {}),
+    // Re-read on every search (closure over the collectors declared below; first
+    // called only once the agent searches).
+    ...(rejectedSource ? { rejectedResources: { list: () => listRejected(), ...(strictRejected ? { strict: true } : {}) } } : {}),
   });
   const storage = new RealStorageV2({
     executor: request.executor,
@@ -129,6 +198,52 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
     ...(request.deadLinkStore ? { deadLinkStore: request.deadLinkStore } : {}),
   });
   const need = request.target.kind === "tv" ? needForTvTarget(request.target) : needForMovie();
+  const userRequest = request.userRequest;
+  const protectExisting =
+    request.protectExisting && (request.protectExisting.episodes === "unknown" || request.protectExisting.episodes.length > 0)
+      ? request.protectExisting
+      : undefined;
+  if (userRequest) {
+    // The replace tools must never be registered without the rules that go with them;
+    // the prompt block renders only when there is a message or a pending episode.
+    if (userRequest.prompt.messages.length === 0 && userRequest.prompt.pending.length === 0) {
+      throw new Error("USER_REQUEST_EMPTY: a replace run needs at least one message or pending episode");
+    }
+    for (const e of userRequest.requestedEpisodes) if (!need.includes(e)) need.push(e);
+  }
+  // Replace run collectors. Rejections made this run are also kept here, with the link
+  // they are rejected by, so they are honoured for the rest of the run even when the
+  // store write failed (spec §7).
+  const replaceResults = new Map<string, NonNullable<RunAcquisitionV2Result["replacement"]>["results"][number]>();
+  const replaceRejected: NonNullable<RunAcquisitionV2Result["replacement"]>["rejected"] = [];
+  const oldFiles = new Set<string>();
+  let rejectedPersistFailed = false;
+  // Concurrent callers share one in-flight read (the sandbox re-checks every cached
+  // candidate at once after a rejection); nothing is cached past that read.
+  let storedInFlight: Promise<Array<{ linkKey: string | null; label: string; sizeBytes: number | null }>> | null = null;
+  const readStored = () => {
+    if (!storedInFlight) {
+      storedInFlight = Promise.resolve()
+        .then(() => rejectedSource?.list() ?? [])
+        .finally(() => {
+          storedInFlight = null;
+        });
+    }
+    return storedInFlight;
+  };
+  const listRejected = async (): Promise<Array<{ linkKey: string | null; label: string; sizeBytes: number | null }>> => {
+    let stored: Array<{ linkKey: string | null; label: string; sizeBytes: number | null }> = [];
+    try {
+      stored = await readStored();
+    } catch (error) {
+      // A user replace run reads strictly: an unreadable rejected list must not let a
+      // rejected source through (the search / transfer fails instead and says so).
+      // Ordinary runs filter on a best-effort basis and carry on.
+      if (strictRejected) throw error;
+      console.log(`[user-message] run ${request.workflowRunId} rejected list read failed: ${errorText(error)}`);
+    }
+    return [...stored, ...replaceRejected.map((r) => ({ linkKey: r.linkKey, label: r.label, sizeBytes: r.sizeBytes }))];
+  };
   // The title key is computed HERE from the target — the agent never supplies it.
   const memoryNow = request.memory?.now ?? (() => new Date().toISOString());
   const memoryDrive = request.memory?.drive ?? request.storageProvider;
@@ -166,7 +281,124 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
     ...(request.searchBudget === undefined ? {} : { searchBudget: request.searchBudget }),
     ...(request.searchProfile === undefined ? {} : { searchProfile: request.searchProfile }),
     ...(memoryBinding ? { memory: memoryBinding } : {}),
+    ...(protectExisting ? { protectExistingFiles: true } : {}),
+    ...(rejectedSource
+      ? {
+          isRejected: async (candidate: { id: string; title: string }) => {
+            // Transfer-time guard for what the search filter could not catch (the raw
+            // pre-search may predate a rejection; a repeated keyword is cached).
+            try {
+              const rows = await listRejected();
+              const key = deadLinkKey(String(registry.get(candidate.id)?.providerPayload?.["url"] ?? ""))?.key;
+              return rows.some(
+                (r) => (key !== undefined && r.linkKey === key) || resourceFingerprintMatches(candidate.title, r),
+              );
+            } catch (error) {
+              // Replace run: fail closed — refuse the transfer (the agent sees why and can
+              // retry) rather than risk landing the very source the user rejected.
+              if (strictRejected) {
+                throw new Error(
+                  `SANDBOX_REJECTED_LIST_UNAVAILABLE: could not read the user's rejected list (${errorText(error)}) — try again in a moment`,
+                );
+              }
+              console.log(`[user-message] run ${request.workflowRunId} rejected check failed (allowing): ${errorText(error)}`);
+              return false;
+            }
+          },
+        }
+      : {}),
+    ...(userRequest
+      ? {
+          replace: {
+            requestedEpisodes: userRequest.requestedEpisodes,
+            // A message is words to read episodes from (an untagged TV message requests
+            // none up front); a pending-only re-check has only its 待换 episodes.
+            hasMessages: userRequest.prompt.messages.length > 0,
+            // An untagged TV message needs an episode identified in THIS run: the
+            // episodes already requested (older 待换 rows, other messages' tags) say
+            // nothing about it. A movie message means the film (requested as MOVIE).
+            untaggedMessages:
+              request.target.kind === "tv" ? userRequest.prompt.messages.filter((m) => m.episodeTags.length === 0).length : 0,
+            // Stored rejections from earlier runs let a PENDING-ONLY re-check (no new
+            // message this run — the earlier rejection is why we are here) skip
+            // rejecting again. A NEW message means the user is unhappy with what is in
+            // place NOW (which may itself be an earlier replacement) — that file must
+            // be rejected this run before anything transfers, so the bypass is withheld.
+            alreadyRejectedEpisodes:
+              userRequest.prompt.messages.length === 0
+                ? [...new Set(userRequest.prompt.rejected.map((r) => r.episode))]
+                : [],
+            onReject: async (items) => {
+              // Skip what is already rejected (same episode + label + size), in the
+              // store or earlier this run — the agent may reject the same file twice.
+              const seen = new Set<string>();
+              const key = (r: { episode: string; label: string; sizeBytes: number | null }) =>
+                JSON.stringify([r.episode, r.label, r.sizeBytes]);
+              for (const r of replaceRejected) seen.add(key(r));
+              try {
+                for (const r of await userRequest.rejectedStore.list()) {
+                  if (r.episode !== undefined) seen.add(key({ episode: r.episode, label: r.label, sizeBytes: r.sizeBytes }));
+                }
+              } catch (error) {
+                console.log(`[user-message] run ${request.workflowRunId} rejected list read failed (not deduping): ${errorText(error)}`);
+              }
+              const fresh = items.filter((i) => {
+                const k = key(i);
+                if (seen.has(k)) return false;
+                seen.add(k);
+                return true;
+              });
+              for (const i of items) oldFiles.add(i.path);
+              if (fresh.length === 0) return;
+              // An episode replaced once before has a known link: reject it by link too,
+              // not only name+size — here and in the store.
+              const rows = fresh.map((i) => ({
+                episode: i.episode,
+                linkKey: userRequest.sourceLinkKeys?.[i.episode] ?? null,
+                label: i.label,
+                sizeBytes: i.sizeBytes,
+                reason: i.reason,
+              }));
+              replaceRejected.push(...rows);
+              try {
+                await userRequest.rejectedStore.add(rows);
+              } catch (error) {
+                // Best-effort (spec §7): the run goes on and the reply says the list was not saved.
+                rejectedPersistFailed = true;
+                console.log(`[user-message] run ${request.workflowRunId} rejected list write failed: ${errorText(error)}`);
+              }
+            },
+            onReport: async (results) => {
+              for (const r of results) {
+                // The agent speaks in short aliases (s2-14); persistence needs the real
+                // candidate, its title and its link identity (for episode_sources and a
+                // future rejection of this same resource).
+                // Only a replaced result names what landed; a not_found never carries one.
+                const candidate = r.outcome === "replaced" && r.candidateId ? registry.get(r.candidateId) : undefined;
+                // A not_found may be upgraded to replaced later in the run: the last report wins.
+                replaceResults.set(r.episode, {
+                  episode: r.episode,
+                  outcome: r.outcome,
+                  note: r.note,
+                  ...(candidate
+                    ? {
+                        candidateId: candidate.id,
+                        label: candidate.title,
+                        linkKey: deadLinkKey(String(candidate.providerPayload?.["url"] ?? ""))?.key ?? null,
+                      }
+                    : {}),
+                  ...(r.outcome === "replaced" && r.sizeBytes !== undefined ? { sizeBytes: r.sizeBytes } : {}),
+                });
+              }
+            },
+          },
+        }
+      : {}),
   });
+  // Replace run (or protected existing files): record every file already in the target dirs
+  // BEFORE anything can touch them. Not best-effort — the protection is the whole
+  // safety story, so a failing listing fails the run.
+  if (userRequest || protectExisting) await sandbox.captureProtectedFiles();
   const loadedMemory = await loadMemoryForRun(request, memoryBinding);
 
   // Pre-warm the raw snapshot (bare title) BEFORE building the system prompt, so the
@@ -257,12 +489,17 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
           },
         }
       : {}),
+    ...(userRequest ? { userRequests: userRequest.prompt } : {}),
+    ...(protectExisting ? { protectExisting } : {}),
   };
 
   const result =
     request.target.kind === "tv"
       ? await runTvAnimeTaskAgent({ ...common, target: stripKind(request.target) })
       : await runMovieTaskAgent({ ...common, target: stripKind(request.target) });
+  // Every requested/rejected episode the agent did not report becomes not_found
+  // (stays 待换). After the loop — the content-filter recovery turn included.
+  if (userRequest) await sandbox.finalizeReplacement();
 
   // The agent transferred candidates by id; the storage adapter recorded the
   // domain attempts and the provider adapter the domain snapshots. Assemble the
@@ -291,11 +528,17 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
     } catch (error) {
       digest = `COVERAGE: ${result.coverage.coverageMet ? "met" : "NOT met"} (details unavailable: ${error instanceof Error ? error.message.slice(0, 120) : "unknown"})`;
     }
+    if (userRequest) {
+      // Facts only: the matching instruction goes outside the fence (userRequest below).
+      const outcomes = [...replaceResults.values()].map((r) => `${r.episode} ${r.outcome}`).join(", ");
+      digest += `\nUSER REQUEST: ${outcomes || "(no episodes reported)"}`;
+    }
     const reflection = await runMemoryReflection({
       sandbox,
       model: request.model,
       digest,
       memory: loadedMemory ?? { title: [], globalIndex: [] },
+      ...(userRequest ? { userRequest: true } : {}),
     });
     console.log(
       `[memory] run ${request.workflowRunId} title=${memoryBinding.titleKey} ${reflection.ran ? `changes=${reflection.changes}` : `skipped=${reflection.skipped ?? "-"}`}`,
@@ -317,7 +560,28 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
         ? `已完成:obtained=${result.coverage.obtained.join(",") || "-"}(finish 终结即停)`
         : result.text),
   });
-  return { ...result, outcome: { resourceSnapshots, decisions, transferAttempts }, auditEvents: sandbox.auditTrail() };
+  return {
+    ...result,
+    outcome: { resourceSnapshots, decisions, transferAttempts },
+    auditEvents: sandbox.auditTrail(),
+    ...(userRequest
+      ? {
+          replacement: {
+            results: [...replaceResults.values()],
+            rejected: replaceRejected,
+            oldFiles: [...oldFiles],
+            identified: sandbox.identifiedThisRun(),
+            ...(rejectedPersistFailed ? { rejectedPersistFailed: true } : {}),
+          },
+        }
+      : {}),
+  };
+}
+
+/** A log-sized error message (outside errors can carry whole response bodies). */
+function errorText(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.length > 160 ? `${message.slice(0, 160)}…` : message;
 }
 
 /**

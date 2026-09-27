@@ -14,14 +14,14 @@ import {
   type TransferAttempt,
   type WorkflowStatus,
 } from "./domain.js";
-import { buildMovieReport, emptyRunOutcome, formatReportPushText } from "./notification-report.js";
+import { buildMovieReport, buildReplacementReport, emptyRunOutcome, formatReportPushText } from "./notification-report.js";
 import { classifyTransferBlock } from "./acquisition-v2/transfer-block.js";
 import { classifySearchSourceFault } from "./acquisition-v2/search-source-fault.js";
 import type { ResourceProvider, StorageExecutor } from "./ports.js";
 import type { DeadLinkStore } from "./acquisition-v2/dead-links.js";
 import { readLandedSize, type LandedSize } from "./acquisition-v2/landed-size.js";
 import type { AgentToolEvent } from "./acquisition-v2/activity.js";
-import { runAcquisitionV2 } from "./acquisition-v2/orchestrator.js";
+import { runAcquisitionV2, type RunAcquisitionV2Request, type RunAcquisitionV2Result } from "./acquisition-v2/orchestrator.js";
 import type { JevJudge } from "./jev-judge.js";
 import { getQualityGuidance, getSearchRecipe } from "./acquisition-v2/search-profile.js";
 import { ensureMediaLibraryDirectory } from "./media-library-folder.js";
@@ -58,13 +58,25 @@ export interface RunMovieAcquisitionV2Request {
   deadLinkStore?: DeadLinkStore;
   /** Agent memory (see orchestrator.memory). */
   memory?: { store: AgentMemoryStore; accountId: string; drive?: string };
+  /** A replace_request run (see orchestrator.userRequest; requestedEpisodes ["MOVIE"]). */
+  userRequest?: RunAcquisitionV2Request["userRequest"];
+  /** Replace runs: the film was obtained before the run (its old file is there), so
+   *  it stays obtained whether or not a replacement landed. Default false. */
+  priorObtained?: boolean;
+  /** See orchestrator.protectExisting (episodes ["MOVIE"] when the film has a kept replacement). */
+  protectExisting?: RunAcquisitionV2Request["protectExisting"];
+  /** See orchestrator.rejectedLookup. */
+  rejectedLookup?: RunAcquisitionV2Request["rejectedLookup"];
   onProgress?: (event: AgentToolEvent) => void;
   now?: () => string;
 }
 
+/** The movie result plus the replace outcome of a replace_request run. */
+export type MovieAcquisitionV2Result = MovieWorkflowResult & { replacement?: RunAcquisitionV2Result["replacement"] };
+
 export async function runMovieAcquisitionV2(
   request: RunMovieAcquisitionV2Request,
-): Promise<MovieWorkflowResult> {
+): Promise<MovieAcquisitionV2Result> {
   const now = request.now ?? defaultNowIso;
 
   // verify-or-create Movies/Title (Year) {tmdb-N} (legacy Title (Year) reused).
@@ -110,19 +122,27 @@ export async function runMovieAcquisitionV2(
     ...(request.jevJudge === undefined ? {} : { jevJudge: request.jevJudge }),
     ...(request.deadLinkStore ? { deadLinkStore: request.deadLinkStore } : {}),
     ...(request.memory ? { memory: request.memory } : {}),
+    ...(request.userRequest ? { userRequest: request.userRequest } : {}),
+    ...(request.protectExisting ? { protectExisting: request.protectExisting } : {}),
+    ...(request.rejectedLookup ? { rejectedLookup: request.rejectedLookup } : {}),
     ...(request.onProgress ? { onProgress: request.onProgress } : {}),
   });
 
   // Truth = the AGENT'S coverage (its markObtained), NOT a mechanical file scan
   // (§1.13/§7b). The agent looked at the real files and declared coverage; the
   // workflow records that, it does not re-derive obtained by counting files.
-  const obtained = v2.coverage.coverageMet;
+  // A replace run never un-obtains the film: the old file stays in the directory
+  // whether or not a replacement landed (spec §4.5). One that was never obtained
+  // is obtained only by what landed now.
+  const obtained = v2.coverage.coverageMet || (request.userRequest !== undefined && request.priorObtained === true);
 
   // Real landed volume for the push (best-effort; never fails the run). The
   // movie dir IS the staging+final location, so its video file(s) are the film.
-  const landed = obtained ? await readLandedSize(request.storage, [movieDirectoryId]) : undefined;
+  // Not on a replace run: the dir holds the old AND the new film (double count).
+  const landed =
+    obtained && !request.userRequest ? await readLandedSize(request.storage, [movieDirectoryId]) : undefined;
 
-  return buildResult({
+  const result = buildResult({
     request,
     movieDirectoryId,
     obtained,
@@ -135,8 +155,10 @@ export async function runMovieAcquisitionV2(
     // 中文字幕软兜底: the agent landed a raw match with no confirmed 中字 → flag it.
     subtitleFallback: obtained && v2.coverage.subtitleFallback,
     ...(landed ? { landed } : {}),
+    ...(v2.replacement ? { replacementResults: v2.replacement.results } : {}),
     now,
   });
+  return v2.replacement ? { ...result, replacement: v2.replacement } : result;
 }
 
 function buildResult(input: {
@@ -152,6 +174,8 @@ function buildResult(input: {
   /** Landed via the 中文字幕 last-resort fallback (no confirmed 中字) → notification flag. */
   subtitleFallback?: boolean;
   landed?: LandedSize;
+  /** A replace_request run: the notification reports the replacement, not "入库". */
+  replacementResults?: Array<{ episode: string; outcome: "replaced" | "not_found" }>;
   now: () => string;
 }): MovieWorkflowResult {
   const season: TrackedSeason = movieAnchorSeason({
@@ -167,9 +191,42 @@ function buildResult(input: {
   }).map((episode) => ({ ...episode, obtained: input.obtained }));
 
   const t = input.request.title;
+  const meta = { posterPath: t.posterPath ?? null, tmdbId: t.tmdbId, mediaType: t.type, year: t.year };
+  if (input.request.userRequest) {
+    const report = buildReplacementReport({
+      titleName: t.title,
+      movie: true,
+      results: input.replacementResults ?? [],
+      transferBlockReason: classifyTransferBlock(input.attempts)?.reason ?? null,
+      searchSourceFaultReason: classifySearchSourceFault(input.auditEvents)?.reason ?? null,
+      meta,
+    });
+    const notification: NotificationEvent = {
+      id: `notification_${input.request.workflowRunId}`,
+      workflowRunId: input.request.workflowRunId,
+      kind: report.status === "failed" ? "transfer_failed" : "replacement_done",
+      title: t.title,
+      body: formatReportPushText(report),
+      createdAt: input.now(),
+      trigger: "user",
+      report,
+    };
+    return {
+      status: input.status,
+      title: t,
+      season,
+      episodes,
+      resourceSnapshots: input.snapshots,
+      transferAttempts: input.attempts,
+      decisions: input.decisions,
+      notification,
+      notifications: [notification],
+      auditEvents: input.auditEvents,
+    };
+  }
   const baseReport = buildMovieReport(
     t.title,
-    { posterPath: t.posterPath ?? null, tmdbId: t.tmdbId, mediaType: t.type, year: t.year },
+    meta,
     input.landed,
     input.subtitleFallback ?? false,
   );

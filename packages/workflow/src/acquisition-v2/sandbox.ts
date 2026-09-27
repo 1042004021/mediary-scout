@@ -52,6 +52,13 @@ const STRIP_NOTICE =
 /** Threshold for large snapshot digestion hint (病3). */
 const LARGE_SNAPSHOT_DIGEST_THRESHOLD = 10;
 
+/** Recorded (in place of "replaced") when the agent reports an episode replaced but a
+ *  file it named for that episode is not in a target dir when it reports: still in
+ *  staging (never moved beside the old one), or moved in and deleted since. The episode
+ *  stays 待换 (moved in and reported again, it is upgraded). */
+const REPLACEMENT_NOT_IN_TARGET_NOTE =
+  "新文件不在目标目录(季目录/电影目录)里:还在暂存,或移进去后又被删掉了。不算完成替换,本轮记为未找到,留待下次巡检。";
+
 /**
  * 把快照的源健康态翻成给 agent 的祈使句警告。返回 undefined 表示证据完整
  * （healthy 或老快照无此字段）——那种情形下的空候选才是权威的「确实没有」，
@@ -209,6 +216,46 @@ export interface TaskSandboxOptions {
     legacyProvider?: string;
     now?: () => string;
   };
+  /** A replace_request run: the user asked for these episodes to be swapped. Files
+   *  already in the target dirs when the run starts are protected (never deleted,
+   *  moved or renamed); the agent rejects the current source and reports
+   *  per-episode outcomes. Absent = the replace tools refuse. */
+  replace?: {
+    requestedEpisodes: string[];
+    /** Whether the run carries at least one user message (false = a pending-only
+     *  re-check of 待换 episodes). With a message and nothing requested at all,
+     *  declareFinish refuses until the agent has identified at least one episode. */
+    hasMessages: boolean;
+    /** TV messages in this run without episode tags (0 on a movie run: a message about
+     *  a film means the film). Such a message is words the agent reads episodes from,
+     *  and the episodes requested up front (older 待换 rows, other messages' tags) say
+     *  nothing about it — so while this is > 0, declareFinish refuses until the agent
+     *  has identified an episode THIS run (see identifiedThisRun). Which message an
+     *  episode came from is the agent's call; the system only asks for one. */
+    untaggedMessages: number;
+    /** Requested episodes whose current source an earlier run already rejected (the
+     *  stored list). When every requested episode is in here the agent may transfer
+     *  without calling rejectCurrentSource again — see assertRejectedFirst. */
+    alreadyRejectedEpisodes?: string[];
+    onReject: (items: Array<{ episode: string; label: string; sizeBytes: number; reason: string; path: string }>) => Promise<void>;
+    /** A recorded "replaced" also carries the agent-named fileIds it was verified by, and
+     *  the real total size of that episode's named video file(s), read from its target
+     *  dir when reporting (a pack's title would give the whole pack's size). */
+    onReport: (
+      results: Array<{ episode: string; outcome: "replaced" | "not_found"; candidateId?: string; fileIds?: string[]; sizeBytes?: number; note: string }>,
+    ) => Promise<void>;
+  };
+  /** Whether a search candidate is a copy of a resource the user rejected for this
+   *  work (any run — the rejected list is account + work scoped, not replace-only).
+   *  The search-side filter cannot catch everything within one run (the raw
+   *  pre-search may predate a rejection; a repeated keyword returns the cached
+   *  snapshot), so every transfer asks again. Absent = no transfer-time guard. */
+  isRejected?: (candidate: { id: string; title: string }) => Promise<boolean>;
+  /** Any run of a work that has kept old + replacement copies (episode_sources):
+   *  files already in the target dirs at the start are protected like in a replace
+   *  run (never deleted, moved, renamed or flattened away), without the replace
+   *  tools. The sandbox has no file↔episode map, so it protects all of them. */
+  protectExistingFiles?: boolean;
 }
 
 /** What the models see of a memory entry (no persistence identifiers). */
@@ -274,7 +321,7 @@ export class TaskSandbox {
   private readonly seasonDirs: Map<number, string>;
   /** A movie task's one target directory (movies have no seasons). */
   private readonly movieDir: string | undefined;
-  private readonly need: readonly string[];
+  private readonly need: string[];
   private readonly titleTerms: readonly string[];
   private readonly subtitleFallback: boolean;
   /** Reserve-zone threshold (movie 8+2) — undefined disables the reserve zone. */
@@ -314,6 +361,39 @@ export class TaskSandbox {
   /** Set the moment a video/subtitle transfer is ATTEMPTED (before the provider call,
    *  so a transfer that threw still counts). Read by hasTransferEvidence. */
   private transferAttempted = false;
+  private readonly replace: TaskSandboxOptions["replace"];
+  private readonly isRejected: TaskSandboxOptions["isRejected"];
+  private readonly protectExistingFiles: boolean;
+  /** Set once captureProtectedFiles has listed the target dirs (see assertRejectedFirst). */
+  private protectedCaptured = false;
+  /** Replace runs: every file in a target dir when the run started (the user's
+   *  current copy — it must survive the run), keyed by id, with its dir label
+   *  ("Season 01", or "" for the movie dir). Only these can be rejected. */
+  private readonly protectedFiles = new Map<string, { file: SimTreeFile; dirLabel: string }>();
+  /** Episodes already reported this run, with the outcome recorded. */
+  private readonly reportedEpisodes = new Map<string, "replaced" | "not_found">();
+  /** Episodes the agent rejected via rejectCurrentSource (in order). */
+  private readonly rejectedEpisodes: string[] = [];
+  /** Episodes the agent declared have no old file in the library (rejectCurrentSource
+   *  with that episode and fileIds []): nothing to reject, so they pass the
+   *  reject-before-transfer gate without a rejected row. The sandbox has no
+   *  file↔episode map, so this is the agent's call (see assertRejectedFirst). */
+  private readonly noFileEpisodes: string[] = [];
+  /** Candidates that landed this run (reportReplacement's evidence): a succeeded
+   *  attempt, or a failed one that still materialized files (quark marks some
+   *  landings failed — the landing point is the truth, not the status flag). */
+  private readonly succeededCandidates = new Set<string>();
+  /** Every file a landed transfer materialized this run → the candidate that landed it
+   *  (transferCandidate / each landed attempt of transferUntilLanded). A "replaced"
+   *  names its episode's new files; each (subtitles aside — real drives never record
+   *  them) must be in here, under the reported candidate — so the old file (pre-run) or
+   *  a made-up id never counts. Where such a file is NOW is read from the target dirs
+   *  when the agent reports (reportReplacement). */
+  private readonly materializedBy = new Map<string, string>();
+  /** File → the episode it backs, for every "replaced" recorded this run. One new file
+   *  backs one episode: E24 can never be reported replaced by E13's file. A backing file
+   *  can no longer be deleted this run (see deleteFiles). */
+  private readonly fileBackedEpisode = new Map<string, string>();
 
   constructor(options: TaskSandboxOptions) {
     this.provider = options.provider;
@@ -330,10 +410,13 @@ export class TaskSandbox {
       Object.entries(options.targetSeasonDirectoryIds ?? {}).map(([season, id]) => [Number(season), id]),
     );
     this.movieDir = options.targetMovieDirectoryId;
-    this.need = options.need ?? [];
+    this.need = [...(options.need ?? [])];
     this.titleTerms = options.titleTerms ?? [];
     this.subtitleProvider = options.subtitleProvider;
     this.memory = options.memory;
+    this.replace = options.replace;
+    this.isRejected = options.isRejected;
+    this.protectExistingFiles = options.protectExistingFiles === true;
   }
 
   /** Every scoped target directory (all seasons + the movie) — the union used for
@@ -353,14 +436,52 @@ export class TaskSandbox {
     return this.seasonDirs.size === 0 ? this.movieDir : undefined;
   }
 
+  /** A movie task: exactly one movie dir and no seasons, so its staging IS that dir (a
+   *  materialized transfer is already in the target). TV tasks always carry season
+   *  dirs, even single-season, so their staging is a separate directory. */
+  private isMovieRun(): boolean {
+    return this.movieDir !== undefined && this.seasonDirs.size === 0;
+  }
+
+  /** Remember which candidate materialized which files this run (reportReplacement
+   *  checks the files an agent names for an episode against it). */
+  private recordMaterialized(candidateId: string, fileIds: string[]): void {
+    for (const id of fileIds) this.materializedBy.set(id, candidateId);
+  }
+
   /** Whether every needed token has been confirmed obtained — the gate that
    *  stops the agent from acquiring past the point of coverage (莉可丽丝 scar). */
   isCoverageMet(): boolean {
-    return this.need.length > 0 && this.need.every((token) => this.obtainedCodes.has(token));
+    return this.need.length > 0 && this.need.every((token) => this.countsAsObtained(token));
   }
 
   private missingNeed(): string[] {
-    return this.need.filter((token) => !this.obtainedCodes.has(token));
+    return this.need.filter((token) => !this.countsAsObtained(token));
+  }
+
+  /** Replace runs: the episodes the user wants swapped (requested or rejected this
+   *  run). Their OLD file is already in the library, so a mark proves nothing until
+   *  a new file has landed — see markObtained. Empty outside a replace run. */
+  private replaceGuardedEpisodes(): Set<string> {
+    return new Set(this.replaceEpisodes());
+  }
+
+  /** Every episode this replace run is about, in order: requested, then rejected or
+   *  declared file-less this run. Empty outside a replace run. */
+  private replaceEpisodes(): string[] {
+    if (!this.replace) return [];
+    return [...new Set([...this.replace.requestedEpisodes, ...this.rejectedEpisodes, ...this.noFileEpisodes])];
+  }
+
+  /** Whether a marked token counts: toward coverage, and as obtained in finish(). A
+   *  replace-guarded episode counts only once reportReplacement recorded it replaced
+   *  (which checks its mark, a landed candidate and the episode's own new files in the
+   *  target). A mark alone is not enough: it may predate the rejection, or be unlocked
+   *  by a transfer that carried a different episode — either way the old file would
+   *  close the transfer gate before this episode was ever replaced. */
+  private countsAsObtained(token: string): boolean {
+    if (!this.obtainedCodes.has(token)) return false;
+    return !this.replaceGuardedEpisodes().has(token) || this.reportedEpisodes.get(token) === "replaced";
   }
 
   /** Search one keyword. Repeats are deduped (no extra provider hit); distinct
@@ -603,14 +724,25 @@ export class TaskSandbox {
     if (!snapshot) {
       throw new Error(`SANDBOX_SNAPSHOT_NOT_OBSERVED: ${input.snapshotId} was not seen in this task`);
     }
-    if (!snapshot.candidates.some((candidate) => candidate.id === input.candidateId)) {
+    const candidate = this.findObservedCandidate(input.candidateId, input.snapshotId);
+    if (!candidate) {
       throw new Error(`SANDBOX_CANDIDATE_NOT_IN_SNAPSHOT: ${input.candidateId} is not in ${input.snapshotId}`);
+    }
+    this.assertRejectedFirst();
+    if (this.isRejected && (await this.isRejected({ id: candidate.id, title: candidate.title }))) {
+      throw new Error(
+        `SANDBOX_CANDIDATE_REJECTED: ${input.candidateId} is a copy of a resource the user rejected — pick a different one`,
+      );
     }
     this.transferAttempted = true;
     const attempt = await this.storage.transferCandidate({
       candidateId: input.candidateId,
       intoDirectoryId: this.stagingDirectoryId,
     });
+    if (attempt.status === "succeeded" || attempt.materializedFileIds.length > 0) {
+      this.succeededCandidates.add(input.candidateId);
+      this.recordMaterialized(input.candidateId, attempt.materializedFileIds);
+    }
     const staging = await this.storage.listTree({ directoryId: this.stagingDirectoryId });
     // A systemic block ONLY when nothing actually landed — a provider can mark an
     // attempt failed yet materialize files (e.g. quark); the truth is the landing
@@ -658,13 +790,14 @@ export class TaskSandbox {
     if (input.candidateIds.length === 0) {
       throw new Error("SANDBOX_NO_CANDIDATES: transferUntilLanded needs at least one candidate");
     }
+    this.assertRejectedFirst();
+    const observed = new Map<string, ResourceSnapshotV2["candidates"][number]>();
     for (const candidateId of input.candidateIds) {
-      const observed = [...this.observedSnapshots.values()].some((snapshot) =>
-        snapshot.candidates.some((candidate) => candidate.id === candidateId),
-      );
-      if (!observed) {
+      const candidate = this.findObservedCandidate(candidateId);
+      if (!candidate) {
         throw new Error(`SANDBOX_CANDIDATE_NOT_OBSERVED: ${candidateId} was not seen in a search this task`);
       }
+      observed.set(candidateId, candidate);
     }
     for (const candidateId of input.candidateIds) {
       if (this.storage.candidateLinkKind(candidateId) !== "share") {
@@ -678,6 +811,12 @@ export class TaskSandbox {
     let transferredCandidateId: string | null = null;
     let systemicBlock: { reason: string } | undefined;
     for (const candidateId of input.candidateIds) {
+      // A copy of what the user rejected is skipped like a dead link (recorded, not
+      // transferred) so the rest of the agent's ordered list still runs.
+      if (this.isRejected && (await this.isRejected({ id: candidateId, title: observed.get(candidateId)!.title }))) {
+        attempts.push({ candidateId, status: "failed", providerMessage: "user rejected" });
+        continue;
+      }
       this.transferAttempted = true;
       const attempt = await this.storage.transferCandidate({
         candidateId,
@@ -689,8 +828,16 @@ export class TaskSandbox {
         ...(attempt.providerMessage ? { providerMessage: attempt.providerMessage } : {}),
       });
       if (attempt.status === "succeeded") {
+        this.succeededCandidates.add(candidateId);
+        this.recordMaterialized(candidateId, attempt.materializedFileIds);
         transferredCandidateId = candidateId;
         break;
+      }
+      // Failed but landed (quark): it landed as far as the replace checks go. The
+      // loop itself is unchanged — it still decides on the status as before.
+      if (attempt.materializedFileIds.length > 0) {
+        this.succeededCandidates.add(candidateId);
+        this.recordMaterialized(candidateId, attempt.materializedFileIds);
       }
       // Layer-1: stop on the first failure that is a SYSTEMIC block (quota / auth /
       // VIP) — it may come after one or more dead-link failures, but once we see a
@@ -754,6 +901,8 @@ export class TaskSandbox {
     if (outOfScope.length > 0) {
       throw new Error(`SANDBOX_FILES_NOT_IN_STAGING: ${outOfScope.join(",")}`);
     }
+    // A movie's staging IS its movie dir, so the old film sits "in staging" too.
+    this.assertNotProtected(resolved.flatMap((move) => move.fileIds));
     // Execute each move (the system does the per-file moves under the hood).
     for (const move of resolved) {
       await this.storage.moveFiles({ fileIds: move.fileIds, targetDirectoryId: move.targetDir });
@@ -770,7 +919,8 @@ export class TaskSandbox {
 
   /** Delete agent-chosen files from a named scoped directory (the dedup
    *  keep-larger execution, or residue cleanup). Scope guard: every id must
-   *  currently be in that directory — no deleting arbitrary/raw ids. Rereads. */
+   *  currently be in that directory — no deleting arbitrary/raw ids. Rereads.
+   *  Replace runs: neither a pre-run file nor one reported as a replacement this run. */
   async deleteFiles(input: {
     directory: "staging" | "season";
     season?: number;
@@ -779,6 +929,8 @@ export class TaskSandbox {
     if (!this.storage) {
       throw new Error("SANDBOX: no storage configured");
     }
+    this.assertNotProtected(input.fileIds);
+    this.assertNotBackingReplacement(input.fileIds);
     const directoryId =
       input.directory === "season" ? this.resolveTargetDir(input.season) : this.stagingDirectoryId;
     if (!directoryId) {
@@ -802,8 +954,25 @@ export class TaskSandbox {
    *  re-judge from the real files every patrol, so a stale mark self-heals next
    *  round. Correctness is the prompt ordering (clean/flatten, THEN mark last),
    *  not a system gate that costs extra 115 reads. No fileId↔episode map (§1.13):
-   *  the code IS the unit; the agent names what it judged present. */
+   *  the code IS the unit; the agent names what it judged present.
+   *
+   *  Replace runs are the one exception: a requested/rejected episode's OLD file is
+   *  already there, and marking it would meet coverage and block every transfer. So
+   *  such a mark is refused (whole call, nothing recorded) until at least one
+   *  transfer succeeded this run. Deliberately coarse — any landed transfer unlocks
+   *  the mark; which episodes that transfer carried stays the agent's judgment. The
+   *  mark still neither counts toward coverage nor leaves the sandbox in finish()
+   *  until reportReplacement records the episode replaced (see countsAsObtained). */
   async markObtained(input: { codes: string[]; subtitleFallback?: boolean }): Promise<{ confirmed: string[] }> {
+    if (this.replace && this.succeededCandidates.size === 0) {
+      const guarded = this.replaceGuardedEpisodes();
+      const early = input.codes.filter((code) => guarded.has(code));
+      if (early.length > 0) {
+        throw new Error(
+          `SANDBOX_REPLACEMENT_NOT_LANDED: ${early.join(",")} — the user wants these replaced and nothing has landed this run; the OLD file does not count. Mark them only after the NEW file is in place`,
+        );
+      }
+    }
     for (const code of input.codes) {
       this.obtainedCodes.add(code);
     }
@@ -844,20 +1013,58 @@ export class TaskSandbox {
       throw new Error("SANDBOX_NOT_A_MOVIE: flattenMovie is movie-only");
     }
     const root = this.movieDir;
-    const nested = (await this.storage.listTree({ directoryId: root })).filter(
-      (file) => (file.isVideo || file.isSubtitle) && file.path.includes("/"),
+    const tree = await this.storage.listTree({ directoryId: root });
+    // Replace run: the old film (and anything beside it) stays exactly where it was —
+    // it is neither lifted nor swept away with a wrapper.
+    const nested = tree.filter(
+      (file) => (file.isVideo || file.isSubtitle) && file.path.includes("/") && !this.protectedFiles.has(file.id),
     );
     if (nested.length > 0) {
       await this.storage.moveFiles({ fileIds: nested.map((file) => file.id), targetDirectoryId: root });
     }
+    const protectedPaths = tree.filter((file) => this.protectedFiles.has(file.id)).map((file) => file.path);
     for (const wrapper of await this.storage.listSubdirectories({ directoryId: root })) {
+      if (protectedPaths.some((path) => path.startsWith(`${wrapper.path}/`))) continue;
       await this.storage.removeDirectory({ directoryId: wrapper.id });
     }
     return { movie: await this.storage.listTree({ directoryId: root }) };
   }
 
-  /** The agent declares it is done. Returns the honest coverage picture from the
-   *  obtained marks — the workflow decides what to persist. */
+  /** The agent's `finish` tool. On a replace run it is refused while an episode the
+   *  user asked about (or the agent rejected) has no reportReplacement yet, and while a
+   *  message's episodes are not identified: a run with a message but nothing requested
+   *  at all, or with a TV message without tags and no episode identified this run —
+   *  the agent reads them from the words, and the episodes requested up front (older
+   *  待换 rows, other messages' tags) say nothing about that message. Finishing then
+   *  would drop its request. The error goes back to the agent and the loop continues
+   *  (the step cap and the recovery turn still end it; finalizeReplacement then records
+   *  the rest as not_found, and a message whose episodes were never identified is
+   *  answered as unidentified). */
+  async declareFinish(): Promise<Awaited<ReturnType<TaskSandbox["finish"]>>> {
+    if (this.replace) {
+      const nothingRequested = this.replace.hasMessages && this.replaceEpisodes().length === 0;
+      if (nothingRequested || (this.replace.untaggedMessages > 0 && !this.identifiedThisRun())) {
+        throw new Error(
+          "SANDBOX_NO_EPISODE_IDENTIFIED: work out from the user's words which episode(s) they mean, call rejectCurrentSource for them (fileIds [] for an episode with no file), then reportReplacement",
+        );
+      }
+      const unreported = this.unreportedReplaceEpisodes();
+      if (unreported.length > 0) {
+        throw new Error(
+          `SANDBOX_REPORT_REQUIRED: ${unreported.join(",")} — call reportReplacement for these (replaced with the candidateId that landed and the episode's new fileIds, or not_found with a note), then finish`,
+        );
+      }
+    }
+    return this.finish();
+  }
+
+  /** Requested or rejected episodes with no reportReplacement yet, in request order. */
+  private unreportedReplaceEpisodes(): string[] {
+    return this.replaceEpisodes().filter((e) => !this.reportedEpisodes.has(e));
+  }
+
+  /** The honest coverage picture from the obtained marks — the workflow decides what
+   *  to persist. Also the loop's own end-of-run summary, so never gated. */
   async finish(): Promise<{ coverageMet: boolean; obtained: string[]; missing: string[]; subtitleFallback: boolean }> {
     // Report the agent's marks beyond just need∩marked — a coherent full pack
     // often delivers episodes BEYOND the aired cursor (the need), and those
@@ -873,6 +1080,12 @@ export class TaskSandbox {
       return m ? [Number(m[1]), Number(m[2])] : null;
     };
     const obtained = [...this.obtainedCodes]
+      // Replace runs: a requested/rejected episode leaves here only once it was reported
+      // replaced. The workflow unions these codes into the persisted obtained set, and
+      // any landed transfer unlocks the mark — so a bare mark would persist an episode
+      // whose replacement was not_found (one declared file-less was never obtained).
+      // Outside a replace run every mark counts, as before.
+      .filter((code) => this.countsAsObtained(code))
       .filter((code) => needSet.has(code) || parse(code) !== null)
       // Order by (season, episode) NUMERICALLY — a lexical sort misorders ≥100
       // (S01E100 < S01E99). Non-episode tokens (e.g. the movie "MOVIE") sort last.
@@ -949,17 +1162,393 @@ export class TaskSandbox {
    *  attempted in this task, or staging already holds files (a movie's staging IS its
    *  directory, so a prior run's landed file counts). False = the task has not moved
    *  anything yet — the content-filter recovery (agent-loop) then fails loud instead of
-   *  running a turn that can only end in a false no-coverage. */
+   *  running a turn that can only end in a false no-coverage.
+   *  A replace run's pre-run files do not count: they are the copy the user rejected (a
+   *  movie's sits in staging, its own directory), nothing a recovery could finish. Outside
+   *  a replace run they still count, protected or not — a film already there may simply
+   *  be waiting for its mark. */
   async hasTransferEvidence(): Promise<boolean> {
     if (this.transferAttempted) return true;
     if (!this.storage || !this.stagingDirectoryId) return false;
     try {
-      return (await this.storage.listTree({ directoryId: this.stagingDirectoryId })).length > 0;
+      const staged = await this.storage.listTree({ directoryId: this.stagingDirectoryId });
+      return staged.some((file) => !(this.replace && this.protectedFiles.has(file.id)));
     } catch {
       // Unreadable staging: do not claim "nothing happened" on missing evidence —
       // let the recovery turn look for itself (its inspect tools report the error).
       return true;
     }
+  }
+
+  // ── User replace request tools ────────────────────────────────────────────
+  /** Whether this run carries a user replace request (the replace tools are
+   *  registered only when it does). */
+  hasReplace(): boolean {
+    return this.replace !== undefined;
+  }
+
+  /** Whether the agent identified at least one episode in THIS run: a successful
+   *  rejectCurrentSource (a rejection, or the declaration that an episode has no file
+   *  here). Being requested up front (a tag, a 待换 row) is not identifying — nothing
+   *  was read from a message's words for it. */
+  identifiedThisRun(): boolean {
+    return this.rejectedEpisodes.length > 0 || this.noFileEpisodes.length > 0;
+  }
+
+  /** Called once before the agent starts: every file already in a target dir is the
+   *  user's current copy and must survive this run (replace run, or a work with kept
+   *  old + replacement copies — see protectExistingFiles). */
+  async captureProtectedFiles(): Promise<void> {
+    if ((!this.replace && !this.protectExistingFiles) || !this.storage) return;
+    for (const [season, directoryId] of this.seasonDirs) {
+      const dirLabel = `Season ${String(season).padStart(2, "0")}`;
+      for (const file of await this.storage.listTree({ directoryId })) this.protectedFiles.set(file.id, { file, dirLabel });
+    }
+    if (this.movieDir !== undefined) {
+      for (const file of await this.storage.listTree({ directoryId: this.movieDir })) {
+        this.protectedFiles.set(file.id, { file, dirLabel: "" });
+      }
+    }
+    this.protectedCaptured = true;
+  }
+
+  /** Replace runs: nothing may be transferred before the user's current copy of EVERY
+   *  requested episode is rejected. The raw snapshot is pre-warmed before the agent can
+   *  reject anything, and transfer tools carry no episode — so a gate opened by one
+   *  rejection would let a model reject E13 and re-land the very E24 the user
+   *  complained about. A requested episode is covered when it was:
+   *  - rejected this run (rejectCurrentSource with its current files);
+   *  - declared to have no old file here (rejectCurrentSource with that episode and
+   *    fileIds []) — the sandbox has no file↔episode map, so this is the agent's call;
+   *  - in alreadyRejectedEpisodes: a stored rejection from an earlier run (a 待换
+   *    re-check — its copies are filtered from search and refused anyway). The caller
+   *    (runAcquisitionV2) only fills this in for a PENDING-ONLY re-check (no new
+   *    message this run): a new message means the user is unhappy with the file in
+   *    place now, which may itself be an earlier replacement — that must be rejected
+   *    fresh, so the caller passes [] and this closes.
+   *  With no requested episode at all (a TV message without tags) the agent reads the
+   *  episodes from the words, so the gate asks for at least one rejectCurrentSource
+   *  call (a rejection or a no-file declaration) before anything transfers.
+   *  Global hatch: the target dirs held no file at all when the run started. */
+  private assertRejectedFirst(): void {
+    if (!this.replace) return;
+    if (this.protectedCaptured && this.protectedFiles.size === 0) return;
+    const requested = this.replace.requestedEpisodes;
+    if (requested.length === 0) {
+      if (this.rejectedEpisodes.length > 0 || this.noFileEpisodes.length > 0) return;
+      throw new Error(
+        "SANDBOX_REJECT_FIRST: call rejectCurrentSource for the files the user complained about before transferring",
+      );
+    }
+    const covered = new Set([...this.rejectedEpisodes, ...this.noFileEpisodes, ...(this.replace.alreadyRejectedEpisodes ?? [])]);
+    const uncovered = requested.filter((episode) => !covered.has(episode));
+    if (uncovered.length === 0) return;
+    throw new Error(
+      `SANDBOX_REJECT_FIRST: ${uncovered.join(",")} not rejected yet — call rejectCurrentSource with the current file of every requested episode before transferring (an episode with no file in the library: that episode and fileIds [])`,
+    );
+  }
+
+  /** After a rejection: drop the newly rejected copies from what the agent can read
+   *  back for free (the raw pre-warm via viewResourceSnapshot, and every cached
+   *  keyword a deduped searchResources returns). observedSnapshots keep the full
+   *  snapshots — transfer validation and persistence need them; the transfer-time
+   *  guard still refuses a rejected id the agent remembers. */
+  private async refilterCachedSnapshots(): Promise<void> {
+    const isRejected = this.isRejected;
+    if (!isRejected) return;
+    const filtered = new Map<ResourceSnapshotV2, ResourceSnapshotV2>();
+    const refilter = async (snapshot: ResourceSnapshotV2): Promise<ResourceSnapshotV2> => {
+      const done = filtered.get(snapshot);
+      if (done) return done;
+      // Asked all at once: the caller can answer the whole batch from one read.
+      const hits = await Promise.all(snapshot.candidates.map((c) => isRejected({ id: c.id, title: c.title })));
+      const keep = snapshot.candidates.filter((_, index) => !hits[index]);
+      const next = keep.length === snapshot.candidates.length ? snapshot : { ...snapshot, candidates: keep };
+      filtered.set(snapshot, next);
+      return next;
+    };
+    for (const [keyword, snapshot] of this.snapshotByKeyword) this.snapshotByKeyword.set(keyword, await refilter(snapshot));
+    if (this.rawSnapshot) this.rawSnapshot = await refilter(this.rawSnapshot);
+  }
+
+  private assertNotProtected(fileIds: string[]): void {
+    const hit = fileIds.filter((id) => this.protectedFiles.has(id));
+    if (hit.length > 0) {
+      throw new Error(
+        `SANDBOX_FILE_PROTECTED: ${hit.join(",")} was in the library before this run — the user deletes old copies, never the agent`,
+      );
+    }
+  }
+
+  /** A file reported as an episode's replacement this run stays: the recorded result
+   *  (and the episode source written from it) stands on that file being there. */
+  private assertNotBackingReplacement(fileIds: string[]): void {
+    const hit = fileIds.filter((id) => this.fileBackedEpisode.has(id));
+    if (hit.length > 0) {
+      throw new Error(
+        `SANDBOX_FILE_BACKS_REPLACEMENT: ${hit.map((id) => `${id} backs ${this.fileBackedEpisode.get(id)}`).join(", ")} — it was reported as that episode's replacement this run, so it stays`,
+      );
+    }
+  }
+
+  /** Episode codes for the replace tools: a movie run takes only "MOVIE"; a TV run
+   *  takes SxxEyy codes whose season is one of this run's season dirs. */
+  private assertEpisodeTokens(episodes: string[]): void {
+    const movieRun = this.isMovieRun();
+    for (const episode of episodes) {
+      if (movieRun) {
+        if (episode === "MOVIE") continue;
+      } else {
+        const m = /^S(\d{2,})E(\d{2,})$/.exec(episode);
+        if (m && this.seasonDirs.has(Number(m[1]))) continue;
+      }
+      throw new Error(`SANDBOX_EPISODE_OUT_OF_SCOPE: ${episode}`);
+    }
+  }
+
+  /** Season number of a SxxEyy token (already validated in scope by assertEpisodeTokens),
+   *  or undefined for a non-episode token like the movie "MOVIE". The token's declared
+   *  season is the agent's claim — checking a replacement file lives in THAT season's dir
+   *  is a fact check, never filename parsing. */
+  private seasonOfEpisode(episode: string): number | undefined {
+    const m = /^S(\d{2,})E(\d{2,})$/.exec(episode);
+    return m ? Number(m[1]) : undefined;
+  }
+
+  /** The candidate the agent means by `candidateId`, from the snapshots it saw this
+   *  run. These are the provider's AGENT-FACING snapshots (RealResourceProviderV2
+   *  hands back short aliases like s2-14), so the lookup is by the id the agent
+   *  passed — never by the provider's real id. `snapshotId` narrows it to one
+   *  snapshot (transferCandidate); omitted = any snapshot seen (transferUntilLanded).
+   *  Both transfer paths read the title the rejection check needs from here. */
+  private findObservedCandidate(candidateId: string, snapshotId?: string): ResourceSnapshotV2["candidates"][number] | undefined {
+    const snapshots =
+      snapshotId === undefined ? [...this.observedSnapshots.values()] : [this.observedSnapshots.get(snapshotId)].filter((x) => x !== undefined);
+    for (const snapshot of snapshots) {
+      const hit = snapshot.candidates.find((c) => c.id === candidateId);
+      if (hit) return hit;
+    }
+    return undefined;
+  }
+
+  /** Reject the current file(s) of the episodes the user complained about: the system
+   *  records name + size (the caller adds the link when known) so every copy is hidden
+   *  from later searches and refused at transfer. The files stay in place. The episodes
+   *  join the need, so one the agent read from the user's words (no tag) can still pass
+   *  the transfer gate. Movie: episodes [] = the film ("MOVIE"); a TV run must list
+   *  its episodes. Only files that were in the library before this run qualify.
+   *  Named episodes with fileIds [] declare "no old file of these here": nothing is
+   *  recorded as rejected, the episodes just pass the transfer gate. */
+  async rejectCurrentSource(
+    input: { episodes: string[]; fileIds: string[]; reason: string },
+  ): Promise<{ rejected: number; declaredNoFile?: string[] }> {
+    if (!this.replace || !this.storage) throw new Error("SANDBOX_NO_REPLACE: this run has no user request");
+    if (input.fileIds.length === 0 && input.episodes.length === 0) {
+      throw new Error("SANDBOX_NO_FILES: pass the fileIds of the current copy (from inspectTargetDir)");
+    }
+    const movieRun = this.isMovieRun();
+    if (!movieRun && input.episodes.length === 0) {
+      throw new Error("SANDBOX_EPISODES_REQUIRED: list every episode the user named (e.g. S01E13) — [] is only for a movie");
+    }
+    this.assertEpisodeTokens(input.episodes);
+    if (input.fileIds.length === 0) {
+      for (const episode of input.episodes) {
+        if (!this.need.includes(episode)) this.need.push(episode);
+        if (!this.noFileEpisodes.includes(episode)) this.noFileEpisodes.push(episode);
+      }
+      return { rejected: 0, declaredNoFile: [...new Set(input.episodes)] };
+    }
+    const missing = input.fileIds.filter((id) => !this.protectedFiles.has(id));
+    if (missing.length > 0) {
+      throw new Error(
+        `SANDBOX_FILES_NOT_IN_TARGET: ${missing.join(",")} — only a file that was in the library before this run can be rejected`,
+      );
+    }
+    const episodes = input.episodes.length > 0 ? input.episodes : ["MOVIE"];
+    const reason = input.reason.slice(0, 200);
+    const items = input.fileIds.flatMap((id) => {
+      const { file, dirLabel: dir } = this.protectedFiles.get(id)!;
+      const path = dir ? `${dir}/${file.path}` : file.path;
+      const label = file.path.split("/").pop()!;
+      return episodes.map((episode) => ({ episode, label, sizeBytes: file.sizeBytes, reason, path }));
+    });
+    await this.replace.onReject(items);
+    for (const episode of episodes) {
+      if (!this.need.includes(episode)) this.need.push(episode);
+      if (!this.rejectedEpisodes.includes(episode)) this.rejectedEpisodes.push(episode);
+    }
+    await this.refilterCachedSnapshots();
+    return { rejected: items.length };
+  }
+
+  /** Per-episode outcome of the request. Every episode must be requested or rejected
+   *  this run. A "replaced" names that episode's own NEW file(s) in fileIds — which file
+   *  is which episode stays the agent's call (the system never reads names); the system
+   *  only checks facts about the claim: the episode was marked obtained this run, its
+   *  candidate landed this run, every named file (subtitles aside, see below) was
+   *  downloaded THIS run BY that candidate (never the old copy, never a made-up id), one
+   *  file backs one episode per run (E24 can never ride on E13's file), and — read from
+   *  the target dirs as the agent reports — every such file is in one now and at least
+   *  one of them is a video.
+   *  A named subtitle in the episode's dir is optional and never checked (real drives do
+   *  not record subtitles as downloaded): it is no evidence and backs nothing. Any failed
+   *  check refuses the whole call (nothing recorded), except a named file missing from
+   *  the target dirs: that episode is recorded not_found (see notInTarget). A replaced
+   *  result carries the named videos' real size, and its files can no longer be deleted
+   *  this run. An episode is recorded once — except that an earlier not_found may be
+   *  upgraded to replaced; other repeats come back as `ignored`. */
+  async reportReplacement(input: {
+    results: Array<{ episode: string; outcome: "replaced" | "not_found"; candidateId?: string; fileIds?: string[]; note: string }>;
+  }): Promise<{
+    recorded: number;
+    ignored: Array<{ episode: string; reason: string }>;
+    /** "replaced" episodes recorded not_found because a named file is not in a target
+     *  dir now (still in staging, or deleted since). */
+    notInTarget?: Array<{ episode: string; reason: string }>;
+  }> {
+    if (!this.replace) throw new Error("SANDBOX_NO_REPLACE: this run has no user request");
+    this.assertEpisodeTokens(input.results.map((r) => r.episode));
+    const allowed = new Set(this.replaceEpisodes());
+    const byEpisode = new Map<string, (typeof input.results)[number]>();
+    for (const r of input.results) {
+      if (!allowed.has(r.episode)) {
+        throw new Error(`SANDBOX_EPISODE_NOT_REQUESTED: ${r.episode} was neither requested by the user nor passed to rejectCurrentSource this run`);
+      }
+      const first = byEpisode.get(r.episode);
+      if (!first) byEpisode.set(r.episode, r);
+      else if (first.outcome !== r.outcome) {
+        throw new Error(`SANDBOX_REPORT_CONFLICT: ${r.episode} is reported both replaced and not_found in one call`);
+      }
+    }
+    const fresh: Array<(typeof input.results)[number]> = [];
+    const ignored: Array<{ episode: string; reason: string }> = [];
+    for (const r of byEpisode.values()) {
+      const earlier = this.reportedEpisodes.get(r.episode);
+      if (earlier === undefined || (earlier === "not_found" && r.outcome === "replaced")) fresh.push(r);
+      else ignored.push({ episode: r.episode, reason: `already reported ${earlier}` });
+    }
+    // Validate every "replaced" before recording any: first the checks that need no
+    // listing, then the named files against the target dirs as they are now.
+    const toCheck = fresh.map((r) => {
+      if (r.outcome !== "replaced") return r;
+      if (!this.obtainedCodes.has(r.episode)) {
+        throw new Error(`SANDBOX_REPLACEMENT_NOT_MARKED: ${r.episode} was not marked obtained this run`);
+      }
+      if (!r.candidateId || !this.succeededCandidates.has(r.candidateId)) {
+        throw new Error(`SANDBOX_REPLACEMENT_NO_TRANSFER: ${r.candidateId ?? "(none)"} did not land in this run`);
+      }
+      const fileIds = [...new Set(r.fileIds ?? [])];
+      if (fileIds.length === 0) {
+        throw new Error(
+          `SANDBOX_REPLACEMENT_FILES_REQUIRED: ${r.episode} — a "replaced" result must name fileIds: the NEW video file(s) of that episode`,
+        );
+      }
+      return { ...r, fileIds };
+    });
+    // Where the named files are NOW, read once for this call (only when something is
+    // reported replaced), never remembered. Keep each scoped target dir SEPARATE so a
+    // replacement is checked against its OWN dir: for TV, one live set per season (keyed
+    // by season number) — a new S01E13 file that was moved into Season 02's dir does NOT
+    // satisfy S01E13; for a movie, the single movie dir. The season dir is separate from
+    // staging, so a new copy never moved in is not beside the old one; a replacement moved
+    // in and deleted since is gone too. Same number of listTree calls as one union list.
+    const anyReplaced = toCheck.some((r) => r.outcome === "replaced");
+    const movieRun = this.isMovieRun();
+    const movieLive =
+      anyReplaced && movieRun ? new Map((await this.inspectTargetDir()).map((file) => [file.id, file])) : new Map<string, SimTreeFile>();
+    const liveBySeason = new Map<number, Map<string, SimTreeFile>>();
+    if (anyReplaced && !movieRun) {
+      const seasons = [...this.seasonDirs.keys()];
+      const trees = await Promise.all(seasons.map((season) => this.inspectTargetDir({ season })));
+      seasons.forEach((season, i) => liveBySeason.set(season, new Map(trees[i]!.map((file) => [file.id, file]))));
+    }
+    // The live set an episode's files must be in: its OWN season's dir (TV) or the movie dir.
+    const liveFor = (episode: string): Map<string, SimTreeFile> => {
+      if (movieRun) return movieLive;
+      const season = this.seasonOfEpisode(episode);
+      return (season !== undefined ? liveBySeason.get(season) : undefined) ?? new Map<string, SimTreeFile>();
+    };
+    // Where each named file came from. Subtitles are optional and never checked: real
+    // drives record only new VIDEO files as downloaded (an assrt subtitle, or one shipped
+    // in a pack, is never among them), so checking them would refuse the whole report. A
+    // named subtitle in the episode's own dir is skipped: it need not be downloaded this
+    // run, is no evidence and backs nothing. Every other named file must have been
+    // downloaded THIS run by the reported candidate and back only this episode. `claimed`
+    // spans this call, so one file named for two episodes in the same call is caught too.
+    const claimed = new Map<string, string>();
+    const checkedFiles = new Map<string, string[]>();
+    for (const r of toCheck) {
+      if (r.outcome !== "replaced") continue;
+      const live = liveFor(r.episode);
+      const fileIds = (r.fileIds ?? []).filter((id) => !live.get(id)?.isSubtitle);
+      const unknown = fileIds.filter((id) => !this.materializedBy.has(id));
+      if (unknown.length > 0) {
+        throw new Error(
+          `SANDBOX_REPLACEMENT_FILE_UNKNOWN: ${unknown.join(",")} were not downloaded this run — name the NEW video file(s) of ${r.episode} that a transfer landed this run (not the old copy)`,
+        );
+      }
+      const foreign = fileIds.filter((id) => this.materializedBy.get(id) !== r.candidateId);
+      if (foreign.length > 0) {
+        const from = foreign.map((id) => `${id} was downloaded by ${this.materializedBy.get(id)}`).join(", ");
+        throw new Error(
+          `SANDBOX_REPLACEMENT_FILE_CANDIDATE_MISMATCH: ${from}, not ${r.candidateId} — report ${r.episode} with the candidateId that landed its file`,
+        );
+      }
+      for (const id of fileIds) {
+        const owner = this.fileBackedEpisode.get(id) ?? claimed.get(id);
+        if (owner !== undefined && owner !== r.episode) {
+          throw new Error(
+            `SANDBOX_REPLACEMENT_FILE_REUSED: ${id} already backs ${owner} — one new file backs one episode; name ${r.episode}'s own new file`,
+          );
+        }
+        claimed.set(id, r.episode);
+      }
+      checkedFiles.set(r.episode, fileIds);
+    }
+    // A checked file not in the episode's OWN target dir records THAT episode not_found (it
+    // stays 待换) instead of throwing the whole batch away — moved into its own season and
+    // reported again, it is upgraded, exactly like an earlier not_found; its files back no
+    // episode until then. Among files that are there, one must be a video: subtitles ride
+    // along with the new video, they never replace an episode on their own (refuses the call).
+    const notInTarget: Array<{ episode: string; reason: string }> = [];
+    const recorded = toCheck.map((r) => {
+      if (r.outcome !== "replaced") return r;
+      const live = liveFor(r.episode);
+      const checked = checkedFiles.get(r.episode) ?? [];
+      const absent = checked.filter((id) => !live.has(id));
+      if (absent.length > 0) {
+        // A movie's staging IS its directory: a file missing from it is gone.
+        const retry = movieRun ? "" : `; if it is still in staging, moveToSeason it into the season directory, then report ${r.episode} again`;
+        notInTarget.push({
+          episode: r.episode,
+          reason: `not in the target directory now: ${absent.join(",")} — recorded not_found${retry}`,
+        });
+        return { episode: r.episode, outcome: "not_found" as const, note: REPLACEMENT_NOT_IN_TARGET_NOTE };
+      }
+      const videos = checked.filter((id) => live.get(id)?.isVideo);
+      if (videos.length === 0) {
+        throw new Error(`SANDBOX_REPLACEMENT_NO_VIDEO: ${r.episode} — name the new video file (subtitles alone don't count)`);
+      }
+      // What the episode was replaced with, as it lies in its dir: a pack's title would
+      // carry the whole pack's size.
+      return { ...r, sizeBytes: videos.reduce((sum, id) => sum + live.get(id)!.sizeBytes, 0) };
+    });
+    for (const r of recorded) {
+      this.reportedEpisodes.set(r.episode, r.outcome);
+      if (r.outcome === "replaced") for (const id of checkedFiles.get(r.episode) ?? []) this.fileBackedEpisode.set(id, r.episode);
+    }
+    if (recorded.length > 0) await this.replace.onReport(recorded.map((r) => ({ ...r, note: r.note.slice(0, 200) })));
+    return { recorded: recorded.length, ignored, ...(notInTarget.length > 0 ? { notInTarget } : {}) };
+  }
+
+  /** End of run: every episode the user asked about (tags / pending) or the agent
+   *  rejected, that the agent did not report, is not_found — so it stays 待换 and later
+   *  patrols keep looking. */
+  async finalizeReplacement(): Promise<void> {
+    if (!this.replace) return;
+    const left = this.unreportedReplaceEpisodes();
+    for (const e of left) this.reportedEpisodes.set(e, "not_found");
+    if (left.length > 0) await this.replace.onReport(left.map((episode) => ({ episode, outcome: "not_found", note: "" })));
   }
 
   // ── Agent memory tools ────────────────────────────────────────────────────
@@ -1494,6 +2083,7 @@ export class TaskSandbox {
             `SANDBOX_NOT_A_SUBTITLE: ${fileId} is not a subtitle file; only subtitles may be renamed`,
           );
         }
+        this.assertNotProtected([fileId]);
         if (/[\\/]/.test(newName)) {
           throw new Error(
             `SANDBOX_INVALID_SUBTITLE_NAME: newName must be a bare filename without path separators`,

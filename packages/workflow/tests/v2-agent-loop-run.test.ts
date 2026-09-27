@@ -289,6 +289,138 @@ describe("runAcquisitionAgent — the real AI SDK tool-loop over the sandbox", (
     expect(calls).toBe(1);
   });
 
+  it("a user request run keeps reportReplacement and rejectCurrentSource in the recovery tool set (never search)", async () => {
+    const storage = new Storage115Simulator({
+      packs: { full_pack: { files: [{ path: "[Grp] LR/LR - 01.mkv", sizeBytes: 100 }] } },
+    });
+    const stagingDirectoryId = await storage.createDirectory({ name: "staging", parentId: "root" });
+    const seasonDirectoryId = await storage.createDirectory({ name: "Season 1", parentId: "root" });
+    await storage.transferCandidate({ candidateId: "full_pack", intoDirectoryId: stagingDirectoryId });
+    const reported: unknown[] = [];
+    const sandbox = new TaskSandbox({
+      provider: new FakeResourceProviderV2({ results: {} }),
+      storage,
+      stagingDirectoryId,
+      targetSeasonDirectoryIds: { 1: seasonDirectoryId },
+      need: ["S01E01"],
+      replace: {
+        requestedEpisodes: ["S01E01"],
+        hasMessages: true,
+        untaggedMessages: 0,
+        onReject: async () => {},
+        onReport: async (r) => { reported.push(...r); },
+      },
+    });
+    let calls = 0;
+    let recoveryTools: string[] = [];
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        calls += 1;
+        if (calls === 1) {
+          return {
+            content: [{ type: "text" as const, text: "" }],
+            finishReason: { unified: "content-filter" as const, raw: "content-filter" as const },
+            usage: USAGE,
+            warnings: [],
+          };
+        }
+        if (calls === 2) {
+          recoveryTools = (options.tools ?? []).map((t) => (t as { name: string }).name);
+          return {
+            content: [{
+              type: "tool-call" as const,
+              toolCallId: "recovery-report",
+              toolName: "reportReplacement",
+              input: JSON.stringify({ results: [{ episode: "S01E01", outcome: "not_found", note: "被中断" }] }),
+            }],
+            finishReason: { unified: "tool-calls" as const, raw: "tool-calls" as const },
+            usage: USAGE,
+            warnings: [],
+          };
+        }
+        return { content: [{ type: "text" as const, text: "done" }], finishReason: { unified: "stop" as const, raw: "stop" as const }, usage: USAGE, warnings: [] };
+      },
+    });
+
+    await runAcquisitionAgent({ sandbox, model, system: "s", prompt: "Replace S01E01.", maxSteps: 10 });
+
+    expect(recoveryTools).toContain("reportReplacement");
+    expect(recoveryTools).not.toContain("searchResources");
+    // finish needs an identified episode on a run with an untagged message: the recovery can identify one.
+    expect(recoveryTools).toContain("rejectCurrentSource");
+    expect(reported).toMatchObject([{ episode: "S01E01", outcome: "not_found", note: "被中断" }]);
+  });
+
+  it("a user request run with an untagged message can still identify its episode and finish in the recovery turn", async () => {
+    const storage = new Storage115Simulator({
+      packs: { full_pack: { files: [{ path: "[Grp] LR/LR - 01.mkv", sizeBytes: 100 }] } },
+    });
+    const stagingDirectoryId = await storage.createDirectory({ name: "staging", parentId: "root" });
+    const seasonDirectoryId = await storage.createDirectory({ name: "Season 1", parentId: "root" });
+    // Something landed before the interruption, so the finish-only recovery applies.
+    await storage.transferCandidate({ candidateId: "full_pack", intoDirectoryId: stagingDirectoryId });
+    const reported: unknown[] = [];
+    const sandbox = new TaskSandbox({
+      provider: new FakeResourceProviderV2({ results: {} }),
+      storage,
+      stagingDirectoryId,
+      targetSeasonDirectoryIds: { 1: seasonDirectoryId },
+      need: [],
+      // "有一集音画不同步": no tags, so nothing is requested up front.
+      replace: {
+        requestedEpisodes: [],
+        hasMessages: true,
+        untaggedMessages: 1,
+        onReject: async () => {},
+        onReport: async (r) => { reported.push(...r); },
+      },
+    });
+    await sandbox.captureProtectedFiles();
+    const finishOutcomes: string[] = [];
+    const declareFinish = sandbox.declareFinish.bind(sandbox);
+    sandbox.declareFinish = async () => {
+      try {
+        const summary = await declareFinish();
+        finishOutcomes.push("accepted");
+        return summary;
+      } catch (error) {
+        finishOutcomes.push(error instanceof Error ? error.message : String(error));
+        throw error;
+      }
+    };
+    const recoverySteps = [
+      { tool: "rejectCurrentSource", input: { episodes: ["S01E01"], fileIds: [], reason: "音画不同步" } },
+      { tool: "reportReplacement", input: { results: [{ episode: "S01E01", outcome: "not_found", note: "被中断,本轮没换成" }] } },
+      { tool: "finish", input: {} },
+    ] as const;
+    let calls = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => {
+        calls += 1;
+        if (calls === 1) {
+          return { content: [{ type: "text" as const, text: "" }], finishReason: { unified: "content-filter" as const, raw: "content-filter" as const }, usage: USAGE, warnings: [] };
+        }
+        const step = recoverySteps[calls - 2];
+        if (step) {
+          return {
+            content: [{ type: "tool-call" as const, toolCallId: `recovery-${calls}`, toolName: step.tool, input: JSON.stringify(step.input) }],
+            finishReason: { unified: "tool-calls" as const, raw: "tool-calls" as const },
+            usage: USAGE,
+            warnings: [],
+          };
+        }
+        return { content: [{ type: "text" as const, text: "done" }], finishReason: { unified: "stop" as const, raw: "stop" as const }, usage: USAGE, warnings: [] };
+      },
+    });
+
+    await runAcquisitionAgent({ sandbox, model, system: "s", prompt: "有一集音画不同步", maxSteps: 10 });
+
+    expect(sandbox.identifiedThisRun()).toBe(true);
+    expect(reported).toMatchObject([{ episode: "S01E01", outcome: "not_found" }]);
+    // The recovery's finish went through (not SANDBOX_NO_EPISODE_IDENTIFIED).
+    expect(finishOutcomes).toEqual(["accepted"]);
+  });
+
   it("does not retry a second content-filter interruption", async () => {
     const { sandbox, storage } = await setup(["S01E01"]);
     await storage.transferCandidate({ candidateId: "full_pack", intoDirectoryId: (sandbox as any).stagingDirectoryId });

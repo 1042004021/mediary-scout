@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildMovieReport,
+  buildReplacementReport,
   buildSeasonReport,
   buildSeriesReport,
   createEpisodeStates,
@@ -9,6 +10,8 @@ import {
   formatDailyDigestPushText,
   formatReportPushText,
   landedSize,
+  scheduledDigestItems,
+  stampReplaceNotification,
   type EpisodeState,
   type NotificationEvent,
   type NotificationReportStatus,
@@ -403,5 +406,145 @@ describe("formatDailyDigestPushText source tags", () => {
       realMissing: [],
     });
     expect(formatDailyDigestPushText([notif])).not.toContain("来自");
+  });
+});
+
+describe("buildReplacementReport — a user-requested replace run", () => {
+  it("names what was replaced and what is still being looked for, never 入库 or a size", () => {
+    const report = buildReplacementReport({
+      titleName: "黄泉使者",
+      movie: false,
+      results: [
+        { episode: "S01E13", outcome: "replaced" },
+        { episode: "S01E24", outcome: "not_found" },
+      ],
+    });
+    expect(report).toMatchObject({ status: "replaced", lines: ["换好 1 集（E13），1 集还在找（E24）"] });
+    expect(report.fileCount).toBeUndefined();
+    expect(formatReportPushText(report)).not.toMatch(/入库|获取完成/);
+  });
+
+  it("keeps the season in the code when the episodes span seasons", () => {
+    const report = buildReplacementReport({
+      titleName: "Show",
+      movie: false,
+      results: [
+        { episode: "S01E02", outcome: "replaced" },
+        { episode: "S02E05", outcome: "replaced" },
+      ],
+    });
+    expect(report.lines).toEqual(["换好 2 集（S01E02、S02E05）"]);
+  });
+
+  it("an episode the user asked for that had no old file is 换好, not also 新增; a real gap still is 新增", () => {
+    // E13 was declared file-less, so it was in the pre-run missing set and lands in
+    // newlyObtained too; E14 is a genuinely new episode.
+    const report = buildReplacementReport({
+      titleName: "黄泉使者",
+      movie: false,
+      results: [{ episode: "S01E13", outcome: "replaced" }],
+      newlyObtained: ["S01E13", "S01E14"],
+    });
+    expect(report.lines).toEqual(["换好 1 集（E13）", "新增 E14"]);
+    expect(report.newlyObtained).toEqual(["S01E14"]);
+  });
+
+  it("a movie: replaced vs still looking", () => {
+    expect(buildReplacementReport({ titleName: "奥德赛", movie: true, results: [{ episode: "MOVIE", outcome: "replaced" }] })).toMatchObject({
+      status: "replaced",
+      lines: ["已换成新版本"],
+    });
+    expect(buildReplacementReport({ titleName: "奥德赛", movie: true, results: [{ episode: "MOVIE", outcome: "not_found" }] })).toMatchObject({
+      status: "no_coverage",
+      lines: ["还没找到可以换的版本 · 巡检时接着找"],
+    });
+  });
+
+  it("nothing replaced but a plain gap landed: not no_coverage — it says what was added", () => {
+    const report = buildReplacementReport({
+      titleName: "Show",
+      movie: false,
+      results: [{ episode: "S01E13", outcome: "not_found" }],
+      newlyObtained: ["S01E25"],
+    });
+    expect(report.status).not.toBe("no_coverage");
+    expect(report.lines).toEqual(["新增 E25", "1 集还在找（E13）"]);
+    expect(report.newlyObtained).toEqual(["S01E25"]);
+  });
+
+  it("replaced and a plain gap landed: both are named", () => {
+    const report = buildReplacementReport({
+      titleName: "Show",
+      movie: false,
+      results: [{ episode: "S01E13", outcome: "replaced" }],
+      newlyObtained: ["S01E25"],
+    });
+    expect(report).toMatchObject({ status: "replaced", lines: ["换好 1 集（E13）", "新增 E25"] });
+  });
+
+  it("nothing replaced because transfers were blocked says so", () => {
+    const report = buildReplacementReport({
+      titleName: "Show",
+      movie: false,
+      results: [{ episode: "S01E01", outcome: "not_found" }],
+      transferBlockReason: "云下载配额不足",
+    });
+    expect(report).toMatchObject({ status: "failed", lines: ["转存失败:云下载配额不足"] });
+  });
+});
+
+describe("stampReplaceNotification — who queued the replace run decides how it is pushed", () => {
+  const base = (status: NotificationReportStatus, kind = "replacement_done"): NotificationEvent => ({
+    id: "n1",
+    workflowRunId: "run_1",
+    kind,
+    title: "Show",
+    body: "x",
+    createdAt: "2026-09-26T08:00:00.000Z",
+    trigger: "user",
+    report: { titleName: "Show", seasonLabel: null, status, lines: ["x"], newlyObtained: [], realMissing: [] },
+  });
+
+  it("a patrol-queued run joins the scheduled digest; a user-queued one stays individual", () => {
+    expect(stampReplaceNotification(base("replaced"), { trigger: "scheduled", routineIfNothingReplaced: false })).toMatchObject({ trigger: "scheduled", kind: "replacement_done" });
+    expect(stampReplaceNotification(base("replaced"), { trigger: "user", routineIfNothingReplaced: false })).toMatchObject({ trigger: "user", kind: "replacement_done" });
+  });
+
+  it("a pending-only run that replaced nothing is routine (already_current); a failure or a replacement never is", () => {
+    const notice = { trigger: "scheduled" as const, routineIfNothingReplaced: true };
+    expect(stampReplaceNotification(base("no_coverage"), notice).kind).toBe("already_current");
+    expect(stampReplaceNotification(base("replaced"), notice).kind).toBe("replacement_done");
+    expect(stampReplaceNotification(base("failed", "transfer_failed"), notice).kind).toBe("transfer_failed");
+    expect(stampReplaceNotification(base("no_coverage"), { ...notice, routineIfNothingReplaced: false }).kind).toBe("replacement_done");
+  });
+
+  it("a run that landed a newly aired episode is never routine, whatever its status", () => {
+    const notice = { trigger: "scheduled" as const, routineIfNothingReplaced: true };
+    const grew = base("no_coverage");
+    grew.report = { ...grew.report!, newlyObtained: ["S01E25"] };
+    expect(stampReplaceNotification(grew, notice).kind).toBe("replacement_done");
+  });
+});
+
+describe("scheduledDigestItems", () => {
+  const n = (kind: string, trigger: "user" | "scheduled"): NotificationEvent => ({
+    id: `${kind}_${trigger}`,
+    workflowRunId: "r",
+    kind,
+    title: "t",
+    body: "b",
+    createdAt: "2026-09-26T08:00:00.000Z",
+    trigger,
+  });
+
+  it("the sweep digest goes out even when nothing changed", () => {
+    expect(scheduledDigestItems([n("already_current", "scheduled")], { skipIfOnlyRoutine: false })).toHaveLength(1);
+  });
+
+  it("a queue drain skips a digest that would only say nothing changed", () => {
+    expect(scheduledDigestItems([n("already_current", "scheduled"), n("replacement_done", "user")], { skipIfOnlyRoutine: true })).toEqual([]);
+    expect(
+      scheduledDigestItems([n("already_current", "scheduled"), n("replacement_done", "scheduled")], { skipIfOnlyRoutine: true }).map((x) => x.kind),
+    ).toEqual(["already_current", "replacement_done"]);
   });
 });

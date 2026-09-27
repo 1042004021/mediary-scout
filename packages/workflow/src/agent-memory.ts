@@ -215,9 +215,15 @@ export function memoryFullError(scope: AgentMemoryScope, count: number, cap: num
 
 /** Memory text is written by earlier model runs from tool output (and by users), so
  *  every place a model sees it renders it as fenced UNTRUSTED DATA. This strips any
- *  fence tag inside the text so it can never close the fence early. */
+ *  fence tag inside the text so it can never close the fence early. Repeated until
+ *  nothing changes: one pass over `</agent_</agent_memory>memory>` leaves a live closer. */
 export function stripMemoryFence(text: string): string {
-  return text.replace(/<\/?agent_memory[^>]*>/gi, "");
+  let out = text;
+  for (let prev = ""; prev !== out; ) {
+    prev = out;
+    out = out.replace(/<\/?agent_memory[^>]*>/gi, "");
+  }
+  return out;
 }
 
 export const AGENT_MEMORY_UNTRUSTED_NOTE =

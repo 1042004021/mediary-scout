@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { MockLanguageModelV3 } from "ai/test";
-import { REFLECTION_SYSTEM, runMemoryReflection, runMemoryReflectionForEval, buildReflectionDigest } from "../src/acquisition-v2/agent-loop.js";
+import { REFLECTION_SYSTEM, USER_REQUEST_REFLECTION_NOTE, runMemoryReflection, runMemoryReflectionForEval, buildReflectionDigest } from "../src/acquisition-v2/agent-loop.js";
 import { TaskSandbox } from "../src/acquisition-v2/sandbox.js";
 import { FakeResourceProviderV2 } from "../src/acquisition-v2/fake-provider.js";
 import { InMemoryWorkflowRepository } from "../src/repository.js";
@@ -242,6 +242,34 @@ describe("reflection never writes give-up notes (2026-09-25 replay of 202 produc
     });
     await runMemoryReflection({ sandbox, model, digest: "x", memory: { title: [], globalIndex: [] } });
     expect(system).toBe(REFLECTION_SYSTEM);
+  });
+});
+
+describe("user request note (outside the run-facts fence)", () => {
+  async function promptFor(userRequest: boolean | undefined): Promise<string> {
+    const { sandbox } = sandboxWith();
+    let prompt = "";
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        prompt = String((options.prompt.find((m) => m.role === "user") as { content: Array<{ text: string }> }).content[0]!.text);
+        return { content: [{ type: "text" as const, text: "nothing" }], finishReason: { unified: "stop" as const, raw: "stop" as const }, usage: USAGE, warnings: [] };
+      },
+    });
+    await runMemoryReflection({
+      sandbox, model, digest: "USER REQUEST: S01E13 not_found", memory: { title: [], globalIndex: [] },
+      ...(userRequest === undefined ? {} : { userRequest }),
+    });
+    return prompt;
+  }
+  it("is appended after </run_facts> when set; the facts line stays inside", async () => {
+    const prompt = await promptFor(true);
+    const close = prompt.indexOf("</run_facts>");
+    expect(prompt.indexOf("USER REQUEST: S01E13 not_found")).toBeLessThan(close);
+    expect(prompt.indexOf(USER_REQUEST_REFLECTION_NOTE)).toBeGreaterThan(close);
+    expect(prompt).toContain("do not write a note about them");
+  });
+  it("is absent otherwise", async () => {
+    for (const flag of [undefined, false]) expect(await promptFor(flag)).not.toContain("do not write a note about them");
   });
 });
 
