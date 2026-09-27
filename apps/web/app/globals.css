@@ -891,13 +891,23 @@ p {
   color: var(--negative);
 }
 
+.episode-cell.unaired,
+.episode-cell.unknown {
+  border-color: rgba(255, 255, 255, 0.08);
+  color: var(--text-muted);
+  opacity: 0.6;
+}
+
 /* 待换: a user asked for this episode to be replaced and no new file has landed yet
-   (the old one is still there). Added on top of the cell's state class, so these rules
-   must stay after the state rules above to win. */
+   (the old one is still there). Added on top of the cell's state class with the same
+   specificity, so these rules must come after EVERY state rule above — unaired and
+   unknown included (their faint border, muted text and 0.6 opacity would otherwise win). */
 .episode-cell.swap {
   position: relative;
   background: rgba(243, 114, 127, 0.14);
   border-color: var(--negative);
+  color: var(--text);
+  opacity: 1;
 }
 
 .episode-cell.swap span {
@@ -913,13 +923,6 @@ p {
   height: 5px;
   border-radius: 50%;
   background: var(--negative);
-}
-
-.episode-cell.unaired,
-.episode-cell.unknown {
-  border-color: rgba(255, 255, 255, 0.08);
-  color: var(--text-muted);
-  opacity: 0.6;
 }
 
 .side-stack {

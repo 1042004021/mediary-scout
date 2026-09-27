@@ -103,7 +103,7 @@ describe("user message actions", () => {
     const [message] = await repo.listUserMessages(primaryWork);
     expect(message).toMatchObject({ body: "13 集发蓝", episodeTags: ["S01E01"], status: "pending", urgent: false });
 
-    expect(await actions.processMessagesNowAction(onPrimary)).toEqual({ success: true, queued: true });
+    expect(await actions.processMessagesNowAction(onPrimary)).toEqual({ success: true, status: "queued" });
     expect((await repo.listUserMessages(primaryWork))[0]?.urgent).toBe(true);
     const active = await repo.listActiveWorkflowRuns({ accountId: "acct_default", connectedStorageId: "cs_primary" });
     expect(active.map((r) => [r.workflowRun.kind, r.title.id])).toEqual([["replace_request", "tmdb_tv_42"]]);
@@ -163,15 +163,34 @@ describe("user message actions", () => {
     expect(await repo.listUserMessages(primaryWork)).toMatchObject([{ body: "原话" }]);
   });
 
+  it("the input is checked before any lookup: a bad message gets the validator's answer even on an untracked title", async () => {
+    // Nothing is tracked, so any lookup would answer 「没有在这块网盘上追踪」 first.
+    expect(await actions.postUserMessageAction({ ...onPrimary, body: "  ", episodeTags: [] })).toEqual({ success: false, message: "留言不能是空的" });
+    expect(await actions.postUserMessageAction({ ...onPrimary, body: "换", episodeTags: ["S1E1"] })).toEqual({ success: false, message: "集数标签不对" });
+  });
+
+  it("the 500-character limit counts the body that is stored, without the surrounding blanks", async () => {
+    await track(repo, "acct_default", "cs_primary");
+    const full = "蓝".repeat(500);
+
+    expect(await actions.postUserMessageAction({ ...onPrimary, body: `\n  ${full}  \n`, episodeTags: [] })).toEqual({ success: true });
+    const [stored] = await repo.listUserMessages(primaryWork);
+    expect(stored?.body).toBe(full);
+    expect(await actions.editUserMessageAction({ id: stored!.id, body: ` ${full} `, episodeTags: [] })).toEqual({ success: true });
+    expect(await actions.postUserMessageAction({ ...onPrimary, body: `${full}蓝`, episodeTags: [] })).toEqual({ success: false, message: "留言最多 500 字" });
+    expect(await actions.editUserMessageAction({ id: stored!.id, body: `${full}蓝`, episodeTags: [] })).toEqual({ success: false, message: "留言最多 500 字" });
+  });
+
   it("现在处理 while a run already holds the work: the message is urgent and runs right after", async () => {
     await track(repo, "acct_default", "cs_primary");
     await repo.createUserMessage({ ...primaryWork, body: "第一条", episodeTags: [], now: NOW });
-    expect(await actions.processMessagesNowAction(onPrimary)).toEqual({ success: true, queued: true });
+    expect(await actions.processMessagesNowAction(onPrimary)).toEqual({ success: true, status: "queued" });
     await repo.claimUserMessages({ ...primaryWork, runId: "run_1", now: NOW });
     // Left while the first one is being processed.
     await repo.createUserMessage({ ...primaryWork, body: "还有第 2 集", episodeTags: [], now: NOW });
 
-    expect(await actions.processMessagesNowAction(onPrimary)).toEqual({ success: true, queued: false });
+    // The card says 「排队中 · 这次处理完接着处理」, not 「马上处理」.
+    expect(await actions.processMessagesNowAction(onPrimary)).toEqual({ success: true, status: "already_running" });
     expect(await repo.listWorksWithPendingMessages({ urgentOnly: true })).toEqual([primaryWork]);
   });
 
@@ -180,7 +199,7 @@ describe("user message actions", () => {
     const m = await repo.createUserMessage({ ...primaryWork, body: "换", episodeTags: [], now: NOW });
     await repo.withdrawUserMessage({ accountId: "acct_default", id: m.id, now: NOW });
 
-    expect(await actions.processMessagesNowAction(onPrimary)).toEqual({ success: true, queued: false });
+    expect(await actions.processMessagesNowAction(onPrimary)).toEqual({ success: true, status: "nothing_waiting" });
     expect(await repo.listActiveWorkflowRuns({ accountId: "acct_default", connectedStorageId: "cs_primary" })).toEqual([]);
   });
 

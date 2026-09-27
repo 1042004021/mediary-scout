@@ -8,7 +8,7 @@ import {
   type MediaTitle,
   type TrackedSeason,
 } from "@media-track/workflow";
-import { loadMessageThread, nextPatrolLabel, resolveMessageWork, swapBadgeLabel } from "./user-message-server";
+import { loadMessageThread, nextPatrolLabel, readTitleMessages, resolveMessageWork, swapBadgeLabel } from "./user-message-server";
 
 const NOW = "2026-09-27T08:00:00.000Z";
 
@@ -165,6 +165,56 @@ describe("loadMessageThread", () => {
     expect(view.pendingReplacements).toEqual(["S01E03", "S01E24"]);
     expect(view.busy).toBe(true);
     expect(view.messages[0]).toMatchObject({ status: "processing" });
+  });
+});
+
+describe("readTitleMessages — the detail page's message decorations", () => {
+  const primary = async () => ({ accountId: "acct_1", connectedStorageId: "cs_primary" });
+
+  it("reads the thread of the work the page is on", async () => {
+    const repo = new InMemoryWorkflowRepository();
+    await track(repo, { drive: "cs_primary", title: show, s: season(show.id, 1) });
+    const m = await repo.createUserMessage({ accountId: "acct_1", drive: "cs_primary", titleKey: show.id, body: "换", episodeTags: [], now: NOW });
+
+    const read = await readTitleMessages({ repo, scope: primary, tmdbId: 42, mediaType: "tv" });
+
+    expect(read?.thread.messages.map((x) => x.id)).toEqual([m.id]);
+  });
+
+  it("null when the title is not tracked on this drive", async () => {
+    const repo = new InMemoryWorkflowRepository();
+
+    expect(await readTitleMessages({ repo, scope: primary, tmdbId: 42, mediaType: "tv" })).toBeNull();
+  });
+
+  it("a failed read logs one short line and leaves the decorations out instead of failing the page", async () => {
+    const repo = new InMemoryWorkflowRepository();
+    await track(repo, { drive: "cs_primary", title: show, s: season(show.id, 1) });
+    const broken = {
+      listTrackedSeasonStates: repo.listTrackedSeasonStates.bind(repo),
+      listPendingReplacements: repo.listPendingReplacements.bind(repo),
+      listUserMessages: async () => {
+        throw new Error(`relation "user_messages" does not exist ${"x".repeat(2000)}`);
+      },
+    };
+    const lines: string[] = [];
+
+    const read = await readTitleMessages({ repo: broken, scope: primary, tmdbId: 42, mediaType: "tv", log: (line) => lines.push(line) });
+
+    expect(read).toBeNull();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("user_messages");
+    expect(lines[0]!.length).toBeLessThan(300);
+  });
+
+  it("a failed workspace lookup is caught the same way", async () => {
+    const lines: string[] = [];
+    const scope = async (): Promise<never> => {
+      throw new Error("connect ECONNREFUSED");
+    };
+
+    expect(await readTitleMessages({ repo: new InMemoryWorkflowRepository(), scope, tmdbId: 42, mediaType: "tv", log: (line) => lines.push(line) })).toBeNull();
+    expect(lines).toHaveLength(1);
   });
 });
 

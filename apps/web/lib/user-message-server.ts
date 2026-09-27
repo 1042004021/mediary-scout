@@ -66,6 +66,42 @@ export async function loadMessageThread(
   };
 }
 
+export interface TitleMessages {
+  thread: MessageThreadView;
+}
+
+/**
+ * The detail page's message decorations — the 待换 badge and cells, and the message
+ * card — for the work on the page's drive; null when the title is not tracked there.
+ * They are decorations: a failed read logs one short line and leaves them out, it
+ * never takes the whole detail page down.
+ */
+export async function readTitleMessages(input: {
+  repo: Pick<WorkflowRepository, "listTrackedSeasonStates" | "listUserMessages" | "listPendingReplacements">;
+  /** The page's workspace scope — a lookup of its own, so its failure is caught too. */
+  scope: () => Promise<WorkflowScope>;
+  tmdbId: number;
+  mediaType: "movie" | "tv";
+  log?: (line: string) => void;
+}): Promise<TitleMessages | null> {
+  try {
+    const work = await resolveMessageWork({ repo: input.repo, scope: await input.scope(), tmdbId: input.tmdbId, mediaType: input.mediaType });
+    if (!work) return null;
+    return { thread: await loadMessageThread(input.repo, work) };
+  } catch (error) {
+    (input.log ?? console.error)(
+      `[user-message] tmdb ${input.mediaType} ${input.tmdbId}: messages read failed, page shown without the 待换 badge/cells and the message card: ${shortError(error)}`,
+    );
+    return null;
+  }
+}
+
+/** A log-sized error message (a DB error can carry a whole query). */
+function shortError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.length > 160 ? `${message.slice(0, 160)}…` : message;
+}
+
 /** When a message left now gets read: the next patrol time (Beijing "HH:MM") today,
  *  else tomorrow's first — 「明早」 when that is before noon. */
 export function nextPatrolLabel(times: string[], hhmm: string): string {

@@ -309,11 +309,12 @@ function RetryButton({ runId, title }: { runId: string; title: string }) {
 }
 
 /** What the cancel control says. A queued acquisition takes its title out of the
- *  library with it; a replace run (a user's message) only drops this attempt — the
- *  library stays, and the message waits for the next patrol. */
+ *  library with it; a replace run only drops this attempt — the library stays, and the
+ *  swap waits for the next patrol (a patrol-queued replace run may carry only 待换
+ *  episodes and no message, so the note speaks of the swap). */
 export function cancelCopy(kind: WorkflowKind): { action: string; confirm: string; note: string | null } {
   return kind === "replace_request"
-    ? { action: "取消这次换源", confirm: "取消这次换源", note: "留言等下次巡检再处理" }
+    ? { action: "取消这次换源", confirm: "取消这次换源", note: "等下次巡检再换" }
     : { action: "取消获取", confirm: "取消并移出", note: null };
 }
 

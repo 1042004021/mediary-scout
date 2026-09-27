@@ -1051,17 +1051,26 @@ async function messageWorkFor(input: MessageWorkInput) {
   return { repo, work: await resolveMessageWork({ repo, scope, tmdbId: input.tmdbId, mediaType: input.mediaType }) };
 }
 
+/** The message as it will be stored (body trimmed), checked before any lookup: the
+ *  length limit applies to what is saved, and a bad message never costs a DB read.
+ *  Null message = valid. */
+async function checkMessageInput(input: { body: string; episodeTags: string[] }) {
+  const { validateUserMessageInput } = await import("@media-track/workflow");
+  // Whatever the client sent: only a string is trimmed, anything else goes to the validator as is.
+  const body = typeof input.body === "string" ? input.body.trim() : input.body;
+  return { body, message: validateUserMessageInput({ body, episodeTags: input.episodeTags }) };
+}
+
 export async function postUserMessageAction(
   input: MessageWorkInput & { body: string; episodeTags: string[] },
 ): Promise<PushSettingsActionResult> {
   assertNotDemo();
   try {
-    const { validateUserMessageInput } = await import("@media-track/workflow");
+    const checked = await checkMessageInput(input);
+    if (checked.message) return { success: false, message: checked.message };
     const { repo, work } = await messageWorkFor(input);
     if (!work) return { success: false, message: MESSAGE_NOT_TRACKED };
-    const invalid = validateUserMessageInput(input);
-    if (invalid) return { success: false, message: invalid };
-    await repo.createUserMessage({ ...work, body: input.body.trim(), episodeTags: input.episodeTags, now: new Date().toISOString() });
+    await repo.createUserMessage({ ...work, body: checked.body, episodeTags: input.episodeTags, now: new Date().toISOString() });
     return { success: true };
   } catch (error) {
     return { success: false, message: `留言没发出去：${String(error)}` };
@@ -1072,15 +1081,14 @@ export async function postUserMessageAction(
 export async function editUserMessageAction(input: { id: string; body: string; episodeTags: string[] }): Promise<PushSettingsActionResult> {
   assertNotDemo();
   try {
+    const checked = await checkMessageInput(input);
+    if (checked.message) return { success: false, message: checked.message };
     const { getWorkflowRepository, requireAuthenticatedAccountId } = await import("../lib/workflow-runtime");
-    const { validateUserMessageInput } = await import("@media-track/workflow");
     const accountId = await requireAuthenticatedAccountId();
-    const invalid = validateUserMessageInput(input);
-    if (invalid) return { success: false, message: invalid };
     const edited = await getWorkflowRepository().editUserMessage({
       accountId,
       id: input.id,
-      body: input.body.trim(),
+      body: checked.body,
       episodeTags: input.episodeTags,
       now: new Date().toISOString(),
     });
@@ -1102,12 +1110,17 @@ export async function withdrawUserMessageAction(input: { id: string }): Promise<
   }
 }
 
-/** 「现在处理」: the work's waiting messages skip the patrol. `queued: false` = a run of
- *  this work is already queued or running (it picks them up, or they go right after it
- *  via the idle-queue scan), or nothing was waiting any more. */
+/** What 「现在处理」 did. "queued": a replace run is queued for the work's waiting
+ *  messages. "already_running": a run of this work is already queued or running — a
+ *  queued replace run takes the messages along when it starts, otherwise they go right
+ *  after the run in flight (the idle-queue scan), so the card says 「排队中 · 这次处理完
+ *  接着处理」. "nothing_waiting": claimed or withdrawn since the page loaded. */
+export type ProcessMessagesNowStatus = "queued" | "already_running" | "nothing_waiting";
+
+/** 「现在处理」: the work's waiting messages skip the patrol. */
 export async function processMessagesNowAction(
   input: MessageWorkInput,
-): Promise<PushSettingsActionResult & { queued?: boolean }> {
+): Promise<PushSettingsActionResult & { status?: ProcessMessagesNowStatus }> {
   assertNotDemo();
   try {
     const { repo, work } = await messageWorkFor(input);
@@ -1118,13 +1131,12 @@ export async function processMessagesNowAction(
     const drive = (await repo.listConnectedStorages(work.accountId)).find((s) => s.id === work.drive);
     if (drive?.status === "frozen") return { success: false, message: "这块网盘登录已失效，重新绑定后再处理" };
     const { queueReplaceRequest } = await import("@media-track/workflow");
-    // Claimed or withdrawn since the page loaded: nothing left to hurry.
     if ((await repo.markUserMessagesUrgent({ ...work, now: new Date().toISOString() })) === 0) {
-      return { success: true, queued: false };
+      return { success: true, status: "nothing_waiting" };
     }
     const result = await queueReplaceRequest({ repository: repo, work, origin: "user" });
     if (result.status === "not_tracked") return { success: false, message: MESSAGE_NOT_TRACKED };
-    return { success: true, queued: result.status === "queued" };
+    return { success: true, status: result.status };
   } catch (error) {
     return { success: false, message: `没能开始处理：${String(error)}` };
   }

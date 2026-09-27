@@ -9,6 +9,7 @@ import { AppSidebar } from "../../../components/app-sidebar";
 import { BackLink } from "../../../components/back-link";
 import { MovieSynopsis } from "../../../components/movie-synopsis";
 import { RequestTrackButton } from "../../../components/request-track-button";
+import { SeasonDetails } from "../../../components/season-details";
 import {
   RequestRemainingButton,
   RequestSeasonButton,
@@ -23,7 +24,7 @@ import {
   type TitleHubView,
 } from "../../../lib/title-hub";
 import { seasonBadgeState } from "../../../lib/title-aggregate";
-import { loadMessageThread, resolveMessageWork, swapBadgeLabel } from "../../../lib/user-message-server";
+import { readTitleMessages, swapBadgeLabel } from "../../../lib/user-message-server";
 import { getActiveWorkspaceScope, getWorkflowRepository, resolveGlobalWorkspace } from "../../../lib/workflow-runtime";
 
 const aggregateBadge = {
@@ -477,7 +478,7 @@ function SeasonRow({
 
   return (
     <li>
-      <details className="hub-season-details">
+      <SeasonDetails initiallyOpen={season.episodes.some((episode) => swap.has(episode.episodeCode))}>
         <summary className="hub-season-row">{rowBody}</summary>
         <div className="episode-grid hub-episode-grid">
           {season.episodes.map((episode) => {
@@ -516,7 +517,7 @@ function SeasonRow({
             label={`取消第 ${season.seasonNumber} 季追踪`}
           />
         </div>
-      </details>
+      </SeasonDetails>
     </li>
   );
 }
@@ -524,12 +525,11 @@ function SeasonRow({
 /** This work's messages and 待换 episodes, read once per request (the title badge and
  *  the season grid both use them). The work is resolved the way the message actions
  *  resolve it, so the page shows what the engine acts on. Null when the title is not
- *  tracked on this drive. */
-const loadTitleMessages = cache(async (tmdbId: number, mediaType: "movie" | "tv", storageId: string | undefined) => {
-  const repo = getWorkflowRepository();
-  const work = await resolveMessageWork({ repo, scope: await getActiveWorkspaceScope(storageId), tmdbId, mediaType });
-  return work ? loadMessageThread(repo, work) : null;
-});
+ *  tracked on this drive — or when the read failed: these are decorations, logged and
+ *  left out rather than failing the whole page. */
+const loadTitleMessages = cache((tmdbId: number, mediaType: "movie" | "tv", storageId: string | undefined) =>
+  readTitleMessages({ repo: getWorkflowRepository(), scope: () => getActiveWorkspaceScope(storageId), tmdbId, mediaType }),
+);
 
 /** 「N 集待换」 (show) /「待换资源」 (film) beside the title's status badge. */
 async function SwapBadge({
@@ -541,8 +541,8 @@ async function SwapBadge({
   mediaType: "movie" | "tv";
   storageId: string | undefined;
 }) {
-  const thread = await loadTitleMessages(tmdbId, mediaType, storageId);
-  const label = thread ? swapBadgeLabel(mediaType, thread.pendingReplacements) : null;
+  const messages = await loadTitleMessages(tmdbId, mediaType, storageId);
+  const label = messages ? swapBadgeLabel(mediaType, messages.thread.pendingReplacements) : null;
   return label ? <span className="hub-badge tone-red">{label}</span> : null;
 }
 
@@ -556,8 +556,8 @@ async function SeasonRowsWithSwap({
   storageId: string | undefined;
   basePath: string;
 }) {
-  const thread = view.aggregate === "untracked" ? null : await loadTitleMessages(view.tmdbId, "tv", storageId);
-  const swap = new Set(thread?.pendingReplacements ?? []);
+  const messages = view.aggregate === "untracked" ? null : await loadTitleMessages(view.tmdbId, "tv", storageId);
+  const swap = new Set(messages?.thread.pendingReplacements ?? []);
   return (
     <>
       {view.seasons.map((season) => (
