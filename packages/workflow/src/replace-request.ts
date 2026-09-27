@@ -423,9 +423,9 @@ async function recordReplacementOutcome(input: {
   const { repository, work, messages, pendingRows, now } = input;
   const replaced = input.results.filter((r) => r.outcome === "replaced");
   const notFound = input.results.filter((r) => r.outcome === "not_found").map((r) => r.episode);
-  if (replaced.length > 0) {
-    await repository.removePendingReplacements({ ...work, episodes: replaced.map((r) => r.episode) });
-  }
+  // Per episode, the source first and only then its 待换 row: a failed write leaves
+  // the row in place, so the episode comes back next patrol. A pending-only run has no
+  // message to release — the row is the only thing that remembers the request.
   for (const r of replaced) {
     await repository.upsertEpisodeSource({
       ...work,
@@ -436,6 +436,7 @@ async function recordReplacementOutcome(input: {
       runId: input.runId,
       recordedAt: now(),
     });
+    await repository.removePendingReplacements({ ...work, episodes: [r.episode] });
   }
   // Keep a still-pending episode on the message that first asked for it.
   const byMessage = new Map<string, string[]>();

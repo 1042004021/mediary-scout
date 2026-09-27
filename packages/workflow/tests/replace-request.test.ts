@@ -737,6 +737,47 @@ describe("runQueuedReplaceRequest — scope, metadata and bookkeeping", () => {
     expect(message?.reply).toBeFalsy();
   });
 
+  it("pending-only run: a source write that fails twice leaves the 待换 row in place (the request is not lost)", async () => {
+    const { repository, title, season } = await trackedShow();
+    const storage = storageWithNewRelease();
+    await seedV2Season(storage, title, season, ["S01E01", "S01E02"]);
+    await repository.addPendingReplacements({ ...WORK, episodes: ["S01E01"], messageId: "msg_old", now: NOW });
+    await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => "run_rr_pend_book" });
+    let calls = 0;
+    repository.upsertEpisodeSource = async () => {
+      calls += 1;
+      throw new Error("db hiccup");
+    };
+    let i = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        i += 1;
+        if (i === 1) return tool("rejectCurrentSource", { episodes: ["S01E01"], fileIds: ["present_S01E01"], reason: "发蓝" }, i);
+        if (i === 2) return tool("searchResources", { keyword: "Show 01" }, i);
+        if (i === 3) {
+          const search = lastToolOutput(options.prompt, "searchResources");
+          const alias = (search.snapshot.candidates as Array<{ id: string; title: string }>).find((c) => c.title === NEW_TITLE)!.id;
+          return tool("transferCandidate", { snapshotId: search.snapshot.id, candidateId: alias }, i);
+        }
+        if (i === 4) return tool("moveToSeason", { moves: [{ season: 1, fileIds: ["new01"] }] }, i);
+        if (i === 5) return tool("markObtained", { codes: ["S01E01"] }, i);
+        if (i === 6) {
+          const search = lastToolOutput(options.prompt, "searchResources");
+          const alias = (search.snapshot.candidates as Array<{ id: string; title: string }>)[0]!.id;
+          return tool("reportReplacement", { results: [{ episode: "S01E01", outcome: "replaced", candidateId: alias, note: "新版" }] }, i);
+        }
+        if (i === 7) return tool("finish", {}, i);
+        return text("done");
+      },
+    });
+
+    const result = await runQueuedReplaceRequest(baseRun(repository, storage, model));
+
+    expect(result).toMatchObject({ status: "ran", workflowRunId: "run_rr_pend_book" });
+    expect(calls).toBe(2);
+    expect((await repository.listPendingReplacements(WORK)).map((p) => [p.episode, p.messageId])).toEqual([["S01E01", "msg_old"]]);
+  });
+
   it("a bookkeeping write that fails once is retried and the messages finish", async () => {
     const { repository, title, season } = await trackedShow();
     const storage = storageWithNewRelease();
