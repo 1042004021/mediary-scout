@@ -8,7 +8,7 @@ import {
   type MediaTitle,
   type TrackedSeason,
 } from "@media-track/workflow";
-import { loadMessageThread, nextPatrolLabel, readTitleMessages, resolveMessageWork, swapBadgeLabel } from "./user-message-server";
+import { loadMessageThread, messageRunView, nextPatrolLabel, readTitleMessages, resolveMessageWork, swapBadgeLabel } from "./user-message-server";
 
 const NOW = "2026-09-27T08:00:00.000Z";
 
@@ -148,10 +148,21 @@ describe("loadMessageThread", () => {
     const view = await loadMessageThread(repo, work);
 
     expect(view.messages).toEqual([
-      { id: latest.id, body: "第二条", episodeTags: [], status: "pending", urgent: false, createdAt: "2026-09-27T03:00:00.000Z", reply: null },
-      { id: first.id, body: "第一条", episodeTags: ["S01E13"], status: "pending", urgent: false, createdAt: "2026-09-27T01:00:00.000Z", reply: null },
+      { id: latest.id, body: "第二条", episodeTags: [], status: "pending", urgent: false, createdAt: "2026-09-27T03:00:00.000Z", processedAt: null, reply: null },
+      { id: first.id, body: "第一条", episodeTags: ["S01E13"], status: "pending", urgent: false, createdAt: "2026-09-27T01:00:00.000Z", processedAt: null, reply: null },
     ]);
     expect(view.busy).toBe(false);
+  });
+
+  it("an answered message carries when it was answered, with the reply", async () => {
+    const repo = new InMemoryWorkflowRepository();
+    await repo.createUserMessage({ ...work, body: "换", episodeTags: [], now: "2026-09-27T01:00:00.000Z" });
+    await repo.claimUserMessages({ ...work, runId: "run_1", now: "2026-09-27T01:10:00.000Z" });
+    await repo.finishUserMessages({ runId: "run_1", reply: { results: [], oldFiles: [], runId: "run_1", unidentified: true }, now: "2026-09-27T01:31:00.000Z" });
+
+    const [answered] = (await loadMessageThread(repo, work)).messages;
+
+    expect(answered).toMatchObject({ status: "done", processedAt: "2026-09-27T01:31:00.000Z", reply: { runId: "run_1", unidentified: true } });
   });
 
   it("待换 episodes come back sorted; busy while a run holds a message", async () => {
@@ -168,23 +179,91 @@ describe("loadMessageThread", () => {
   });
 });
 
+describe("messageRunView — what the work's active run means for its messages", () => {
+  const work = { accountId: "acct_1", drive: "cs_primary", titleKey: "tmdb_tv_42" };
+  const scope = { accountId: "acct_1", connectedStorageId: "cs_primary" };
+
+  /** A tracked show with one message on the primary drive. */
+  async function seeded() {
+    const repo = new InMemoryWorkflowRepository();
+    await track(repo, { drive: "cs_primary", title: show, s: season(show.id, 1) });
+    await repo.createUserMessage({ ...work, body: "换", episodeTags: [], now: NOW });
+    return repo;
+  }
+
+  it("a running replace run: its live line feeds the ticker, and a newer urgent message waits for it", async () => {
+    const repo = await seeded();
+    const queued = await queueReplaceRequest({ repository: repo, work });
+    await repo.claimNextQueuedWorkflowRun({ kind: "replace_request", now: NOW });
+    await repo.updateWorkflowRunProgress(queued.workflowRunId!, { activity: "正在搜索资源：Show 13", phase: "search", percent: 30, updatedAt: NOW });
+
+    expect(messageRunView(await repo.listActiveWorkflowRuns(scope), work)).toEqual({ running: true, activity: "正在搜索资源：Show 13", waitsForRun: true });
+  });
+
+  it("a replace run that is only queued takes every waiting message along when it starts: nothing to wait for", async () => {
+    const repo = await seeded();
+    await queueReplaceRequest({ repository: repo, work });
+
+    expect(messageRunView(await repo.listActiveWorkflowRuns(scope), work)).toEqual({ running: false, activity: null, waitsForRun: false });
+  });
+
+  it("another kind of run on the title holds the work lock: urgent messages go after it", async () => {
+    const repo = await seeded();
+    const s2 = season(show.id, 2);
+    await repo.saveWorkflowRunSnapshot({
+      accountId: "acct_1",
+      connectedStorageId: "cs_primary",
+      title: show,
+      season: s2,
+      workflowRun: { id: "run_s2", kind: "type2_init", status: "running", trackedSeasonId: s2.id, startedAt: NOW, finishedAt: null, auditEvents: [] },
+      episodes: createEpisodeStates({ trackedSeasonId: s2.id, seasonNumber: 2, totalEpisodes: 2, latestAiredEpisode: 2 }),
+      resourceSnapshots: [],
+      decisions: [],
+      transferAttempts: [],
+      notifications: [],
+    });
+
+    expect(messageRunView(await repo.listActiveWorkflowRuns(scope), work)).toEqual({ running: false, activity: null, waitsForRun: true });
+  });
+
+  it("runs of another title, or of this title on another drive, do not count", async () => {
+    const repo = await seeded();
+    const other: MediaTitle = { ...show, id: "tmdb_tv_7", tmdbId: 7 };
+    await track(repo, { drive: "cs_primary", title: other, s: season(other.id, 1) });
+    await repo.createUserMessage({ ...work, titleKey: other.id, body: "换", episodeTags: [], now: NOW });
+    await queueReplaceRequest({ repository: repo, work: { ...work, titleKey: other.id } });
+    await repo.claimNextQueuedWorkflowRun({ kind: "replace_request", now: NOW });
+    await track(repo, { drive: "cs_quark", title: show, s: season(show.id, 1) });
+    await repo.createUserMessage({ ...work, drive: "cs_quark", body: "换", episodeTags: [], now: NOW });
+    await queueReplaceRequest({ repository: repo, work: { ...work, drive: "cs_quark" } });
+    await repo.claimNextQueuedWorkflowRun({ kind: "replace_request", now: NOW });
+
+    // Account-wide listing: both runs are in it, neither is this work's.
+    const runs = await repo.listActiveWorkflowRuns({ accountId: "acct_1", connectedStorageId: null });
+    expect(runs).toHaveLength(2);
+    expect(messageRunView(runs, work)).toEqual({ running: false, activity: null, waitsForRun: false });
+  });
+});
+
 describe("readTitleMessages — the detail page's message decorations", () => {
   const primary = async () => ({ accountId: "acct_1", connectedStorageId: "cs_primary" });
 
-  it("reads the thread of the work the page is on", async () => {
+  it("reads the thread of the work the page is on, what its run is doing, and the patrol times", async () => {
     const repo = new InMemoryWorkflowRepository();
     await track(repo, { drive: "cs_primary", title: show, s: season(show.id, 1) });
     const m = await repo.createUserMessage({ accountId: "acct_1", drive: "cs_primary", titleKey: show.id, body: "换", episodeTags: [], now: NOW });
 
-    const read = await readTitleMessages({ repo, scope: primary, tmdbId: 42, mediaType: "tv" });
+    const read = await readTitleMessages({ repo, scope: primary, tmdbId: 42, mediaType: "tv", sweepTimes: async () => ["06:00", "21:00"] });
 
     expect(read?.thread.messages.map((x) => x.id)).toEqual([m.id]);
+    expect(read?.run).toEqual({ running: false, activity: null, waitsForRun: false });
+    expect(read?.sweepTimes).toEqual(["06:00", "21:00"]);
   });
 
   it("null when the title is not tracked on this drive", async () => {
     const repo = new InMemoryWorkflowRepository();
 
-    expect(await readTitleMessages({ repo, scope: primary, tmdbId: 42, mediaType: "tv" })).toBeNull();
+    expect(await readTitleMessages({ repo, scope: primary, tmdbId: 42, mediaType: "tv", sweepTimes: async () => [] })).toBeNull();
   });
 
   it("a failed read logs one short line and leaves the decorations out instead of failing the page", async () => {
@@ -193,13 +272,14 @@ describe("readTitleMessages — the detail page's message decorations", () => {
     const broken = {
       listTrackedSeasonStates: repo.listTrackedSeasonStates.bind(repo),
       listPendingReplacements: repo.listPendingReplacements.bind(repo),
+      listActiveWorkflowRuns: repo.listActiveWorkflowRuns.bind(repo),
       listUserMessages: async () => {
         throw new Error(`relation "user_messages" does not exist ${"x".repeat(2000)}`);
       },
     };
     const lines: string[] = [];
 
-    const read = await readTitleMessages({ repo: broken, scope: primary, tmdbId: 42, mediaType: "tv", log: (line) => lines.push(line) });
+    const read = await readTitleMessages({ repo: broken, scope: primary, tmdbId: 42, mediaType: "tv", sweepTimes: async () => [], log: (line) => lines.push(line) });
 
     expect(read).toBeNull();
     expect(lines).toHaveLength(1);
@@ -207,14 +287,17 @@ describe("readTitleMessages — the detail page's message decorations", () => {
     expect(lines[0]!.length).toBeLessThan(300);
   });
 
-  it("a failed workspace lookup is caught the same way", async () => {
+  it("a failed workspace or settings lookup is caught the same way", async () => {
+    const repo = new InMemoryWorkflowRepository();
+    await track(repo, { drive: "cs_primary", title: show, s: season(show.id, 1) });
     const lines: string[] = [];
-    const scope = async (): Promise<never> => {
+    const failing = async (): Promise<never> => {
       throw new Error("connect ECONNREFUSED");
     };
 
-    expect(await readTitleMessages({ repo: new InMemoryWorkflowRepository(), scope, tmdbId: 42, mediaType: "tv", log: (line) => lines.push(line) })).toBeNull();
-    expect(lines).toHaveLength(1);
+    expect(await readTitleMessages({ repo, scope: failing, tmdbId: 42, mediaType: "tv", sweepTimes: async () => [], log: (line) => lines.push(line) })).toBeNull();
+    expect(await readTitleMessages({ repo, scope: primary, tmdbId: 42, mediaType: "tv", sweepTimes: failing, log: (line) => lines.push(line) })).toBeNull();
+    expect(lines).toHaveLength(2);
   });
 });
 

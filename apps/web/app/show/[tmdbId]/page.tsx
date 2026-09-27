@@ -2,7 +2,7 @@ import Link from "next/link";
 import { connection } from "next/server";
 import { Suspense, cache, type ReactNode } from "react";
 import { TriangleAlert } from "lucide-react";
-import { isMovieUnreleased } from "@media-track/workflow";
+import { isMovieUnreleased, type EpisodeDisplayState } from "@media-track/workflow";
 import { AcquiringPoller } from "../../../components/acquiring-poller";
 import { AcquisitionLockProvider } from "../../../components/acquisition-lock";
 import { AppSidebar } from "../../../components/app-sidebar";
@@ -10,12 +10,15 @@ import { BackLink } from "../../../components/back-link";
 import { MovieSynopsis } from "../../../components/movie-synopsis";
 import { RequestTrackButton } from "../../../components/request-track-button";
 import { SeasonDetails } from "../../../components/season-details";
+import { SwapBadgeLive, SwapEpisodeCell, SwapKeepProvider } from "../../../components/swap-keep";
 import {
   RequestRemainingButton,
   RequestSeasonButton,
 } from "../../../components/title-action-buttons";
 import { UntrackButton } from "../../../components/untrack-button";
 import { AgentMemoryNotes } from "../../../components/agent-memory-panel";
+import { UserMessageThread } from "../../../components/user-message-thread";
+import { isDemoMode } from "../../../lib/demo-mode";
 import type { DemoAcquisitionEntry } from "../../../lib/demo-session";
 import {
   getDetailView,
@@ -24,8 +27,15 @@ import {
   type TitleHubView,
 } from "../../../lib/title-hub";
 import { seasonBadgeState } from "../../../lib/title-aggregate";
-import { readTitleMessages, swapBadgeLabel } from "../../../lib/user-message-server";
-import { getActiveWorkspaceScope, getWorkflowRepository, resolveGlobalWorkspace } from "../../../lib/workflow-runtime";
+import { nextPatrolLabel, readTitleMessages } from "../../../lib/user-message-server";
+import { showsMessageCard } from "../../../lib/user-message-state";
+import {
+  beijingDateTime,
+  getActiveWorkspaceScope,
+  getDailySweepTimes,
+  getWorkflowRepository,
+  resolveGlobalWorkspace,
+} from "../../../lib/workflow-runtime";
 
 const aggregateBadge = {
   untracked: null,
@@ -171,8 +181,13 @@ function TvHub({
   backHref: string;
 }) {
   const badge = aggregateBadge[view.aggregate];
+  // The message card's episode picker: every episode of a tracked season in the library.
+  const libraryEpisodes = view.seasons
+    .filter((season) => season.tracked)
+    .flatMap((season) => season.episodes.filter((episode) => episode.obtained).map((episode) => episode.episodeCode));
   return (
     <AcquisitionLockProvider>
+    <SwapKeepProvider key={`tv:${view.tmdbId}:${storageId ?? ""}`}>
     {view.acquiring ? <AcquiringPoller /> : null}
     <section className="title-hub title-hub-immersive">
       {/* Backdrop clipped to hub-hero only — seasons stay on plain page bg. */}
@@ -257,8 +272,18 @@ function TvHub({
           <SeasonRowsWithSwap view={view} storageId={storageId} basePath={basePath} />
         </ul>
       </section>
+      {view.aggregate !== "untracked" ? (
+        <TitleMessageSection
+          tmdbId={view.tmdbId}
+          mediaType="tv"
+          storageId={storageId}
+          hasFile={libraryEpisodes.length > 0}
+          episodes={libraryEpisodes}
+        />
+      ) : null}
       {view.aggregate !== "untracked" ? <TitleMemorySection mediaType="tv" tmdbId={view.tmdbId} /> : null}
     </section>
+    </SwapKeepProvider>
     </AcquisitionLockProvider>
   );
 }
@@ -300,6 +325,7 @@ function MovieHub({
 
   return (
     <AcquisitionLockProvider>
+    <SwapKeepProvider key={`movie:${view.tmdbId}:${storageId ?? ""}`}>
       {view.acquiring ? <AcquiringPoller /> : null}
       <section className="title-hub title-hub-immersive">
         {/* Backdrop lives inside hub-hero only — must NOT cover synopsis body. */}
@@ -369,8 +395,12 @@ function MovieHub({
             </div>
           ) : null}
         </div>
+        {view.state !== "untracked" ? (
+          <TitleMessageSection tmdbId={view.tmdbId} mediaType="movie" storageId={storageId} hasFile={view.obtained} episodes={[]} />
+        ) : null}
         {view.state !== "untracked" ? <TitleMemorySection mediaType="movie" tmdbId={view.tmdbId} /> : null}
       </section>
+    </SwapKeepProvider>
     </AcquisitionLockProvider>
   );
 }
@@ -407,6 +437,15 @@ function HubSkeleton({ backLabel, backHref }: { backLabel: string; backHref: str
     </section>
   );
 }
+
+/** What an episode cell says for its state. */
+const EPISODE_STATE_LABEL: Record<EpisodeDisplayState, string> = {
+  obtained: "已获取",
+  missing_aired: "缺集",
+  provider_ahead: "超前",
+  unaired: "未播",
+  unknown: "未知",
+};
 
 function SeasonRow({
   season,
@@ -482,27 +521,15 @@ function SeasonRow({
         <summary className="hub-season-row">{rowBody}</summary>
         <div className="episode-grid hub-episode-grid">
           {season.episodes.map((episode) => {
-            const swapping = swap.has(episode.episodeCode);
-            return (
-              <div
-                className={`episode-cell ${episode.displayState.replace("_", "-")}${swapping ? " swap" : ""}`}
-                key={episode.episodeCode}
-                title={swapping ? "你要求换 · 巡检会继续找" : undefined}
-              >
+            const stateClass = episode.displayState.replace("_", "-");
+            const stateLabel = EPISODE_STATE_LABEL[episode.displayState];
+            // A 待换 cell is a client piece: 「不换了」 on the message card restores it at once.
+            return swap.has(episode.episodeCode) ? (
+              <SwapEpisodeCell key={episode.episodeCode} code={episode.episodeCode} stateClass={stateClass} stateLabel={stateLabel} />
+            ) : (
+              <div className={`episode-cell ${stateClass}`} key={episode.episodeCode}>
                 <strong>{episode.episodeCode.replace(/^S\d+/, "")}</strong>
-                <span>
-                  {swapping
-                    ? "待换"
-                    : episode.displayState === "obtained"
-                      ? "已获取"
-                      : episode.displayState === "missing_aired"
-                        ? "缺集"
-                        : episode.displayState === "provider_ahead"
-                          ? "超前"
-                          : episode.displayState === "unaired"
-                            ? "未播"
-                            : "未知"}
-                </span>
+                <span>{stateLabel}</span>
               </div>
             );
           })}
@@ -527,9 +554,16 @@ function SeasonRow({
  *  resolve it, so the page shows what the engine acts on. Null when the title is not
  *  tracked on this drive — or when the read failed: these are decorations, logged and
  *  left out rather than failing the whole page. */
-const loadTitleMessages = cache((tmdbId: number, mediaType: "movie" | "tv", storageId: string | undefined) =>
-  readTitleMessages({ repo: getWorkflowRepository(), scope: () => getActiveWorkspaceScope(storageId), tmdbId, mediaType }),
-);
+const loadTitleMessages = cache((tmdbId: number, mediaType: "movie" | "tv", storageId: string | undefined) => {
+  const repo = getWorkflowRepository();
+  return readTitleMessages({
+    repo,
+    scope: () => getActiveWorkspaceScope(storageId),
+    tmdbId,
+    mediaType,
+    sweepTimes: () => getDailySweepTimes(repo),
+  });
+});
 
 /** 「N 集待换」 (show) /「待换资源」 (film) beside the title's status badge. */
 async function SwapBadge({
@@ -542,8 +576,47 @@ async function SwapBadge({
   storageId: string | undefined;
 }) {
   const messages = await loadTitleMessages(tmdbId, mediaType, storageId);
-  const label = messages ? swapBadgeLabel(mediaType, messages.thread.pendingReplacements) : null;
-  return label ? <span className="hub-badge tone-red">{label}</span> : null;
+  // A client piece: 「不换了」 on the message card takes it down at once.
+  return messages ? <SwapBadgeLive mediaType={mediaType} pending={messages.thread.pendingReplacements} /> : null;
+}
+
+/** The message card: under the season rows (TV) or the synopsis (film), above
+ *  the agent's notes. Shown while the work has a file on this drive, or messages / 待换
+ *  to show — never keyed off the film's 已入库: a film whose replace run is in flight
+ *  reads 获取中, and the card must not vanish exactly then. Not on the read-only demo. */
+async function TitleMessageSection({
+  tmdbId,
+  mediaType,
+  storageId,
+  hasFile,
+  episodes,
+}: {
+  tmdbId: number;
+  mediaType: "movie" | "tv";
+  storageId: string | undefined;
+  hasFile: boolean;
+  /** The picker's cells (TV); [] for a film. */
+  episodes: string[];
+}) {
+  if (isDemoMode()) return null;
+  const messages = await loadTitleMessages(tmdbId, mediaType, storageId);
+  if (!messages) return null;
+  const { thread, run, sweepTimes } = messages;
+  if (!showsMessageCard({ tracked: true, hasFile, messageCount: thread.messages.length, pendingCount: thread.pendingReplacements.length })) {
+    return null;
+  }
+  return (
+    <div className="hub-message">
+      <UserMessageThread
+        work={{ tmdbId, mediaType, storageId }}
+        view={thread}
+        run={run}
+        nextPatrol={nextPatrolLabel(sweepTimes, beijingDateTime().hhmm)}
+        episodes={episodes}
+        now={new Date().toISOString()}
+      />
+    </div>
+  );
 }
 
 /** The season rows, each episode a user asked to replace drawn 「待换」 in red. */

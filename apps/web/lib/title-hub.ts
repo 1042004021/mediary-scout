@@ -80,6 +80,10 @@ export interface MovieHubView {
   /** acquired=已入库, reserved=未上映已预定, acquiring=获取中, missing=已上映未获取, untracked=未追踪. */
   state: "acquired" | "reserved" | "acquiring" | "missing" | "untracked";
   acquiring: boolean;
+  /** The film's file is in the library. Not the same as state "acquired": while a run
+   *  of the film is queued or running (a user's replace request keeps the old file)
+   *  the state reads 获取中. */
+  obtained: boolean;
 }
 
 export type DetailView = TitleHubView | MovieHubView;
@@ -286,7 +290,7 @@ export async function getDetailView(
     const obtained = movieState.episodes.some((episode) => episode.obtained);
     const reserved = isMovieUnreleased(movieState.title.releaseDate, now);
     const state = acquiring ? "acquiring" : reserved ? "reserved" : obtained ? "acquired" : "missing";
-    return movieHubViewFromTitle(movieState.title, state, acquiring);
+    return movieHubViewFromTitle(movieState.title, state, acquiring, obtained);
   }
 
   // Untracked title: TMDB's movie/tv id namespaces collide (movie 278 ≠ tv 278).
@@ -299,7 +303,7 @@ export async function getDetailView(
       return null;
     }
     // Untracked stays untracked even if unreleased — `reserved` means tracked + waiting.
-    return movieHubViewFromTitle(movieTarget.title, "untracked", false);
+    return movieHubViewFromTitle(movieTarget.title, "untracked", false, false);
   };
 
   if (typeHint === "movie") {
@@ -323,6 +327,7 @@ function movieHubViewFromTitle(
   title: MediaTitle,
   state: MovieHubView["state"],
   acquiring: boolean,
+  obtained: boolean,
 ): MovieHubView {
   return {
     kind: "movie",
@@ -336,6 +341,7 @@ function movieHubViewFromTitle(
     releaseDate: title.releaseDate ?? null,
     state,
     acquiring,
+    obtained,
   };
 }
 

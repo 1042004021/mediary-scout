@@ -6,12 +6,16 @@
  */
 import {
   userMessageDrive,
-  type UserMessage,
+  type PersistedWorkflowRunSnapshot,
   type UserMessageScope,
   type UserRequestStore,
   type WorkflowRepository,
   type WorkflowScope,
 } from "@media-track/workflow";
+import type { ThreadMessage } from "./user-message-state";
+
+// The badge label is shared with the client card (which must not import this module).
+export { swapBadgeLabel } from "./user-message-state";
 
 /**
  * The work a message is filed under — the one the engine looks up: the page's own
@@ -39,7 +43,7 @@ export async function resolveMessageWork(input: {
 
 export interface MessageThreadView {
   /** Newest first; withdrawn ones are gone. */
-  messages: Array<Pick<UserMessage, "id" | "body" | "episodeTags" | "status" | "urgent" | "createdAt" | "reply">>;
+  messages: ThreadMessage[];
   /** Episode codes still 待换 (sorted); "MOVIE" for a film. */
   pendingReplacements: string[];
   /** A run holds one of the messages right now. */
@@ -52,13 +56,14 @@ export async function loadMessageThread(
 ): Promise<MessageThreadView> {
   const [messages, pending] = await Promise.all([repo.listUserMessages(work), repo.listPendingReplacements(work)]);
   return {
-    messages: messages.map(({ id, body, episodeTags, status, urgent, createdAt, reply }) => ({
+    messages: messages.map(({ id, body, episodeTags, status, urgent, createdAt, processedAt, reply }) => ({
       id,
       body,
       episodeTags,
       status,
       urgent,
       createdAt,
+      processedAt,
       reply,
     })),
     pendingReplacements: pending.map((p) => p.episode).sort(),
@@ -66,8 +71,38 @@ export async function loadMessageThread(
   };
 }
 
+/** What the work's active run means for its messages. */
+export interface MessageRunView {
+  /** A replace run of this work is running now. */
+  running: boolean;
+  /** Its live line (progress.activity), for the ticker; null before the first one. */
+  activity: string | null;
+  /** An urgent message waits for the run in flight: a replace run already running (it
+   *  took what was pending when it started) or any other kind of run on the title (the
+   *  title lock). A replace run that is only queued is not one — it takes every pending
+   *  message along when it starts. */
+  waitsForRun: boolean;
+}
+
+/** `runs`: active runs of the page's scope (listActiveWorkflowRuns). */
+export function messageRunView(
+  runs: ReadonlyArray<Pick<PersistedWorkflowRunSnapshot, "title" | "connectedStorageId" | "workflowRun">>,
+  work: UserMessageScope,
+): MessageRunView {
+  const mine = runs.filter((r) => r.title.id === work.titleKey && userMessageDrive(r.connectedStorageId) === work.drive);
+  const replaceRunning = mine.find((r) => r.workflowRun.kind === "replace_request" && r.workflowRun.status === "running");
+  return {
+    running: replaceRunning !== undefined,
+    activity: replaceRunning?.workflowRun.progress?.activity.trim() || null,
+    waitsForRun: mine.some((r) => r.workflowRun.kind !== "replace_request" || r.workflowRun.status === "running"),
+  };
+}
+
 export interface TitleMessages {
   thread: MessageThreadView;
+  run: MessageRunView;
+  /** The daily patrol times (Beijing "HH:MM"), for 「等巡检 · 明早 06:00」. */
+  sweepTimes: string[];
 }
 
 /**
@@ -77,17 +112,25 @@ export interface TitleMessages {
  * never takes the whole detail page down.
  */
 export async function readTitleMessages(input: {
-  repo: Pick<WorkflowRepository, "listTrackedSeasonStates" | "listUserMessages" | "listPendingReplacements">;
+  repo: Pick<WorkflowRepository, "listTrackedSeasonStates" | "listUserMessages" | "listPendingReplacements" | "listActiveWorkflowRuns">;
   /** The page's workspace scope — a lookup of its own, so its failure is caught too. */
   scope: () => Promise<WorkflowScope>;
   tmdbId: number;
   mediaType: "movie" | "tv";
+  /** The patrol times setting (getDailySweepTimes). */
+  sweepTimes: () => Promise<string[]>;
   log?: (line: string) => void;
 }): Promise<TitleMessages | null> {
   try {
-    const work = await resolveMessageWork({ repo: input.repo, scope: await input.scope(), tmdbId: input.tmdbId, mediaType: input.mediaType });
+    const scope = await input.scope();
+    const work = await resolveMessageWork({ repo: input.repo, scope, tmdbId: input.tmdbId, mediaType: input.mediaType });
     if (!work) return null;
-    return { thread: await loadMessageThread(input.repo, work) };
+    const [thread, runs, sweepTimes] = await Promise.all([
+      loadMessageThread(input.repo, work),
+      input.repo.listActiveWorkflowRuns(scope),
+      input.sweepTimes(),
+    ]);
+    return { thread, run: messageRunView(runs, work), sweepTimes };
   } catch (error) {
     (input.log ?? console.error)(
       `[user-message] tmdb ${input.mediaType} ${input.tmdbId}: messages read failed, page shown without the 待换 badge/cells and the message card: ${shortError(error)}`,
@@ -110,11 +153,4 @@ export function nextPatrolLabel(times: string[], hhmm: string): string {
   if (today) return `今天 ${today}`;
   const first = sorted[0] ?? "06:00";
   return first < "12:00" ? `明早 ${first}` : `明天 ${first}`;
-}
-
-/** The badge beside the title while something is 待换: how many episodes of a show, or
- *  「待换资源」 for a film. Null when nothing is. */
-export function swapBadgeLabel(mediaType: "movie" | "tv", pendingReplacements: readonly string[]): string | null {
-  if (mediaType === "movie") return pendingReplacements.includes("MOVIE") ? "待换资源" : null;
-  return pendingReplacements.length > 0 ? `${pendingReplacements.length} 集待换` : null;
 }
