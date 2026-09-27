@@ -1198,6 +1198,30 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     for (const seasonId of targetSeasonIds) {
       this.episodesBySeason.delete(seasonScopeKey(seasonId, storageValue));
     }
+
+    // Clean up this work's pending user-request state too, so it doesn't come
+    // back to haunt a fresh (re-)track: a stale pending message just keeps
+    // producing not_tracked queue attempts, and a stale pending_replacement
+    // would revive an old replace request the moment the title is re-tracked.
+    // episode_sources and rejected_resources stay — they're useful history if
+    // the user re-tracks. Processing messages are untouched (a running run
+    // already refused above; nothing here is mid-flight).
+    const work = { accountId: scope.accountId ?? DEFAULT_ACCOUNT_ID, drive: userMessageDrive(scope.connectedStorageId), titleKey: states[0]!.title.id };
+    if (seasonNumber === undefined) {
+      const now = new Date().toISOString();
+      for (const m of this.userMessages.values()) {
+        if (sameWork(m, work) && m.status === "pending") Object.assign(m, { status: "withdrawn", updatedAt: now });
+      }
+      for (const [key, p] of this.pendingReplacements) {
+        if (sameWork(p, work)) this.pendingReplacements.delete(key);
+      }
+    } else {
+      const seasonPrefix = `S${String(seasonNumber).padStart(2, "0")}E`;
+      for (const [key, p] of this.pendingReplacements) {
+        if (sameWork(p, work) && p.episode.startsWith(seasonPrefix)) this.pendingReplacements.delete(key);
+      }
+    }
+
     return { status: "untracked", removedSeasons: targetSeasonIds.size };
   }
 

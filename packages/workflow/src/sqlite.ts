@@ -994,6 +994,36 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
             .run(seasonId, storageValue);
           this.teardownSeasonScoped(seasonId, storageValue);
         }
+
+        // Clean up this work's pending user-request state too, so it doesn't come
+        // back to haunt a fresh (re-)track: a stale pending message just keeps
+        // producing not_tracked queue attempts, and a stale pending_replacement
+        // would revive an old replace request the moment the title is re-tracked.
+        // episode_sources and rejected_resources stay — they're useful history if
+        // the user re-tracks. Processing messages are untouched (a running run
+        // already refused above; nothing here is mid-flight).
+        const accountId = scope.accountId ?? DEFAULT_ACCOUNT_ID;
+        const drive = userMessageDrive(scope.connectedStorageId);
+        const titleKey = states[0]!.title.id;
+        if (seasonNumber === undefined) {
+          const now = new Date().toISOString();
+          this.db
+            .prepare(
+              "UPDATE user_messages SET status = 'withdrawn', updated_at = ? WHERE account_id = ? AND drive = ? AND title_key = ? AND status = 'pending'",
+            )
+            .run(now, accountId, drive, titleKey);
+          this.db
+            .prepare("DELETE FROM pending_replacements WHERE account_id = ? AND drive = ? AND title_key = ?")
+            .run(accountId, drive, titleKey);
+        } else {
+          const seasonPrefix = `S${String(seasonNumber).padStart(2, "0")}E%`;
+          this.db
+            .prepare(
+              "DELETE FROM pending_replacements WHERE account_id = ? AND drive = ? AND title_key = ? AND episode LIKE ?",
+            )
+            .run(accountId, drive, titleKey, seasonPrefix);
+        }
+
         return { status: "untracked" as const, removedSeasons: targetSeasonIds.length };
       },
     )();

@@ -1520,6 +1520,75 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         expect(await repo.listTrackedSeasonStates(scope)).toHaveLength(1);
       });
 
+      it("untrackTitle (whole title) withdraws pending messages and drops pending replacements for that work only", async () => {
+        const repo = await fresh();
+        await repo.saveWorkflowRunSnapshot(
+          queuedRun({ id: "uw", status: "succeeded", connectedStorageId: "cs_uw", tmdbId: 321, type: "tv" }),
+        );
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_uw" };
+        const work = { accountId: "acct_default", drive: "cs_uw", titleKey: "title_uw" };
+        const t0 = "2026-09-26T00:00:00.000Z";
+        const pending = await repo.createUserMessage({ ...work, body: "还在等", episodeTags: [], now: t0 });
+        await repo.claimUserMessages({ ...work, runId: "run_x", now: t0 });
+        await repo.releaseUserMessages({ runId: "run_x", now: t0 });
+        await repo.addPendingReplacements({ ...work, episodes: ["S01E01"], messageId: pending.id, now: t0 });
+        await repo.upsertEpisodeSource({ ...work, episode: "S01E01", linkKey: "115:aa", label: "a.mkv", sizeBytes: 1, runId: "run_x", recordedAt: t0 });
+        await repo.addRejectedResources({
+          accountId: "acct_default", titleKey: "title_uw", now: t0,
+          items: [{ episode: "S01E01", linkKey: "115:bb", label: "b.mkv", sizeBytes: 1, reason: "假", messageId: null }],
+        });
+
+        // Another drive's work with the same title id must be untouched.
+        const otherDriveWork = { accountId: "acct_default", drive: "cs_other", titleKey: "title_uw" };
+        await repo.createUserMessage({ ...otherDriveWork, body: "别的盘", episodeTags: [], now: t0 });
+        await repo.addPendingReplacements({ ...otherDriveWork, episodes: ["S01E02"], messageId: "m_other", now: t0 });
+        // Another title on the same drive must be untouched.
+        const otherTitleWork = { ...work, titleKey: "title_other" };
+        await repo.createUserMessage({ ...otherTitleWork, body: "别的剧", episodeTags: [], now: t0 });
+        await repo.addPendingReplacements({ ...otherTitleWork, episodes: ["S01E03"], messageId: "m_other2", now: t0 });
+
+        const result = await repo.untrackTitle(321, scope, "tv");
+        expect(result).toEqual({ status: "untracked", removedSeasons: 1 });
+
+        // listUserMessages excludes withdrawn rows by design, so "gone from here" IS
+        // the withdrawn assertion.
+        expect(await repo.listUserMessages(work)).toEqual([]);
+        expect(await repo.listPendingReplacements(work)).toEqual([]);
+        expect(await repo.listEpisodeSources(work)).toHaveLength(1);
+        expect(await repo.listRejectedResources({ accountId: "acct_default", titleKey: "title_uw" })).toHaveLength(1);
+
+        expect((await repo.listUserMessages(otherDriveWork))[0]).toMatchObject({ status: "pending" });
+        expect(await repo.listPendingReplacements(otherDriveWork)).toHaveLength(1);
+        expect((await repo.listUserMessages(otherTitleWork))[0]).toMatchObject({ status: "pending" });
+        expect(await repo.listPendingReplacements(otherTitleWork)).toHaveLength(1);
+      });
+
+      it("untrackTitle (single season) removes only that season's pending replacements, leaves messages alone", async () => {
+        const repo = await fresh();
+        // Two seasons of the SAME title (shared title.id, distinct season.id) —
+        // mirrors how one tv title tracks multiple seasons in production.
+        const base = queuedRun({ id: "us1", status: "succeeded", connectedStorageId: "cs_us", tmdbId: 654, type: "tv", seasonNumber: 1 });
+        await repo.saveWorkflowRunSnapshot(base);
+        await repo.saveWorkflowRunSnapshot({
+          ...base,
+          season: { ...base.season, id: "season_us2", seasonNumber: 2 },
+          workflowRun: { ...base.workflowRun, id: "us2", trackedSeasonId: "season_us2" },
+          episodes: base.episodes.map((e) => ({ ...e, trackedSeasonId: "season_us2" })),
+        });
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_us" };
+        const work = { accountId: "acct_default", drive: "cs_us", titleKey: "title_us1" };
+        const t0 = "2026-09-26T00:00:00.000Z";
+        const pending = await repo.createUserMessage({ ...work, body: "留着", episodeTags: [], now: t0 });
+        await repo.addPendingReplacements({ ...work, episodes: ["S01E01", "S02E01"], messageId: pending.id, now: t0 });
+
+        const result = await repo.untrackTitle(654, scope, "tv", 1);
+        expect(result).toEqual({ status: "untracked", removedSeasons: 1 });
+
+        expect((await repo.listPendingReplacements(work)).map((p) => p.episode)).toEqual(["S02E01"]);
+        const [msg] = await repo.listUserMessages(work);
+        expect(msg).toMatchObject({ status: "pending", id: pending.id });
+      });
+
       it("retryFailedWorkflowRun requeues a failed run so it becomes claimable", async () => {
         const repo = await fresh();
         await repo.saveWorkflowRunSnapshot(

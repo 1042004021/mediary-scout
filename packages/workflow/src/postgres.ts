@@ -893,6 +893,38 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
         );
         await this.teardownSeasonScoped(client, seasonId, storageValue);
       }
+
+      // Clean up this work's pending user-request state too, so it doesn't come
+      // back to haunt a fresh (re-)track: a stale pending message just keeps
+      // producing not_tracked queue attempts, and a stale pending_replacement
+      // would revive an old replace request the moment the title is re-tracked.
+      // episode_sources and rejected_resources stay — they're useful history if
+      // the user re-tracks. Processing messages are untouched (a running run
+      // already refused above; nothing here is mid-flight).
+      const workScope = {
+        accountId: scope.accountId ?? DEFAULT_ACCOUNT_ID,
+        drive: userMessageDrive(scope.connectedStorageId),
+        titleKey: states[0]!.title.id,
+      };
+      await lockUserMessageWork(client, workScope);
+      if (seasonNumber === undefined) {
+        const now = new Date().toISOString();
+        await client.query(
+          "UPDATE user_messages SET status = 'withdrawn', updated_at = $1 WHERE account_id = $2 AND drive = $3 AND title_key = $4 AND status = 'pending'",
+          [now, workScope.accountId, workScope.drive, workScope.titleKey],
+        );
+        await client.query(
+          "DELETE FROM pending_replacements WHERE account_id = $1 AND drive = $2 AND title_key = $3",
+          [workScope.accountId, workScope.drive, workScope.titleKey],
+        );
+      } else {
+        const seasonPrefix = `S${String(seasonNumber).padStart(2, "0")}E%`;
+        await client.query(
+          "DELETE FROM pending_replacements WHERE account_id = $1 AND drive = $2 AND title_key = $3 AND episode LIKE $4",
+          [workScope.accountId, workScope.drive, workScope.titleKey, seasonPrefix],
+        );
+      }
+
       return { status: "untracked" as const, removedSeasons: targetSeasonIds.length };
     });
   }
