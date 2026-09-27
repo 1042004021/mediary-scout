@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { MockLanguageModelV3 } from "ai/test";
 import { runAcquisitionV2Workflow } from "../src/acquisition-v2/workflow-v2.js";
+import { readSkillSection } from "../src/acquisition-v2/skill.js";
+import { buildTvAnimeSystemPrompt } from "../src/acquisition-v2/task-agents.js";
 import { TaskSandbox } from "../src/acquisition-v2/sandbox.js";
 import { FakeResourceProviderV2 } from "../src/acquisition-v2/fake-provider.js";
 import { Storage115Simulator } from "../src/acquisition-v2/storage-115-simulator.js";
@@ -104,7 +106,7 @@ async function stagedSandbox() {
   const search = await sandbox.searchResources("show");
   const transfer = await sandbox.transferCandidate({ snapshotId: search.snapshot!.id, candidateId: "pack" });
   const [first, second] = transfer.staging;
-  return { sandbox, storage, first: first!.id, second: second!.id };
+  return { sandbox, storage, stagingDirectoryId, first: first!.id, second: second!.id };
 }
 
 describe("TaskSandbox unmoved files", () => {
@@ -134,6 +136,82 @@ describe("TaskSandbox unmoved files", () => {
     storage.moveFiles = async (input) => ({ moved: input.fileIds });
     await sandbox.deleteFiles({ directory: "staging", fileIds: [first] });
     expect(sandbox.unmovedStagingFileIds()).toEqual([second]);
+  });
+});
+
+describe("discardStaging refuses while a failed move's files are still in staging", () => {
+  function watchRemove(storage: Storage115Simulator) {
+    const calls: string[] = [];
+    const real = storage.removeDirectory.bind(storage);
+    storage.removeDirectory = async (input) => {
+      calls.push(input.directoryId);
+      return real(input);
+    };
+    return calls;
+  }
+
+  it("a failed move makes discardStaging throw and not remove the directory", async () => {
+    const { sandbox, storage, first, second } = await stagedSandbox();
+    const removed = watchRemove(storage);
+    storage.moveFiles = async () => {
+      throw new Error("budget");
+    };
+    await expect(sandbox.moveToSeason({ moves: [{ season: 1, fileIds: [first, second] }] })).rejects.toThrow(/MOVE_NOT_DONE/);
+    await expect(sandbox.discardStaging()).rejects.toThrow(
+      `SANDBOX_STAGING_HOLDS_UNMOVED: 2 file(s) whose move failed are still in staging (${first}, ${second}) — move them into their season with moveToSeason, or deleteFiles them on purpose, before discarding staging`,
+    );
+    expect(removed).toEqual([]);
+    expect((await sandbox.inspectStaging()).map((file) => file.id).sort()).toEqual([first, second].sort());
+  });
+
+  it("a later successful move of the same files lets discardStaging remove staging", async () => {
+    const { sandbox, storage, stagingDirectoryId, first, second } = await stagedSandbox();
+    const removed = watchRemove(storage);
+    const realMove = storage.moveFiles.bind(storage);
+    let fail = true;
+    storage.moveFiles = async (input) => {
+      if (fail) {
+        throw new Error("budget");
+      }
+      return realMove(input);
+    };
+    await expect(sandbox.moveToSeason({ moves: [{ season: 1, fileIds: [first, second] }] })).rejects.toThrow(/MOVE_NOT_DONE/);
+    fail = false;
+    await sandbox.moveToSeason({ moves: [{ season: 1, fileIds: [first, second] }] });
+    const result = await sandbox.discardStaging();
+    expect(result.removed.length).toBeGreaterThan(0);
+    expect(removed).toEqual([stagingDirectoryId]);
+    await expect(sandbox.inspectStaging()).rejects.toThrow(/SIM_DIR_NOT_FOUND/);
+  });
+
+  it("deleteFiles of the unmoved ids lets discardStaging remove staging", async () => {
+    const { sandbox, storage, stagingDirectoryId, first, second } = await stagedSandbox();
+    const removed = watchRemove(storage);
+    storage.moveFiles = async () => {
+      throw new Error("budget");
+    };
+    await expect(sandbox.moveToSeason({ moves: [{ season: 1, fileIds: [first, second] }] })).rejects.toThrow(/MOVE_NOT_DONE/);
+    storage.moveFiles = async (input) => ({ moved: input.fileIds });
+    await sandbox.deleteFiles({ directory: "staging", fileIds: [first, second] });
+    const result = await sandbox.discardStaging();
+    expect(result.removed.length).toBeGreaterThan(0);
+    expect(removed).toEqual([stagingDirectoryId]);
+    await expect(sandbox.inspectStaging()).rejects.toThrow(/SIM_DIR_NOT_FOUND/);
+  });
+
+  it("with no failed move, discardStaging still removes staging", async () => {
+    const { sandbox, storage, stagingDirectoryId } = await stagedSandbox();
+    const removed = watchRemove(storage);
+    const result = await sandbox.discardStaging();
+    expect(result.removed.length).toBeGreaterThan(0);
+    expect(removed).toEqual([stagingDirectoryId]);
+    await expect(sandbox.inspectStaging()).rejects.toThrow(/SIM_DIR_NOT_FOUND/);
+  });
+
+  it("TV playbook and task prompt say discardStaging is refused while unmoved files remain", () => {
+    const sentence = "discardStaging is refused while files whose move failed are still in staging.";
+    expect(readSkillSection("tv")).toContain(sentence);
+    expect(buildTvAnimeSystemPrompt({})).toContain(sentence);
   });
 });
 

@@ -1167,6 +1167,12 @@ export class TaskSandbox {
         "SANDBOX_STAGING_IS_TARGET: this task has no separate staging to discard (a movie flattens in place)",
       );
     }
+    if (this.unmovedFileIds.size > 0) {
+      const ids = [...this.unmovedFileIds];
+      throw new Error(
+        `SANDBOX_STAGING_HOLDS_UNMOVED: ${ids.length} file(s) whose move failed are still in staging (${ids.join(", ")}) — move them into their season with moveToSeason, or deleteFiles them on purpose, before discarding staging`,
+      );
+    }
     return this.storage.removeDirectory({ directoryId: this.stagingDirectoryId });
   }
 
