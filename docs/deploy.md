@@ -416,6 +416,21 @@ docker compose build --build-arg NPM_REGISTRY=https://registry.npmmirror.com
 > docker compose exec web cat BUILD_COMMIT
 > ```
 
+### 在网页里一键更新
+
+设置 → 更新会列出新的发布版本，自托管实例上有「立即更新」。
+
+第一次要先手动升级一次，更新助手容器才会起来。在部署目录运行：
+
+```bash
+./scripts/deploy.sh
+```
+
+一次更新会等正在跑的任务结束，把数据库备份到 `backups/pre-update-*.sql.gz`（只留最近 5 份），然后构建新版本——这段时间旧版本继续服务。构建好了再替换，网页大约有一分钟打不开。接着检查新版本，没通过就自动回到旧版本。
+
+它不会覆盖你改过的已跟踪文件。配置写在 `.env`。
+
+只有更新助手容器挂 Docker socket。它不映射任何端口，只接受「更新到这个发布标签」，令牌只有 web 容器能读。更新助手不会更新自己。某个版本如果改了 `updater/`，发布说明会写明，那时在部署目录运行 `docker compose up -d --build updater`。
 
 ## 备份与恢复（pgdata）
 
