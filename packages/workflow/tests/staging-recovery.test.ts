@@ -9,6 +9,7 @@ import {
   type StorageExecutor,
 } from "../src/index.js";
 import { runAcquisitionV2Workflow } from "../src/acquisition-v2/workflow-v2.js";
+import { runStagingRecoveryV2AndPersist } from "../src/runner-v2.js";
 import { Storage115Simulator, type SimTreeFile } from "../src/acquisition-v2/storage-115-simulator.js";
 import type { ResourceSnapshot } from "../src/domain.js";
 
@@ -512,6 +513,132 @@ describe("staging_recovery", () => {
     const saved = await repo.getWorkflowRunSnapshot("recovery-setup", { accountId: "acct", connectedStorageId: "drive" });
     expect(saved?.workflowRun.status).toBe("queued");
     expect(saved?.notifications).toEqual([]);
+  });
+
+  it("a sibling season untracked while a two-season recovery runs stays untracked", async () => {
+    const repo = new InMemoryWorkflowRepository();
+    const scope = { accountId: "acct", connectedStorageId: "drive" };
+    const title = {
+      id: "title_7",
+      tmdbId: 7,
+      type: "tv" as const,
+      title: "Show",
+      originalTitle: "Show",
+      year: 2024,
+      aliases: [] as string[],
+    };
+    const storage = new FakeStorageExecutor();
+    const showId = await storage.createDirectory({ name: "Show (2024) {tmdb-7}", parentId: "root" });
+    const seasonDirs = [
+      await storage.createDirectory({ name: "Season 01", parentId: showId }),
+      await storage.createDirectory({ name: "Season 02", parentId: showId }),
+    ];
+    await storage.createDirectory({ name: "staging-old", parentId: showId });
+    for (const seasonNumber of [1, 2] as const) {
+      const season = {
+        id: `title_7_s${seasonNumber}`,
+        mediaTitleId: title.id,
+        seasonNumber,
+        status: "active" as const,
+        qualityPreference: "1080p" as const,
+        storageDirectoryId: seasonDirs[seasonNumber - 1]!,
+        totalEpisodes: 1,
+        latestAiredEpisode: 1,
+        latestAiredSource: "metadata" as const,
+      };
+      const episodes = createEpisodeStates({
+        trackedSeasonId: season.id,
+        seasonNumber,
+        totalEpisodes: 1,
+        latestAiredEpisode: 1,
+      }).map((episode) => ({ ...episode, obtained: true }));
+      await repo.saveWorkflowRunSnapshot({
+        ...scope,
+        title,
+        season,
+        workflowRun: {
+          id: `done-s${seasonNumber}`,
+          kind: "type3_monitor",
+          status: "succeeded",
+          trackedSeasonId: season.id,
+          startedAt: "2026-09-26T00:00:00.000Z",
+          finishedAt: "2026-09-26T01:00:00.000Z",
+          auditEvents: [],
+        },
+        episodes,
+        resourceSnapshots: [],
+        decisions: [],
+        transferAttempts: [],
+        notifications: [],
+      });
+    }
+    const states = (await repo.listTrackedSeasonStates(scope)).sort((a, b) => a.season.seasonNumber - b.season.seasonNumber);
+    await repo.saveWorkflowRunSnapshot({
+      ...scope,
+      title,
+      season: states[0]!.season,
+      workflowRun: {
+        id: "recovery-ms",
+        kind: "staging_recovery",
+        status: "running",
+        trackedSeasonId: states[0]!.season.id,
+        startedAt: "2026-09-28T03:00:00.000Z",
+        finishedAt: null,
+        auditEvents: [
+          {
+            type: "staging_recovery_queued",
+            message: "queued",
+            data: { stagingDirectoryId: "stg", showDirectoryId: showId, seasonNumbers: [1, 2] },
+          },
+        ],
+      },
+      episodes: states[0]!.episodes,
+      resourceSnapshots: [],
+      decisions: [],
+      transferAttempts: [],
+      notifications: [],
+    });
+    let untracked: { status: string; removedSeasons: number } | undefined;
+    await runStagingRecoveryV2AndPersist({
+      title,
+      seasons: states.map((state) => ({ season: state.season, episodes: state.episodes })),
+      lockSeasonNumber: 1,
+      lockAuditEvents: [],
+      stagingRecovery: { showDirectoryId: showId, stagingDirectoryId: "stg" },
+      categoryParentId: "unused",
+      resourceProvider: {
+        async search(): Promise<ResourceSnapshot> {
+          return { id: "snap", provider: "pansou", keyword: "Show", candidates: [], createdAt: "2026-09-28T03:00:00.000Z" };
+        },
+      },
+      storage,
+      model: new MockLanguageModelV3({
+        doGenerate: async () => {
+          untracked ??= await repo.untrackTitle(7, scope, "tv", 2);
+          return {
+            content: [{ type: "text" as const, text: "stopping" }],
+            finishReason: { unified: "stop" as const, raw: "stop" as const },
+            usage: USAGE,
+            warnings: [],
+          };
+        },
+      }),
+      repository: repo,
+      ...scope,
+      agentMemory: false,
+      maxSteps: 1,
+      workflowRun: { id: "recovery-ms", startedAt: "2026-09-28T03:00:00.000Z", finishedAt: null },
+      now: () => "2026-09-28T04:00:00.000Z",
+    });
+
+    expect(untracked).toEqual({ status: "untracked", removedSeasons: 1 });
+    const after = await repo.listTrackedSeasonStates(scope);
+    expect(after.map((state) => state.season.seasonNumber)).toEqual([1]);
+    expect(await repo.getWorkflowRunSnapshot("recovery-ms_s2", scope)).toBeNull();
+    const lock = await repo.getWorkflowRunSnapshot("recovery-ms", scope);
+    expect(lock?.workflowRun.kind).toBe("staging_recovery");
+    expect(lock?.season.seasonNumber).toBe(1);
+    expect(lock?.workflowRun.status).not.toBe("running");
   });
 
   it("an ordinary acquisition that throws still discards its own staging", async () => {

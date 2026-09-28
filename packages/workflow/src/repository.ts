@@ -83,7 +83,7 @@ export function titleBlockFilter(
   return null;
 }
 
-/** Whether the reservation refuses (`not_tracked`) a (season, drive) that is no longer
+/** Whether a reservation or a save refuses a (season, drive) that is no longer
  *  tracked: asked for directly, or implied by keepCurrentEpisodes (nothing to keep). */
 export function reservationRequiresTrackedSeason(
   input: Pick<ReserveWorkflowRunInput, "requireTrackedSeason" | "keepCurrentEpisodes">,
@@ -201,8 +201,12 @@ export type WorkflowRunReservationResult =
 export interface WorkflowRepository extends DeadLinkStore, AgentMemoryStore, UserRequestStore {
   saveWorkflowRunSnapshot(
     input: PersistWorkflowRunSnapshotInput & {
-      /** Write the run only. The season's episode bucket stays as stored. */
+      /** Write the run only. The season's episode bucket stays as stored.
+       *  Implies requireTrackedSeason: an untracked season has nothing to keep. */
       keepCurrentEpisodes?: boolean;
+      /** Write nothing at all when this (season, drive) is no longer tracked.
+       *  A recovery's late sibling write must not undo the user's untrack. */
+      requireTrackedSeason?: boolean;
     },
   ): Promise<void>;
   reserveWorkflowRun(input: ReserveWorkflowRunInput): Promise<WorkflowRunReservationResult>;
@@ -994,9 +998,9 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
   }
 
   async saveWorkflowRunSnapshot(
-    input: PersistWorkflowRunSnapshotInput & { keepCurrentEpisodes?: boolean },
+    input: PersistWorkflowRunSnapshotInput & { keepCurrentEpisodes?: boolean; requireTrackedSeason?: boolean },
   ): Promise<void> {
-    const { keepCurrentEpisodes, ...snapshot } = input;
+    const { keepCurrentEpisodes, requireTrackedSeason: _requireTrackedSeason, ...snapshot } = input;
     validateWorkflowRunSnapshot(snapshot);
 
     const cloned = cloneWorkflowValue(snapshot);
@@ -1008,6 +1012,16 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     const existing = this.workflowRuns.get(cloned.workflowRun.id);
     cloned.connectedStorageId =
       cloned.connectedStorageId ?? existing?.connectedStorageId ?? null;
+    // Synchronous with the write below: no await, so an untrack cannot land between them.
+    if (
+      reservationRequiresTrackedSeason({
+        ...(input.requireTrackedSeason === true ? { requireTrackedSeason: true } : {}),
+        ...(keepCurrentEpisodes === true ? { keepCurrentEpisodes: true } : {}),
+      }) &&
+      !this.isSeasonTracked(cloned.season.id, cloned.connectedStorageId)
+    ) {
+      return;
+    }
     const bucketKey = seasonScopeKey(cloned.season.id, cloned.connectedStorageId);
     if (keepCurrentEpisodes === true) {
       const current = this.episodesBySeason.get(bucketKey);

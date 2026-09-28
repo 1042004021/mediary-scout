@@ -320,14 +320,27 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
   }
 
   async saveWorkflowRunSnapshot(
-    input: PersistWorkflowRunSnapshotInput & { keepCurrentEpisodes?: boolean },
+    input: PersistWorkflowRunSnapshotInput & { keepCurrentEpisodes?: boolean; requireTrackedSeason?: boolean },
   ): Promise<void> {
-    const { keepCurrentEpisodes, ...rest } = input;
+    const { keepCurrentEpisodes, requireTrackedSeason, ...rest } = input;
     validateWorkflowRunSnapshot(rest);
     const snapshot = cloneWorkflowValue(rest);
-    // better-sqlite3 transactions are synchronous — the whole multi-table write
-    // commits atomically or rolls back on throw.
-    this.db.transaction(() => this.replaceWorkflowRunSnapshot(snapshot, { runOnly: keepCurrentEpisodes === true }))();
+    const requireTracked = reservationRequiresTrackedSeason({
+      ...(requireTrackedSeason === true ? { requireTrackedSeason: true } : {}),
+      ...(keepCurrentEpisodes === true ? { keepCurrentEpisodes: true } : {}),
+    });
+    // better-sqlite3 transactions are synchronous — the check and the write
+    // commit together, so an untrack cannot land between them.
+    this.db.transaction(() => {
+      if (requireTracked) {
+        const connectedStorageId = snapshot.connectedStorageId ?? UNSCOPED_STORAGE;
+        const tracked = this.db
+          .prepare("SELECT 1 FROM tracked_seasons WHERE id = ? AND connected_storage_id = ?")
+          .get(snapshot.season.id, connectedStorageId);
+        if (tracked === undefined) return;
+      }
+      this.replaceWorkflowRunSnapshot(snapshot, { runOnly: keepCurrentEpisodes === true });
+    })();
   }
 
   async reserveWorkflowRun(input: ReserveWorkflowRunInput): Promise<WorkflowRunReservationResult> {

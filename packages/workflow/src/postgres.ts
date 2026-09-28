@@ -462,14 +462,30 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
   }
 
   async saveWorkflowRunSnapshot(
-    input: PersistWorkflowRunSnapshotInput & { keepCurrentEpisodes?: boolean },
+    input: PersistWorkflowRunSnapshotInput & { keepCurrentEpisodes?: boolean; requireTrackedSeason?: boolean },
   ): Promise<void> {
-    const { keepCurrentEpisodes, ...rest } = input;
+    const { keepCurrentEpisodes, requireTrackedSeason, ...rest } = input;
     validateWorkflowRunSnapshot(rest);
     const snapshot = cloneWorkflowValue(rest);
-    await this.withTransaction((client) =>
-      this.replaceWorkflowRunSnapshot(client, snapshot, { runOnly: keepCurrentEpisodes === true }),
-    );
+    const requireTracked = reservationRequiresTrackedSeason({
+      ...(requireTrackedSeason === true ? { requireTrackedSeason: true } : {}),
+      ...(keepCurrentEpisodes === true ? { keepCurrentEpisodes: true } : {}),
+    });
+    await this.withTransaction(async (client) => {
+      if (requireTracked) {
+        const accountId = snapshot.accountId ?? DEFAULT_ACCOUNT_ID;
+        const connectedStorageId = snapshot.connectedStorageId ?? UNSCOPED_STORAGE;
+        // Same lock untrackTitle takes, then a row lock, so this write cannot
+        // recreate a season the user has just dropped.
+        await lockWorkflowTitle(client, accountId, snapshot.connectedStorageId, snapshot.season.mediaTitleId);
+        const tracked = await client.query(
+          "SELECT 1 FROM tracked_seasons WHERE id = $1 AND connected_storage_id = $2 FOR KEY SHARE",
+          [snapshot.season.id, connectedStorageId],
+        );
+        if ((tracked.rowCount ?? 0) === 0) return;
+      }
+      await this.replaceWorkflowRunSnapshot(client, snapshot, { runOnly: keepCurrentEpisodes === true });
+    });
   }
 
   async reserveWorkflowRun(input: ReserveWorkflowRunInput): Promise<WorkflowRunReservationResult> {

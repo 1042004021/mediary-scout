@@ -569,8 +569,9 @@ export async function runReplaceRequestV2AndPersist(
 /**
  * A leftover staging dir, judged by the agent and persisted like any other TV run.
  * No notification. The lock season keeps the claimed run id; other seasons get a
- * sibling record so their obtained marks land. Memory reflection is skipped inside
- * the engine (`stagingRecovery`).
+ * sibling record so their obtained marks land. Each of those writes is skipped
+ * when the season was untracked while this hidden run was going — the untrack wins.
+ * Memory reflection is skipped inside the engine (`stagingRecovery`).
  */
 export async function runStagingRecoveryV2AndPersist(
   input: TvV2Common & {
@@ -642,6 +643,7 @@ export async function runStagingRecoveryV2AndPersist(
       decisions: [],
       transferAttempts: [],
       notifications: [],
+      requireTrackedSeason: true,
     });
   }
   await input.repository.saveWorkflowRunSnapshot({
@@ -662,6 +664,7 @@ export async function runStagingRecoveryV2AndPersist(
     decisions: bridged.decisions,
     transferAttempts: bridged.transferAttempts,
     notifications: [],
+    requireTrackedSeason: true,
   });
   return { ...bridged, notifications: [] };
 }

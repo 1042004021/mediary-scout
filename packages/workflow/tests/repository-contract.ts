@@ -2484,6 +2484,64 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         }
       });
 
+      it("saveWorkflowRunSnapshot requireTrackedSeason writes a tracked season and nothing after untrack", async () => {
+        const repo = await fresh();
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_req" };
+        const tracked = queuedRun({ id: "req_seed", status: "succeeded", connectedStorageId: "cs_req", tmdbId: 4401 });
+        await repo.saveWorkflowRunSnapshot(tracked);
+
+        await repo.saveWorkflowRunSnapshot({
+          ...tracked,
+          requireTrackedSeason: true,
+          workflowRun: {
+            ...tracked.workflowRun,
+            id: "req_live",
+            kind: "type3_monitor",
+            startedAt: "2026-09-28T01:00:00.000Z",
+            finishedAt: "2026-09-28T01:10:00.000Z",
+          },
+        });
+        expect((await repo.getWorkflowRunSnapshot("req_live", scope))?.workflowRun.id).toBe("req_live");
+        expect((await repo.listTrackedSeasonStates(scope)).map((state) => state.season.id)).toContain("season_req_seed");
+
+        expect(await repo.untrackTitle(4401, scope, "tv")).toEqual({ status: "untracked", removedSeasons: 1 });
+        expect(await repo.listTrackedSeasonStates(scope)).toEqual([]);
+
+        await repo.saveWorkflowRunSnapshot({
+          ...tracked,
+          requireTrackedSeason: true,
+          workflowRun: {
+            ...tracked.workflowRun,
+            id: "req_back",
+            startedAt: "2026-09-28T02:00:00.000Z",
+            finishedAt: "2026-09-28T02:10:00.000Z",
+          },
+        });
+        expect(await repo.listTrackedSeasonStates(scope)).toEqual([]);
+        expect(await repo.getWorkflowRunSnapshot("req_back", scope)).toBeNull();
+      });
+
+      it("saveWorkflowRunSnapshot keepCurrentEpisodes writes nothing once the season is untracked", async () => {
+        const repo = await fresh();
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_keep_gone" };
+        const tracked = queuedRun({ id: "keep_gone", status: "succeeded", connectedStorageId: "cs_keep_gone", tmdbId: 4402 });
+        await repo.saveWorkflowRunSnapshot(tracked);
+        expect(await repo.untrackTitle(4402, scope, "tv")).toEqual({ status: "untracked", removedSeasons: 1 });
+
+        await repo.saveWorkflowRunSnapshot({
+          ...tracked,
+          keepCurrentEpisodes: true,
+          workflowRun: {
+            ...tracked.workflowRun,
+            id: "keep_gone_write",
+            startedAt: "2026-09-28T03:00:00.000Z",
+            finishedAt: "2026-09-28T03:10:00.000Z",
+          },
+        });
+        expect(await repo.listTrackedSeasonStates(scope)).toEqual([]);
+        expect(await repo.getWorkflowRunSnapshot("keep_gone_write", scope)).toBeNull();
+      });
+
       it("keepCurrentEpisodes: a replace reservation from a stale read writes only the run — what a run persisted in between stays; without it the reservation writes what it was handed, as before", async () => {
         const repo = await fresh();
         /** Track a season, read it (S01E02 missing), let a patrol run of it finish (S01E02
