@@ -47,6 +47,12 @@ async function resolveIsOwner(
   return account?.isOwner ?? false;
 }
 
+/** Owner check for the current request's account (single-user = implicit owner). */
+export async function resolveCurrentIsOwner(): Promise<boolean> {
+  const repository = getWorkflowRepository();
+  return resolveIsOwner(repository, await getCurrentAccountId());
+}
+
 /** Attention bookkeeping is per-account ONLY — read via getAccountSetting
  *  directly, never the global-fallback scoped settings. */
 async function loadAttentionState(

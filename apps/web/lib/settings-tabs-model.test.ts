@@ -61,13 +61,25 @@ describe("settingsTabQuery", () => {
   });
 });
 
+describe("update tab", () => {
+  it("is listed after 巡检与通知", () => {
+    const ids = SETTINGS_TABS.map((tab) => tab.id);
+    expect(ids.indexOf("update")).toBe(ids.indexOf("patrol") + 1);
+  });
+  it("is observed: a deep link falls back to drives until its slot renders", () => {
+    expect(resolveSettingsTab("update", {})).toBe("drives");
+    expect(resolveSettingsTab("update", { update: true })).toBe("update");
+  });
+});
+
 describe("SETTINGS_TABS", () => {
-  it("六个 tab、顺序与标签固定", () => {
+  it("七个 tab、顺序与标签固定", () => {
     expect(SETTINGS_TABS.map((tab) => tab.id)).toEqual([
       "drives",
       "services",
       "preferences",
       "patrol",
+      "update",
       "account",
       "remote",
     ]);
@@ -76,12 +88,13 @@ describe("SETTINGS_TABS", () => {
       "资源与服务",
       "获取偏好",
       "巡检与通知",
+      "更新",
       "账号",
       "远程访问",
     ]);
   });
 
-  it("受观察（内容为空即隐藏）的 tab 就是 account + remote", () => {
-    expect([...OBSERVED_SETTINGS_TABS]).toEqual(["account", "remote"]);
+  it("受观察（内容为空即隐藏）的 tab 就是 account + remote + update", () => {
+    expect([...OBSERVED_SETTINGS_TABS]).toEqual(["account", "remote", "update"]);
   });
 });
