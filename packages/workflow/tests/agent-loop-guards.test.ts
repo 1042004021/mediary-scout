@@ -216,6 +216,39 @@ describe("prepareStepSystemOverride (composes step-cap + budget nudges)", () => 
     expect(prepareStepSystemOverride({ stepNumber: 5, maxSteps: 60, baseSystem: base, apiCallsSpent: 10 })).toBeUndefined();
     expect(prepareStepSystemOverride({ stepNumber: 5, maxSteps: 60, baseSystem: base })).toBeUndefined();
   });
+  it("a recovery near the cap or over budget gets only the recovery reminder", () => {
+    const reminder =
+      "【进度提醒】这次整理快到上限了。请:① 已确认是季目录缺的视频,moveToSeason 入季并 markObtained;② 还没判断清楚的文件不要删,也不要 discardStaging——留着,下次会再整理;③ finish。";
+    const nearCap = prepareStepSystemOverride({
+      stepNumber: 55,
+      maxSteps: 60,
+      baseSystem: base,
+      apiCallsSpent: 10,
+      stagingRecovery: true,
+    })!;
+    const overBudget = prepareStepSystemOverride({
+      stepNumber: 5,
+      maxSteps: 60,
+      baseSystem: base,
+      apiCallsSpent: 260,
+      stagingRecovery: true,
+    })!;
+    expect(nearCap).toBe(`${base}\n\n${reminder}`);
+    expect(overBudget).toBe(`${base}\n\n${reminder}`);
+    expect(nearCap).not.toContain("discardStaging 清空");
+    expect(overBudget).not.toContain(STEP_50_REMINDER);
+    expect(overBudget).not.toContain(BUDGET_REMINDER);
+    expect(prepareStepSystemOverride({
+      stepNumber: 5,
+      maxSteps: 60,
+      baseSystem: base,
+      apiCallsSpent: 10,
+      stagingRecovery: true,
+    })).toBeUndefined();
+    const ordinary = prepareStepSystemOverride({ stepNumber: 55, maxSteps: 60, baseSystem: base, apiCallsSpent: 260 })!;
+    expect(ordinary).toContain(STEP_50_REMINDER);
+    expect(ordinary).toContain(BUDGET_REMINDER);
+  });
 });
 
 describe("DEFAULT_MAX_STEPS", () => {

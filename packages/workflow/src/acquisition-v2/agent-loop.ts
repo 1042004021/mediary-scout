@@ -414,6 +414,7 @@ export async function runAcquisitionAgent(
           baseSystem: system,
           ...(typeof spent === "number" ? { apiCallsSpent: spent } : {}),
           ...(typeof request.budgetSoftAt === "number" ? { budgetSoftAt: request.budgetSoftAt } : {}),
+          ...(request.stagingRecovery ? { stagingRecovery: true } : {}),
         });
         return overriddenSystem ? { system: overriddenSystem } : undefined;
       },

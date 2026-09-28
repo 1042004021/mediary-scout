@@ -421,10 +421,9 @@ export class TaskSandbox {
    *  move or deleteFiles has not cleared. The harness reads this and will not
    *  delete staging while it is non-empty — those files may be the only copies. */
   private readonly unmovedFileIds = new Set<string>();
-  /** Set only when the agent calls finish or discardStaging and that call returns.
-   *  The harness reads coverage with finish() after every loop; that read is not
-   *  a decision to delete an adopted leftover. */
-  private terminalCleanupReached = false;
+  /** Set only when discardStaging returns. A recovery finish is not permission
+   *  to delete the leftover; the harness coverage read of finish() is not either. */
+  private leftoverDiscarded = false;
 
   constructor(options: TaskSandboxOptions) {
     this.provider = options.provider;
@@ -1155,9 +1154,9 @@ export class TaskSandbox {
     return { deleted, directory: await this.listTreeOf(directoryId) };
   }
 
-  /** The agent called finish or discardStaging successfully in this run. */
-  reachedTerminalCleanup(): boolean {
-    return this.terminalCleanupReached;
+  /** The agent called discardStaging and it returned. */
+  stagingDiscarded(): boolean {
+    return this.leftoverDiscarded;
   }
 
   /** File ids still only in staging because their move failed. Read-only. */
@@ -1224,7 +1223,7 @@ export class TaskSandbox {
       );
     }
     const removed = await this.storage.removeDirectory({ directoryId: this.stagingDirectoryId });
-    this.terminalCleanupReached = true;
+    this.leftoverDiscarded = true;
     return removed;
   }
 
@@ -1301,9 +1300,7 @@ export class TaskSandbox {
         );
       }
     }
-    const result = await this.finish();
-    this.terminalCleanupReached = true;
-    return result;
+    return this.finish();
   }
 
   /** Requested or rejected episodes with no reportReplacement yet, in request order. */

@@ -227,6 +227,10 @@ export function reflectionSystemOverride(input: {
  * nudge applies. Both can fire at once (near the step cap AND over budget) — then
  * both are appended. Pure → unit-testable; prepareStep just calls this.
  */
+/** A recovery does not search, and an episode the DB already has is not re-fetched. */
+export const RECOVERY_WRAP_UP_REMINDER =
+  "【进度提醒】这次整理快到上限了。请:① 已确认是季目录缺的视频,moveToSeason 入季并 markObtained;② 还没判断清楚的文件不要删,也不要 discardStaging——留着,下次会再整理;③ finish。";
+
 export function prepareStepSystemOverride(input: {
   stepNumber: number;
   maxSteps: number;
@@ -234,10 +238,16 @@ export function prepareStepSystemOverride(input: {
   apiCallsSpent?: number;
   remindWithinSteps?: number;
   budgetSoftAt?: number;
+  /** Leftover recovery: one reminder, never the acquisition wrap-up. */
+  stagingRecovery?: boolean;
 }): string | undefined {
-  const nudges = [
-    stepReflectionNudge(input.stepNumber, input.maxSteps, input.remindWithinSteps),
-    budgetReflectionNudge(input.apiCallsSpent, input.budgetSoftAt),
-  ].filter((nudge): nudge is string => nudge !== null);
+  const stepNudge = stepReflectionNudge(input.stepNumber, input.maxSteps, input.remindWithinSteps);
+  const budgetNudge = budgetReflectionNudge(input.apiCallsSpent, input.budgetSoftAt);
+  if (input.stagingRecovery) {
+    return stepNudge !== null || budgetNudge !== null
+      ? `${input.baseSystem}\n\n${RECOVERY_WRAP_UP_REMINDER}`
+      : undefined;
+  }
+  const nudges = [stepNudge, budgetNudge].filter((nudge): nudge is string => nudge !== null);
   return nudges.length > 0 ? [input.baseSystem, ...nudges].join("\n\n") : undefined;
 }

@@ -143,7 +143,7 @@ export interface RunAcquisitionV2Request {
   /** Filled with the sandbox reader as soon as the sandbox exists, including when
    *  the agent loop later throws. The harness cleanup reads it from `finally`. */
   unmovedStaging?: { read: (() => string[]) | null };
-  /** Same lifetime as unmovedStaging. True once the agent called finish or discardStaging. */
+  /** Same lifetime as unmovedStaging. True once the agent called discardStaging. */
   terminalCleanup?: { read: (() => boolean) | null };
 }
 
@@ -485,7 +485,7 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
     request.unmovedStaging.read = () => sandbox.unmovedStagingFileIds();
   }
   if (request.terminalCleanup) {
-    request.terminalCleanup.read = () => sandbox.reachedTerminalCleanup();
+    request.terminalCleanup.read = () => sandbox.stagingDiscarded();
   }
   // Replace run (or protected existing files): record every file already in the target dirs
   // BEFORE anything can touch them. Not best-effort — the protection is the whole

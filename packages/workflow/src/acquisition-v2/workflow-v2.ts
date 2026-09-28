@@ -154,7 +154,7 @@ export async function runAcquisitionV2Workflow(
         return fileCount > 0 ? { fileCount } : null;
       },
       // The adopted leftover can be the only copy. A throw must not delete it,
-      // and a normal exit deletes it only after finish or discardStaging.
+      // and a normal exit deletes it only after discardStaging. finish does not.
       ...(request.stagingRecovery
         ? { preserveOnThrow: true, discardOnNormalReturn: () => terminalCleanup.read?.() ?? false }
         : {}),

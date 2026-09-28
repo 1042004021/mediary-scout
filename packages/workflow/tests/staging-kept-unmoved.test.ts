@@ -667,7 +667,19 @@ function recoveryRequest(executor: StuckFileExecutor, model: MockLanguageModelV3
   };
 }
 
-describe("recovery discards an adopted leftover only after finish or discardStaging", () => {
+describe("recovery discards an adopted leftover only after discardStaging", () => {
+  function seedLeftover(executor: FakeStorageExecutor) {
+    executor.seedDirectoryFiles("stg-leftover", [
+      {
+        id: "only-copy",
+        storageDirectoryId: "stg-leftover",
+        name: "Show.S01E01.mkv",
+        sizeBytes: 1000,
+        providerFileId: "only-copy",
+      },
+    ]);
+  }
+
   it("keeps the leftover when the model stops without calling finish or discardStaging", async () => {
     const executor = new StuckFileExecutor();
     const result = await runAcquisitionV2Workflow(recoveryRequest(executor, textStop()));
@@ -675,24 +687,52 @@ describe("recovery discards an adopted leftover only after finish or discardStag
     expect(executor.removed).not.toContain("stg-leftover");
   });
 
-  it("discards the leftover when the recovery calls finish", async () => {
-    const executor = new StuckFileExecutor();
+  it("keeps the leftover and its file when the recovery calls finish and then stops", async () => {
+    const executor = new FakeStorageExecutor();
+    seedLeftover(executor);
+    let step = 0;
     const model = new MockLanguageModelV3({
-      doGenerate: async () => tool("finish", {}, 1),
+      doGenerate: async () => {
+        step += 1;
+        if (step === 1) return tool("finish", {}, step);
+        return {
+          content: [{ type: "text" as const, text: "stopping" }],
+          finishReason: { unified: "stop" as const, raw: "stop" as const },
+          usage: USAGE,
+          warnings: [],
+        };
+      },
     });
-    await runAcquisitionV2Workflow(recoveryRequest(executor, model));
-    expect(executor.removed).toContain("stg-leftover");
+    await expect(
+      runAcquisitionV2Workflow({
+        ...workflowRequest(executor as StuckFileExecutor, model),
+        maxSteps: 2,
+        stagingRecovery: { showDirectoryId: "show-left", stagingDirectoryId: "stg-leftover" },
+      }),
+    ).resolves.toMatchObject({ directories: { stagingDirectoryId: "stg-leftover" } });
+    const files = await executor.listTree({ directoryId: "stg-leftover" });
+    expect(files.map((file) => file.providerFileId)).toContain("only-copy");
   });
 
-  it("discards the leftover when the recovery calls discardStaging, without throwing", async () => {
-    const executor = new StuckFileExecutor();
+  it("removes the leftover when the recovery calls discardStaging and then finish", async () => {
+    const executor = new FakeStorageExecutor();
+    seedLeftover(executor);
+    let step = 0;
     const model = new MockLanguageModelV3({
-      doGenerate: async () => tool("discardStaging", {}, 1),
+      doGenerate: async () => {
+        step += 1;
+        if (step === 1) return tool("discardStaging", {}, step);
+        return tool("finish", {}, step);
+      },
     });
-    await expect(runAcquisitionV2Workflow(recoveryRequest(executor, model))).resolves.toMatchObject({
-      directories: { stagingDirectoryId: "stg-leftover" },
-    });
-    expect(executor.removed).toContain("stg-leftover");
+    await expect(
+      runAcquisitionV2Workflow({
+        ...workflowRequest(executor as StuckFileExecutor, model),
+        maxSteps: 2,
+        stagingRecovery: { showDirectoryId: "show-left", stagingDirectoryId: "stg-leftover" },
+      }),
+    ).resolves.toMatchObject({ directories: { stagingDirectoryId: "stg-leftover" } });
+    expect(await executor.listTree({ directoryId: "stg-leftover" })).toEqual([]);
   });
 
   it("still discards a fresh staging dir when an ordinary run stops without finish", async () => {
