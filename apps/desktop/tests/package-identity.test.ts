@@ -16,7 +16,8 @@ describe("desktop app identity", () => {
 
   it("keeps the appId and product name that make a new version replace the old one", () => {
     const builder = read("../electron-builder.yml");
-    expect(builder).toMatch(new RegExp(`^appId: ${APP_ID.replaceAll(".", "\\.")}$`, "m"));
+    expect(APP_ID).toBe("sbs.dirtyfancy.mediary-scout");
+    expect(builder).toMatch(/^appId: sbs\.dirtyfancy\.mediary-scout$/m);
     expect(builder).toMatch(/^productName: Mediary Scout$/m);
   });
 });
