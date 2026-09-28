@@ -118,17 +118,16 @@ export async function fetchReleaseFeed(fetchImpl: typeof fetch = fetch): Promise
 /** Null when GitHub is unreachable, the latest release is not a date release (e.g. v1.4.1),
  *  or it does not yet include both a .dmg and an .exe from this repo. The release is created
  *  before the assets finish uploading.
- *  Cached like the feed: an hour after success, five minutes after a failure. */
+ *  An hour only when both installers came back; five minutes otherwise, so the upload window
+ *  is not hidden for an hour. */
 export async function fetchLatestDesktopRelease(fetchImpl: typeof fetch = fetch): Promise<DesktopRelease | null> {
   if (desktopCache && Date.now() - desktopCache.at < desktopCache.ttl) return desktopCache.release;
   let release: DesktopRelease | null = null;
   let ttl = FAIL_TTL_MS;
   try {
     const raw = await getText(fetchImpl, LATEST_RELEASE_URL);
-    if (raw) {
-      release = desktopReleaseFrom(JSON.parse(raw));
-      ttl = OK_TTL_MS;
-    }
+    if (raw) release = desktopReleaseFrom(JSON.parse(raw));
+    if (release) ttl = OK_TTL_MS;
   } catch {
     release = null;
   }

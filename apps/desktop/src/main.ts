@@ -290,7 +290,8 @@ async function checkForUpdate(): Promise<void> {
       return;
     }
     const latest = parseLatestRelease(await response.json());
-    lastUpdateCheckAt = Date.now();
+    // Null means installers are still uploading, or it is not a date release: retry on the hourly tick.
+    if (latest !== null) lastUpdateCheckAt = Date.now();
     const notice = decideUpdateNotice({ latest, currentVersion: app.getVersion(), notifiedTag: readNotifiedTag() });
     offeredUpdate = notice.offer;
     refreshTray();

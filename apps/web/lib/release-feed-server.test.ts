@@ -153,6 +153,40 @@ describe("fetchLatestDesktopRelease", () => {
     expect(await fetchLatestDesktopRelease(onlyExe)).toBeNull();
   });
 
+  it("treats a release that is still missing an installer as a five-minute failure", async () => {
+    const failTtl = 5 * 60 * 1000;
+    const onlyExe = JSON.stringify({
+      tag_name: "v2026.10.02",
+      assets: [asset("Mediary.Scout.Setup.2026.1002.0.exe")],
+    });
+    const both = JSON.stringify({
+      tag_name: "v2026.10.02",
+      assets: [asset("Mediary.Scout-2026.1002.0-arm64.dmg"), asset("Mediary.Scout.Setup.2026.1002.0.exe")],
+    });
+    let body = onlyExe;
+    const fetchImpl = vi.fn(async () => new Response(body, { status: 200 })) as unknown as typeof fetch;
+    vi.useFakeTimers();
+    try {
+      const start = new Date("2026-10-02T00:00:00.000Z");
+      vi.setSystemTime(start);
+      expect(await fetchLatestDesktopRelease(fetchImpl)).toBeNull();
+      vi.setSystemTime(new Date(start.getTime() + failTtl - 1));
+      expect(await fetchLatestDesktopRelease(fetchImpl)).toBeNull();
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      body = both;
+      vi.setSystemTime(new Date(start.getTime() + failTtl));
+      expect(await fetchLatestDesktopRelease(fetchImpl)).toEqual({
+        tag: "v2026.10.02",
+        pageUrl: "https://github.com/fancydirty/mediary-scout/releases/tag/v2026.10.02",
+        dmgUrl: asset("Mediary.Scout-2026.1002.0-arm64.dmg").browser_download_url,
+        exeUrl: asset("Mediary.Scout.Setup.2026.1002.0.exe").browser_download_url,
+      });
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("returns null when GitHub is unreachable, and caches the failure", async () => {
     const fetchImpl = vi.fn(async () => {
       throw new Error("offline");
