@@ -11,6 +11,9 @@ const OK_TTL_MS = 60 * 60 * 1000;
 const FAIL_TTL_MS = 5 * 60 * 1000;
 /** Notes fetched for the newest N releases only (the tab shows 3, "更早" expands to 10). */
 const NOTES_LIMIT = 10;
+const LATEST_RELEASE_URL = `https://api.github.com/repos/${REPO}/releases/latest`;
+/** Installers are only trusted from this repo's own release downloads. */
+const DOWNLOAD_PREFIX = `https://github.com/${REPO}/releases/download/`;
 
 export interface ReleaseEntry {
   tag: string;
@@ -19,11 +22,21 @@ export interface ReleaseEntry {
   notes: ReleaseNote[];
 }
 
+/** The newest Release published on GitHub with installers: what desktop users can download. */
+export interface DesktopRelease {
+  tag: string;
+  pageUrl: string;
+  dmgUrl: string | null;
+  exeUrl: string | null;
+}
+
 let cache: { at: number; ttl: number; feed: ReleaseEntry[] } | null = null;
+let desktopCache: { at: number; ttl: number; release: DesktopRelease | null } | null = null;
 const relationCache = new Map<string, { at: number; relation: CommitRelation | null }>();
 
 export function invalidateReleaseFeedCache(): void {
   cache = null;
+  desktopCache = null;
   relationCache.clear();
 }
 
@@ -100,4 +113,46 @@ export async function fetchReleaseFeed(fetchImpl: typeof fetch = fetch): Promise
   }
   cache = { at: Date.now(), ttl, feed };
   return feed;
+}
+
+/** Null when GitHub is unreachable or the latest release is not a date release (e.g. v1.4.1).
+ *  Cached like the feed: an hour after success, five minutes after a failure. */
+export async function fetchLatestDesktopRelease(fetchImpl: typeof fetch = fetch): Promise<DesktopRelease | null> {
+  if (desktopCache && Date.now() - desktopCache.at < desktopCache.ttl) return desktopCache.release;
+  let release: DesktopRelease | null = null;
+  let ttl = FAIL_TTL_MS;
+  try {
+    const raw = await getText(fetchImpl, LATEST_RELEASE_URL);
+    if (raw) {
+      release = desktopReleaseFrom(JSON.parse(raw));
+      ttl = OK_TTL_MS;
+    }
+  } catch {
+    release = null;
+  }
+  desktopCache = { at: Date.now(), ttl, release };
+  return release;
+}
+
+function desktopReleaseFrom(body: unknown): DesktopRelease | null {
+  const data = (body ?? {}) as { tag_name?: unknown; assets?: unknown };
+  if (typeof data.tag_name !== "string" || !parseReleaseTag(data.tag_name)) return null;
+  const assets = Array.isArray(data.assets)
+    ? (data.assets as Array<{ name?: unknown; browser_download_url?: unknown } | null>)
+    : [];
+  const installer = (extension: string): string | null => {
+    for (const asset of assets) {
+      const url = asset?.browser_download_url;
+      if (typeof asset?.name === "string" && asset.name.endsWith(extension) && typeof url === "string" && url.startsWith(DOWNLOAD_PREFIX)) {
+        return url;
+      }
+    }
+    return null;
+  };
+  return {
+    tag: data.tag_name,
+    pageUrl: `https://github.com/${REPO}/releases/tag/${data.tag_name}`,
+    dmgUrl: installer(".dmg"),
+    exeUrl: installer(".exe"),
+  };
 }
