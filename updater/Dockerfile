@@ -6,4 +6,6 @@ RUN apk add --no-cache git nodejs su-exec
 WORKDIR /updater
 COPY server.mjs run-update.sh ./
 RUN chmod +x run-update.sh && git config --system --add safe.directory /repo
-CMD ["node", "server.mjs"]
+# Exec-form ENTRYPOINT, not CMD: the base image's docker-entrypoint.sh prepends
+# `docker` to any command that is a docker subcommand, and `node` is one (`docker node`).
+ENTRYPOINT ["node", "server.mjs"]

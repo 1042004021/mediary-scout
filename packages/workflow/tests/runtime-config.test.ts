@@ -73,4 +73,24 @@ describe("docker-compose.yml web service config", () => {
     expect(web.volumes).toContain("updater-state:/updater-state:ro");
     expect(web.volumes?.some((mount) => mount.includes("docker.sock"))).toBe(false);
   });
+
+  it("starts the updater with an exec-form node ENTRYPOINT", () => {
+    // docker:*-cli's own entrypoint prepends `docker` to a CMD that is a docker
+    // subcommand, and `node` is one: `CMD ["node", ...]` runs `docker node ...`.
+    const dockerfile = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "../../../updater/Dockerfile"), "utf8");
+    const lines = dockerfile.split("\n").map((line) => line.trim());
+    expect(lines).toContain('ENTRYPOINT ["node", "server.mjs"]');
+    expect(lines.some((line) => /^CMD\b/.test(line))).toBe(false);
+  });
+
+  it("keeps database dumps out of the image build context and out of git", () => {
+    const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+    const entries = (file: string) =>
+      readFileSync(resolve(root, file), "utf8")
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line && !line.startsWith("#"));
+    expect(entries(".dockerignore")).toContain("backups");
+    expect(entries(".gitignore")).toContain("/backups/");
+  });
 });
