@@ -255,10 +255,9 @@ async function sweepDrive(
         // A directory at the depth limit was not opened. A file below it is
         // invisible here, and a recovery's discardStaging would delete it.
         // Leave the orphan whether or not other files were visible.
-        const listSubdirectories = executor.listSubdirectories;
         const subdirs =
-          typeof listSubdirectories === "function"
-            ? await pace(() => listSubdirectories({ directoryId: child.id, maxDepth: JANITOR_LIST_DEPTH }))
+          typeof executor.listSubdirectories === "function"
+            ? await pace(() => executor.listSubdirectories!({ directoryId: child.id, maxDepth: JANITOR_LIST_DEPTH }))
             : null;
         if (subdirs === null || subdirs.some((dir) => subdirectorySitsAtDepthLimit(dir.path))) {
           skippedDeep += 1;
@@ -281,13 +280,18 @@ async function sweepDrive(
         // failed to match, stays — deleting it might throw away a real title.
         if (!seasons || seasons.length === 0) {
           const tmdbId = tmdbIdFromMediaLibraryFolderName(show.name);
+          // The snapshot above is from the start of the sweep. A title the user
+          // starts tracking during the walk must not lose its leftover.
           if (tmdbId !== null && !tvNamespaceTitleIsTracked(states, tmdbId)) {
-            const result = await pace(() => executor.removeDirectory(child.id));
-            if (result.removed) removedUntracked += 1;
-            else notRemoved += 1;
-          } else {
-            skippedUnmatched += 1;
+            const fresh = await repository.listTrackedSeasonStates(scope);
+            if (!tvNamespaceTitleIsTracked(fresh, tmdbId)) {
+              const result = await pace(() => executor.removeDirectory(child.id));
+              if (result.removed) removedUntracked += 1;
+              else notRemoved += 1;
+              continue;
+            }
           }
+          skippedUnmatched += 1;
           continue;
         }
         if (queued >= RECOVERY_CAP) continue;

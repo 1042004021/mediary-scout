@@ -2,6 +2,7 @@ import {
   DEFAULT_ACCOUNT_ID,
   isStagingJanitorId,
   isUserVisibleNotificationKind,
+  isUserVisibleWorkflowKind,
   type AgentDecision,
   type AgentStep,
   type EpisodeState,
@@ -1430,11 +1431,13 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     const stored = this.workflowRuns.get(workflowRunId);
     // A kind with no queue claimer can never leave `queued` — retrying it would
     // strand the run and re-block the season (see isQueueClaimableKind).
+    // A hidden kind is claimable by the worker but must not be reachable here.
     if (
       !stored ||
       !scopeMatches(scope, stored.accountId, stored.connectedStorageId) ||
       stored.workflowRun.status !== "failed" ||
-      !isQueueClaimableKind(stored.workflowRun.kind)
+      !isQueueClaimableKind(stored.workflowRun.kind) ||
+      !isUserVisibleWorkflowKind(stored.workflowRun.kind)
     ) {
       return { status: "not_retriable" };
     }
@@ -1874,7 +1877,9 @@ export function tearsDownTrackingOnCancel(kind: WorkflowKind): boolean {
  *  enforced per write-site, not centrally. Callers that can move a run into
  *  `queued` must consult this predicate themselves — currently
  *  `recoverOrphanRunningRun` (crash recovery) and `retryFailedWorkflowRun` (all
- *  three repository implementations). Nothing structurally prevents a future
+ *  three repository implementations). `retryFailedWorkflowRun` also refuses a
+ *  kind `isUserVisibleWorkflowKind` rejects: `staging_recovery` is claimable, but
+ *  a user retry must not requeue a hidden run. Nothing structurally prevents a future
  *  write-site from forgetting. Candidates for a central fix, best first:
  *    1. The shared pure transitions themselves (`retriedWorkflowRun`,
  *       `recoverOrphanRunningRun`) — already one place each rather than three,

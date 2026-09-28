@@ -1312,4 +1312,119 @@ describe("sweepOrphanStagingDirs", () => {
     });
     expect(listed).toBe(false);
   });
+
+  it("calls executor methods with this when listing a settled leftover", async () => {
+    class BoundExecutor {
+      readonly calls: string[] = [];
+      async listChildDirectories(parentId: string) {
+        this.calls.push("listChildDirectories");
+        if (parentId === "tv") return [{ id: "show", name: "Show" }];
+        if (parentId === "show") return [{ id: "stg-bound", name: "staging-old" }];
+        return [];
+      }
+      async listTree() {
+        this.calls.push("listTree");
+        return [{ path: "Show.S01E01.mkv", providerFileId: "f1", sizeBytes: 1024 * 1024 }];
+      }
+      async listSubdirectories() {
+        this.calls.push("listSubdirectories");
+        return [];
+      }
+      async removeDirectory(id: string) {
+        this.calls.push(`removeDirectory:${id}`);
+        return { removed: true };
+      }
+    }
+    const repo = new InMemoryWorkflowRepository();
+    await saveTracked(repo, "drive-bound", "show", "Show", 41);
+    const executor = new BoundExecutor();
+    await sweepOrphanStagingDirs({
+      repository: repo,
+      now: NOW,
+      drives: [drive({ storageId: "drive-bound", executor })],
+    });
+    expect(executor.calls).toContain("listSubdirectories");
+    const queued = await recoveriesOf(repo, "drive-bound");
+    expect(queued).toHaveLength(1);
+    expect(queued[0]?.workflowRun.auditEvents.some((event) => event.data?.["stagingDirectoryId"] === "stg-bound")).toBe(true);
+  });
+
+  it("does not delete an untracked leftover when the title becomes tracked during the walk", async () => {
+    const inner = new InMemoryWorkflowRepository();
+    let reads = 0;
+    const repository = {
+      getWorkflowRunSnapshot: (id: string, accountId?: string) => inner.getWorkflowRunSnapshot(id, accountId),
+      getAccountSetting: (accountId: string, key: string) => inner.getAccountSetting(accountId, key),
+      setAccountSetting: (accountId: string, key: string, value: string) => inner.setAccountSetting(accountId, key, value),
+      listActiveWorkflowRuns: (scope?: Parameters<InMemoryWorkflowRepository["listActiveWorkflowRuns"]>[0]) =>
+        inner.listActiveWorkflowRuns(scope),
+      findActiveStagingRecovery: (input: Parameters<InMemoryWorkflowRepository["findActiveStagingRecovery"]>[0]) =>
+        inner.findActiveStagingRecovery(input),
+      reserveWorkflowRun: (input: Parameters<InMemoryWorkflowRepository["reserveWorkflowRun"]>[0]) =>
+        inner.reserveWorkflowRun(input),
+      listTrackedSeasonStates: async () => {
+        reads += 1;
+        if (reads === 1) return [];
+        return [
+          {
+            accountId: "acct",
+            connectedStorageId: "drive-late",
+            title: {
+              id: "title_late",
+              tmdbId: 77,
+              type: "tv" as const,
+              title: "Gone Show",
+              originalTitle: "Gone Show",
+              year: 2020,
+              aliases: [],
+            },
+            season: {
+              id: "title_late_s1",
+              mediaTitleId: "title_late",
+              seasonNumber: 1,
+              status: "active" as const,
+              qualityPreference: "1080p" as const,
+              storageDirectoryId: "tracked-elsewhere",
+              totalEpisodes: 1,
+              latestAiredEpisode: 1,
+              latestAiredSource: "metadata" as const,
+            },
+            episodes: [],
+          },
+        ];
+      },
+    };
+    const removed: string[] = [];
+    const logs: string[] = [];
+    await sweepOrphanStagingDirs({
+      repository,
+      now: NOW,
+      log: (line) => logs.push(line),
+      drives: [
+        drive({
+          storageId: "drive-late",
+          executor: {
+            async listChildDirectories(parentId: string) {
+              if (parentId === "tv") return [{ id: "show", name: "Gone Show (2020) {tmdb-77}" }];
+              if (parentId === "show") return [{ id: "stg-late", name: "staging-run-late" }];
+              return [];
+            },
+            async listTree() {
+              return [{ path: "a.mkv", providerFileId: "a", sizeBytes: 1024 * 1024 }];
+            },
+            async listSubdirectories() {
+              return [];
+            },
+            async removeDirectory(id: string) {
+              removed.push(id);
+              return { removed: true };
+            },
+          },
+        }),
+      ],
+    });
+    expect(removed).not.toContain("stg-late");
+    expect(await recoveriesOf(inner, "drive-late")).toEqual([]);
+    expect(logs.some((line) => /drive-late: removed 0 empty, queued 0 recovery, skipped 1 unmatched/.test(line))).toBe(true);
+  });
 });

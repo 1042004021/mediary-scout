@@ -5,6 +5,7 @@ import {
   episodeNumberFromCode,
   HIDDEN_NOTIFICATION_KINDS,
   isStagingJanitorId,
+  isUserVisibleWorkflowKind,
   type AgentDecision,
   type AgentStep,
   type EpisodeState,
@@ -1017,12 +1018,14 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       const ownerStorage = (row.rows[0]?.connected_storage_id as string | null | undefined) ?? null;
       // A kind with no queue claimer can never leave `queued` — retrying it would
       // strand the run and re-block the season (see isQueueClaimableKind).
+      // A hidden kind is claimable by the worker but must not be reachable here.
       if (
         !run ||
         owner !== scope.accountId ||
         (scope.connectedStorageId != null && ownerStorage !== scope.connectedStorageId) ||
         run.status !== "failed" ||
-        !isQueueClaimableKind(run.kind)
+        !isQueueClaimableKind(run.kind) ||
+        !isUserVisibleWorkflowKind(run.kind)
       ) {
         return { status: "not_retriable" as const };
       }

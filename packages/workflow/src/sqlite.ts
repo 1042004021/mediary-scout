@@ -6,6 +6,7 @@ import {
   HIDDEN_NOTIFICATION_KINDS,
   isStagingJanitorId,
   isUserVisibleNotificationKind,
+  isUserVisibleWorkflowKind,
 } from "./domain.js";
 import type {
   AgentDecision,
@@ -1113,11 +1114,13 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
       const ownerStorage = rawStorage === UNSCOPED_STORAGE ? null : rawStorage;
       // A kind with no queue claimer can never leave `queued` — retrying it would
       // strand the run and re-block the season (see isQueueClaimableKind).
+      // A hidden kind is claimable by the worker but must not be reachable here.
       if (
         !run ||
         !scopeMatches(scope, owner, ownerStorage) ||
         run.status !== "failed" ||
-        !isQueueClaimableKind(run.kind)
+        !isQueueClaimableKind(run.kind) ||
+        !isUserVisibleWorkflowKind(run.kind)
       ) {
         return { status: "not_retriable" as const };
       }

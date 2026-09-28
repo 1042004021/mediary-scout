@@ -2666,6 +2666,25 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         expect(after?.workflowRun.finishedAt).toBe("2026-06-11T02:00:00.000Z");
       });
 
+      it("retryFailedWorkflowRun refuses a failed staging_recovery", async () => {
+        const repo = await fresh();
+        const snap = queuedRun({ id: "failed_recovery", status: "failed", connectedStorageId: "cs_hidden_retry" });
+        await repo.saveWorkflowRunSnapshot({
+          ...snap,
+          workflowRun: {
+            ...snap.workflowRun,
+            kind: "staging_recovery",
+            status: "failed",
+            finishedAt: "2026-06-11T02:00:00.000Z",
+          },
+        });
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_hidden_retry" };
+        expect(await repo.retryFailedWorkflowRun("failed_recovery", scope)).toEqual({ status: "not_retriable" });
+        const after = await repo.getWorkflowRunSnapshot("failed_recovery", scope);
+        expect(after?.workflowRun.status).toBe("failed");
+        expect(after?.workflowRun.finishedAt).toBe("2026-06-11T02:00:00.000Z");
+      });
+
       it("retryFailedWorkflowRun refuses a non-failed (queued) run", async () => {
         const repo = await fresh();
         await repo.saveWorkflowRunSnapshot(queuedRun({ id: "queued_r", connectedStorageId: "cs_rq" }));
