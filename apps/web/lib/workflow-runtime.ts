@@ -1824,10 +1824,9 @@ export async function runScheduledType3(options?: {
       },
       ...(sync ? { syncSeasonMetadata: sync } : {}),
     });
-    if (heldBack) {
-      // Release this call's slots (as on a failure) and do not stamp a completed sweep,
-      // so the new version patrols the rest today. Seasons that did run are only
-      // re-checked; the janitor also waits for the next full sweep.
+    // Release this call's slots (as on a failure) and do not stamp a completed sweep,
+    // so the new version patrols the rest today. Seasons that did run are only re-checked.
+    const stopForUpdate = async () => {
       if (claimedNow.length > 0) {
         await repository.setSetting(
           LAST_SWEEP_CLAIMS_SETTING_KEY,
@@ -1835,19 +1834,24 @@ export async function runScheduledType3(options?: {
         );
       }
       await pushNotificationsSince(repository, startedAt, { sweep: true });
-      return { skipped: "update_in_progress", outcomes: result };
-    }
+      return { skipped: "update_in_progress" as const, outcomes: result };
+    };
+    if (heldBack) return await stopForUpdate();
     try {
-      await sweepOrphanStagingDirs({
+      const janitor = await sweepOrphanStagingDirs({
         repository,
         drives: await stagingJanitorDrives(),
         now: new Date().toISOString(),
+        mayStartRun,
       });
+      if (janitor.held) heldBack = true;
     } catch (error) {
       console.error(
         `[patrol] staging janitor failed: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
+    // The janitor stopped for an update: the sweep did not finish either.
+    if (heldBack) return await stopForUpdate();
     await repository.setSetting(LAST_SWEEP_COMPLETED_AT_SETTING_KEY, new Date().toISOString());
     await pushNotificationsSince(repository, startedAt, { sweep: true });
     return { outcomes: result };

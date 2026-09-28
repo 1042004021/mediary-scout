@@ -319,12 +319,15 @@ describe("runScheduledType3（per-slot 认领 + 合并补跑）", () => {
   // Harness 沿用旧 desktop describe：内存 SQLite 真 get/setSetting、fake Date 钉
   // 北京钟（UTC+8）、stub runScheduledType3Monitoring 免真盘真模型。
   const monitor = vi.fn(async () => []);
+  const janitor = vi.fn(async () => ({ held: false }));
   const prevPg = process.env.MEDIA_TRACK_POSTGRES_URL;
   let rt: typeof import("./workflow-runtime");
 
   const boot = async (settings: Record<string, string>, beijingISO: string) => {
     monitor.mockClear();
     monitor.mockImplementation(async () => []);
+    janitor.mockClear();
+    janitor.mockImplementation(async () => ({ held: false }));
     process.env.MEDIA_TRACK_SQLITE_PATH = ":memory:";
     delete process.env.MEDIA_TRACK_POSTGRES_URL;
     vi.useFakeTimers({ toFake: ["Date"] });
@@ -332,7 +335,7 @@ describe("runScheduledType3（per-slot 认领 + 合并补跑）", () => {
     vi.resetModules();
     vi.doMock("@media-track/workflow", async () => {
       const actual = await vi.importActual<typeof import("@media-track/workflow")>("@media-track/workflow");
-      return { ...actual, runScheduledType3Monitoring: monitor };
+      return { ...actual, runScheduledType3Monitoring: monitor, sweepOrphanStagingDirs: janitor };
     });
     rt = await import("./workflow-runtime");
     const repository = rt.getWorkflowRepository();
@@ -517,6 +520,17 @@ describe("runScheduledType3（per-slot 认领 + 合并补跑）", () => {
     const again = await rt.runScheduledType3();
     expect(again.skipped).toBeUndefined();
     expect(await claims(repository)).toEqual({ date: "2026-07-09", slots: ["06:00"] });
+  });
+
+  it("staging 清理因更新暂停停下：同样释放时间点、不记完成", async () => {
+    const repository = await boot({ daily_sweep_times: TIMES }, "2026-07-09T06:30");
+    janitor.mockImplementation((async () => ({ held: true })) as never);
+    const result = await rt.runScheduledType3();
+    expect(result.skipped).toBe("update_in_progress");
+    expect(await claims(repository)).toEqual({ date: "2026-07-09", slots: [] });
+    expect((await repository.getSetting(rt.LAST_SWEEP_COMPLETED_AT_SETTING_KEY)) ?? null).toBeNull();
+    const passed = (janitor.mock.calls[0] as unknown as [{ mayStartRun?: () => boolean }])[0].mayStartRun;
+    expect(typeof passed).toBe("function");
   });
 
   it("成功后写 last_sweep_completed_at（含定时路径）", async () => {
