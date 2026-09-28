@@ -29,7 +29,7 @@ export interface StagingJanitorDrive {
   provider: string;
   tvCid: string | null;
   animeCid: string | null;
-  executor: Partial<Pick<StorageExecutor, "listChildDirectories" | "listTree" | "removeDirectory">>;
+  executor: Partial<Pick<StorageExecutor, "listChildDirectories" | "listTree" | "listSubdirectories" | "removeDirectory">>;
 }
 
 export interface StagingJanitorClock {
@@ -117,7 +117,18 @@ function settledForSweep(
   return Number.isFinite(age) && age > SWEEP_SETTLE_MS;
 }
 
-type CapableExecutor = Pick<StorageExecutor, "listChildDirectories" | "listTree" | "removeDirectory">;
+/** A subdirectory path with this many segments was recorded but not opened.
+ *  115, 123, quark, 光鸭 and 天翼 all walk the same way: depth 1 is the orphan,
+ *  each child adds one `path` segment, and `depth > maxDepth` returns before
+ *  listing. A dir whose path has JANITOR_LIST_DEPTH segments may hold files
+ *  the file walk never saw. */
+function subdirectorySitsAtDepthLimit(path: string): boolean {
+  const segments = path.split("/").filter((segment) => segment.length > 0);
+  return segments.length >= JANITOR_LIST_DEPTH;
+}
+
+type CapableExecutor = Pick<StorageExecutor, "listChildDirectories" | "listTree" | "removeDirectory"> &
+  Partial<Pick<StorageExecutor, "listSubdirectories">>;
 
 function canSweep(executor: StagingJanitorDrive["executor"]): executor is CapableExecutor {
   return (
@@ -180,9 +191,9 @@ async function sweepDrive(
   repository: SweepRepository,
   now: string,
   clock: StagingJanitorClock,
-): Promise<{ removed: number; queued: number; notRemoved: number }> {
+): Promise<{ removed: number; queued: number; notRemoved: number; skippedDeep: number }> {
   if (drive.status !== "active" || !canSweep(drive.executor)) {
-    return { removed: 0, queued: 0, notRemoved: 0 };
+    return { removed: 0, queued: 0, notRemoved: 0, skippedDeep: 0 };
   }
   const executor = drive.executor;
   const pace = pacerFor(minIntervalMs(drive.provider), clock);
@@ -193,6 +204,7 @@ async function sweepDrive(
   let removed = 0;
   let notRemoved = 0;
   let queued = 0;
+  let skippedDeep = 0;
 
   const shows: Array<{ id: string; name: string; type: "tv" | "anime" }> = [];
   for (const category of [
@@ -223,8 +235,18 @@ async function sweepDrive(
         const tree = await pace(() => executor.listTree({ directoryId: child.id, maxDepth: JANITOR_LIST_DEPTH }));
         const again = await repository.getWorkflowRunSnapshot(runId, drive.accountId);
         if (runCameBack(snapshot, again)) continue;
-        // No files anywhere in the walk, wrapper folders included.
+        // No files in the walk. A directory sitting at the depth limit was not
+        // opened, so a file below it would also look like this — leave it.
         if (tree.length === 0) {
+          const listSubdirectories = executor.listSubdirectories;
+          const subdirs =
+            typeof listSubdirectories === "function"
+              ? await pace(() => listSubdirectories({ directoryId: child.id, maxDepth: JANITOR_LIST_DEPTH }))
+              : null;
+          if (subdirs === null || subdirs.some((dir) => subdirectorySitsAtDepthLimit(dir.path))) {
+            skippedDeep += 1;
+            continue;
+          }
           const result = await pace(() => executor.removeDirectory(child.id));
           if (result.removed) removed += 1;
           else notRemoved += 1;
@@ -285,7 +307,7 @@ async function sweepDrive(
   }
 
   await repository.setAccountSetting(drive.accountId, cursorKey(drive.storageId), "");
-  return { removed, queued, notRemoved };
+  return { removed, queued, notRemoved, skippedDeep };
 }
 
 /**
@@ -315,7 +337,8 @@ export async function sweepOrphanStagingDirs(input: {
         counts.notRemoved > 0
           ? `removed ${counts.removed} empty (${counts.notRemoved} could not be removed)`
           : `removed ${counts.removed} empty`;
-      log(`[patrol] staging janitor ${drive.storageId}: ${removal}, queued ${counts.queued} recovery`);
+      const deep = counts.skippedDeep > 0 ? `, skipped ${counts.skippedDeep} deep` : "";
+      log(`[patrol] staging janitor ${drive.storageId}: ${removal}, queued ${counts.queued} recovery${deep}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       log(`[patrol] staging janitor ${drive.storageId}: failed: ${message}`);

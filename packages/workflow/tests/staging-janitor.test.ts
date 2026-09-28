@@ -25,19 +25,35 @@ function memoryDrive(seed: { dirs: Dir[]; files?: StoredFile[] }) {
     async listChildDirectories(parentId: string) {
       return dirs.filter((dir) => dir.parentId === parentId).map((dir) => ({ id: dir.id, name: dir.name }));
     },
-    async listTree(input: { directoryId: string }) {
+    async listTree(input: { directoryId: string; maxDepth?: number }) {
+      const maxDepth = input.maxDepth ?? 6;
       const dirIds = new Set<string>();
-      const stack = [input.directoryId];
-      while (stack.length > 0) {
-        const current = stack.pop()!;
-        dirIds.add(current);
+      const walk = (dirId: string, depth: number) => {
+        if (depth > maxDepth) return;
+        dirIds.add(dirId);
         for (const dir of dirs) {
-          if (dir.parentId === current) stack.push(dir.id);
+          if (dir.parentId === dirId) walk(dir.id, depth + 1);
         }
-      }
+      };
+      walk(input.directoryId, 1);
       return files
         .filter((file) => dirIds.has(file.dirId))
         .map((file) => ({ path: file.path, providerFileId: file.providerFileId, sizeBytes: file.sizeBytes }));
+    },
+    async listSubdirectories(input: { directoryId: string; maxDepth?: number }) {
+      const maxDepth = input.maxDepth ?? 6;
+      const results: Array<{ id: string; path: string }> = [];
+      const walk = (dirId: string, prefix: string, depth: number) => {
+        if (depth > maxDepth) return;
+        for (const dir of dirs) {
+          if (dir.parentId !== dirId) continue;
+          const path = `${prefix}${dir.name}`;
+          results.push({ id: dir.id, path });
+          walk(dir.id, `${path}/`, depth + 1);
+        }
+      };
+      walk(input.directoryId, "", 1);
+      return results;
     },
     async removeDirectory(id: string) {
       removed.push(id);
@@ -441,6 +457,10 @@ describe("sweepOrphanStagingDirs", () => {
             times.push(now);
             return [];
           },
+          async listSubdirectories() {
+            times.push(now);
+            return [];
+          },
           async removeDirectory(id: string) {
             times.push(now);
             return { removed: id.length > 0 };
@@ -460,11 +480,11 @@ describe("sweepOrphanStagingDirs", () => {
         drive({ storageId: "d115", provider: "pan115", executor: pan115.executor }),
       ],
     });
-    // category, show, listTree, removeDirectory — three gaps. An empty tree is empty
-    // even when a wrapper folder is inside it, so there is no extra listing.
-    expect(pan123.times.slice(1).map((time, index) => time - pan123.times[index]!)).toEqual([1500, 1500, 1500]);
+    // category, show, listTree, listSubdirectories, removeDirectory — four gaps.
+    // An empty file walk still lists subdirectories, to see whether the depth limit hid a file.
+    expect(pan123.times.slice(1).map((time, index) => time - pan123.times[index]!)).toEqual([1500, 1500, 1500, 1500]);
     expect(pan115.times.every((time) => time === pan115.times[0])).toBe(true);
-    expect(sleeps).toEqual([1500, 1500, 1500]);
+    expect(sleeps).toEqual([1500, 1500, 1500, 1500]);
   });
 
   it("resumes a cut-short walk at the show that threw, and clears the cursor after a full walk", async () => {
@@ -526,6 +546,9 @@ describe("sweepOrphanStagingDirs", () => {
         if (trees === 1) {
           throw new Error("PAN123_FAILED(/file/list/new): code=100011 请勿频繁操作");
         }
+        return [];
+      },
+      async listSubdirectories() {
         return [];
       },
       async removeDirectory() {
@@ -605,6 +628,9 @@ describe("sweepOrphanStagingDirs", () => {
             async listTree() {
               return [];
             },
+            async listSubdirectories() {
+              return [];
+            },
             async removeDirectory() {
               return { removed: false };
             },
@@ -635,6 +661,9 @@ describe("sweepOrphanStagingDirs", () => {
             },
             async listTree() {
               return [];
+            },
+            async listSubdirectories() {
+              return [{ id: "nested", path: "pack" }];
             },
             async removeDirectory(id: string) {
               removed.push(id);
@@ -697,6 +726,9 @@ describe("sweepOrphanStagingDirs", () => {
               return [];
             },
             async listTree() {
+              return [];
+            },
+            async listSubdirectories() {
               return [];
             },
             async removeDirectory(id: string) {
@@ -859,6 +891,115 @@ describe("sweepOrphanStagingDirs", () => {
     expect(await inner.listNotifications({ accountId: "acct" })).toEqual([]);
     expect(await recoveriesOf(inner, "drive-report")).toEqual([]);
     expect(reads).toBeGreaterThanOrEqual(2);
+  });
+
+  it("does not remove an orphan whose only file sits below the listing depth, and does not queue it", async () => {
+    const removed: string[] = [];
+    const repo = new InMemoryWorkflowRepository();
+    const logs: string[] = [];
+    const deepPath = Array.from({ length: 10 }, (_, index) => `L${index + 1}`).join("/");
+    await sweepOrphanStagingDirs({
+      repository: repo,
+      now: NOW,
+      log: (line) => logs.push(line),
+      drives: [
+        drive({
+          storageId: "drive-unseen",
+          executor: {
+            async listChildDirectories(parentId: string) {
+              if (parentId === "tv") return [{ id: "show", name: "Show" }];
+              if (parentId === "show") return [{ id: "stg-deep", name: "staging-old" }];
+              return [];
+            },
+            // The file is inside the tenth directory. listTree stops before opening it.
+            async listTree() {
+              return [];
+            },
+            async listSubdirectories() {
+              return [{ id: "bottom", path: deepPath }];
+            },
+            async removeDirectory(id: string) {
+              removed.push(id);
+              return { removed: true };
+            },
+          },
+        }),
+      ],
+    });
+    expect(removed).toEqual([]);
+    expect(await recoveriesOf(repo, "drive-unseen")).toEqual([]);
+    expect(logs.some((line) => /drive-unseen: removed 0 empty, queued 0 recovery, skipped 1 deep/.test(line))).toBe(true);
+  });
+
+  it("still removes an orphan that holds only empty wrapper folders", async () => {
+    const removed: string[] = [];
+    const repo = new InMemoryWorkflowRepository();
+    await sweepOrphanStagingDirs({
+      repository: repo,
+      now: NOW,
+      drives: [
+        drive({
+          storageId: "drive-wrappers",
+          executor: {
+            async listChildDirectories(parentId: string) {
+              if (parentId === "tv") return [{ id: "show", name: "Show" }];
+              if (parentId === "show") return [{ id: "stg-wrap", name: "staging-old" }];
+              return [];
+            },
+            async listTree() {
+              return [];
+            },
+            async listSubdirectories() {
+              return [
+                { id: "wrap", path: "双轨" },
+                { id: "inner", path: "双轨/inner" },
+              ];
+            },
+            async removeDirectory(id: string) {
+              removed.push(id);
+              return { removed: true };
+            },
+          },
+        }),
+      ],
+    });
+    expect(removed).toEqual(["stg-wrap"]);
+  });
+
+  it("still queues a recovery when the depth-limited walk sees a file", async () => {
+    const repo = new InMemoryWorkflowRepository();
+    await saveTracked(repo, "drive-seen", "show", "Show", 41);
+    const removed: string[] = [];
+    await sweepOrphanStagingDirs({
+      repository: repo,
+      now: NOW,
+      drives: [
+        drive({
+          storageId: "drive-seen",
+          executor: {
+            async listChildDirectories(parentId: string) {
+              if (parentId === "tv") return [{ id: "show", name: "Show" }];
+              if (parentId === "show") return [{ id: "stg-file", name: "staging-old" }];
+              return [];
+            },
+            async listTree() {
+              return [{ path: "Show.S01E01.mkv", providerFileId: "f1", sizeBytes: 1024 * 1024 }];
+            },
+            async listSubdirectories() {
+              return [{ id: "wrap", path: "双轨" }];
+            },
+            async removeDirectory(id: string) {
+              removed.push(id);
+              return { removed: true };
+            },
+          },
+        }),
+      ],
+    });
+    expect(removed).toEqual([]);
+    const queued = await recoveriesOf(repo, "drive-seen");
+    expect(queued).toHaveLength(1);
+    expect(queued[0]?.workflowRun.auditEvents.some((event) => event.data?.["stagingDirectoryId"] === "stg-file")).toBe(true);
   });
 
   it("does not touch a drive whose executor cannot list and remove", async () => {
