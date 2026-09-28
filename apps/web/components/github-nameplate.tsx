@@ -6,7 +6,9 @@ import { SupportAuthorLink } from "./support-author-link";
  *  暗记 + CTA: "this is open source, here's the repo", plus the tip link. Shows on
  *  both demo and self-hosted (demo visitors are potential self-hosters too). No star
  *  count (new repo, thin numbers look bleak) — just the GitHub mark + a one-line
- *  pitch. Loading skeletons leave it out. */
+ *  pitch. It sits after the page content, outside any in-page Suspense boundary (like
+ *  Settings, where it has always shown while sections stream in); only the route-level
+ *  loading shells (the empty `aria-busy` main) leave it out. */
 export function GitHubNameplate() {
   return (
     <footer className="github-nameplate">
