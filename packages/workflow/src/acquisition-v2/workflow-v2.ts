@@ -152,6 +152,8 @@ export async function runAcquisitionV2Workflow(
         const fileCount = unmovedStaging.read?.().length ?? 0;
         return fileCount > 0 ? { fileCount } : null;
       },
+      // The adopted leftover can be the only copy. A throw must not delete it.
+      ...(request.stagingRecovery ? { preserveOnThrow: true } : {}),
       onKept: (event) => kept.push(event),
     },
     async () => {

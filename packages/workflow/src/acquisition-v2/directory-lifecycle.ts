@@ -277,6 +277,9 @@ export async function withStagingCleanup<T>(
     /** Non-null: files whose move failed are still only in staging. Do not remove
      *  the dir (a kept dir would also look like a leak, so skip the read-back). */
     keep?: () => { fileCount: number } | null;
+    /** A recovery adopted an existing leftover. A throw must leave that dir
+     *  where it is; a normal return still discards it. */
+    preserveOnThrow?: boolean;
     onKept?: (event: StagingKeptUnmoved) => void;
   },
   run: () => Promise<T>,
@@ -291,6 +294,9 @@ export async function withStagingCleanup<T>(
     throw error;
   } finally {
     const cleanup = async (): Promise<void> => {
+      if (threw && args.preserveOnThrow) {
+        return;
+      }
       const kept = args.keep?.() ?? null;
       if (kept) {
         const event: StagingKeptUnmoved = {

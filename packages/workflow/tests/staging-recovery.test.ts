@@ -3,10 +3,12 @@ import { MockLanguageModelV3 } from "ai/test";
 import type { LanguageModelV3CallOptions } from "@ai-sdk/provider";
 import {
   createEpisodeStates,
+  FakeStorageExecutor,
   InMemoryWorkflowRepository,
   runQueuedStagingRecovery,
   type StorageExecutor,
 } from "../src/index.js";
+import { runAcquisitionV2Workflow } from "../src/acquisition-v2/workflow-v2.js";
 import { Storage115Simulator, type SimTreeFile } from "../src/acquisition-v2/storage-115-simulator.js";
 import type { ResourceSnapshot } from "../src/domain.js";
 
@@ -105,8 +107,9 @@ function recoveryModel(offered: Set<string>, failMove: boolean, sawPrompt: { val
   });
 }
 
-function asExecutor(sim: Storage115Simulator, failMove: boolean): { executor: StorageExecutor; created: string[] } {
+function asExecutor(sim: Storage115Simulator, failMove: boolean): { executor: StorageExecutor; created: string[]; removed: string[] } {
   const created: string[] = [];
+  const removed: string[] = [];
   let moves = 0;
   const executor = {
     async createDirectory(input: { name: string; parentId: string }) {
@@ -133,6 +136,7 @@ function asExecutor(sim: Storage115Simulator, failMove: boolean): { executor: St
       return sim.deleteFiles(input);
     },
     async removeDirectory(directoryId: string) {
+      removed.push(directoryId);
       try {
         await sim.removeDirectory({ directoryId });
         return { removed: true };
@@ -146,7 +150,7 @@ function asExecutor(sim: Storage115Simulator, failMove: boolean): { executor: St
       throw new Error("rename is not part of this recovery");
     },
   };
-  return { executor: executor as unknown as StorageExecutor, created };
+  return { executor: executor as unknown as StorageExecutor, created, removed };
 }
 
 async function stage(failMove: boolean) {
@@ -169,7 +173,7 @@ async function stage(failMove: boolean) {
   await sim.transferCandidate({ candidateId: "left", intoDirectoryId: stagingId });
   const seasonBefore = await sim.listTree({ directoryId: seasonId });
   const stagingBefore = await sim.listTree({ directoryId: stagingId });
-  const { executor, created } = asExecutor(sim, failMove);
+  const { executor, created, removed } = asExecutor(sim, failMove);
   const repo = new InMemoryWorkflowRepository();
   const title = {
     id: "title_7",
@@ -253,7 +257,7 @@ async function stage(failMove: boolean) {
       return { id: "snap", provider: "pansou", keyword: "Show", candidates: [], createdAt: "2026-09-28T03:00:00.000Z" };
     },
   };
-  return { sim, repo, executor, created, seasonId, stagingId, seasonBefore, stagingBefore, searches: () => searches, resourceProvider };
+  return { sim, repo, executor, created, removed, seasonId, stagingId, seasonBefore, stagingBefore, searches: () => searches, resourceProvider };
 }
 
 describe("staging_recovery", () => {
@@ -292,6 +296,7 @@ describe("staging_recovery", () => {
     expect(seasonIds).toContain(subtitle.id);
     expect(seasonIds).not.toContain(duplicate.id);
     await expect(staged.sim.listTree({ directoryId: staged.stagingId })).rejects.toThrow(/NOT_FOUND/);
+    expect(staged.removed).toContain(staged.stagingId);
   });
 
   it("keeps the staging dir when the move fails and does not mark the episode obtained", async () => {
@@ -314,5 +319,103 @@ describe("staging_recovery", () => {
     const still = await staged.sim.listTree({ directoryId: staged.stagingId });
     expect(still.map((file) => file.id).sort()).toEqual(staged.stagingBefore.map((file) => file.id).sort());
     for (const name of FORBIDDEN) expect(offered.has(name)).toBe(false);
+  });
+
+  it("a model error before any tool call leaves the leftover in place, fails the run, and writes no notification", async () => {
+    const staged = await stage(false);
+    const result = await runQueuedStagingRecovery({
+      repository: staged.repo,
+      resourceProvider: staged.resourceProvider,
+      storage: staged.executor,
+      model: new MockLanguageModelV3({
+        doGenerate: async () => {
+          throw new Error("model exploded before any tool");
+        },
+      }),
+      now: () => "2026-09-28T04:00:00.000Z",
+    });
+    expect(result.status).toBe("failed");
+    expect(staged.removed).not.toContain(staged.stagingId);
+    const still = await staged.sim.listTree({ directoryId: staged.stagingId });
+    expect(still.map((file) => file.id).sort()).toEqual(staged.stagingBefore.map((file) => file.id).sort());
+    const saved = await staged.repo.getWorkflowRunSnapshot("recovery-1", { accountId: "acct", connectedStorageId: "drive" });
+    expect(saved?.workflowRun.status).toBe("failed");
+    expect(saved?.notifications).toEqual([]);
+    expect(await staged.repo.listNotifications({ accountId: "acct" })).toEqual([]);
+    // Terminal: a later sweep can queue this dir again.
+    expect(
+      await staged.repo.findActiveStagingRecovery({
+        accountId: "acct",
+        connectedStorageId: "drive",
+        stagingDirectoryId: staged.stagingId,
+      }),
+    ).toBeNull();
+  });
+
+  it("a transient error requeues the same run against the same leftover dir", async () => {
+    const staged = await stage(false);
+    const result = await runQueuedStagingRecovery({
+      repository: staged.repo,
+      resourceProvider: staged.resourceProvider,
+      storage: staged.executor,
+      model: new MockLanguageModelV3({
+        doGenerate: async () => {
+          throw new Error("socket hang up");
+        },
+      }),
+      now: () => "2026-09-28T04:00:00.000Z",
+    });
+    expect(result).toMatchObject({ status: "ran", workflowRunId: "recovery-1", workflowStatus: "queued" });
+    expect(staged.removed).not.toContain(staged.stagingId);
+    const still = await staged.sim.listTree({ directoryId: staged.stagingId });
+    expect(still.length).toBe(staged.stagingBefore.length);
+    const active = await staged.repo.findActiveStagingRecovery({
+      accountId: "acct",
+      connectedStorageId: "drive",
+      stagingDirectoryId: staged.stagingId,
+    });
+    expect(active?.workflowRun.id).toBe("recovery-1");
+    expect(active?.workflowRun.auditEvents.some((event) => event.data?.["stagingDirectoryId"] === staged.stagingId)).toBe(true);
+    expect(active?.notifications).toEqual([]);
+  });
+
+  it("an ordinary acquisition that throws still discards its own staging", async () => {
+    const executor = new FakeStorageExecutor();
+    const created: Array<{ id: string; name: string }> = [];
+    const removed: string[] = [];
+    const createDirectory = executor.createDirectory.bind(executor);
+    executor.createDirectory = async (input) => {
+      const id = await createDirectory(input);
+      created.push({ id, name: input.name });
+      return id;
+    };
+    const removeDirectory = executor.removeDirectory.bind(executor);
+    executor.removeDirectory = async (directoryId) => {
+      removed.push(directoryId);
+      return removeDirectory(directoryId);
+    };
+    await expect(
+      runAcquisitionV2Workflow({
+        provider: {
+          async search() {
+            return { id: "snap", provider: "pansou", keyword: "Show", candidates: [], createdAt: "2026-09-28T03:00:00.000Z" };
+          },
+        },
+        executor,
+        model: new MockLanguageModelV3({
+          doGenerate: async () => {
+            throw new Error("model exploded before any tool");
+          },
+        }),
+        workflowRunId: "run-ordinary",
+        title: { name: "Show", year: 2024, aliases: [], tmdbId: 42 },
+        categoryParentId: "tv_root",
+        seasons: [{ seasonNumber: 1, latestAiredEpisode: 1 }],
+        qualityPreference: "1080p",
+      }),
+    ).rejects.toThrow(/model exploded before any tool/);
+    const staging = created.find((dir) => dir.name === "staging-run-ordinary");
+    expect(staging).toBeDefined();
+    expect(removed).toContain(staging!.id);
   });
 });
