@@ -119,4 +119,14 @@ describe("proxy gate — multi-user mode", () => {
       delete process.env.MEDIA_TRACK_MULTI_USER;
     }
   });
+
+  it("多用户、无 session：/api/update/busy 放行，/api/update/status 仍重定向", () => {
+    process.env.MEDIA_TRACK_MULTI_USER = "1";
+    try {
+      expect(redirectsToLogin(makeRequest({ path: "/api/update/busy" }))).toBe(false);
+      expect(redirectsToLogin(makeRequest({ path: "/api/update/status" }))).toBe(true);
+    } finally {
+      delete process.env.MEDIA_TRACK_MULTI_USER;
+    }
+  });
 });

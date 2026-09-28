@@ -21,7 +21,9 @@ import { NextResponse, type NextRequest } from "next/server";
  * invalid/expired cookie, so reads fail closed even if a stale cookie slips past.
  */
 const SESSION_COOKIE_NAME = "mt_session";
-const HANDLER_GUARDED_API_PREFIXES = ["/api/health", "/api/workflows/", "/api/agent/"];
+// /api/update/busy is the updater's probe. It has no session cookie; the route checks
+// the updater token itself. Redirecting it to /login would make the probe fail open.
+const HANDLER_GUARDED_API_PREFIXES = ["/api/health", "/api/workflows/", "/api/agent/", "/api/update/busy"];
 
 /** 经隧道的远程请求判定。与 workflow-runtime.isRemoteRequest() 保持一致：
  *  用 cf-ray/cdn-loop 而非仅 cf-connecting-ip（后者可被 zone 规则删除 → fail-open）。 */
