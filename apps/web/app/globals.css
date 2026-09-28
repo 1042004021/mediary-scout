@@ -3886,6 +3886,99 @@ select.setting-control {
   }
 }
 
+/* Hallmark · component: support-dialog · genre: modern-minimal · theme: project (apps/web/DESIGN.md, Spotify)
+ * states: trigger default · hover · focus-visible · dialog open · close
+ * 设置页底部铭牌里的「请作者喝杯咖啡」：一行文字按钮，点开才出现收款码。 */
+.github-nameplate {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: 18px;
+  row-gap: 8px;
+}
+.support-author-trigger {
+  appearance: none;
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 0.15s var(--ease-out, ease-out);
+}
+.support-author-trigger:hover {
+  color: var(--text);
+}
+.support-author-trigger:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+.support-author-dialog {
+  padding: 0;
+  border: 0;
+  border-radius: 12px;
+  background: var(--bg-surface);
+  color: var(--text);
+  box-shadow: var(--shadow-heavy);
+  max-width: min(460px, calc(100vw - 32px));
+  width: 100%;
+  /* Short viewports (landscape phones): scroll inside the dialog so 关闭 stays reachable. */
+  max-height: calc(100dvh - 32px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.support-author-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.6);
+}
+.support-author-panel {
+  padding: 22px 22px 18px;
+}
+.support-author-title {
+  margin: 0 0 8px;
+  font-size: 17px;
+  font-weight: 700;
+}
+.support-author-copy,
+.support-author-note {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+.support-author-codes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin: 16px 0 12px;
+}
+.support-author-codes figure {
+  margin: 0;
+  text-align: center;
+}
+.support-author-codes img {
+  display: block;
+  width: 100%;
+  height: auto;
+  /* The two codes differ in shape (WeChat is wider): same box, contained, so the captions line up. */
+  aspect-ratio: 2 / 3;
+  object-fit: contain;
+  border-radius: 8px;
+}
+.support-author-codes figcaption {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-soft);
+}
+.support-author-note a {
+  color: var(--text);
+}
+.support-author-close {
+  margin-top: 14px;
+}
+
 /* 搜索页空态「近期热门」发现区(#95)。Tab 药丸复用 .filter-pill。 */
 .trending {
   margin-top: 8px;

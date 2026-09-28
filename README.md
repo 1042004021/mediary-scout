@@ -235,6 +235,10 @@ This project actively participates in and endorses the [LINUX DO](https://linux.
 
 [![认可 LINUX DO](https://img.shields.io/badge/LINUX%20DO-认可-2ecc71?style=flat&labelColor=1f1f1f)](https://linux.do)
 
+## Support the author
+
+Mediary Scout is a free, open-source side project with no hosted service — servers, test drive memberships and AI calls come out of pocket. If it saves you time, you can buy me a coffee via WeChat or Alipay: **[support page →](docs/support/README.md)** · [thank-you list](docs/support/thanks.md). Donations don't unlock anything; every feature is the same for everyone.
+
 ## Star History
 <a href="https://www.star-history.com/?repos=fancydirty%2Fmediary-scout&type=date&legend=top-left">
   <picture>
