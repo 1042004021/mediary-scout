@@ -2,6 +2,7 @@ import type { WorkflowKind } from "./domain.js";
 import type { StorageExecutor } from "./ports.js";
 import { isActiveWorkflowStatus, type TrackedSeasonState, type WorkflowRepository } from "./repository.js";
 import { legacyMediaLibraryFolderName, mediaLibraryFolderName } from "./media-library-folder.js";
+import { JANITOR_LIST_DEPTH } from "./staging-depth.js";
 
 /** Every kind. `blockIfTitleHasActiveRun` ignores staging_recovery so a user
  *  action can proceed; this reservation must still wait for one. */
@@ -16,8 +17,6 @@ const TITLE_BLOCK_KINDS: Record<WorkflowKind, true> = {
 
 /** A failed run is requeued on the same id within 15 minutes. Don't touch its staging until that window is long gone. */
 const SWEEP_SETTLE_MS = 60 * 60 * 1000;
-/** Deeper than a couple of wrappers, shallower than a full library walk. */
-const JANITOR_LIST_DEPTH = 10;
 /** Non-empty leftovers judged later. The rest wait for the next sweep. */
 const RECOVERY_CAP = 5;
 

@@ -78,10 +78,10 @@ export interface StorageV2 {
    *  `transferUntilLanded` (which iterates on failure) accepts only "share"
    *  candidates and uses this to reject magnets/unknown links up front. */
   candidateLinkKind(candidateId: string): "share" | "magnet" | "unknown";
-  listTree(input: { directoryId: string }): Promise<SimTreeFile[]>;
+  listTree(input: { directoryId: string; maxDepth?: number }): Promise<SimTreeFile[]>;
   /** Recursive list of subdirectories under a directory (path relative to it) —
    *  the source of the wrapper-dir handle flatten removes. */
-  listSubdirectories(input: { directoryId: string }): Promise<Array<{ id: string; path: string }>>;
+  listSubdirectories(input: { directoryId: string; maxDepth?: number }): Promise<Array<{ id: string; path: string }>>;
   moveFiles(input: { fileIds: string[]; targetDirectoryId: string }): Promise<{ moved: string[] }>;
   /** Rename a single file in place (same directory) — the subtitle-rename exception. */
   renameFile(input: { directoryId: string; fileId: string; newName: string }): Promise<void>;
@@ -251,7 +251,7 @@ export class Storage115Simulator implements StorageV2 {
   }
 
   /** Recursive, path-preserving snapshot of everything under a directory. */
-  async listTree(input: { directoryId: string }): Promise<SimTreeFile[]> {
+  async listTree(input: { directoryId: string; maxDepth?: number }): Promise<SimTreeFile[]> {
     if (!this.dirs.has(input.directoryId)) {
       throw new Error(`SIM_DIR_NOT_FOUND: ${input.directoryId}`);
     }
@@ -313,7 +313,7 @@ export class Storage115Simulator implements StorageV2 {
   }
 
   /** Recursive subdirectories of a directory, path-relative to it. */
-  async listSubdirectories(input: { directoryId: string }): Promise<Array<{ id: string; path: string }>> {
+  async listSubdirectories(input: { directoryId: string; maxDepth?: number }): Promise<Array<{ id: string; path: string }>> {
     if (!this.dirs.has(input.directoryId)) {
       throw new Error(`SIM_DIR_NOT_FOUND: ${input.directoryId}`);
     }

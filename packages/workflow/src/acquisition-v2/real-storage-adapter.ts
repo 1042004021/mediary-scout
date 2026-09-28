@@ -271,8 +271,11 @@ export class RealStorageV2 implements StorageV2 {
     return results;
   }
 
-  async listTree(input: { directoryId: string }): Promise<SimTreeFile[]> {
-    const tree = await this.executor.listTree({ directoryId: input.directoryId });
+  async listTree(input: { directoryId: string; maxDepth?: number }): Promise<SimTreeFile[]> {
+    const tree = await this.executor.listTree({
+      directoryId: input.directoryId,
+      ...(input.maxDepth === undefined ? {} : { maxDepth: input.maxDepth }),
+    });
     return tree.map((file) => ({
       id: file.providerFileId,
       path: file.path,
@@ -282,8 +285,11 @@ export class RealStorageV2 implements StorageV2 {
     }));
   }
 
-  async listSubdirectories(input: { directoryId: string }): Promise<Array<{ id: string; path: string }>> {
-    return this.executor.listSubdirectories({ directoryId: input.directoryId });
+  async listSubdirectories(input: { directoryId: string; maxDepth?: number }): Promise<Array<{ id: string; path: string }>> {
+    return this.executor.listSubdirectories({
+      directoryId: input.directoryId,
+      ...(input.maxDepth === undefined ? {} : { maxDepth: input.maxDepth }),
+    });
   }
 
   async moveFiles(input: { fileIds: string[]; targetDirectoryId: string }): Promise<{ moved: string[] }> {

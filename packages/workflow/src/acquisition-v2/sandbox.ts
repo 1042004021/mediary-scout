@@ -266,6 +266,9 @@ export interface TaskSandboxOptions {
    *  run (never deleted, moved, renamed or flattened away), without the replace
    *  tools. The sandbox has no file↔episode map, so it protects all of them. */
   protectExistingFiles?: boolean;
+  /** Listings of the staging directory use this maxDepth. A recovery sets
+   *  JANITOR_LIST_DEPTH. Absent: the storage default (ordinary runs). */
+  stagingListDepth?: number;
 }
 
 /** What the models see of a memory entry (no persistence identifiers). */
@@ -374,6 +377,7 @@ export class TaskSandbox {
   private readonly replace: TaskSandboxOptions["replace"];
   private readonly isRejected: TaskSandboxOptions["isRejected"];
   private readonly protectExistingFiles: boolean;
+  private readonly stagingListDepth: number | undefined;
   /** Set once captureProtectedFiles has listed the target dirs (see assertRejectedFirst). */
   private protectedCaptured = false;
   /** Replace runs: every file in a target dir when the run started (the user's
@@ -441,6 +445,19 @@ export class TaskSandbox {
     this.isRejected = options.isRejected;
     this.linkOf = options.linkOf;
     this.protectExistingFiles = options.protectExistingFiles === true;
+    this.stagingListDepth = options.stagingListDepth;
+  }
+
+  /** A listing. The staging directory of a recovery is walked to the depth the
+   *  janitor already verified; every other directory keeps the storage default. */
+  private listTreeOf(directoryId: string): Promise<SimTreeFile[]> {
+    if (!this.storage) {
+      throw new Error("SANDBOX: no storage configured");
+    }
+    if (directoryId === this.stagingDirectoryId && this.stagingListDepth !== undefined) {
+      return this.storage.listTree({ directoryId, maxDepth: this.stagingListDepth });
+    }
+    return this.storage.listTree({ directoryId });
   }
 
   /** Every scoped target directory (all seasons + the movie) — the union used for
@@ -782,7 +799,7 @@ export class TaskSandbox {
     if (!this.storage || !this.stagingDirectoryId) {
       throw new Error("SANDBOX: no storage/staging handle configured");
     }
-    return this.storage.listTree({ directoryId: this.stagingDirectoryId });
+    return this.listTreeOf(this.stagingDirectoryId);
   }
 
   /** Read-only list of the wrapper subdirectories currently in staging.
@@ -792,7 +809,11 @@ export class TaskSandbox {
     if (!this.storage || !this.stagingDirectoryId) {
       throw new Error("SANDBOX: no storage/staging handle configured");
     }
-    return this.storage.listSubdirectories({ directoryId: this.stagingDirectoryId });
+    return this.storage.listSubdirectories(
+      this.stagingListDepth === undefined
+        ? { directoryId: this.stagingDirectoryId }
+        : { directoryId: this.stagingDirectoryId, maxDepth: this.stagingListDepth },
+    );
   }
 
   /** Read-only full raw tree of a scoped target directory — ground truth for what
@@ -808,10 +829,10 @@ export class TaskSandbox {
       if (!dir) {
         throw new Error(`SANDBOX: no target directory for season ${input.season}`);
       }
-      return this.storage.listTree({ directoryId: dir });
+      return this.listTreeOf(dir);
     }
     const trees = await Promise.all(
-      this.allTargetDirIds().map((directoryId) => this.storage!.listTree({ directoryId })),
+      this.allTargetDirIds().map((directoryId) => this.listTreeOf(directoryId)),
     );
     return trees.flat();
   }
@@ -863,7 +884,7 @@ export class TaskSandbox {
     // An empty id list landed nothing, even when the status says succeeded.
     if (attempt.materializedFileIds.length > 0) this.keepLink(input.candidateId);
     else this.releaseLink(input.candidateId);
-    const staging = await this.storage.listTree({ directoryId: this.stagingDirectoryId });
+    const staging = await this.listTreeOf(this.stagingDirectoryId);
     // A systemic block ONLY when nothing actually landed — a provider can mark an
     // attempt failed yet materialize files (e.g. quark); the truth is the landing
     // point (staging / materializedFileIds), not the status flag.
@@ -995,7 +1016,7 @@ export class TaskSandbox {
         break;
       }
     }
-    const landed = await this.storage.listTree({ directoryId: this.stagingDirectoryId });
+    const landed = await this.listTreeOf(this.stagingDirectoryId);
     return { landed, transferredCandidateId, attempts, ...(systemicBlock ? { systemicBlock } : {}) };
   }
 
@@ -1032,7 +1053,7 @@ export class TaskSandbox {
     // ids itself — otherwise markObtained plus harness cleanup deletes the only copies.
     let stagingTree;
     try {
-      stagingTree = await this.storage.listTree({ directoryId: this.stagingDirectoryId });
+      stagingTree = await this.listTreeOf(this.stagingDirectoryId);
     } catch (error) {
       const ids = resolved.flatMap((move) => move.fileIds);
       for (const fileId of ids) this.unmovedFileIds.add(fileId);
@@ -1090,10 +1111,10 @@ export class TaskSandbox {
     const seasons: Record<number, SimTreeFile[]> = {};
     for (const move of resolved) {
       if (move.season !== undefined) {
-        seasons[move.season] = await this.storage.listTree({ directoryId: move.targetDir });
+        seasons[move.season] = await this.listTreeOf(move.targetDir);
       }
     }
-    return { seasons, staging: await this.storage.listTree({ directoryId: this.stagingDirectoryId }) };
+    return { seasons, staging: await this.listTreeOf(this.stagingDirectoryId) };
   }
 
   /** Delete agent-chosen files from a named scoped directory (the dedup
@@ -1116,7 +1137,7 @@ export class TaskSandbox {
       throw new Error(`SANDBOX: no ${input.directory} handle configured`);
     }
     const present = new Set(
-      (await this.storage.listTree({ directoryId })).map((file) => file.id),
+      (await this.listTreeOf(directoryId)).map((file) => file.id),
     );
     const outOfScope = input.fileIds.filter((fileId) => !present.has(fileId));
     if (outOfScope.length > 0) {
@@ -1127,7 +1148,7 @@ export class TaskSandbox {
     for (const fileId of deleted) {
       this.unmovedFileIds.delete(fileId);
     }
-    return { deleted, directory: await this.storage.listTree({ directoryId }) };
+    return { deleted, directory: await this.listTreeOf(directoryId) };
   }
 
   /** File ids still only in staging because their move failed. Read-only. */
@@ -1207,7 +1228,7 @@ export class TaskSandbox {
       throw new Error("SANDBOX_NOT_A_MOVIE: flattenMovie is movie-only");
     }
     const root = this.movieDir;
-    const tree = await this.storage.listTree({ directoryId: root });
+    const tree = await this.listTreeOf(root);
     // Replace run: the old film (and anything beside it) stays exactly where it was —
     // it is neither lifted nor swept away with a wrapper.
     const nested = tree.filter(
@@ -1241,7 +1262,7 @@ export class TaskSandbox {
         `FLATTEN_NOT_DONE: ${unlifted.length} file(s) did not move out of their wrapper (${unlifted.map((file) => file.id).join(",")}) — the wrapper holding them was kept; call flattenMovie again`,
       );
     }
-    return { movie: await this.storage.listTree({ directoryId: root }) };
+    return { movie: await this.listTreeOf(root) };
   }
 
   /** The agent's `finish` tool. On a replace run it is refused while an episode the
@@ -1385,7 +1406,7 @@ export class TaskSandbox {
     if (this.transferAttempted) return true;
     if (!this.storage || !this.stagingDirectoryId) return false;
     try {
-      const staged = await this.storage.listTree({ directoryId: this.stagingDirectoryId });
+      const staged = await this.listTreeOf(this.stagingDirectoryId);
       return staged.some((file) => !(this.replace && this.protectedFiles.has(file.id)));
     } catch {
       // Unreadable staging: do not claim "nothing happened" on missing evidence —
@@ -1416,10 +1437,10 @@ export class TaskSandbox {
     if ((!this.replace && !this.protectExistingFiles) || !this.storage) return;
     for (const [season, directoryId] of this.seasonDirs) {
       const dirLabel = `Season ${String(season).padStart(2, "0")}`;
-      for (const file of await this.storage.listTree({ directoryId })) this.protectedFiles.set(file.id, { file, dirLabel });
+      for (const file of await this.listTreeOf(directoryId)) this.protectedFiles.set(file.id, { file, dirLabel });
     }
     if (this.movieDir !== undefined) {
-      for (const file of await this.storage.listTree({ directoryId: this.movieDir })) {
+      for (const file of await this.listTreeOf(this.movieDir)) {
         this.protectedFiles.set(file.id, { file, dirLabel: "" });
       }
     }
@@ -2328,7 +2349,7 @@ export class TaskSandbox {
         "SANDBOX_EMPTY_RENAMES: renames must not be empty — decide every subtitle↔episode pairing first (至少一项)",
       );
     }
-    const staging = await this.storage.listTree({ directoryId: this.stagingDirectoryId });
+    const staging = await this.listTreeOf(this.stagingDirectoryId);
     const renamed: string[] = [];
     const errors: Array<{ fileId: string; error: string }> = [];
     for (const { fileId, newName } of input.renames) {

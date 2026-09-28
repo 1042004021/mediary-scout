@@ -15,6 +15,7 @@ import { RealResourceProviderV2 } from "./real-provider-adapter.js";
 import { RealStorageV2 } from "./real-storage-adapter.js";
 import { budgetSoftThreshold } from "./agent-loop-guards.js";
 import { TaskSandbox } from "./sandbox.js";
+import { JANITOR_LIST_DEPTH } from "../staging-depth.js";
 import { AssrtSubtitleProvider, type AssrtProviderPort } from "../subtitle-provider.js";
 import { JevPrefilterProvider } from "../jev-prefilter-provider.js";
 import type { JevJudge, JevJudgeTarget } from "../jev-judge.js";
@@ -329,6 +330,7 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
     ...(request.searchProfile === undefined ? {} : { searchProfile: request.searchProfile }),
     ...(memoryBinding ? { memory: memoryBinding } : {}),
     ...(protectExisting ? { protectExistingFiles: true } : {}),
+    ...(request.stagingRecovery ? { stagingListDepth: JANITOR_LIST_DEPTH } : {}),
     ...(rejectedSource
       ? {
           isRejected: async (candidate: { id: string; title: string }) => {
