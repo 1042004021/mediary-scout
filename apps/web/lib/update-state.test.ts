@@ -32,6 +32,11 @@ describe("buildUpdateView", () => {
     const view = buildUpdateView({ ...base, currentCommit: "d".repeat(40), relation: "ahead" });
     expect(view.current.label).toBe("dddddddd · 比 v2026.10.02 新的开发版本");
   });
+  it("calls a build with no stamped commit 未知版本 and offers nothing", () => {
+    const view = buildUpdateView({ ...base, currentCommit: null });
+    expect(view.current).toEqual({ label: "未知版本", tag: null });
+    expect(view.available).toBeNull();
+  });
   it("offers nothing when the feed is empty (offline)", () => {
     const view = buildUpdateView({ ...base, currentCommit: "d".repeat(40), feed: [] });
     expect(view.available).toBeNull();

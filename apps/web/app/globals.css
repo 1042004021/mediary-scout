@@ -3985,6 +3985,7 @@ select.setting-control {
 .update-version { font-size: 22px; font-weight: 700; letter-spacing: -0.01em; }
 .update-faint { font-size: 12px; color: var(--text-faint); }
 .update-muted { margin: 10px 0 0; font-size: 12.5px; line-height: 1.55; color: var(--text-muted); }
+.update-muted a { color: var(--text); }
 .update-log-title { margin: 0 0 8px; font-size: 13.5px; font-weight: 600; }
 .update-release { border-top: 1px solid var(--divider); padding: 10px 0; }
 .update-release:first-of-type { border-top: 0; }
