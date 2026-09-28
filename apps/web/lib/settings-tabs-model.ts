@@ -5,6 +5,7 @@ export const SETTINGS_TABS = [
   { id: "services", label: "资源与服务" },
   { id: "preferences", label: "获取偏好" },
   { id: "patrol", label: "巡检与通知" },
+  { id: "update", label: "更新" },
   { id: "account", label: "账号" },
   { id: "remote", label: "远程访问" },
 ] as const;
@@ -21,11 +22,11 @@ const TAB_IDS = new Set<string>(SETTINGS_TABS.map((tab) => tab.id));
  * → hide). See the MutationObserver in `settings-tabs.tsx` for why the flag
  * cannot simply be read from env at build time.
  *
- * Both members render `null` for the same class of reason (not the站主 /
- * feature off), so they share one mechanism — but their visibility is
- * INDEPENDENT: 多用户关时 account 隐藏而 remote 仍可显示。
+ * Members render `null` for the same class of reason (not the站主 /
+ * feature off / 演示站), so they share one mechanism — but their visibility is
+ * INDEPENDENT: 多用户关时 account 隐藏而 remote 仍可显示；演示站只藏 update。
  */
-export const OBSERVED_SETTINGS_TABS = ["account", "remote"] as const;
+export const OBSERVED_SETTINGS_TABS = ["account", "remote", "update"] as const;
 
 export type ObservedSettingsTabId = (typeof OBSERVED_SETTINGS_TABS)[number];
 

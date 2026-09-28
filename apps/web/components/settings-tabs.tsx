@@ -18,18 +18,19 @@ function isObserved(tab: SettingsTabId): tab is ObservedSettingsTabId {
 }
 
 /**
- * 设置页 tab 壳：六个 slot 常挂载（Suspense 流式照旧），按当前 tab 显隐。
+ * 设置页 tab 壳：七个 slot 常挂载（Suspense 流式照旧），按当前 tab 显隐。
  * - tab 状态 = ?tab=（router.replace 软导航，保留 ?w）。
- * - 「账号」「远程访问」两个 tab 的可见性不读服务端 flag（cacheComponents 会把
+ * - 「账号」「远程访问」「更新」的可见性不读服务端 flag（cacheComponents 会把
  *   build 时的 env 值烤进静态壳，docker 镜像 build/run 环境不同——
  *   PasswordChangeSection 同款教训）：观察对应 slot 是否真的流出了内容
- *   （账号：多用户关时两个 section 都渲染 null；远程访问：非站主渲染 null）。
+ *   （账号：多用户关时两个 section 都渲染 null；远程访问：非站主渲染 null；更新：非站主或演示站渲染 null）。
  */
 export function SettingsTabs(props: {
   drives: ReactNode;
   services: ReactNode;
   preferences: ReactNode;
   patrol: ReactNode;
+  update: ReactNode;
   account: ReactNode;
   remote: ReactNode;
 }) {
@@ -90,6 +91,7 @@ export function SettingsTabs(props: {
     { id: "services", content: props.services },
     { id: "preferences", content: props.preferences },
     { id: "patrol", content: props.patrol },
+    { id: "update", content: props.update },
     { id: "account", content: props.account },
     { id: "remote", content: props.remote },
   ];

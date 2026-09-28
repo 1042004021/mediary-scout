@@ -34,6 +34,7 @@ import { SettingsTabs } from "../../components/settings-tabs";
 import { PasswordChangeForm } from "../../components/password-change-form";
 import { AccountAdminPanel } from "../../components/account-admin-panel";
 import { RemoteAccessSection } from "../../components/settings/remote-access-section";
+import { UpdateSection } from "../../components/settings/update-section";
 import { GitHubNameplate } from "../../components/github-nameplate";
 import { SettingsActionInbox } from "../../components/settings-action-inbox";
 import { loadSettingsAttentionSummary, markSettingsAttentionSeen } from "../../lib/settings-attention-server";
@@ -157,6 +158,11 @@ export default function SettingsPage({
                     <PushNotificationSection />
                   </Suspense>
                 </>
+              }
+              update={
+                <Suspense fallback={null}>
+                  <UpdateSection />
+                </Suspense>
               }
               account={
                 <>

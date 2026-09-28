@@ -1,0 +1,94 @@
+import { connection } from "next/server";
+import { isDemoMode } from "../../lib/demo-mode";
+import { resolveIsDesktop } from "../../lib/workflow-runtime";
+import type { UpdateView } from "../../lib/update-state";
+import { loadUpdateView } from "../../lib/update-view-server";
+import { resolveCurrentIsOwner } from "../../lib/settings-attention-server";
+
+const KIND_LABEL = { add: "新增", improve: "改进", fix: "修复" } as const;
+
+/* Hallmark · component: update-tab · genre: modern-minimal · theme: project (apps/web/DESIGN.md, Spotify)
+ * states: up-to-date · update-available · updating · waiting · rolled-back · no-updater · offline feed
+ * 方向 A：状态卡在上 · 更新日志在下。 */
+export async function UpdateSection() {
+  await connection();
+  if (isDemoMode() || !(await resolveCurrentIsOwner())) return null;
+  return <UpdateTab view={await loadUpdateView()} desktop={resolveIsDesktop()} />;
+}
+
+export function ReleaseBlock({ release }: { release: UpdateView["releases"][number] }) {
+  return (
+    <div className="update-release">
+      <div className="update-release-head">
+        <strong>{release.tag}</strong>
+        <span className="update-faint">{release.date}</span>
+        {release.isCurrent ? <span className="service-pill">当前</span> : null}
+      </div>
+      <ul>
+        {release.notes.map((note, index) => (
+          <li key={`${index}:${note.text}`}>
+            <span className={`update-kind is-${note.kind}`}>{KIND_LABEL[note.kind]}</span>
+            {note.text}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+export function UpdateTab({ view, desktop }: { view: UpdateView; desktop: boolean }) {
+  return (
+    <div className="update-tab">
+      <section className="panel update-status">
+        <div className="update-status-head">
+          <div>
+            <div className="update-faint">当前版本</div>
+            <div className="update-version">{view.current.label}</div>
+          </div>
+          {view.available ? (
+            <span className="service-pill is-on">有新版本 {view.available.tag}</span>
+          ) : view.status === "offline" ? (
+            <span className="service-pill is-off">暂时查不到新版本</span>
+          ) : view.status === "unknown" ? (
+            <span className="service-pill is-off">无法确认是否最新</span>
+          ) : (
+            <span className="service-pill">已是最新</span>
+          )}
+        </div>
+        {desktop ? (
+          <p className="update-muted">
+            桌面版在{" "}
+            <a href="https://github.com/fancydirty/mediary-scout/releases/latest" target="_blank" rel="noopener noreferrer">
+              发布页
+            </a>{" "}
+            下载新版本安装包。
+          </p>
+        ) : null}
+      </section>
+      <section className="panel update-log">
+        <h3 className="update-log-title">更新日志</h3>
+        {view.releases.length === 0 ? <p className="update-muted">暂时查不到更新日志。</p> : null}
+        {view.releases.slice(0, 3).map((release) => (
+          <ReleaseBlock key={release.tag} release={release} />
+        ))}
+        {view.releases.length > 3 ? (
+          <details className="update-older">
+            <summary>更早的版本</summary>
+            {view.releases.slice(3, 10).map((release) => (
+              <ReleaseBlock key={release.tag} release={release} />
+            ))}
+            {view.releases.length > 10 ? (
+              <p className="update-muted">
+                这里只列最近 10 个版本，更早的见{" "}
+                <a href="https://github.com/fancydirty/mediary-scout/tree/main/release-notes" target="_blank" rel="noopener noreferrer">
+                  全部发布说明
+                </a>
+                。
+              </p>
+            ) : null}
+          </details>
+        ) : null}
+      </section>
+    </div>
+  );
+}

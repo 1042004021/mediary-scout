@@ -1,0 +1,90 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { fetchCommitRelation, fetchReleaseFeed, invalidateReleaseFeedCache } from "./release-feed-server";
+
+function fakeFetch(routes: Record<string, { status: number; body: string }>) {
+  return vi.fn(async (url: string) => {
+    const hit = routes[url];
+    if (!hit) return new Response("not found", { status: 404 });
+    return new Response(hit.body, { status: hit.status });
+  }) as unknown as typeof fetch;
+}
+
+const TAGS = "https://api.github.com/repos/fancydirty/mediary-scout/git/matching-refs/tags/v";
+const ref = (tag: string, sha: string, type = "commit") => ({ ref: `refs/tags/${tag}`, object: { sha, type } });
+const notes = (tag: string) =>
+  `https://api.github.com/repos/fancydirty/mediary-scout/contents/release-notes/${tag}.md?ref=${tag}`;
+const compare = (base: string, head: string) =>
+  `https://api.github.com/repos/fancydirty/mediary-scout/compare/${base}...${head}`;
+
+describe("fetchReleaseFeed", () => {
+  beforeEach(() => invalidateReleaseFeedCache());
+
+  it("keeps only valid release tags, newest first, with their notes", async () => {
+    const fetchImpl = fakeFetch({
+      [TAGS]: {
+        status: 200,
+        body: JSON.stringify([
+          ref("v1.4.1", "a".repeat(40)),
+          ref("v3000.01.01", "d".repeat(40)),
+          ref("v2026.09.28", "b".repeat(40)),
+          ref("v2026.10.02", "c".repeat(40)),
+        ]),
+      },
+      [notes("v2026.10.02")]: { status: 200, body: "- 新增 一键更新" },
+      [notes("v2026.09.28")]: { status: 404, body: "" },
+    });
+    const feed = await fetchReleaseFeed(fetchImpl);
+    expect(feed.map((r) => r.tag)).toEqual(["v3000.01.01", "v2026.10.02", "v2026.09.28"]);
+    expect(feed[1]).toMatchObject({ commit: "c".repeat(40), notes: [{ kind: "add", text: "一键更新" }] });
+    expect(feed[2]!.notes).toEqual([]);
+  });
+
+  it("keeps every release, not just a first page, and fetches notes for the newest 10 only", async () => {
+    const tags = Array.from({ length: 45 }, (_, index) => {
+      const day = new Date(Date.UTC(2026, 9, 1) + index * 86_400_000).toISOString().slice(0, 10);
+      return ref(`v${day.replaceAll("-", ".")}`, index.toString(16).padStart(40, "0"));
+    });
+    const fetchImpl = fakeFetch({ [TAGS]: { status: 200, body: JSON.stringify(tags) } });
+    const feed = await fetchReleaseFeed(fetchImpl);
+    expect(feed).toHaveLength(45);
+    expect(feed.at(-1)?.tag).toBe("v2026.10.01");
+    const noteCalls = vi.mocked(fetchImpl).mock.calls.filter(([url]) => String(url).includes("/contents/"));
+    expect(noteCalls).toHaveLength(10);
+  });
+
+  it("skips annotated tags (their sha is a tag object, not a commit)", async () => {
+    const fetchImpl = fakeFetch({
+      [TAGS]: { status: 200, body: JSON.stringify([ref("v2026.10.02", "c".repeat(40), "tag"), ref("v2026.09.28", "b".repeat(40))]) },
+    });
+    expect((await fetchReleaseFeed(fetchImpl)).map((r) => r.tag)).toEqual(["v2026.09.28"]);
+  });
+
+  it("returns [] when GitHub is unreachable, and caches the failure", async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new Error("offline");
+    }) as unknown as typeof fetch;
+    expect(await fetchReleaseFeed(fetchImpl)).toEqual([]);
+    expect(await fetchReleaseFeed(fetchImpl)).toEqual([]);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("fetchCommitRelation", () => {
+  beforeEach(() => invalidateReleaseFeedCache());
+
+  it("returns where head stands relative to base", async () => {
+    const base = "b".repeat(40);
+    const head = "d".repeat(40);
+    const fetchImpl = fakeFetch({ [compare(base, head)]: { status: 200, body: JSON.stringify({ status: "ahead" }) } });
+    expect(await fetchCommitRelation(base, head, fetchImpl)).toBe("ahead");
+  });
+
+  it("returns null on failure or an unknown status", async () => {
+    const base = "b".repeat(40);
+    const head = "d".repeat(40);
+    expect(await fetchCommitRelation(base, head, fakeFetch({}))).toBeNull();
+    const odd = fakeFetch({ [compare(base, head)]: { status: 200, body: JSON.stringify({ status: "weird" }) } });
+    invalidateReleaseFeedCache();
+    expect(await fetchCommitRelation(base, head, odd)).toBeNull();
+  });
+});

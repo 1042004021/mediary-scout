@@ -3979,6 +3979,25 @@ select.setting-control {
   margin-top: 14px;
 }
 
+/* Hallmark · component: update-tab · genre: modern-minimal · theme: project (Spotify tokens) */
+.update-tab .panel + .panel { margin-top: 12px; }
+.update-status-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.update-version { font-size: 22px; font-weight: 700; letter-spacing: -0.01em; }
+.update-faint { font-size: 12px; color: var(--text-faint); }
+.update-muted { margin: 10px 0 0; font-size: 12.5px; line-height: 1.55; color: var(--text-muted); }
+.update-muted a { color: var(--text); }
+.update-log-title { margin: 0 0 8px; font-size: 13.5px; font-weight: 600; }
+.update-release { border-top: 1px solid var(--divider); padding: 10px 0; }
+.update-release:first-of-type { border-top: 0; }
+.update-release-head { display: flex; gap: 10px; align-items: center; }
+.update-older { border-top: 1px solid var(--divider); padding-top: 10px; }
+.update-older > summary { cursor: pointer; font-size: 12.5px; color: var(--text-muted); }
+.update-release ul { margin: 8px 0 0; padding: 0; list-style: none; }
+.update-release li { position: relative; padding-left: 44px; font-size: 13px; line-height: 1.6; color: var(--text-soft); }
+.update-kind { position: absolute; left: 0; top: 2px; font-size: 10.5px; font-weight: 600; color: var(--text-faint); }
+.update-kind.is-add { color: var(--accent); }
+.update-kind.is-fix { color: var(--info); }
+
 /* 搜索页空态「近期热门」发现区(#95)。Tab 药丸复用 .filter-pill。 */
 .trending {
   margin-top: 8px;
