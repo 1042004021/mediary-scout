@@ -211,7 +211,7 @@ function gitShas(stubDir) {
   return readFileSync(join(stubDir, "git-shas"), "utf8").trim().split("\n");
 }
 
-describe("run-update.sh", () => {
+describe("run-update.sh", { timeout: 60_000 }, () => {
   it("updates, backing up before the build and swapping only web", async () => {
     const { repo, stubDir, log, env } = setup();
     const result = await run(env);
@@ -302,7 +302,7 @@ describe("run-update.sh", () => {
       `checkout refs/tags/${TAG}`,
       `checkout ${FROM}`,
     ]);
-  }, 60_000);
+  });
 
   it("exits 20 when the rollback never verifies either", async () => {
     const { stubDir, log, env } = setup();
@@ -317,7 +317,7 @@ describe("run-update.sh", () => {
     expect(steps.filter((step) => step === "build")).toHaveLength(2);
     expect(gitShas(stubDir)).toEqual([TAG_COMMIT, FROM]);
     expect(steps).toContain(`checkout ${FROM}`);
-  }, 60_000);
+  });
 
   it("rejects a non-release tag before calling anything", async () => {
     for (const tag of ["main", "v2026.10.02;rm -rf /"]) {
