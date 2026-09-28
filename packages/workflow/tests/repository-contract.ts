@@ -1672,6 +1672,57 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         ).toBeNull();
       });
 
+      it("hides a legacy staging-janitor inbox row and still returns a real staging_recovery", async () => {
+        const repo = await fresh();
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_default" };
+        const real = trackedSnapshot({ key: "show", runId: "run_show_done", startedAt: "2026-09-27T00:00:00.000Z" });
+        await repo.saveWorkflowRunSnapshot(real);
+        await repo.saveWorkflowRunSnapshot({
+          ...real,
+          workflowRun: {
+            ...real.workflowRun,
+            id: "recovery-real",
+            kind: "staging_recovery",
+            status: "queued",
+            finishedAt: null,
+            startedAt: "2026-09-28T03:00:00.000Z",
+            auditEvents: [
+              {
+                type: "staging_recovery_queued",
+                message: "queued",
+                data: { stagingDirectoryId: "stg-real" },
+              },
+            ],
+          },
+        });
+        const legacyBase = trackedSnapshot({ key: "janitor" });
+        const legacyTitleId = "staging-janitor-title:drive1";
+        const legacySeasonId = "staging-janitor-season:drive1";
+        await repo.saveWorkflowRunSnapshot({
+          ...legacyBase,
+          title: { ...legacyBase.title, id: legacyTitleId, title: "暂存残留" },
+          season: { ...legacyBase.season, id: legacySeasonId, mediaTitleId: legacyTitleId },
+          workflowRun: {
+            ...legacyBase.workflowRun,
+            id: "staging-janitor:drive1",
+            trackedSeasonId: legacySeasonId,
+            kind: "type3_monitor",
+            status: "succeeded",
+          },
+          episodes: legacyBase.episodes.map((episode) => ({ ...episode, trackedSeasonId: legacySeasonId })),
+        });
+
+        const listed = await repo.listTrackedSeasonStates(scope);
+        expect(listed.map((state) => state.season.id)).toContain("season_show");
+        expect(listed.map((state) => state.season.id)).not.toContain(legacySeasonId);
+        expect(await repo.getTrackedSeasonState(legacySeasonId, scope)).toBeNull();
+        expect((await repo.getTrackedSeasonState("season_show", scope))?.title.id).toBe("title_show");
+        expect((await repo.listAllTrackedSeasonStates()).map((state) => state.season.id)).not.toContain(legacySeasonId);
+        const claimed = await repo.claimNextQueuedWorkflowRun({ kind: "staging_recovery", now: "2026-09-28T04:00:00.000Z" });
+        expect(claimed?.workflowRun.id).toBe("recovery-real");
+        expect(claimed?.workflowRun.trackedSeasonId).toBe("season_show");
+      });
+
       it("listTrackedSeasonStates returns seasons ordered by compareTrackedSeasonStates (title, season, id)", async () => {
         const repo = await fresh();
         await repo.saveWorkflowRunSnapshot(

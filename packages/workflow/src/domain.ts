@@ -8,6 +8,11 @@ import type { MergedSourceHealth } from "./resource-source-health.js";
  */
 export const DEFAULT_ACCOUNT_ID = "acct_default";
 
+/** Hides rows the previous janitor wrote (`staging-janitor:<storageId>` inbox runs). */
+export function isStagingJanitorId(id: string): boolean {
+  return id.startsWith("staging-janitor");
+}
+
 export type MediaType = "movie" | "tv" | "anime";
 export type SeasonStatus = "active" | "completed";
 export type LatestAiredSource = "metadata" | "manual" | "unknown";
