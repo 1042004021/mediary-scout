@@ -15,7 +15,7 @@ let remoteProbeCache:
   | { checkedAt: number; commit: string | null }
   | null = null;
 
-async function readBuildCommit(): Promise<string | null> {
+export async function readBuildCommit(): Promise<string | null> {
   try {
     return normalizeCommit(await readFile("/app/BUILD_COMMIT", "utf8"));
   } catch {
