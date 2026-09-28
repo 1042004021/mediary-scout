@@ -239,6 +239,7 @@ async function sweepDrive(
   const savedCursor = await repository.getAccountSetting(drive.accountId, cursorKey(drive.storageId));
   const cursorIndex = savedCursor ? shows.findIndex((show) => show.id === savedCursor) : -1;
   const start = cursorIndex < 0 ? 0 : cursorIndex;
+  const startedFromSavedCursor = cursorIndex >= 0;
 
   for (let index = start; index < shows.length; index += 1) {
     const show = shows[index]!;
@@ -344,7 +345,11 @@ async function sweepDrive(
         busyTitles.add(lock.title.id);
       }
     } catch (error) {
-      await repository.setAccountSetting(drive.accountId, cursorKey(drive.storageId), show.id);
+      // A show that throws on the sweep we resumed onto has failed twice in a
+      // row. Skip it until the next full pass so the shows after it still run.
+      const resumeAt =
+        startedFromSavedCursor && index === start ? (shows[index + 1]?.id ?? "") : show.id;
+      await repository.setAccountSetting(drive.accountId, cursorKey(drive.storageId), resumeAt);
       throw error;
     }
   }
@@ -363,8 +368,9 @@ async function sweepDrive(
  *
  * ponytail: one fresh executor per drive, so the 115 guard still caps a single
  * sweep (~295 listings). A listing throw stores `staging_janitor_cursor:<storageId>`
- * (the show dir id) and the next sweep continues there. pan123 calls are spaced
- * 1500ms; other brands are not. Sequential on purpose.
+ * (the show dir id) and the next sweep continues there. If that same show throws
+ * again, the cursor moves to the next show so one directory cannot stall the drive.
+ * pan123 calls are spaced 1500ms; other brands are not. Sequential on purpose.
  */
 export async function sweepOrphanStagingDirs(input: {
   repository: SweepRepository;

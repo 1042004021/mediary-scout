@@ -1427,4 +1427,84 @@ describe("sweepOrphanStagingDirs", () => {
     expect(await recoveriesOf(inner, "drive-late")).toEqual([]);
     expect(logs.some((line) => /drive-late: removed 0 empty, queued 0 recovery, skipped 1 unmatched/.test(line))).toBe(true);
   });
+
+  it("skips a show that throws on two sweeps in a row so the rest of the drive is reached", async () => {
+    const repo = new InMemoryWorkflowRepository();
+    const removed: string[] = [];
+    const executor = {
+      async listChildDirectories(parentId: string) {
+        if (parentId === "tv") {
+          return [
+            { id: "showA", name: "A" },
+            { id: "showB", name: "B" },
+            { id: "showC", name: "C" },
+          ];
+        }
+        if (parentId === "showB") throw new Error("PAN115_LIST_TOO_LARGE");
+        if (parentId === "showA") return [{ id: "stg-a", name: "staging-old-a" }];
+        if (parentId === "showC") return [{ id: "stg-c", name: "staging-old-c" }];
+        return [];
+      },
+      async listTree() {
+        return [];
+      },
+      async listSubdirectories() {
+        return [];
+      },
+      async removeDirectory(id: string) {
+        removed.push(id);
+        return { removed: true };
+      },
+    };
+    const target = drive({ storageId: "drive-stall", executor });
+    await sweepOrphanStagingDirs({ repository: repo, drives: [target], now: NOW });
+    expect(removed).toEqual(["stg-a"]);
+    expect(await repo.getAccountSetting("acct", "staging_janitor_cursor:drive-stall")).toBe("showB");
+
+    await sweepOrphanStagingDirs({ repository: repo, drives: [target], now: NOW });
+    expect(removed).toEqual(["stg-a"]);
+    expect(await repo.getAccountSetting("acct", "staging_janitor_cursor:drive-stall")).toBe("showC");
+
+    await sweepOrphanStagingDirs({ repository: repo, drives: [target], now: NOW });
+    expect(removed).toEqual(["stg-a", "stg-c"]);
+  });
+
+  it("processes a show that threw once, then continues to the shows after it", async () => {
+    const repo = new InMemoryWorkflowRepository();
+    const removed: string[] = [];
+    let failShowB = true;
+    const executor = {
+      async listChildDirectories(parentId: string) {
+        if (parentId === "tv") {
+          return [
+            { id: "showA", name: "A" },
+            { id: "showB", name: "B" },
+            { id: "showC", name: "C" },
+          ];
+        }
+        if (parentId === "showB" && failShowB) throw new Error("budget exhausted");
+        if (parentId === "showA") return [{ id: "stg-a", name: "staging-old-a" }];
+        if (parentId === "showB") return [{ id: "stg-b", name: "staging-old-b" }];
+        if (parentId === "showC") return [{ id: "stg-c", name: "staging-old-c" }];
+        return [];
+      },
+      async listTree() {
+        return [];
+      },
+      async listSubdirectories() {
+        return [];
+      },
+      async removeDirectory(id: string) {
+        removed.push(id);
+        return { removed: true };
+      },
+    };
+    const target = drive({ storageId: "drive-once", executor });
+    await sweepOrphanStagingDirs({ repository: repo, drives: [target], now: NOW });
+    expect(removed).toEqual(["stg-a"]);
+    failShowB = false;
+    await sweepOrphanStagingDirs({ repository: repo, drives: [target], now: NOW });
+    expect(removed).toEqual(["stg-a", "stg-b", "stg-c"]);
+    expect(await repo.getAccountSetting("acct", "staging_janitor_cursor:drive-once")).toBe("");
+  });
 });

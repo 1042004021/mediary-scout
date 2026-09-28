@@ -675,6 +675,7 @@ describe("recovery discards an adopted leftover only after discardStaging", () =
         storageDirectoryId: "stg-leftover",
         name: "Show.S01E01.mkv",
         sizeBytes: 1000,
+        episodeCode: "S01E01",
         providerFileId: "only-copy",
       },
     ]);
