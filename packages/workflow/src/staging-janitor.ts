@@ -1,6 +1,18 @@
+import type { WorkflowKind } from "./domain.js";
 import type { StorageExecutor } from "./ports.js";
 import { isActiveWorkflowStatus, type TrackedSeasonState, type WorkflowRepository } from "./repository.js";
 import { legacyMediaLibraryFolderName, mediaLibraryFolderName } from "./media-library-folder.js";
+
+/** Every kind. `blockIfTitleHasActiveRun` ignores staging_recovery so a user
+ *  action can proceed; this reservation must still wait for one. */
+const TITLE_BLOCK_KINDS: Record<WorkflowKind, true> = {
+  type1_package_init: true,
+  type2_init: true,
+  type3_monitor: true,
+  movie_init: true,
+  replace_request: true,
+  staging_recovery: true,
+};
 
 /** A failed run is requeued on the same id within 15 minutes. Don't touch its staging until that window is long gone. */
 const SWEEP_SETTLE_MS = 60 * 60 * 1000;
@@ -258,7 +270,7 @@ async function sweepDrive(
           decisions: [],
           transferAttempts: [],
           notifications: [],
-          blockIfTitleHasActiveRun: true,
+          blockIfTitleHasActiveKinds: Object.keys(TITLE_BLOCK_KINDS) as WorkflowKind[],
           requireTrackedSeason: true,
           keepCurrentEpisodes: true,
         });

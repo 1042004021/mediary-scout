@@ -1148,6 +1148,71 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         ).toBe("reserved");
       });
 
+      it("blockIfTitleHasActiveRun does not let a queued staging_recovery pin the title", async () => {
+        const repo = await fresh();
+        const base = workflowPersistenceFixture();
+        const queued = (
+          id: string,
+          titleId: string,
+          seasonNumber: number,
+          kind: "staging_recovery" | "type2_init" | "type3_monitor" | "replace_request" | "movie_init",
+          over: Record<string, unknown> = {},
+        ) =>
+          reIded(id, {
+            title: { ...base.title, id: titleId },
+            season: { ...base.season, id: `${titleId}_s${seasonNumber}`, mediaTitleId: titleId, seasonNumber },
+            workflowRun: {
+              ...base.workflowRun,
+              id,
+              kind,
+              status: "queued" as const,
+              trackedSeasonId: `${titleId}_s${seasonNumber}`,
+              finishedAt: null,
+              auditEvents: [],
+            },
+            episodes: [],
+            connectedStorageId: "cs_pin",
+            ...over,
+          });
+        expect((await repo.reserveWorkflowRun(queued("run_pin_recovery", "title_pin", 1, "staging_recovery"))).status).toBe("reserved");
+        // User acquire sets this flag. A leftover recovery must not refuse it.
+        expect(
+          (await repo.reserveWorkflowRun(queued("run_pin_user", "title_pin", 2, "type2_init", { blockIfTitleHasActiveRun: true }))).status,
+        ).toBe("reserved");
+        // A real user run still pins the title.
+        expect(
+          (await repo.reserveWorkflowRun(queued("run_pin_again", "title_pin", 3, "movie_init", { blockIfTitleHasActiveRun: true }))).status,
+        ).toBe("already_active");
+        // Replace, on its own title, is likewise not pinned by a recovery.
+        expect((await repo.reserveWorkflowRun(queued("run_rep_recovery", "title_replace", 1, "staging_recovery"))).status).toBe("reserved");
+        expect(
+          (await repo.reserveWorkflowRun(queued("run_rep_user", "title_replace", 2, "replace_request", { blockIfTitleHasActiveRun: true }))).status,
+        ).toBe("reserved");
+        // The janitor lists every kind, so a recovery still refuses another recovery.
+        expect((await repo.reserveWorkflowRun(queued("run_jan_recovery", "title_janitor", 1, "staging_recovery"))).status).toBe("reserved");
+        expect(
+          (await repo.reserveWorkflowRun(
+            queued("run_jan_again", "title_janitor", 2, "staging_recovery", {
+              blockIfTitleHasActiveKinds: [
+                "type1_package_init",
+                "type2_init",
+                "type3_monitor",
+                "movie_init",
+                "replace_request",
+                "staging_recovery",
+              ],
+            }),
+          )).status,
+        ).toBe("already_active");
+        // Patrol blocks only on replace_request.
+        expect((await repo.reserveWorkflowRun(queued("run_pat_recovery", "title_patrol", 1, "staging_recovery"))).status).toBe("reserved");
+        expect(
+          (await repo.reserveWorkflowRun(
+            queued("run_pat_user", "title_patrol", 2, "type3_monitor", { blockIfTitleHasActiveKinds: ["replace_request"] }),
+          )).status,
+        ).toBe("reserved");
+      });
+
       it("blockIfEpisodeStatesExist returns already_has_episode_state when the scoped bucket is non-empty", async () => {
         const repo = await fresh();
         // Seed episode states via a TERMINAL (succeeded) run so the active-run check

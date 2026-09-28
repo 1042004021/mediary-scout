@@ -319,6 +319,77 @@ describe("sweepOrphanStagingDirs", () => {
     expect(await repo.listNotifications({ accountId: "acct" })).toEqual([]);
   });
 
+  it("does not queue when a recovery for that staging dir is already queued and the show itself is idle", async () => {
+    // A recovery stored on this show is an active run, so the busy-title set
+    // skips the show before the per-dir lookup. Recording it under another title
+    // that names the same dir is the case only findActiveStagingRecovery decides.
+    const repo = new InMemoryWorkflowRepository();
+    const disk = memoryDrive({
+      dirs: [
+        { id: "tv", name: "TV", parentId: "root" },
+        { id: "showA", name: "Show A", parentId: "tv" },
+        { id: "stg-a", name: "staging-run-old", parentId: "showA" },
+      ],
+      files: [{ dirId: "stg-a", path: "a.mkv", providerFileId: "a", sizeBytes: 2 * 1024 * 1024 }],
+    });
+    await saveTracked(repo, "drive-dedupe", "showA", "Show A", 11);
+    await repo.saveWorkflowRunSnapshot({
+      accountId: "acct",
+      connectedStorageId: "drive-dedupe",
+      title: {
+        id: "title_other",
+        tmdbId: 99,
+        type: "tv",
+        title: "Other",
+        originalTitle: "Other",
+        year: 2020,
+        aliases: [],
+      },
+      season: {
+        id: "title_other_s1",
+        mediaTitleId: "title_other",
+        seasonNumber: 1,
+        status: "active",
+        qualityPreference: "1080p",
+        storageDirectoryId: "somewhere-else",
+        totalEpisodes: 1,
+        latestAiredEpisode: 1,
+        latestAiredSource: "metadata",
+      },
+      workflowRun: {
+        id: "recovery-already",
+        kind: "staging_recovery",
+        status: "queued",
+        trackedSeasonId: "title_other_s1",
+        startedAt: "2026-09-27T02:00:00.000Z",
+        finishedAt: null,
+        auditEvents: [
+          {
+            type: "staging_recovery_queued",
+            message: "already queued",
+            data: { stagingDirectoryId: "stg-a", showDirectoryId: "showA", seasonNumbers: [1] },
+          },
+        ],
+      },
+      episodes: [],
+      resourceSnapshots: [],
+      decisions: [],
+      transferAttempts: [],
+      notifications: [],
+    });
+
+    await sweepOrphanStagingDirs({
+      repository: repo,
+      drives: [drive({ storageId: "drive-dedupe", executor: disk.executor })],
+      now: "2026-09-28T03:00:00.000Z",
+    });
+
+    const recoveries = await recoveriesOf(repo, "drive-dedupe");
+    expect(recoveries.map((run) => run.workflowRun.id)).toEqual(["recovery-already"]);
+    expect(disk.removed).toEqual([]);
+    expect(await repo.listNotifications({ accountId: "acct" })).toEqual([]);
+  });
+
   it("queues at most 5 recovery runs per drive per sweep", async () => {
     const repo = new InMemoryWorkflowRepository();
     const dirs: Array<{ id: string; name: string; parentId: string }> = [{ id: "tv", name: "TV", parentId: "root" }];

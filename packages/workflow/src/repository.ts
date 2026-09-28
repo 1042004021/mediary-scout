@@ -67,11 +67,14 @@ export function seasonScopeKey(seasonId: string, connectedStorageId: string | nu
 }
 
 /** Which active runs of the same title refuse a reservation, or null when the
- *  reservation is not title-exclusive at all (see ReserveWorkflowRunInput). */
+ *  reservation is not title-exclusive at all (see ReserveWorkflowRunInput).
+ *  `blockIfTitleHasActiveRun` ignores `staging_recovery`: a leftover-staging run
+ *  must not pin the title against a user action. Callers that must also wait
+ *  for one (the janitor) pass it in `blockIfTitleHasActiveKinds`. */
 export function titleBlockFilter(
   input: Pick<ReserveWorkflowRunInput, "blockIfTitleHasActiveRun" | "blockIfTitleHasActiveKinds">,
 ): ((run: Pick<WorkflowRun, "kind">) => boolean) | null {
-  if (input.blockIfTitleHasActiveRun === true) return () => true;
+  if (input.blockIfTitleHasActiveRun === true) return (run) => run.kind !== "staging_recovery";
   const kinds = input.blockIfTitleHasActiveKinds;
   if (kinds && kinds.length > 0) return (run) => kinds.includes(run.kind);
   return null;
@@ -130,13 +133,15 @@ export interface TrackedSeasonState {
 export interface ReserveWorkflowRunInput extends PersistWorkflowRunSnapshotInput {
   blockIfEpisodeStatesExist?: boolean;
   /**
-   * Title-level mutual exclusion: refuse the reservation if ANY run for the
-   * same media title is already active, regardless of season or kind. All
-   * seasons of a title share one `Title (Year)/` show directory and staging
-   * parent, so two concurrent acquisition runs would race on directory
-   * creation, staging, and dedup. User-triggered acquisitions set this so a
-   * user clicking "get S1", "get S2", "get S3" in quick succession can never
-   * spawn overlapping writers on the same title.
+   * Title-level mutual exclusion: refuse the reservation if any user-visible run
+   * for the same media title is already active, regardless of season. A queued
+   * `staging_recovery` does not count, so a leftover-staging run cannot pin the
+   * title; that recovery stays queued and the worker claims it once user-facing
+   * work is done. All seasons of a title share one `Title (Year)/` show directory
+   * and staging parent, so two concurrent acquisition runs would race on directory
+   * creation, staging, and dedup. User-triggered acquisitions set this so a user
+   * clicking "get S1", "get S2", "get S3" in quick succession can never spawn
+   * overlapping writers on the same title.
    */
   blockIfTitleHasActiveRun?: boolean;
   /**
