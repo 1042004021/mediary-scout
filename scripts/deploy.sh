@@ -22,6 +22,9 @@ set -eu
 # portability across /bin/sh implementations (busybox ash, dash, bash).
 cd "$(dirname "$0")/.."
 
+# The updater leaves the deploy folder on a release tag; pull needs a branch.
+git symbolic-ref -q HEAD >/dev/null || git checkout main
+
 echo "==> git pull --ff-only"
 git pull --ff-only
 

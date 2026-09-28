@@ -1,0 +1,352 @@
+import { spawn } from "node:child_process";
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { describe, expect, it } from "vitest";
+
+const SCRIPT = fileURLToPath(new URL("./run-update.sh", import.meta.url));
+const FROM = "a".repeat(40);
+const TAG_COMMIT = "b".repeat(40);
+const TAG = "v2026.10.02";
+
+function writeExe(dir, name, body) {
+  const path = join(dir, name);
+  writeFileSync(path, body);
+  chmodSync(path, 0o755);
+}
+
+/** One line per invocation: `name arg arg ...`. Shared by every stub via STUB_LOG. */
+const LOG_FN = `
+log_call() {
+  printf '%s' "$1" >> "$STUB_LOG"
+  shift
+  for arg in "$@"; do
+    printf ' %s' "$arg" >> "$STUB_LOG"
+  done
+  printf '\\n' >> "$STUB_LOG"
+}
+`;
+
+function installStubs(bin) {
+  writeExe(bin, "stat", `#!/bin/sh\n${LOG_FN}\nlog_call stat "$@"\nif [ "\${1-}" = "-c" ]; then printf '%s:%s\\n' "$(id -u)" "$(id -g)"; fi\n`);
+  writeExe(bin, "hostname", `#!/bin/sh\n${LOG_FN}\nlog_call hostname "$@"\nprintf '%s\\n' updater-test\n`);
+  writeExe(bin, "sleep", `#!/bin/sh\nexit 0\n`);
+  writeExe(bin, "chown", `#!/bin/sh\n${LOG_FN}\nlog_call chown "$@"\nexit 0\n`);
+  writeExe(
+    bin,
+    "su-exec",
+    `#!/bin/sh\n${LOG_FN}\nlog_call su-exec "$@"\nshift\nexec "$@"\n`,
+  );
+  writeExe(
+    bin,
+    "wget",
+    `#!/bin/sh
+${LOG_FN}
+log_call wget "$@"
+n=0
+if [ -f "$STUB_DIR/wget-n" ]; then n=$(cat "$STUB_DIR/wget-n"); fi
+n=$((n + 1))
+printf '%s\\n' "$n" > "$STUB_DIR/wget-n"
+if [ -f "$STUB_DIR/wget-lines" ]; then
+  line=$(sed -n "\${n}p" "$STUB_DIR/wget-lines" || true)
+  if [ -z "$line" ]; then line=$(tail -n 1 "$STUB_DIR/wget-lines" || true); fi
+  printf '%s\\n' "$line"
+else
+  printf '%s\\n' '{"busy":false}'
+fi
+`,
+  );
+  writeExe(
+    bin,
+    "git",
+    `#!/bin/sh
+${LOG_FN}
+log_call git "$@"
+cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    status|rev-parse|fetch|checkout) cmd="$arg" ;;
+  esac
+done
+case "$cmd" in
+  status)
+    if [ -f "$STUB_DIR/status-out" ]; then cat "$STUB_DIR/status-out"; fi
+    ;;
+  rev-parse)
+    cat "$STUB_DIR/head"
+    ;;
+  fetch)
+    ;;
+  checkout)
+    ref=""
+    for arg in "$@"; do ref="$arg"; done
+    case "$ref" in
+      refs/tags/*) printf '%s\\n' "$GIT_TAG_COMMIT" > "$STUB_DIR/head" ;;
+      *) printf '%s\\n' "$ref" > "$STUB_DIR/head" ;;
+    esac
+    ;;
+  *)
+    echo "unexpected git: $*" >&2
+    exit 99
+    ;;
+esac
+`,
+  );
+  writeExe(
+    bin,
+    "docker",
+    `#!/bin/sh
+${LOG_FN}
+log_call docker "$@"
+if [ "\${1-}" = "inspect" ]; then
+  printf '%s\\n' mediary
+  exit 0
+fi
+args="$*"
+if printf '%s' "$args" | grep -q pg_dump; then
+  if [ -f "$STUB_DIR/fail-pg-dump" ]; then exit 1; fi
+  printf '%s\\n' DUMP
+  exit 0
+fi
+if printf '%s' "$args" | grep -q 'build web'; then
+  printf '%s\\n' "\${GIT_SHA-}" >> "$STUB_DIR/git-shas"
+  if [ -f "$STUB_DIR/fail-build" ]; then exit 1; fi
+  exit 0
+fi
+if printf '%s' "$args" | grep -q ' up '; then
+  exit 0
+fi
+if printf '%s' "$args" | grep -q 'BUILD_COMMIT'; then
+  last=""
+  if [ -f "$STUB_DIR/git-shas" ]; then last=$(tail -n 1 "$STUB_DIR/git-shas"); fi
+  if [ -f "$STUB_DIR/never-report" ]; then
+    printf '%s\\n' mismatch
+    exit 0
+  fi
+  if [ -f "$STUB_DIR/hide-shas" ] && grep -qx "$last" "$STUB_DIR/hide-shas"; then
+    printf '%s\\n' mismatch
+    exit 0
+  fi
+  printf '%s\\n' "$last"
+  exit 0
+fi
+if printf '%s' "$args" | grep -q 'node -e'; then
+  exit 0
+fi
+echo "unexpected docker: $*" >&2
+exit 99
+`,
+  );
+}
+
+function setup() {
+  const root = mkdtempSync(join(tmpdir(), "run-update-"));
+  const repo = join(root, "repo");
+  const state = join(root, "state");
+  const bin = join(root, "bin");
+  const stubDir = join(root, "stub");
+  mkdirSync(repo);
+  mkdirSync(state);
+  mkdirSync(bin);
+  mkdirSync(stubDir);
+  const log = join(root, "calls.log");
+  writeFileSync(log, "");
+  writeFileSync(join(stubDir, "head"), `${FROM}\n`);
+  writeFileSync(join(state, "token"), "t0k3n\n");
+  installStubs(bin);
+  const env = {
+    ...process.env,
+    PATH: `${bin}:${process.env.PATH ?? ""}`,
+    UPDATER_REPO_DIR: repo,
+    UPDATER_STATE_DIR: state,
+    UPDATER_WEB_BASE: "http://web.test:3000",
+    STUB_DIR: stubDir,
+    STUB_LOG: log,
+    GIT_TAG_COMMIT: TAG_COMMIT,
+  };
+  return { repo, stubDir, log, env };
+}
+
+function run(env, tag = TAG) {
+  return new Promise((resolve) => {
+    const child = spawn("sh", [SCRIPT, tag], { env });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("close", (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
+function linesOf(log) {
+  return readFileSync(log, "utf8").split("\n").filter(Boolean);
+}
+
+/** docker / git / wget calls, in order, reduced to the step the script meant. */
+function signatures(log) {
+  return linesOf(log)
+    .filter((line) => /^(docker|git|wget) /.test(line))
+    .map((line) => {
+      if (line.startsWith("wget ")) return "wget";
+      if (line.includes("pg_dump")) return "pg_dump";
+      if (line.includes("build web")) return "build";
+      if (line.includes(" up ")) return "up";
+      if (line.includes("BUILD_COMMIT")) return "cat_commit";
+      if (line.includes("node -e") || line.includes(" node ")) return "health";
+      if (line.startsWith("docker ") && line.includes(" inspect ")) return "inspect";
+      if (line.startsWith("git ") && line.includes(" status ")) return "status";
+      if (line.startsWith("git ") && line.includes(" rev-parse ")) return "rev-parse";
+      if (line.startsWith("git ") && line.includes(" fetch ")) return "fetch";
+      if (line.startsWith("git ") && line.includes(" checkout ")) return `checkout ${line.trim().split(" ").at(-1)}`;
+      return line;
+    });
+}
+
+function gitShas(stubDir) {
+  return readFileSync(join(stubDir, "git-shas"), "utf8").trim().split("\n");
+}
+
+describe("run-update.sh", () => {
+  it("updates, backing up before the build and swapping only web", async () => {
+    const { repo, stubDir, log, env } = setup();
+    const result = await run(env);
+    expect(result.stderr).toBe("");
+    expect(result.code).toBe(0);
+    expect(signatures(log)).toEqual([
+      "status",
+      "inspect",
+      "rev-parse",
+      "pg_dump",
+      "fetch",
+      `checkout refs/tags/${TAG}`,
+      "rev-parse",
+      "build",
+      "wget",
+      "up",
+      "cat_commit",
+      "health",
+    ]);
+    const dockerLines = linesOf(log).filter((line) => line.startsWith("docker "));
+    const dumpAt = dockerLines.findIndex((line) => line.includes("pg_dump"));
+    const buildAt = dockerLines.findIndex((line) => line.includes("build web"));
+    expect(dumpAt).toBeGreaterThanOrEqual(0);
+    expect(buildAt).toBeGreaterThan(dumpAt);
+    const ups = dockerLines.filter((line) => line.includes(" up "));
+    expect(ups).toHaveLength(1);
+    expect(ups[0]).toMatch(/up -d --no-deps web$/);
+    expect(ups[0]).toContain(`--project-directory ${repo}`);
+    const wget = linesOf(log).find((line) => line.startsWith("wget "));
+    expect(wget).toContain("http://web.test:3000/api/update/busy");
+    expect(wget).toContain("Bearer t0k3n");
+    expect(gitShas(stubDir)).toEqual([TAG_COMMIT]);
+    const backups = readdirSync(join(repo, "backups"));
+    const gz = backups.filter((name) => name.endsWith(".sql.gz"));
+    expect(gz).toEqual([expect.stringMatching(/^pre-update-\d{8}-\d{6}\.sql\.gz$/)]);
+    expect(backups.some((name) => name.endsWith(".tmp"))).toBe(false);
+    expect(result.stdout).toContain(`==> DONE ${TAG}`);
+  });
+
+  it("stops before docker or checkout when tracked files are edited", async () => {
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "status-out"), " M docker-compose.yml\n");
+    const result = await run(env);
+    expect(result.code).toBe(30);
+    expect(result.stdout).toContain("==> LOCAL_CHANGES");
+    expect(linesOf(log).some((line) => line.startsWith("docker "))).toBe(false);
+    expect(linesOf(log).some((line) => line.includes(" checkout"))).toBe(false);
+    expect(signatures(log).every((step) => step === "status")).toBe(true);
+  });
+
+  it("checks the previous commit back out when the build fails, and does not swap", async () => {
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "fail-build"), "1");
+    const result = await run(env);
+    expect(result.code).toBe(10);
+    expect(result.stdout).toContain("==> BUILD_FAILED");
+    expect(signatures(log)).toEqual([
+      "status",
+      "inspect",
+      "rev-parse",
+      "pg_dump",
+      "fetch",
+      `checkout refs/tags/${TAG}`,
+      "rev-parse",
+      "build",
+      `checkout ${FROM}`,
+    ]);
+    expect(gitShas(stubDir)).toEqual([TAG_COMMIT]);
+  });
+
+  it("rolls back when the new container never reports the target commit", async () => {
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "hide-shas"), `${TAG_COMMIT}\n`);
+    const result = await run(env);
+    expect(result.stderr).toBe("");
+    expect(result.code).toBe(10);
+    expect(result.stdout).toContain("==> ROLLED_BACK");
+    expect(result.stdout).not.toContain("ROLLBACK_FAILED");
+    const steps = signatures(log);
+    expect(steps.filter((step) => step === "cat_commit")).toHaveLength(91);
+    expect(steps.filter((step) => step === "build")).toHaveLength(2);
+    expect(steps.filter((step) => step === "up")).toHaveLength(2);
+    for (const line of linesOf(log).filter((entry) => entry.includes(" up "))) {
+      expect(line).toMatch(/up -d --no-deps web$/);
+    }
+    expect(gitShas(stubDir)).toEqual([TAG_COMMIT, FROM]);
+    expect(steps.filter((step) => step.startsWith("checkout "))).toEqual([
+      `checkout refs/tags/${TAG}`,
+      `checkout ${FROM}`,
+    ]);
+  }, 60_000);
+
+  it("exits 20 when the rollback never verifies either", async () => {
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "never-report"), "1");
+    const result = await run(env);
+    expect(result.code).toBe(20);
+    expect(result.stdout).toContain("==> ROLLBACK_FAILED");
+    expect(result.stdout).not.toContain("==> ROLLED_BACK");
+    const steps = signatures(log);
+    expect(steps.filter((step) => step === "cat_commit")).toHaveLength(180);
+    expect(steps.filter((step) => step === "health")).toHaveLength(0);
+    expect(steps.filter((step) => step === "build")).toHaveLength(2);
+    expect(gitShas(stubDir)).toEqual([TAG_COMMIT, FROM]);
+    expect(steps).toContain(`checkout ${FROM}`);
+  }, 60_000);
+
+  it("rejects a non-release tag before calling anything", async () => {
+    for (const tag of ["main", "v2026.10.02;rm -rf /"]) {
+      const { log, env } = setup();
+      const result = await run(env, tag);
+      expect(result.code).not.toBe(0);
+      expect(linesOf(log)).toEqual([]);
+      expect(result.stdout).toContain("not a release tag");
+    }
+  });
+
+  it("prints one waiting step, then switches once the busy probe goes idle", async () => {
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "wget-lines"), '{"busy":true}\n{"busy":true}\n{"busy":false}\n');
+    const result = await run(env);
+    expect(result.code).toBe(0);
+    expect(result.stdout.split("\n").filter((line) => line === "==> STEP waiting")).toHaveLength(1);
+    expect(result.stdout.indexOf("==> STEP waiting")).toBeLessThan(result.stdout.indexOf("==> STEP switching"));
+    expect(signatures(log).filter((step) => step === "wget")).toHaveLength(3);
+  });
+
+  it("stops before checkout or build when pg_dump fails, and leaves no temp dump", async () => {
+    const { repo, stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "fail-pg-dump"), "1");
+    const result = await run(env);
+    expect(result.code).not.toBe(0);
+    expect(signatures(log)).toEqual(["status", "inspect", "rev-parse", "pg_dump"]);
+    const backups = readdirSync(join(repo, "backups"));
+    expect(backups.filter((name) => name.endsWith(".sql.tmp"))).toEqual([]);
+    expect(backups.filter((name) => name.endsWith(".sql.gz"))).toEqual([]);
+  });
+});

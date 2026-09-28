@@ -7,7 +7,7 @@ export default defineConfig({
   // string-rendered in tests. (Vite 8 ignores the legacy `esbuild` key.)
   oxc: { jsx: { runtime: "automatic", importSource: "react" } },
   test: {
-    include: ["packages/**/*.test.ts", "apps/**/*.test.ts", "workers/**/*.test.ts", "site/**/*.test.mjs"],
+    include: ["packages/**/*.test.ts", "apps/**/*.test.ts", "workers/**/*.test.ts", "site/**/*.test.mjs", "updater/**/*.test.mjs"],
     environment: "node",
     passWithNoTests: false,
   },
