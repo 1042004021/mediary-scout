@@ -440,6 +440,26 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # A newly created Release becomes Latest unless we say otherwise. Re-publishing an
+      # older tag must not steal Latest from a newer date release.
+      - name: Decide whether this release is Latest
+        id: latest
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          CURRENT=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || true)
+          MAKE_LATEST=true
+          if printf '%s' "$CURRENT" | grep -Eq '^v[0-9]{4}\.(0[1-9]|1[0-2])\.(0[1-9]|[12][0-9]|3[01])(\.([2-9]|[1-9][0-9]+))?$'; then
+            NEWER=$(printf '%s\n%s\n' "$TAG" "$CURRENT" | sort -V | tail -1)
+            if [ "$NEWER" = "$CURRENT" ] && [ "$CURRENT" != "$TAG" ]; then
+              MAKE_LATEST=false
+            fi
+          fi
+          echo "make_latest=$MAKE_LATEST (current: ${CURRENT:-none})"
+          echo "make_latest=$MAKE_LATEST" >> "$GITHUB_OUTPUT"
+
       - name: Upload DMG + installer to GitHub Release
         if: ${{ !inputs.dry_run }}
         uses: softprops/action-gh-release@v2
@@ -447,6 +467,7 @@ jobs:
           tag_name: ${{ needs.preflight.outputs.tag }}
           name: 巡影 ${{ needs.preflight.outputs.tag }}
           body_path: ${{ runner.temp }}/release-body.md
+          make_latest: ${{ steps.latest.outputs.make_latest }}
           files: |
             dist/*.dmg
             dist/*.exe
