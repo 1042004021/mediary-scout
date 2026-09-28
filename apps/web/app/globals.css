@@ -3850,7 +3850,7 @@ select.setting-control {
   margin-top: 32px;
   padding-top: 16px;
   border-top: 1px solid var(--border, #2a2a2a);
-  max-width: 720px;
+  /* Spans the main column, so it lines up under wide grids (search / library) too. */
 }
 .github-nameplate-link {
   display: inline-flex;
