@@ -189,6 +189,23 @@ docker compose up -d
 
 [![认可 LINUX DO](https://img.shields.io/badge/LINUX%20DO-认可-2ecc71?style=flat&labelColor=1f1f1f)](https://linux.do)
 
+## 支持作者
+
+Mediary Scout 是我一个人业余做的开源项目，不收费，也不做托管服务；服务器、测试用的网盘会员和 AI 调用都是自掏腰包。如果它帮你省了时间，可以请我喝杯咖啡：
+
+<table>
+  <tr>
+    <td align="center"><b>微信</b></td>
+    <td align="center"><b>支付宝</b></td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/support/wechat.png" alt="微信收款码" width="220"></td>
+    <td><img src="docs/images/support/alipay.png" alt="支付宝收款码" width="220"></td>
+  </tr>
+</table>
+
+备注里留个昵称，会整理进[鸣谢名单](docs/support/thanks.md)。打赏纯属自愿，不换任何额外功能。
+
 ## Star History
 <a href="https://www.star-history.com/?repos=fancydirty%2Fmediary-scout&type=date&legend=top-left">
   <picture>

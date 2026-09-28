@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { SupportAuthorLink } from "./support-author-link";
 
 /** Small open-source nameplate at the bottom of the Settings page — a quiet
  * 暗记 + CTA: self-hosters who dig into Settings are exactly the audience for
@@ -30,6 +31,7 @@ export function GitHubNameplate() {
           Mediary Scout · 开源自部署 · <span className="github-nameplate-cta">GitHub →</span>
         </span>
       </Link>
+      <SupportAuthorLink />
     </footer>
   );
 }
