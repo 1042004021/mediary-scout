@@ -124,7 +124,8 @@ export function buildSandboxToolSet(
     onToolCall?: (toolName: string, args: Record<string, unknown>) => void;
     /** The run's drive brand — selects the brand-specific dead-links section. */
     storageProvider?: string;
-    /** Leftover staging: no search, no transfer, no subtitle landing. */
+    /** Leftover staging: no search, no transfer, no subtitle landing.
+     *  renameSubtitle stays: a leftover .ass/.srt may not match its video. */
     stagingRecovery?: boolean;
   } = {},
 ): ToolSet {
@@ -305,6 +306,11 @@ export function buildSandboxToolSet(
       execute: (args: { candidateId: number }) =>
         asEvidence(() => sandbox.transferSubtitle({ candidateId: args.candidateId })),
     };
+  }
+  // Recovery has no assrt token, so `options.subtitle` is unset, but a leftover
+  // subtitle often does not share its video's name. Rename needs only the staging
+  // listing — no subtitle snapshot.
+  if (recover || options.subtitle) {
     tools["renameSubtitle"] = {
       description:
         "Rename landed subtitle files to match their videos, in ONE BATCH: decide EVERY subtitle↔episode pairing first (fileIds from inspectStaging), then submit them all as renames:[{fileId,newName},…] — same filename prefix as each episode's video, keep the subtitle extension (video Show.S02E01.mkv → subtitle Show.S02E01.ass; 简/繁 variants keep their .sc/.tc infix). NEVER rename one file per call — at 77 episodes that collapses; the batch is one call regardless of count. Subtitles are the ONLY files you may rename (the documented exception) so the scraper auto-loads them. Per-item guard violations come back in `errors` without aborting the rest. Then move each subtitle into its season with its video via moveToSeason.",

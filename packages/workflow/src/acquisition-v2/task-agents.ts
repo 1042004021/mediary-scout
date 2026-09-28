@@ -138,7 +138,7 @@ export interface TaskAgentPromptOptions {
 
 /** Shown to the agent for a leftover staging dir. Search and transfer tools are not registered. */
 export const STAGING_RECOVERY_PROMPT =
-  "This staging directory is left over from an earlier run. Nothing will be searched or transferred. Inspect this staging directory and each Season directory. For an episode whose Season directory has no video but this staging holds one, move that video and its subtitles into the season (flat) and markObtained it. If moveToSeason fails, those files did NOT move — do not markObtained their episodes this run. Everything else here is surplus. Then discardStaging and finish. Never delete anything outside staging.";
+  "This staging directory is left over from an earlier run. Nothing will be searched or transferred. Inspect this staging directory and each Season directory. For an episode whose Season directory has no video but this staging holds one, move that video and its subtitles into the season (flat) and markObtained it. If a subtitle's name does not match its video, renameSubtitle it to that video's name before moving it. If moveToSeason fails, those files did NOT move — do not markObtained their episodes this run. Everything else here is surplus. Then discardStaging and finish. Never delete anything outside staging.";
 
 /** The kept old + replacement copies, so keep-larger dedup does not undo a replacement. */
 function protectExistingLine(options: Pick<TaskAgentPromptOptions, "protectExisting">): string {
