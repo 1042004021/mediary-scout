@@ -10,7 +10,7 @@ on:
         description: "Release tag (e.g. v2026.09.28)"
         required: true
       dry_run:
-        description: "Build and check both installers from the selected branch, but do not publish a Release"
+        description: "Build the branch selected in Run workflow, not the tag's commit. The tag only sets the version number and which release-notes file to check. Does not publish a Release."
         type: boolean
         default: false
 

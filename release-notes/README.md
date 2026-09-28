@@ -16,4 +16,6 @@
 2. 打 macOS、Windows 两个安装包，桌面版本号由标签推出（`v2026.09.28` → `2026.928.0`，`v2026.09.28.2` → `2026.928.2`），不用手改 `apps/desktop/package.json`；
 3. 两个都通过后，在 GitHub 发布「巡影 vYYYY.MM.DD」，正文就是本文件（去掉标题）加一段下载说明。
 
-想先试打包、不发布：在 Actions 里手动运行 Release Desktop，填标签、勾上 `dry_run`。
+想先试打包、不发布：在 Actions 里手动运行 Release Desktop，在「Run workflow」里选好要构建的分支，填标签、勾上 `dry_run`。dry run 构建的是你选的那条分支，不是标签指向的提交；标签只用来定版本号，以及核对哪一份发布说明。
+
+如果几个标签推得比一次发布还快（大约 40 分钟），GitHub 只保留最新的一个排队任务，中间的标签可能被跳过。到 Actions 里用 workflow_dispatch 重跑那个标签即可；只要已经有更新的发布，它不会抢走「Latest」。
