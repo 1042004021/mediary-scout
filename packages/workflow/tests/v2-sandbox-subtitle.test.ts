@@ -5,6 +5,7 @@ import { Storage115Simulator, type TransferAttemptResult } from "../src/acquisit
 import { Pan115AuthError } from "../src/pan115-cookie-client.js";
 import type { AssrtCandidate, AssrtSubtitleFile } from "../src/subtitle-provider.js";
 import { buildSandboxToolSet } from "../src/acquisition-v2/agent-loop.js";
+import { STAGING_RECOVERY_PROMPT } from "../src/acquisition-v2/task-agents.js";
 
 /** The provider object shape primeSubtitleSnapshot takes. */
 type FakeAssrtProvider = {
@@ -530,6 +531,38 @@ describe("buildSandboxToolSet renameSubtitle registration", () => {
     const sandbox = new TaskSandbox({ provider, storage, stagingDirectoryId: "s", need: ["S01E01"] });
     expect("renameSubtitle" in buildSandboxToolSet(sandbox)).toBe(false);
     expect("renameSubtitle" in buildSandboxToolSet(sandbox, { subtitle: true })).toBe(true);
+  });
+
+  it("a recovery exposes renameSubtitle only, and a run without subtitles exposes none of the three", async () => {
+    const provider = new FakeResourceProviderV2({ results: { title: [] } });
+    const storage = new Storage115Simulator({ packs: {} });
+    const stagingDirectoryId = await storage.createDirectory({ name: "staging-old", parentId: "root" });
+    const landed = (
+      await storage.transferSubtitleUrl({
+        url: "http://x/a.ass",
+        filename: "mismatch.ass",
+        intoDirectoryId: stagingDirectoryId,
+      })
+    ).materializedFileIds[0]!;
+    const sandbox = new TaskSandbox({ provider, storage, stagingDirectoryId, need: ["S01E05"] });
+    const recovery = buildSandboxToolSet(sandbox, { stagingRecovery: true });
+    expect("renameSubtitle" in recovery).toBe(true);
+    expect("viewSubtitleSnapshot" in recovery).toBe(false);
+    expect("transferSubtitle" in recovery).toBe(false);
+    expect("searchResources" in recovery).toBe(false);
+    expect("transferCandidate" in recovery).toBe(false);
+    const plain = buildSandboxToolSet(sandbox);
+    expect("renameSubtitle" in plain).toBe(false);
+    expect("viewSubtitleSnapshot" in plain).toBe(false);
+    expect("transferSubtitle" in plain).toBe(false);
+    expect(STAGING_RECOVERY_PROMPT).toContain("renameSubtitle");
+
+    const renamed = await (
+      recovery["renameSubtitle"] as { execute: (args: { renames: Array<{ fileId: string; newName: string }> }) => Promise<{ renamed: string[] }> }
+    ).execute({ renames: [{ fileId: landed, newName: "Show.S01E05.ass" }] });
+    expect(renamed.renamed).toEqual(["Show.S01E05.ass"]);
+    const tree = await storage.listTree({ directoryId: stagingDirectoryId });
+    expect(tree.map((file) => file.path)).toEqual(["Show.S01E05.ass"]);
   });
 });
 

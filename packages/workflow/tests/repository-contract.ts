@@ -9,6 +9,7 @@ import type { Account } from "../src/account-credentials.js";
 import type { TransferAttempt } from "../src/domain.js";
 import { workflowPersistenceFixture } from "./workflow-fixtures.js";
 import { queueReplaceRequest } from "../src/replace-request.js";
+import { handleWorkflowRunFailure } from "../src/worker.js";
 
 /** A factory that yields a FRESH, empty repository and a teardown. Postgres/SQLite
  *  return async; InMemory is sync — accept both. */
@@ -1148,6 +1149,71 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         ).toBe("reserved");
       });
 
+      it("blockIfTitleHasActiveRun does not let a queued staging_recovery pin the title", async () => {
+        const repo = await fresh();
+        const base = workflowPersistenceFixture();
+        const queued = (
+          id: string,
+          titleId: string,
+          seasonNumber: number,
+          kind: "staging_recovery" | "type2_init" | "type3_monitor" | "replace_request" | "movie_init",
+          over: Record<string, unknown> = {},
+        ) =>
+          reIded(id, {
+            title: { ...base.title, id: titleId },
+            season: { ...base.season, id: `${titleId}_s${seasonNumber}`, mediaTitleId: titleId, seasonNumber },
+            workflowRun: {
+              ...base.workflowRun,
+              id,
+              kind,
+              status: "queued" as const,
+              trackedSeasonId: `${titleId}_s${seasonNumber}`,
+              finishedAt: null,
+              auditEvents: [],
+            },
+            episodes: [],
+            connectedStorageId: "cs_pin",
+            ...over,
+          });
+        expect((await repo.reserveWorkflowRun(queued("run_pin_recovery", "title_pin", 1, "staging_recovery"))).status).toBe("reserved");
+        // User acquire sets this flag. A leftover recovery must not refuse it.
+        expect(
+          (await repo.reserveWorkflowRun(queued("run_pin_user", "title_pin", 2, "type2_init", { blockIfTitleHasActiveRun: true }))).status,
+        ).toBe("reserved");
+        // A real user run still pins the title.
+        expect(
+          (await repo.reserveWorkflowRun(queued("run_pin_again", "title_pin", 3, "movie_init", { blockIfTitleHasActiveRun: true }))).status,
+        ).toBe("already_active");
+        // Replace, on its own title, is likewise not pinned by a recovery.
+        expect((await repo.reserveWorkflowRun(queued("run_rep_recovery", "title_replace", 1, "staging_recovery"))).status).toBe("reserved");
+        expect(
+          (await repo.reserveWorkflowRun(queued("run_rep_user", "title_replace", 2, "replace_request", { blockIfTitleHasActiveRun: true }))).status,
+        ).toBe("reserved");
+        // The janitor lists every kind, so a recovery still refuses another recovery.
+        expect((await repo.reserveWorkflowRun(queued("run_jan_recovery", "title_janitor", 1, "staging_recovery"))).status).toBe("reserved");
+        expect(
+          (await repo.reserveWorkflowRun(
+            queued("run_jan_again", "title_janitor", 2, "staging_recovery", {
+              blockIfTitleHasActiveKinds: [
+                "type1_package_init",
+                "type2_init",
+                "type3_monitor",
+                "movie_init",
+                "replace_request",
+                "staging_recovery",
+              ],
+            }),
+          )).status,
+        ).toBe("already_active");
+        // Patrol blocks only on replace_request.
+        expect((await repo.reserveWorkflowRun(queued("run_pat_recovery", "title_patrol", 1, "staging_recovery"))).status).toBe("reserved");
+        expect(
+          (await repo.reserveWorkflowRun(
+            queued("run_pat_user", "title_patrol", 2, "type3_monitor", { blockIfTitleHasActiveKinds: ["replace_request"] }),
+          )).status,
+        ).toBe("reserved");
+      });
+
       it("blockIfEpisodeStatesExist returns already_has_episode_state when the scoped bucket is non-empty", async () => {
         const repo = await fresh();
         // Seed episode states via a TERMINAL (succeeded) run so the active-run check
@@ -1607,6 +1673,57 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         ).toBeNull();
       });
 
+      it("hides a legacy staging-janitor inbox row and still returns a real staging_recovery", async () => {
+        const repo = await fresh();
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_default" };
+        const real = trackedSnapshot({ key: "show", runId: "run_show_done", startedAt: "2026-09-27T00:00:00.000Z" });
+        await repo.saveWorkflowRunSnapshot(real);
+        await repo.saveWorkflowRunSnapshot({
+          ...real,
+          workflowRun: {
+            ...real.workflowRun,
+            id: "recovery-real",
+            kind: "staging_recovery",
+            status: "queued",
+            finishedAt: null,
+            startedAt: "2026-09-28T03:00:00.000Z",
+            auditEvents: [
+              {
+                type: "staging_recovery_queued",
+                message: "queued",
+                data: { stagingDirectoryId: "stg-real" },
+              },
+            ],
+          },
+        });
+        const legacyBase = trackedSnapshot({ key: "janitor" });
+        const legacyTitleId = "staging-janitor-title:drive1";
+        const legacySeasonId = "staging-janitor-season:drive1";
+        await repo.saveWorkflowRunSnapshot({
+          ...legacyBase,
+          title: { ...legacyBase.title, id: legacyTitleId, title: "暂存残留" },
+          season: { ...legacyBase.season, id: legacySeasonId, mediaTitleId: legacyTitleId },
+          workflowRun: {
+            ...legacyBase.workflowRun,
+            id: "staging-janitor:drive1",
+            trackedSeasonId: legacySeasonId,
+            kind: "type3_monitor",
+            status: "succeeded",
+          },
+          episodes: legacyBase.episodes.map((episode) => ({ ...episode, trackedSeasonId: legacySeasonId })),
+        });
+
+        const listed = await repo.listTrackedSeasonStates(scope);
+        expect(listed.map((state) => state.season.id)).toContain("season_show");
+        expect(listed.map((state) => state.season.id)).not.toContain(legacySeasonId);
+        expect(await repo.getTrackedSeasonState(legacySeasonId, scope)).toBeNull();
+        expect((await repo.getTrackedSeasonState("season_show", scope))?.title.id).toBe("title_show");
+        expect((await repo.listAllTrackedSeasonStates()).map((state) => state.season.id)).not.toContain(legacySeasonId);
+        const claimed = await repo.claimNextQueuedWorkflowRun({ kind: "staging_recovery", now: "2026-09-28T04:00:00.000Z" });
+        expect(claimed?.workflowRun.id).toBe("recovery-real");
+        expect(claimed?.workflowRun.trackedSeasonId).toBe("season_show");
+      });
+
       it("listTrackedSeasonStates returns seasons ordered by compareTrackedSeasonStates (title, season, id)", async () => {
         const repo = await fresh();
         await repo.saveWorkflowRunSnapshot(
@@ -1655,72 +1772,60 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         expect(all.map((state) => state.title.title)).toEqual(["Alpha", "Bravo"]);
       });
 
-      it("hides the staging-janitor inbox run from tracked-season listings but keeps its notifications", async () => {
+      it("findActiveStagingRecovery returns the queued run for that leftover dir and not a finished one", async () => {
         const repo = await fresh();
-        await repo.saveWorkflowRunSnapshot(
-          trackedSnapshot({ key: "real", titleName: "Real Show", connectedStorageId: "cs_default" }),
-        );
-        const storageId = "cs_janitor";
-        const runId = `staging-janitor:${storageId}`;
-        const seasonId = `staging-janitor-season:${storageId}`;
-        const titleId = `staging-janitor-title:${storageId}`;
+        const storageId = "cs_recovery";
+        const scope = { accountId: "acct_default", connectedStorageId: storageId };
+        const base = trackedSnapshot({ key: "rec", titleName: "Recovered", connectedStorageId: storageId });
         await repo.saveWorkflowRunSnapshot({
-          accountId: "acct_default",
-          connectedStorageId: storageId,
-          title: {
-            id: titleId,
-            tmdbId: 0,
-            type: "tv",
-            title: "暂存残留",
-            originalTitle: "",
-            year: 0,
-            aliases: [],
-          },
-          season: {
-            id: seasonId,
-            mediaTitleId: titleId,
-            seasonNumber: 0,
-            status: "completed",
-            qualityPreference: "",
-            storageDirectoryId: "",
-            totalEpisodes: 0,
-            latestAiredEpisode: 0,
-            latestAiredSource: "unknown",
-          },
+          ...base,
           workflowRun: {
-            id: runId,
-            kind: "type3_monitor",
-            status: "reserved",
-            trackedSeasonId: seasonId,
-            startedAt: "2026-09-27T03:00:00.000Z",
-            finishedAt: null,
-            auditEvents: [],
+            ...base.workflowRun,
+            id: "recovery_live",
+            kind: "staging_recovery",
+            status: "queued",
+            auditEvents: [
+              {
+                type: "staging_recovery_queued",
+                message: "queued",
+                data: { stagingDirectoryId: "stg_live", showDirectoryId: "show_rec", seasonNumbers: [1] },
+              },
+            ],
           },
-          episodes: [],
-          resourceSnapshots: [],
-          decisions: [],
-          transferAttempts: [],
-          notifications: [
-            {
-              id: `staging_leftover:${storageId}:sweep`,
-              workflowRunId: runId,
-              kind: "staging_leftover",
-              title: "网盘暂存目录残留（1 个）",
-              body: "Show / staging-run：1 个文件，1 MB",
-              createdAt: "2026-09-27T03:00:00.000Z",
-              trigger: "user",
-            },
-          ],
+          notifications: [],
         });
-        const accountScope = { accountId: "acct_default", connectedStorageId: null as null };
-        expect(await repo.getTrackedSeasonState(seasonId, { accountId: "acct_default", connectedStorageId: storageId })).toBeNull();
-        expect((await repo.listTrackedSeasonStates(accountScope)).map((state) => state.season.id)).toEqual(["season_real"]);
-        expect((await repo.listAllTrackedSeasonStates()).some((state) => state.season.id === seasonId)).toBe(false);
-        expect((await repo.listAllTrackedSeasonStates()).some((state) => state.season.id === "season_real")).toBe(true);
-        const notes = await repo.listNotifications({ accountId: "acct_default", connectedStorageId: storageId });
-        expect(notes.map((note) => note.kind)).toContain("staging_leftover");
-        const recent = await repo.listRecentNotificationsWithAccount();
-        expect(recent.some((entry) => entry.notification.kind === "staging_leftover" && entry.accountId === "acct_default" && entry.connectedStorageId === storageId)).toBe(true);
+        await repo.saveWorkflowRunSnapshot({
+          ...trackedSnapshot({ key: "done", titleName: "Done", connectedStorageId: storageId }),
+          workflowRun: {
+            id: "recovery_done",
+            kind: "staging_recovery",
+            status: "succeeded",
+            trackedSeasonId: "season_done",
+            startedAt: "2026-09-27T03:00:00.000Z",
+            finishedAt: "2026-09-27T04:00:00.000Z",
+            auditEvents: [
+              {
+                type: "staging_recovery_queued",
+                message: "queued",
+                data: { stagingDirectoryId: "stg_done", showDirectoryId: "show_done", seasonNumbers: [1] },
+              },
+            ],
+          },
+        });
+        const live = await repo.findActiveStagingRecovery({ ...scope, stagingDirectoryId: "stg_live" });
+        expect(live?.workflowRun.id).toBe("recovery_live");
+        expect(await repo.findActiveStagingRecovery({ ...scope, stagingDirectoryId: "stg_done" })).toBeNull();
+        expect(await repo.findActiveStagingRecovery({ ...scope, stagingDirectoryId: "stg_other" })).toBeNull();
+        expect(
+          await repo.findActiveStagingRecovery({
+            accountId: "acct_default",
+            connectedStorageId: "cs_other",
+            stagingDirectoryId: "stg_live",
+          }),
+        ).toBeNull();
+        const active = await repo.listActiveWorkflowRuns(scope);
+        expect(active.map((run) => run.workflowRun.id)).toContain("recovery_live");
+        expect(active.map((run) => run.workflowRun.id)).not.toContain("recovery_done");
       });
 
       it("listEpisodeStates returns the drive's episodes for a concrete scope", async () => {
@@ -1901,6 +2006,42 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         expect(recent[0]?.notification.id).toBe("notification_1");
       });
 
+      it("hidden notification kinds are dropped before the limit", async () => {
+        const repo = await fresh();
+        const base = workflowPersistenceFixture();
+        const ordinary = {
+          id: "note_real",
+          workflowRunId: base.workflowRun.id,
+          kind: "tracking_initialized",
+          title: "Show",
+          body: "real",
+          createdAt: "2026-09-01T00:00:00.000Z",
+        };
+        const hidden = Array.from({ length: 40 }, (_, index) => ({
+          id: `note_hidden_${index}`,
+          workflowRunId: base.workflowRun.id,
+          kind: "staging_leftover",
+          title: "hidden",
+          body: "hidden",
+          createdAt: `2026-09-28T00:${String(index).padStart(2, "0")}:00.000Z`,
+        }));
+        await repo.saveWorkflowRunSnapshot({
+          ...base,
+          accountId: "acct_default",
+          connectedStorageId: "cs_hidden",
+          notifications: [ordinary, ...hidden],
+        });
+        const listed = await repo.listNotifications({
+          accountId: "acct_default",
+          connectedStorageId: "cs_hidden",
+          limit: 30,
+        });
+        expect(listed.map((notification) => notification.id)).toEqual(["note_real"]);
+        const recent = await repo.listRecentNotificationsWithAccount({ limit: 30 });
+        expect(recent.map((row) => row.notification.id)).toEqual(["note_real"]);
+        expect(recent.some((row) => row.notification.kind === "staging_leftover" || row.notification.kind === "staging_recovery")).toBe(false);
+      });
+
       it("listRecentNotificationsWithAccount surfaces unscoped runs as null, never the internal sentinel", async () => {
         const repo = await fresh();
         await repo.saveWorkflowRunSnapshot({
@@ -2067,6 +2208,43 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         expect((await repo.untrackTitle(777, scope, "movie")).status).toBe("not_found");
         // untouched
         expect(await repo.listTrackedSeasonStates(scope)).toHaveLength(1);
+      });
+
+      it("untrackTitle removes a season that only has a running staging_recovery, and a missing run's progress is a no-op", async () => {
+        const repo = await fresh();
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_hid" };
+        const tracked = queuedRun({ id: "hid_seed", status: "succeeded", connectedStorageId: "cs_hid", tmdbId: 4410 });
+        await repo.saveWorkflowRunSnapshot(tracked);
+        await repo.saveWorkflowRunSnapshot({
+          ...tracked,
+          workflowRun: {
+            ...tracked.workflowRun,
+            id: "hid_recovery",
+            kind: "staging_recovery",
+            status: "running",
+            startedAt: "2026-09-28T03:00:00.000Z",
+            finishedAt: null,
+          },
+        });
+        expect(await repo.untrackTitle(4410, scope, "tv")).toEqual({ status: "untracked", removedSeasons: 1 });
+        expect(await repo.listTrackedSeasonStates(scope)).toEqual([]);
+        expect(await repo.getWorkflowRunSnapshot("hid_recovery", scope)).toBeNull();
+        await repo.updateWorkflowRunProgress("hid_recovery", {
+          activity: "整理",
+          phase: "organize",
+          percent: 40,
+          updatedAt: "2026-09-28T03:01:00.000Z",
+        });
+        await repo.appendAgentStep("hid_recovery", {
+          ordinal: 0,
+          toolName: "inspectStaging",
+          args: {},
+          activity: "查看暂存",
+          phase: "verify",
+          at: "2026-09-28T03:01:00.000Z",
+        });
+        expect(await repo.getWorkflowRunSnapshot("hid_recovery", scope)).toBeNull();
+        expect(await repo.listTrackedSeasonStates(scope)).toEqual([]);
       });
 
       it("untrackTitle returns in_flight and removes nothing when a target season has a running run", async () => {
@@ -2343,6 +2521,64 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         }
       });
 
+      it("saveWorkflowRunSnapshot requireTrackedSeason writes a tracked season and nothing after untrack", async () => {
+        const repo = await fresh();
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_req" };
+        const tracked = queuedRun({ id: "req_seed", status: "succeeded", connectedStorageId: "cs_req", tmdbId: 4401 });
+        await repo.saveWorkflowRunSnapshot(tracked);
+
+        await repo.saveWorkflowRunSnapshot({
+          ...tracked,
+          requireTrackedSeason: true,
+          workflowRun: {
+            ...tracked.workflowRun,
+            id: "req_live",
+            kind: "type3_monitor",
+            startedAt: "2026-09-28T01:00:00.000Z",
+            finishedAt: "2026-09-28T01:10:00.000Z",
+          },
+        });
+        expect((await repo.getWorkflowRunSnapshot("req_live", scope))?.workflowRun.id).toBe("req_live");
+        expect((await repo.listTrackedSeasonStates(scope)).map((state) => state.season.id)).toContain("season_req_seed");
+
+        expect(await repo.untrackTitle(4401, scope, "tv")).toEqual({ status: "untracked", removedSeasons: 1 });
+        expect(await repo.listTrackedSeasonStates(scope)).toEqual([]);
+
+        await repo.saveWorkflowRunSnapshot({
+          ...tracked,
+          requireTrackedSeason: true,
+          workflowRun: {
+            ...tracked.workflowRun,
+            id: "req_back",
+            startedAt: "2026-09-28T02:00:00.000Z",
+            finishedAt: "2026-09-28T02:10:00.000Z",
+          },
+        });
+        expect(await repo.listTrackedSeasonStates(scope)).toEqual([]);
+        expect(await repo.getWorkflowRunSnapshot("req_back", scope)).toBeNull();
+      });
+
+      it("saveWorkflowRunSnapshot keepCurrentEpisodes writes nothing once the season is untracked", async () => {
+        const repo = await fresh();
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_keep_gone" };
+        const tracked = queuedRun({ id: "keep_gone", status: "succeeded", connectedStorageId: "cs_keep_gone", tmdbId: 4402 });
+        await repo.saveWorkflowRunSnapshot(tracked);
+        expect(await repo.untrackTitle(4402, scope, "tv")).toEqual({ status: "untracked", removedSeasons: 1 });
+
+        await repo.saveWorkflowRunSnapshot({
+          ...tracked,
+          keepCurrentEpisodes: true,
+          workflowRun: {
+            ...tracked.workflowRun,
+            id: "keep_gone_write",
+            startedAt: "2026-09-28T03:00:00.000Z",
+            finishedAt: "2026-09-28T03:10:00.000Z",
+          },
+        });
+        expect(await repo.listTrackedSeasonStates(scope)).toEqual([]);
+        expect(await repo.getWorkflowRunSnapshot("keep_gone_write", scope)).toBeNull();
+      });
+
       it("keepCurrentEpisodes: a replace reservation from a stale read writes only the run — what a run persisted in between stays; without it the reservation writes what it was handed, as before", async () => {
         const repo = await fresh();
         /** Track a season, read it (S01E02 missing), let a patrol run of it finish (S01E02
@@ -2406,6 +2642,79 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         expect(await repo.getWorkflowRunSnapshot("kc_gone_replace", untrackedScope)).toBeNull();
       });
 
+      it("a failed or requeued staging_recovery does not roll back an episode marked while it was queued", async () => {
+        const markThenFail = async (id: string, error: Error) => {
+          const repo = await fresh();
+          const scope = { accountId: "acct_default", connectedStorageId: `cs_${id}` };
+          const seed = queuedRun({ id, status: "succeeded", connectedStorageId: `cs_${id}` });
+          await repo.saveWorkflowRunSnapshot(seed);
+          const [read] = await repo.listTrackedSeasonStates(scope);
+          expect(read!.episodes.find((episode) => episode.episodeCode === "S01E02")?.obtained).toBe(false);
+          const reserved = await repo.reserveWorkflowRun({
+            ...seed,
+            episodes: read!.episodes,
+            keepCurrentEpisodes: true,
+            requireTrackedSeason: true,
+            workflowRun: {
+              ...seed.workflowRun,
+              id: `${id}_recovery`,
+              kind: "staging_recovery",
+              status: "queued",
+              startedAt: "2026-09-27T00:00:00.000Z",
+              finishedAt: null,
+              auditEvents: [
+                {
+                  type: "staging_recovery_queued",
+                  message: "queued",
+                  data: { stagingDirectoryId: "stg", showDirectoryId: "show", seasonNumbers: [1] },
+                },
+              ],
+            },
+          });
+          expect(reserved.status).toBe("reserved");
+          await repo.saveWorkflowRunSnapshot({
+            ...seed,
+            episodes: read!.episodes.map((episode) => ({
+              ...episode,
+              obtained: true,
+              verifiedFileIds: [`file_${episode.episodeCode}`],
+            })),
+            workflowRun: {
+              ...seed.workflowRun,
+              id: `${id}_user`,
+              kind: "type3_monitor",
+              status: "succeeded",
+              startedAt: "2026-09-27T01:00:00.000Z",
+              finishedAt: "2026-09-27T01:10:00.000Z",
+            },
+          });
+          const claimed = await repo.claimNextQueuedWorkflowRun({
+            kind: "staging_recovery",
+            now: "2026-09-27T02:00:00.000Z",
+          });
+          expect(claimed?.workflowRun.id).toBe(`${id}_recovery`);
+          const handled = await handleWorkflowRunFailure({
+            claimed: claimed!,
+            error,
+            repository: repo,
+            now: () => "2026-09-27T02:01:00.000Z",
+          });
+          const after = await repo.getTrackedSeasonState(`season_${id}`, scope);
+          return {
+            handled,
+            obtained: after?.episodes.find((episode) => episode.episodeCode === "S01E02")?.obtained,
+          };
+        };
+
+        const permanent = await markThenFail("stale_fail", new Error("agent model unavailable"));
+        expect(permanent.handled.status).toBe("failed");
+        expect(permanent.obtained).toBe(true);
+
+        const transient = await markThenFail("stale_retry", new Error("socket disconnected"));
+        expect(transient.handled.status).toBe("auto_requeued");
+        expect(transient.obtained).toBe(true);
+      });
+
       it("retryFailedWorkflowRun requeues a failed run so it becomes claimable", async () => {
         const repo = await fresh();
         await repo.saveWorkflowRunSnapshot(
@@ -2449,6 +2758,25 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         const after = await repo.getWorkflowRunSnapshot("failed_r3", scope);
         expect(after?.workflowRun.status).toBe("failed");
         // retriedWorkflowRun clears finishedAt — it must not have run at all.
+        expect(after?.workflowRun.finishedAt).toBe("2026-06-11T02:00:00.000Z");
+      });
+
+      it("retryFailedWorkflowRun refuses a failed staging_recovery", async () => {
+        const repo = await fresh();
+        const snap = queuedRun({ id: "failed_recovery", status: "failed", connectedStorageId: "cs_hidden_retry" });
+        await repo.saveWorkflowRunSnapshot({
+          ...snap,
+          workflowRun: {
+            ...snap.workflowRun,
+            kind: "staging_recovery",
+            status: "failed",
+            finishedAt: "2026-06-11T02:00:00.000Z",
+          },
+        });
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_hidden_retry" };
+        expect(await repo.retryFailedWorkflowRun("failed_recovery", scope)).toEqual({ status: "not_retriable" });
+        const after = await repo.getWorkflowRunSnapshot("failed_recovery", scope);
+        expect(after?.workflowRun.status).toBe("failed");
         expect(after?.workflowRun.finishedAt).toBe("2026-06-11T02:00:00.000Z");
       });
 

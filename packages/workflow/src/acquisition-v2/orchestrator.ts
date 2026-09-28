@@ -15,6 +15,7 @@ import { RealResourceProviderV2 } from "./real-provider-adapter.js";
 import { RealStorageV2 } from "./real-storage-adapter.js";
 import { budgetSoftThreshold } from "./agent-loop-guards.js";
 import { TaskSandbox } from "./sandbox.js";
+import { JANITOR_LIST_DEPTH } from "../staging-depth.js";
 import { AssrtSubtitleProvider, type AssrtProviderPort } from "../subtitle-provider.js";
 import { JevPrefilterProvider } from "../jev-prefilter-provider.js";
 import type { JevJudge, JevJudgeTarget } from "../jev-judge.js";
@@ -115,6 +116,8 @@ export interface RunAcquisitionV2Request {
   /** This work's recent transfers, read once at run start and shown on candidates.
    *  A failing read fails open (logged, no notes). */
   linkHistory?: { list: () => Promise<LinkHistoryRow[]> };
+  /** Leftover staging: no search, no transfer, no memory reflection. Season files stay protected. */
+  stagingRecovery?: boolean;
   /** A replace_request run (user message). See docs/superpowers/specs/2026-09-26-user-message-replace-design.md. */
   userRequest?: {
     /** Episodes the user named or that are still pending (movie: ["MOVIE"]). Added to the need. */
@@ -140,6 +143,8 @@ export interface RunAcquisitionV2Request {
   /** Filled with the sandbox reader as soon as the sandbox exists, including when
    *  the agent loop later throws. The harness cleanup reads it from `finally`. */
   unmovedStaging?: { read: (() => string[]) | null };
+  /** Same lifetime as unmovedStaging. True once the agent called discardStaging. */
+  terminalCleanup?: { read: (() => boolean) | null };
 }
 
 /** The persistable trace of a V2 run, in the same shape the old serial path
@@ -327,6 +332,7 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
     ...(request.searchProfile === undefined ? {} : { searchProfile: request.searchProfile }),
     ...(memoryBinding ? { memory: memoryBinding } : {}),
     ...(protectExisting ? { protectExistingFiles: true } : {}),
+    ...(request.stagingRecovery ? { stagingListDepth: JANITOR_LIST_DEPTH } : {}),
     ...(rejectedSource
       ? {
           isRejected: async (candidate: { id: string; title: string }) => {
@@ -478,6 +484,9 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
   if (request.unmovedStaging) {
     request.unmovedStaging.read = () => sandbox.unmovedStagingFileIds();
   }
+  if (request.terminalCleanup) {
+    request.terminalCleanup.read = () => sandbox.stagingDiscarded();
+  }
   // Replace run (or protected existing files): record every file already in the target dirs
   // BEFORE anything can touch them. Not best-effort — the protection is the whole
   // safety story, so a failing listing fails the run.
@@ -487,15 +496,18 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
   // Pre-warm the raw snapshot (bare title) BEFORE building the system prompt, so the
   // prefetchedCandidateCount pointer can be injected. If the provider fails (network
   // error, etc.), gracefully degrade: no pointer, agent searches normally.
+  // A staging recovery does not search at all.
   let prefetchedCandidateCount: number | undefined;
-  try {
-    const rawKeyword = request.target.title; // bare title (中文名), no quality/subtitle/year
-    await sandbox.primeRawSnapshot(rawKeyword);
-    prefetchedCandidateCount = sandbox.viewResourceSnapshot().candidateCount;
-  } catch (error) {
-    // Provider unavailable → no pre-warm; agent will searchResources normally.
-    // Do NOT crash the workflow.
-    prefetchedCandidateCount = undefined;
+  if (!request.stagingRecovery) {
+    try {
+      const rawKeyword = request.target.title; // bare title (中文名), no quality/subtitle/year
+      await sandbox.primeRawSnapshot(rawKeyword);
+      prefetchedCandidateCount = sandbox.viewResourceSnapshot().candidateCount;
+    } catch (error) {
+      // Provider unavailable → no pre-warm; agent will searchResources normally.
+      // Do NOT crash the workflow.
+      prefetchedCandidateCount = undefined;
+    }
   }
 
   // Pre-warm the assrt subtitle snapshot when all three gates pass: token
@@ -522,6 +534,7 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
   // too — see the 加品牌 touch-point list.
   const origins = request.originCountries ?? [];
   const subtitleActive =
+    !request.stagingRecovery &&
     request.assrtToken !== undefined &&
     request.assrtToken.trim() !== "" &&
     origins.length > 0 &&
@@ -575,6 +588,7 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
       : {}),
     ...(userRequest ? { userRequests: userRequest.prompt } : {}),
     ...(protectExisting ? { protectExisting } : {}),
+    ...(request.stagingRecovery ? { stagingRecovery: true as const } : {}),
   };
 
   const result =
@@ -597,7 +611,8 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
   const resourceSnapshots = provider.snapshots();
 
   // Post-run reflection: best-effort, never changes the outcome.
-  if (memoryBinding) {
+  // A staging recovery is not an acquisition the next run should learn from.
+  if (memoryBinding && !request.stagingRecovery) {
     // Built from outside data (candidate titles, provider messages) — inside the
     // best-effort boundary: a digest that cannot be built falls back to the coverage
     // line; it never turns a finished acquisition into a failed run.

@@ -295,6 +295,11 @@ export async function handleWorkflowRunFailure(input: {
   //    (see worker.test "clears initial episode state when the agent model dies").
   //    A replace_request is the exception: it runs on a library that already has
   //    files, and a failed replace must leave that library exactly as it was.
+  // A staging recovery runs on a library that already has files, and its failure
+  // is not the user's problem: write no notification, and do not touch the
+  // episode bucket. The claimed copy is from queue time on InMemory, and a user
+  // run is allowed to mark episodes while this recovery sits queued.
+  const silent = claimed.workflowRun.kind === "staging_recovery";
   const keepEpisodes = willRetry || claimed.workflowRun.kind === "replace_request";
   await repository.saveWorkflowRunSnapshot({
     accountId: claimed.accountId,
@@ -306,7 +311,8 @@ export async function handleWorkflowRunFailure(input: {
     resourceSnapshots: willRetry ? claimed.resourceSnapshots : [],
     decisions: willRetry ? claimed.decisions : [],
     transferAttempts: willRetry ? claimed.transferAttempts : [],
-    notifications: [notification],
+    notifications: silent ? [] : [notification],
+    ...(silent ? { keepCurrentEpisodes: true } : {}),
   });
   // Brand auth (dead cookie/token) — freeze the drive so the queue refuses more
   // work until re-bound. LLM Unauthorized is NOT a brand AuthError; only the
@@ -501,14 +507,16 @@ export async function runScheduledType3Monitoring(input: {
       console.error(`[user-message] patrol could not queue a replace request for ${titleKey}: ${String(error)}`);
     }
   }
-  // Also skip works whose replace run is already in flight: a type3 run beside it
-  // would work the same directories at the same time. This filter is only the cheap
-  // path; a replace run queued after it is caught by the patrol reservation itself
-  // (blockIfTitleHasActiveKinds).
+  // Also skip a title whose replace run or leftover recovery is already active.
+  // Patrols run outside the queue drain, so either would move files in the same
+  // directories at the same time. This filter is only the cheap path; a run queued
+  // after it is caught by the patrol reservation (blockIfTitleHasActiveKinds).
+  // The janitor will not queue a recovery while any run of the title is active,
+  // so the exclusion holds both ways.
   const busyKeys = new Set((await input.repository.listWorksWithProcessingMessages()).map(workKey));
   for (const accountId of new Set(trackedStates.map((s) => s.accountId))) {
     for (const run of await input.repository.listActiveWorkflowRuns({ accountId, connectedStorageId: null })) {
-      if (run.workflowRun.kind !== "replace_request") continue;
+      if (run.workflowRun.kind !== "replace_request" && run.workflowRun.kind !== "staging_recovery") continue;
       busyKeys.add(workKey({ accountId, drive: userMessageDrive(run.connectedStorageId), titleKey: run.title.id }));
     }
   }
@@ -638,9 +646,11 @@ async function patrolTrackedState(args: {
       decisions: [],
       transferAttempts: [],
       notifications: [],
-      // The sweep's busy-work filter is not atomic with this reservation: a replace
-      // run queued in between (现在处理) would otherwise work the same directories.
-      blockIfTitleHasActiveKinds: ["replace_request"],
+      // Patrols run outside the queue drain. A replace, or a leftover recovery the
+      // drain can claim mid-patrol, moves files in the same directories. The
+      // janitor will not queue a recovery while this patrol is active, so the
+      // exclusion holds both ways.
+      blockIfTitleHasActiveKinds: ["replace_request", "staging_recovery"],
       // The state was read when the sweep started (then the drive's deps, a TMDB sync):
       // a season untracked since must not be tracked again by this reservation.
       requireTrackedSeason: true,
@@ -826,8 +836,8 @@ async function patrolMovie(args: {
     decisions: [],
     transferAttempts: [],
     notifications: [],
-    // Same race as the TV patrol: a replace run queued after the sweep's filter.
-    blockIfTitleHasActiveKinds: ["replace_request"],
+    // Same as the TV patrol: a replace or a leftover recovery queued after the filter.
+    blockIfTitleHasActiveKinds: ["replace_request", "staging_recovery"],
     // …and an untrack after the sweep read the film.
     requireTrackedSeason: true,
     ...(staleActiveRunStartedBefore === null

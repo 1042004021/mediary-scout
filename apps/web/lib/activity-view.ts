@@ -1,4 +1,5 @@
 import {
+  isUserVisibleWorkflowKind,
   landedSize,
   type MediaType,
   type NotificationReportStatus,
@@ -87,7 +88,9 @@ export async function getActivityView(input: {
     input.accountId === undefined
       ? undefined
       : { accountId: input.accountId, connectedStorageId: input.connectedStorageId ?? null };
-  const activeRuns = await input.repository.listActiveWorkflowRuns(scope);
+  const activeRuns = (await input.repository.listActiveWorkflowRuns(scope)).filter((snapshot) =>
+    isUserVisibleWorkflowKind(snapshot.workflowRun.kind),
+  );
 
   // Poster backfill source: older notifications predate report.posterPath, so a
   // completed item can lack a poster. The title is still tracked → source the
@@ -146,9 +149,7 @@ export async function getActivityView(input: {
       : {}),
   });
   const recentCompleted: ActivityCompletedItem[] = notifications
-    .filter(
-      (notification) => notification.kind !== "already_current" && notification.report !== undefined,
-    )
+    .filter((notification) => notification.kind !== "already_current" && notification.report !== undefined)
     .map((notification) => {
       const report = notification.report!;
       const size = landedSize(report);

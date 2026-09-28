@@ -3,6 +3,7 @@ import type { LanguageModel } from "ai";
 import type { ResourceProvider, StorageExecutor } from "../ports.js";
 import type { AuditEvent } from "../domain.js";
 import {
+  bindRecoveryDirectories,
   ensureSeasonAcquisitionDirectories,
   stagingCleanupUnverifiedAuditEvent,
   stagingKeptAuditEvent,
@@ -78,6 +79,9 @@ export interface RunAcquisitionV2WorkflowRequest {
   rejectedLookup?: RunAcquisitionV2Request["rejectedLookup"];
   /** See orchestrator.linkHistory. */
   linkHistory?: RunAcquisitionV2Request["linkHistory"];
+  /** Leftover staging. The orphan dir is the staging handle; season dirs are resolved
+   *  under `showDirectoryId`. The agent runs even when the DB already says complete. */
+  stagingRecovery?: { showDirectoryId: string; stagingDirectoryId: string };
   onProgress?: (event: AgentToolEvent) => void;
 }
 
@@ -106,15 +110,23 @@ export async function runAcquisitionV2Workflow(
   request: RunAcquisitionV2WorkflowRequest,
 ): Promise<RunAcquisitionV2WorkflowResult> {
   // 7a — verify-or-create the directory tree, get scoped handles.
-  const directories = await ensureSeasonAcquisitionDirectories({
-    executor: request.executor,
-    categoryParentId: request.categoryParentId,
-    showName: request.title.name,
-    year: request.title.year,
-    tmdbId: request.title.tmdbId,
-    seasons: request.seasons.map((season) => season.seasonNumber),
-    workflowRunId: request.workflowRunId,
-  });
+  // A recovery adopts the leftover dir and does not create a new staging dir.
+  const directories = request.stagingRecovery
+    ? await bindRecoveryDirectories({
+        executor: request.executor,
+        showDirectoryId: request.stagingRecovery.showDirectoryId,
+        stagingDirectoryId: request.stagingRecovery.stagingDirectoryId,
+        seasons: request.seasons.map((season) => season.seasonNumber),
+      })
+    : await ensureSeasonAcquisitionDirectories({
+        executor: request.executor,
+        categoryParentId: request.categoryParentId,
+        showName: request.title.name,
+        year: request.title.year,
+        tmdbId: request.title.tmdbId,
+        seasons: request.seasons.map((season) => season.seasonNumber),
+        workflowRunId: request.workflowRunId,
+      });
 
   // Harness-level leak guard: whatever the agent does (covers, fails, or
   // reportNoCoverage), the run's staging dir is discarded when this returns or
@@ -129,6 +141,7 @@ export async function runAcquisitionV2Workflow(
   // Assigned inside runAcquisitionV2 the moment the sandbox exists, so a throw
   // from the agent loop still lets this finally see files whose move failed.
   const unmovedStaging: { read: (() => string[]) | null } = { read: null };
+  const terminalCleanup: { read: (() => boolean) | null } = { read: null };
   const result = await withStagingCleanup(
     {
       executor: request.executor,
@@ -140,6 +153,11 @@ export async function runAcquisitionV2Workflow(
         const fileCount = unmovedStaging.read?.().length ?? 0;
         return fileCount > 0 ? { fileCount } : null;
       },
+      // The adopted leftover can be the only copy. A throw must not delete it,
+      // and a normal exit deletes it only after discardStaging. finish does not.
+      ...(request.stagingRecovery
+        ? { preserveOnThrow: true, discardOnNormalReturn: () => terminalCleanup.read?.() ?? false }
+        : {}),
       onKept: (event) => kept.push(event),
     },
     async () => {
@@ -153,7 +171,8 @@ export async function runAcquisitionV2Workflow(
   const before = syncSeasonNeed({ seasons: seasonsForSync, obtained: priorObtained });
   // A user request runs the agent even on a complete library: the episodes to
   // replace are obtained (the old file is there), so they are never "missing".
-  if (before.missing.length === 0 && !request.userRequest) {
+  // A leftover may be the only copy of an episode the DB already calls obtained.
+  if (before.missing.length === 0 && !request.userRequest && !request.stagingRecovery) {
     // Already current — no agent run, no side effects (the type-3 no-op path).
     return {
       directories,
@@ -200,11 +219,16 @@ export async function runAcquisitionV2Workflow(
     ...(request.deadLinkStore ? { deadLinkStore: request.deadLinkStore } : {}),
     ...(request.memory ? { memory: request.memory } : {}),
     ...(request.userRequest ? { userRequest: request.userRequest } : {}),
-    ...(request.protectExisting ? { protectExisting: request.protectExisting } : {}),
+    ...(request.stagingRecovery
+      ? { stagingRecovery: true as const, protectExisting: { episodes: "unknown" as const } }
+      : request.protectExisting
+        ? { protectExisting: request.protectExisting }
+        : {}),
     ...(request.rejectedLookup ? { rejectedLookup: request.rejectedLookup } : {}),
     ...(request.linkHistory ? { linkHistory: request.linkHistory } : {}),
     ...(request.onProgress ? { onProgress: request.onProgress } : {}),
     unmovedStaging,
+    ...(request.stagingRecovery ? { terminalCleanup } : {}),
   });
 
   // Reconcile from the AGENT'S coverage (its markObtained), NOT a 115 re-scan:

@@ -124,8 +124,12 @@ export function buildSandboxToolSet(
     onToolCall?: (toolName: string, args: Record<string, unknown>) => void;
     /** The run's drive brand — selects the brand-specific dead-links section. */
     storageProvider?: string;
+    /** Leftover staging: no search, no transfer, no subtitle landing.
+     *  renameSubtitle stays: a leftover .ass/.srt may not match its video. */
+    stagingRecovery?: boolean;
   } = {},
 ): ToolSet {
+  const recover = options.stagingRecovery === true;
   const tools: Record<string, unknown> = {
     readSkill: {
       description:
@@ -136,6 +140,9 @@ export function buildSandboxToolSet(
       execute: (args: { section: string }) =>
         Promise.resolve({ section: args.section, body: readSkillSection(args.section, options.storageProvider) }),
     },
+    ...(recover
+      ? {}
+      : {
     viewResourceSnapshot: {
       description:
         "View the system's pre-warmed raw snapshot (活期文档). Read-only, free, repeatable — does NOT consume search budget. The system already searched the raw keyword (bare title) for you; this returns all those candidates (id + title, and · 发布 YYYY-MM-DD when the post date is known). Use this FIRST to see what's available. Do NOT use searchResources to re-search the raw keyword — searchResources is ONLY for 繁体/英文 upgrades when the raw snapshot is insufficient. " +
@@ -150,6 +157,7 @@ export function buildSandboxToolSet(
       inputSchema: z.object({ keyword: z.string() }),
       execute: (args: { keyword: string }) => asEvidence(() => sandbox.searchResources(args.keyword)),
     },
+        }),
     inspectStaging: {
       description: "Read-only: the full raw file tree currently in this task's staging. Judge identity/dupes/extras from these real files.",
       inputSchema: z.object({}),
@@ -161,6 +169,9 @@ export function buildSandboxToolSet(
       inputSchema: z.object({ season: z.number().int().positive().optional() }),
       execute: (args: { season?: number }) => asEvidence(() => sandbox.inspectTargetDir(args)),
     },
+    ...(recover
+      ? {}
+      : {
     transferCandidate: {
       description:
         "Transfer ONE snapshot-bound candidate into staging, then read back the TRUE materialized files. The candidate must come from a snapshot you searched this task. Refused once coverage is already met.",
@@ -168,6 +179,7 @@ export function buildSandboxToolSet(
       execute: (args: { snapshotId: string; candidateId: string }) =>
         asEvidence(() => sandbox.transferCandidate(args)),
     },
+      }),
     moveToSeason: {
       description:
         "Submit your WHOLE distribution plan in ONE call: `{moves:[{season,fileIds},...]}` — which files go into which season's directory. Each video's SUBTITLES go in the SAME season's fileIds (never leave subtitles behind — they must land beside their video). Move ONLY still-missing episodes; never recopy a season the library already has. A movie move OMITS `season` (the file lands in the movie directory). Returns every touched season dir + the remaining staging so you verify the whole distribution at once and fix any misplacement with another call. Every fileId must currently be in staging.",
@@ -228,7 +240,7 @@ export function buildSandboxToolSet(
       execute: (args: { reason: string }) => asEvidence(() => sandbox.reportNoCoverage(args.reason)),
     },
   };
-  if (options.movie) {
+  if (options.movie && !recover) {
     tools["transferUntilLanded"] = {
       description:
         'Movie only. Transfer a PRIORITY-ORDERED list of candidates you judged to be the SAME target film (best resource first), stopping at the FIRST that 秒传-lands; the rest are abandoned. FAIL-LOUD SHARE LINKS ONLY (115/夸克/天翼/123/光鸭 转存分享 all qualify) — magnets do NOT fail loud, so for a magnet use transferCandidate and verify via inspectStaging. YOU pick the set (a keyword search returns same-named DIFFERENT works — never hand it everything); the system just burns through the dead links for you (链接已过期/分享已取消/错误的链接 are common). Returns {landed, transferredCandidateId, attempts}. If an attempt reports no_target_change with nothing landed (a large share\'s async server-side copy can outlast the settle window — a possible FALSE miss), the tool STOPS instead of burning the next candidate: re-read via inspectStaging first, then decide. Use this when several shares for the one film may be dead/black-box; for a single obvious share, transferCandidate is fine. User request run: a candidate that is a copy of what the user rejected is skipped (not transferred) and listed as a failed attempt "user rejected".',
@@ -280,7 +292,7 @@ export function buildSandboxToolSet(
       execute: (args: { scope: "title" | "global"; name: string }) => asEvidence(() => readMemoryFenced(sandbox, args)),
     };
   }
-  if (options.subtitle) {
+  if (options.subtitle && !recover) {
     tools["viewSubtitleSnapshot"] = {
       description:
         "View the system's pre-warmed assrt.net subtitle snapshot (活期文档). Read-only, free, repeatable. The system already searched assrt for this title's bare name; this returns the candidate subtitle packages (id + title + language tag, plus community evidence when available: ★vote score / 字幕组 / upload time). THIS TOOL APPEARING IN YOUR TOOLSET means this run needs external Chinese subtitles — read it and pick a package whose language covers your need (简/繁/双语), weighing higher ★ and a known 字幕组 as community-validated quality, then transferSubtitle to land its files.",
@@ -294,6 +306,11 @@ export function buildSandboxToolSet(
       execute: (args: { candidateId: number }) =>
         asEvidence(() => sandbox.transferSubtitle({ candidateId: args.candidateId })),
     };
+  }
+  // Recovery has no assrt token, so `options.subtitle` is unset, but a leftover
+  // subtitle often does not share its video's name. Rename needs only the staging
+  // listing — no subtitle snapshot.
+  if (recover || options.subtitle) {
     tools["renameSubtitle"] = {
       description:
         "Rename landed subtitle files to match their videos, in ONE BATCH: decide EVERY subtitle↔episode pairing first (fileIds from inspectStaging), then submit them all as renames:[{fileId,newName},…] — same filename prefix as each episode's video, keep the subtitle extension (video Show.S02E01.mkv → subtitle Show.S02E01.ass; 简/繁 variants keep their .sc/.tc infix). NEVER rename one file per call — at 77 episodes that collapses; the batch is one call regardless of count. Subtitles are the ONLY files you may rename (the documented exception) so the scraper auto-loads them. Per-item guard violations come back in `errors` without aborting the rest. Then move each subtitle into its season with its video via moveToSeason.",
@@ -327,6 +344,8 @@ export interface AcquisitionAgentRequest {
   subtitle?: boolean;
   /** The run's drive brand — selects the brand-specific dead-links skill section. */
   storageProvider?: string;
+  /** Leftover staging: the tool set has no search or transfer tools. */
+  stagingRecovery?: boolean;
   /** Per-tool-call live progress for the activity page (cleaned activity + phase
    *  + raw name/args). Best-effort; absent in tests/headless. */
   onProgress?: (event: AgentToolEvent) => void;
@@ -356,6 +375,7 @@ export async function runAcquisitionAgent(
   const tools = buildSandboxToolSet(request.sandbox, {
     movie: request.movie ?? false,
     ...(request.subtitle ? { subtitle: true } : {}),
+    ...(request.stagingRecovery ? { stagingRecovery: true } : {}),
     ...(request.storageProvider === undefined ? {} : { storageProvider: request.storageProvider }),
     ...(onProgress
       ? {
@@ -394,6 +414,7 @@ export async function runAcquisitionAgent(
           baseSystem: system,
           ...(typeof spent === "number" ? { apiCallsSpent: spent } : {}),
           ...(typeof request.budgetSoftAt === "number" ? { budgetSoftAt: request.budgetSoftAt } : {}),
+          ...(request.stagingRecovery ? { stagingRecovery: true } : {}),
         });
         return overriddenSystem ? { system: overriddenSystem } : undefined;
       },

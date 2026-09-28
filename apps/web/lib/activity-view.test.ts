@@ -147,6 +147,19 @@ describe("getActivityView", () => {
     );
   });
 
+  it("a staging_recovery run is absent from the activity the user sees", async () => {
+    const repo = new InMemoryWorkflowRepository();
+    await repo.saveWorkflowRunSnapshot(
+      run({ id: "r_hidden", tmdbId: 9, name: "Hidden", status: "running", startedAt: "2026-06-17T00:00:00Z", kind: "staging_recovery" }),
+    );
+    await repo.saveWorkflowRunSnapshot(
+      run({ id: "r_seen", tmdbId: 8, name: "Seen", status: "queued", startedAt: "2026-06-17T00:00:01Z" }),
+    );
+    const view = await getActivityView({ repository: repo });
+    expect(view.active.map((item) => item.runId)).toEqual(["r_seen"]);
+    expect(view.recentCompleted.map((item) => item.workflowRunId)).not.toContain("r_hidden");
+  });
+
   it("a replace run reads at the title level: its lock season's episodes say nothing about what it covers", async () => {
     // A request for S02E01 locks the title on its first tracked season; the snapshot
     // holds S01's episodes (two of them missing) — neither the season nor the count is

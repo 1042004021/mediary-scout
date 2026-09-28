@@ -1,11 +1,28 @@
-import type { NotificationEvent } from "./domain.js";
-import { formatBytes } from "./notification-report.js";
+import type { WorkflowKind } from "./domain.js";
 import type { StorageExecutor } from "./ports.js";
-import { isActiveWorkflowStatus, type WorkflowRepository } from "./repository.js";
+import { isActiveWorkflowStatus, type TrackedSeasonState, type WorkflowRepository } from "./repository.js";
+import {
+  legacyMediaLibraryFolderName,
+  mediaLibraryFolderName,
+  tmdbIdFromMediaLibraryFolderName,
+} from "./media-library-folder.js";
+import { JANITOR_LIST_DEPTH } from "./staging-depth.js";
 
-const REPORTED_SETTING_KEY = "staging_leftover_reported";
+/** Every kind. `blockIfTitleHasActiveRun` ignores staging_recovery so a user
+ *  action can proceed; this reservation must still wait for one. */
+const TITLE_BLOCK_KINDS: Record<WorkflowKind, true> = {
+  type1_package_init: true,
+  type2_init: true,
+  type3_monitor: true,
+  movie_init: true,
+  replace_request: true,
+  staging_recovery: true,
+};
+
 /** A failed run is requeued on the same id within 15 minutes. Don't touch its staging until that window is long gone. */
 const SWEEP_SETTLE_MS = 60 * 60 * 1000;
+/** Non-empty leftovers judged later. The rest wait for the next sweep. */
+const RECOVERY_CAP = 5;
 
 export interface StagingJanitorDrive {
   accountId: string;
@@ -15,7 +32,7 @@ export interface StagingJanitorDrive {
   provider: string;
   tvCid: string | null;
   animeCid: string | null;
-  executor: Partial<Pick<StorageExecutor, "listChildDirectories" | "listTree" | "removeDirectory">>;
+  executor: Partial<Pick<StorageExecutor, "listChildDirectories" | "listTree" | "listSubdirectories" | "removeDirectory">>;
 }
 
 export interface StagingJanitorClock {
@@ -24,8 +41,9 @@ export interface StagingJanitorClock {
 }
 
 const PAN123_MIN_INTERVAL_MS = 1500;
-/** One paced call can paginate. 123 answers the burst with code=100011. Two backoffs, then give up. */
-const RATE_LIMIT_BACKOFF_MS = [3000, 6000];
+/** One paced call can paginate. 123 answers the burst with code=100011.
+ *  Three waits, then give up. The resume cursor stays where the walk stopped. */
+const RATE_LIMIT_BACKOFF_MS = [30_000, 60_000, 120_000];
 
 function isRateLimited(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
@@ -42,8 +60,8 @@ function minIntervalMs(provider: string): number {
 }
 
 /** Start-to-start gap. The first call does not wait. gap 0 never sleeps.
- *  A code=100011 / 请勿频繁操作 waits 3s then 6s and retries; the third such
- *  failure, or any other error, propagates. */
+ *  A code=100011 / 请勿频繁操作 waits 30s, then 60s, then 120s and retries;
+ *  the fourth such failure, or any other error, propagates. */
 function pacerFor(gapMs: number, clock: StagingJanitorClock): <T>(run: () => Promise<T>) => Promise<T> {
   let last = Number.NEGATIVE_INFINITY;
   return async function pace<T>(run: () => Promise<T>): Promise<T> {
@@ -74,7 +92,13 @@ function pacerFor(gapMs: number, clock: StagingJanitorClock): <T>(run: () => Pro
 
 type SweepRepository = Pick<
   WorkflowRepository,
-  "getWorkflowRunSnapshot" | "getAccountSetting" | "setAccountSetting" | "saveWorkflowRunSnapshot"
+  | "getWorkflowRunSnapshot"
+  | "getAccountSetting"
+  | "setAccountSetting"
+  | "listTrackedSeasonStates"
+  | "listActiveWorkflowRuns"
+  | "findActiveStagingRecovery"
+  | "reserveWorkflowRun"
 >;
 
 /** The run was claimed again, or a missing run gained a snapshot, since the first read. */
@@ -96,7 +120,18 @@ function settledForSweep(
   return Number.isFinite(age) && age > SWEEP_SETTLE_MS;
 }
 
-type CapableExecutor = Pick<StorageExecutor, "listChildDirectories" | "listTree" | "removeDirectory">;
+/** A subdirectory path with this many segments was recorded but not opened.
+ *  115, 123, quark, 光鸭 and 天翼 all walk the same way: depth 1 is the orphan,
+ *  each child adds one `path` segment, and `depth > maxDepth` returns before
+ *  listing. A dir whose path has JANITOR_LIST_DEPTH segments may hold files
+ *  the file walk never saw. */
+function subdirectorySitsAtDepthLimit(path: string): boolean {
+  const segments = path.split("/").filter((segment) => segment.length > 0);
+  return segments.length >= JANITOR_LIST_DEPTH;
+}
+
+type CapableExecutor = Pick<StorageExecutor, "listChildDirectories" | "listTree" | "removeDirectory"> &
+  Partial<Pick<StorageExecutor, "listSubdirectories">>;
 
 function canSweep(executor: StagingJanitorDrive["executor"]): executor is CapableExecutor {
   return (
@@ -112,148 +147,53 @@ function stagingRunId(name: string): string | null {
   return match?.[1] ? match[1] : null;
 }
 
-function reportedToken(storageId: string, directoryId: string): string {
-  return `${storageId}:${directoryId}`;
-}
-
 function cursorKey(storageId: string): string {
   return `staging_janitor_cursor:${storageId}`;
 }
 
-interface Leftover {
-  showName: string;
-  directoryId: string;
-  directoryName: string;
-  fileCount: number;
-  totalBytes: number;
-  /** listTree still saw no files, but the directory has subdirectories. */
-  unknownContents: boolean;
+/** The tracked seasons of the show this directory belongs to, lowest season first. */
+function seasonsForShow(
+  show: { id: string; name: string },
+  children: Array<{ id: string; name: string }>,
+  states: TrackedSeasonState[],
+  mediaType: "tv" | "anime",
+): TrackedSeasonState[] | null {
+  const childIds = new Set(children.map((child) => child.id));
+  const byTitle = new Map<string, TrackedSeasonState[]>();
+  for (const state of states) {
+    if (state.title.type !== mediaType) continue;
+    const list = byTitle.get(state.title.id) ?? [];
+    list.push(state);
+    byTitle.set(state.title.id, list);
+  }
+  const matches = (seasons: TrackedSeasonState[]): boolean =>
+    seasons.some(
+      (season) => season.season.storageDirectoryId === show.id || childIds.has(season.season.storageDirectoryId),
+    );
+  const idHits = [...byTitle.entries()].filter(([, seasons]) => matches(seasons)).map(([id]) => id);
+  let titleId = idHits.length === 1 ? idHits[0] : undefined;
+  if (!titleId && idHits.length === 0) {
+    const nameHits = [...byTitle.entries()]
+      .filter(([, seasons]) => {
+        const title = seasons[0]!.title;
+        const names = [
+          mediaLibraryFolderName({ title: title.title, year: title.year, tmdbId: title.tmdbId }),
+          legacyMediaLibraryFolderName({ title: title.title, year: title.year }),
+        ];
+        return names.includes(show.name);
+      })
+      .map(([id]) => id);
+    if (nameHits.length === 1) titleId = nameHits[0];
+  }
+  if (!titleId) return null;
+  return byTitle.get(titleId)!.sort((a, b) => a.season.seasonNumber - b.season.seasonNumber);
 }
 
-const ADVICE = "这些文件不在季目录里，请到网盘手动处理。";
-/** Deeper than the executors' default (6). A real pack's files sit inside a few wrappers. */
-const JANITOR_LIST_DEPTH = 20;
-
-function leftoverLine(item: Leftover): string {
-  if (item.unknownContents) {
-    return `${item.showName} / ${item.directoryName}：有子目录，文件数未知`;
-  }
-  return `${item.showName} / ${item.directoryName}：${item.fileCount} 个文件，${formatBytes(item.totalBytes)}`;
-}
-
-function leftoverBody(items: Leftover[]): string {
-  const lines = items.slice(0, 10).map(leftoverLine);
-  if (items.length > 10) {
-    const totalBytes = items
-      .filter((item) => !item.unknownContents)
-      .reduce((sum, item) => sum + item.totalBytes, 0);
-    lines.push(`…等共 ${items.length} 个目录，合计 ${formatBytes(totalBytes)}`);
-  }
-  lines.push(ADVICE);
-  return lines.join("\n");
-}
-
-async function loadReported(repository: SweepRepository, accountId: string): Promise<Set<string>> {
-  const raw = await repository.getAccountSetting(accountId, REPORTED_SETTING_KEY);
-  if (!raw) {
-    return new Set();
-  }
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    if (!Array.isArray(parsed)) {
-      return new Set();
-    }
-    return new Set(parsed.filter((item): item is string => typeof item === "string"));
-  } catch {
-    return new Set();
-  }
-}
-
-async function saveReported(repository: SweepRepository, accountId: string, ids: Set<string>): Promise<void> {
-  await repository.setAccountSetting(accountId, REPORTED_SETTING_KEY, JSON.stringify([...ids].sort()));
-}
-
-/** One notice for every newly found non-empty orphan of this drive. Returns how
- *  many directories it remembered. A duplicate sweep id writes nothing. */
-async function recordLeftovers(
-  repository: SweepRepository,
-  drive: StagingJanitorDrive,
-  items: Leftover[],
-  reported: Set<string>,
-  now: string,
-): Promise<number> {
-  if (items.length === 0) {
-    return 0;
-  }
-  const runId = `staging-janitor:${drive.storageId}`;
-  const seasonId = `staging-janitor-season:${drive.storageId}`;
-  const titleId = `staging-janitor-title:${drive.storageId}`;
-  const notification: NotificationEvent = {
-    id: `staging_leftover:${drive.storageId}:${now}`,
-    workflowRunId: runId,
-    kind: "staging_leftover",
-    title: `网盘暂存目录残留（${items.length} 个）`,
-    body: leftoverBody(items),
-    createdAt: now,
-    trigger: "user",
-  };
-  const existing = await repository.getWorkflowRunSnapshot(runId, {
-    accountId: drive.accountId,
-    connectedStorageId: drive.storageId,
-  });
-  if (existing?.notifications.some((item) => item.id === notification.id)) {
-    return 0;
-  }
-  if (existing) {
-    await repository.saveWorkflowRunSnapshot({
-      ...existing,
-      notifications: [...existing.notifications, notification],
-    });
-  } else {
-    await repository.saveWorkflowRunSnapshot({
-      accountId: drive.accountId,
-      connectedStorageId: drive.storageId,
-      title: {
-        id: titleId,
-        tmdbId: 0,
-        type: "tv",
-        title: "暂存残留",
-        originalTitle: "",
-        year: 0,
-        aliases: [],
-      },
-      season: {
-        id: seasonId,
-        mediaTitleId: titleId,
-        seasonNumber: 0,
-        status: "completed",
-        qualityPreference: "",
-        storageDirectoryId: "",
-        totalEpisodes: 0,
-        latestAiredEpisode: 0,
-        latestAiredSource: "unknown",
-      },
-      workflowRun: {
-        id: runId,
-        kind: "type3_monitor",
-        status: "reserved",
-        trackedSeasonId: seasonId,
-        startedAt: now,
-        finishedAt: null,
-        auditEvents: [],
-      },
-      episodes: [],
-      resourceSnapshots: [],
-      decisions: [],
-      transferAttempts: [],
-      notifications: [notification],
-    });
-  }
-  for (const item of items) {
-    reported.add(reportedToken(drive.storageId, item.directoryId));
-  }
-  await saveReported(repository, drive.accountId, reported);
-  return items.length;
+/** tv and anime share TMDB's tv id namespace. A movie with the same number is a different title. */
+function tvNamespaceTitleIsTracked(states: TrackedSeasonState[], tmdbId: number): boolean {
+  return states.some(
+    (state) => state.title.tmdbId === tmdbId && (state.title.type === "tv" || state.title.type === "anime"),
+  );
 }
 
 async function sweepDrive(
@@ -261,31 +201,45 @@ async function sweepDrive(
   repository: SweepRepository,
   now: string,
   clock: StagingJanitorClock,
-): Promise<{ removed: number; reported: number; notRemoved: number }> {
+): Promise<{
+  removed: number;
+  queued: number;
+  notRemoved: number;
+  skippedDeep: number;
+  removedUntracked: number;
+  skippedUnmatched: number;
+}> {
   if (drive.status !== "active" || !canSweep(drive.executor)) {
-    return { removed: 0, reported: 0, notRemoved: 0 };
+    return { removed: 0, queued: 0, notRemoved: 0, skippedDeep: 0, removedUntracked: 0, skippedUnmatched: 0 };
   }
   const executor = drive.executor;
   const pace = pacerFor(minIntervalMs(drive.provider), clock);
-  const reported = await loadReported(repository, drive.accountId);
-  const pending: Leftover[] = [];
+  const scope = { accountId: drive.accountId, connectedStorageId: drive.storageId };
+  const states = await repository.listTrackedSeasonStates(scope);
+  const active = await repository.listActiveWorkflowRuns(scope);
+  const busyTitles = new Set(active.map((run) => run.title.id));
   let removed = 0;
   let notRemoved = 0;
+  let queued = 0;
+  let skippedDeep = 0;
+  let removedUntracked = 0;
+  let skippedUnmatched = 0;
 
-  const shows: Array<{ id: string; name: string }> = [];
-  for (const categoryId of [drive.tvCid, drive.animeCid]) {
-    if (!categoryId) {
-      continue;
-    }
+  const shows: Array<{ id: string; name: string; type: "tv" | "anime" }> = [];
+  for (const category of [
+    drive.tvCid ? { id: drive.tvCid, type: "tv" as const } : null,
+    drive.animeCid ? { id: drive.animeCid, type: "anime" as const } : null,
+  ]) {
+    if (!category) continue;
     // A category listing that throws has no show id. Leave the previous cursor.
-    shows.push(...(await pace(() => executor.listChildDirectories(categoryId))));
+    const children = await pace(() => executor.listChildDirectories(category.id));
+    for (const child of children) shows.push({ ...child, type: category.type });
   }
 
   const savedCursor = await repository.getAccountSetting(drive.accountId, cursorKey(drive.storageId));
   const cursorIndex = savedCursor ? shows.findIndex((show) => show.id === savedCursor) : -1;
   const start = cursorIndex < 0 ? 0 : cursorIndex;
-
-  const flush = (): Promise<number> => recordLeftovers(repository, drive, pending.splice(0), reported, now);
+  const startedFromSavedCursor = cursorIndex >= 0;
 
   for (let index = start; index < shows.length; index += 1) {
     const show = shows[index]!;
@@ -293,74 +247,130 @@ async function sweepDrive(
       const children = await pace(() => executor.listChildDirectories(show.id));
       for (const child of children) {
         const runId = stagingRunId(child.name);
-        if (!runId) {
-          continue;
-        }
+        if (!runId) continue;
         const snapshot = await repository.getWorkflowRunSnapshot(runId, drive.accountId);
         // Missing, or finished more than an hour ago. A run that just failed can be
         // requeued on this same id and recreate this directory.
-        if (!settledForSweep(snapshot, now)) {
-          continue;
-        }
+        if (!settledForSweep(snapshot, now)) continue;
         const tree = await pace(() => executor.listTree({ directoryId: child.id, maxDepth: JANITOR_LIST_DEPTH }));
-        // Still empty after a deep walk: a subdirectory means files may sit further
-        // down. Do not delete, and do not report a made-up zero.
-        const subdirs = tree.length === 0 ? await pace(() => executor.listChildDirectories(child.id)) : [];
-        if (tree.length === 0 && subdirs.length === 0) {
-          const again = await repository.getWorkflowRunSnapshot(runId, drive.accountId);
-          if (runCameBack(snapshot, again)) {
-            continue;
-          }
-          const result = await pace(() => executor.removeDirectory(child.id));
-          if (result.removed) {
-            removed += 1;
-          } else {
-            notRemoved += 1;
-          }
+        // A directory at the depth limit was not opened. A file below it is
+        // invisible here, and a recovery's discardStaging would delete it.
+        // Leave the orphan whether or not other files were visible.
+        const subdirs =
+          typeof executor.listSubdirectories === "function"
+            ? await pace(() => executor.listSubdirectories!({ directoryId: child.id, maxDepth: JANITOR_LIST_DEPTH }))
+            : null;
+        if (subdirs === null || subdirs.some((dir) => subdirectorySitsAtDepthLimit(dir.path))) {
+          skippedDeep += 1;
           continue;
         }
-        if (reported.has(reportedToken(drive.storageId, child.id))) {
-          continue;
-        }
+        // Re-read after both listings, right before any delete or queue: the run
+        // can be requeued on this id while the provider walks the tree.
         const again = await repository.getWorkflowRunSnapshot(runId, drive.accountId);
-        if (runCameBack(snapshot, again)) {
+        if (runCameBack(snapshot, again)) continue;
+        // No files anywhere in the walk, wrapper folders included.
+        if (tree.length === 0) {
+          const result = await pace(() => executor.removeDirectory(child.id));
+          if (result.removed) removed += 1;
+          else notRemoved += 1;
           continue;
         }
-        const unknownContents = tree.length === 0;
-        const totalBytes = unknownContents
-          ? 0
-          : tree.reduce((sum, file) => sum + (Number.isFinite(file.sizeBytes) ? file.sizeBytes : 0), 0);
-        pending.push({
-          showName: show.name,
-          directoryId: child.id,
-          directoryName: child.name,
-          fileCount: tree.length,
-          totalBytes,
-          unknownContents,
+        const seasons = seasonsForShow(show, children, states, show.type);
+        // No season matched. A `{tmdb-N}` folder is untracked when this drive has
+        // no tv/anime season with that id. Its files were for a title this drive
+        // no longer tracks: nothing will ever move them into a season, and keeping
+        // them leaves a half-finished folder in the library for good. A legacy
+        // name, or a tracked id we failed to match, stays — deleting it might
+        // throw away a real title.
+        if (!seasons || seasons.length === 0) {
+          const tmdbId = tmdbIdFromMediaLibraryFolderName(show.name);
+          // The snapshot above is from the start of the sweep. A title the user
+          // starts tracking during the walk must not lose its leftover.
+          if (tmdbId !== null && !tvNamespaceTitleIsTracked(states, tmdbId)) {
+            const fresh = await repository.listTrackedSeasonStates(scope);
+            if (!tvNamespaceTitleIsTracked(fresh, tmdbId)) {
+              const result = await pace(() => executor.removeDirectory(child.id));
+              if (result.removed) removedUntracked += 1;
+              else notRemoved += 1;
+              continue;
+            }
+          }
+          skippedUnmatched += 1;
+          continue;
+        }
+        if (queued >= RECOVERY_CAP) continue;
+        if (busyTitles.has(seasons[0]!.title.id)) continue;
+        const already = await repository.findActiveStagingRecovery({
+          accountId: drive.accountId,
+          connectedStorageId: drive.storageId,
+          stagingDirectoryId: child.id,
         });
+        if (already) continue;
+        const lock = seasons[0]!;
+        const reservation = await repository.reserveWorkflowRun({
+          accountId: drive.accountId,
+          connectedStorageId: drive.storageId,
+          title: lock.title,
+          season: lock.season,
+          workflowRun: {
+            id: crypto.randomUUID(),
+            kind: "staging_recovery",
+            status: "queued",
+            trackedSeasonId: lock.season.id,
+            startedAt: now,
+            finishedAt: null,
+            auditEvents: [
+              {
+                type: "staging_recovery_queued",
+                message: `Queued staging recovery for ${child.id}`,
+                data: {
+                  stagingDirectoryId: child.id,
+                  showDirectoryId: show.id,
+                  seasonNumbers: seasons.map((season) => season.season.seasonNumber),
+                },
+              },
+            ],
+          },
+          episodes: lock.episodes,
+          resourceSnapshots: [],
+          decisions: [],
+          transferAttempts: [],
+          notifications: [],
+          blockIfTitleHasActiveKinds: Object.keys(TITLE_BLOCK_KINDS) as WorkflowKind[],
+          requireTrackedSeason: true,
+          keepCurrentEpisodes: true,
+        });
+        if (reservation.status !== "reserved") continue;
+        queued += 1;
+        busyTitles.add(lock.title.id);
       }
     } catch (error) {
-      await repository.setAccountSetting(drive.accountId, cursorKey(drive.storageId), show.id);
-      await flush();
+      // A show that throws on the sweep we resumed onto has failed twice in a
+      // row. Skip it until the next full pass so the shows after it still run.
+      const resumeAt =
+        startedFromSavedCursor && index === start ? (shows[index + 1]?.id ?? "") : show.id;
+      await repository.setAccountSetting(drive.accountId, cursorKey(drive.storageId), resumeAt);
       throw error;
     }
   }
 
-  const newlyReported = await flush();
   await repository.setAccountSetting(drive.accountId, cursorKey(drive.storageId), "");
-  return { removed, reported: newlyReported, notRemoved };
+  return { removed, queued, notRemoved, skippedDeep, removedUntracked, skippedUnmatched };
 }
 
 /**
- * Daily-patrol pass over leftover `staging-<runId>` dirs. Empty orphans (the run
- * is not queued/running — missing counts) are removed. Non-empty ones are kept
- * and reported once per drive per sweep: a prior run may have marked those
- * episodes obtained while the files never left staging.
+ * Daily-patrol pass over leftover `staging-<runId>` dirs. An orphan with no files
+ * (empty wrapper folders included) is removed once its run is missing or finished
+ * more than an hour ago. A non-empty one queues one silent `staging_recovery` run
+ * — at most 5 per drive per sweep — and is never mentioned to the user.
+ * A non-empty leftover whose show folder is `{tmdb-N}`, and this drive no longer
+ * tracks that tv/anime id, is removed too (the staging dir only, not the show).
  *
  * ponytail: one fresh executor per drive, so the 115 guard still caps a single
  * sweep (~295 listings). A listing throw stores `staging_janitor_cursor:<storageId>`
- * (the show dir id) and the next sweep continues there. pan123 calls are spaced
- * 1500ms; other brands are not. Sequential on purpose.
+ * (the show dir id) and the next sweep continues there. If that same show throws
+ * again, the cursor moves to the next show so one directory cannot stall the drive.
+ * pan123 calls are spaced 1500ms; other brands are not. Sequential on purpose.
  */
 export async function sweepOrphanStagingDirs(input: {
   repository: SweepRepository;
@@ -378,8 +388,11 @@ export async function sweepOrphanStagingDirs(input: {
         counts.notRemoved > 0
           ? `removed ${counts.removed} empty (${counts.notRemoved} could not be removed)`
           : `removed ${counts.removed} empty`;
+      const untracked = counts.removedUntracked > 0 ? `, removed ${counts.removedUntracked} untracked` : "";
+      const unmatched = counts.skippedUnmatched > 0 ? `, skipped ${counts.skippedUnmatched} unmatched` : "";
+      const deep = counts.skippedDeep > 0 ? `, skipped ${counts.skippedDeep} deep` : "";
       log(
-        `[patrol] staging janitor ${drive.storageId}: ${removal}, reported ${counts.reported} non-empty`,
+        `[patrol] staging janitor ${drive.storageId}: ${removal}, queued ${counts.queued} recovery${untracked}${unmatched}${deep}`,
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

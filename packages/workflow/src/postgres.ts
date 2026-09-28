@@ -3,7 +3,9 @@ import type { Pool, PoolClient } from "pg";
 import {
   DEFAULT_ACCOUNT_ID,
   episodeNumberFromCode,
+  HIDDEN_NOTIFICATION_KINDS,
   isStagingJanitorId,
+  isUserVisibleWorkflowKind,
   type AgentDecision,
   type AgentStep,
   type EpisodeState,
@@ -34,6 +36,7 @@ import {
   type ReserveWorkflowRunInput,
   type TrackedSeasonState,
   validateWorkflowRunSnapshot,
+  findStagingRecoveryIn,
   withDerivedEpisodeSummaries,
   workflowSnapshotFromReservation,
   DuplicateUsernameError,
@@ -458,10 +461,31 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
     return this.schemaReady;
   }
 
-  async saveWorkflowRunSnapshot(input: PersistWorkflowRunSnapshotInput): Promise<void> {
-    validateWorkflowRunSnapshot(input);
-    const snapshot = cloneWorkflowValue(input);
-    await this.withTransaction((client) => this.replaceWorkflowRunSnapshot(client, snapshot));
+  async saveWorkflowRunSnapshot(
+    input: PersistWorkflowRunSnapshotInput & { keepCurrentEpisodes?: boolean; requireTrackedSeason?: boolean },
+  ): Promise<void> {
+    const { keepCurrentEpisodes, requireTrackedSeason, ...rest } = input;
+    validateWorkflowRunSnapshot(rest);
+    const snapshot = cloneWorkflowValue(rest);
+    const requireTracked = reservationRequiresTrackedSeason({
+      ...(requireTrackedSeason === true ? { requireTrackedSeason: true } : {}),
+      ...(keepCurrentEpisodes === true ? { keepCurrentEpisodes: true } : {}),
+    });
+    await this.withTransaction(async (client) => {
+      if (requireTracked) {
+        const accountId = snapshot.accountId ?? DEFAULT_ACCOUNT_ID;
+        const connectedStorageId = snapshot.connectedStorageId ?? UNSCOPED_STORAGE;
+        // Same lock untrackTitle takes, then a row lock, so this write cannot
+        // recreate a season the user has just dropped.
+        await lockWorkflowTitle(client, accountId, snapshot.connectedStorageId, snapshot.season.mediaTitleId);
+        const tracked = await client.query(
+          "SELECT 1 FROM tracked_seasons WHERE id = $1 AND connected_storage_id = $2 FOR KEY SHARE",
+          [snapshot.season.id, connectedStorageId],
+        );
+        if ((tracked.rowCount ?? 0) === 0) return;
+      }
+      await this.replaceWorkflowRunSnapshot(client, snapshot, { runOnly: keepCurrentEpisodes === true });
+    });
   }
 
   async reserveWorkflowRun(input: ReserveWorkflowRunInput): Promise<WorkflowRunReservationResult> {
@@ -697,6 +721,18 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
     return snapshots;
   }
 
+  async findActiveStagingRecovery(input: {
+    accountId: string;
+    connectedStorageId: string | null;
+    stagingDirectoryId: string;
+  }): Promise<PersistedWorkflowRunSnapshot | null> {
+    const runs = await this.listActiveWorkflowRuns({
+      accountId: input.accountId,
+      connectedStorageId: input.connectedStorageId,
+    });
+    return findStagingRecoveryIn(runs, input.stagingDirectoryId);
+  }
+
   async updateWorkflowRunProgress(workflowRunId: string, progress: WorkflowRunProgress): Promise<void> {
     await this.withTransaction(async (client) => {
       const run = await this.selectOne<WorkflowRun>(
@@ -901,9 +937,10 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       // finds the season gone (not_tracked) instead of tracking it again.
       await lockWorkflowTitle(client, workScope.accountId, scope.connectedStorageId, workScope.titleKey);
       // In-flight guard: a running run on any target season → refuse, delete nothing.
+      // A staging_recovery is hidden and cannot be cancelled, so it does not count.
       const running = await client.query(
         "SELECT 1 FROM workflow_runs WHERE tracked_season_id = ANY($1) AND connected_storage_id = $2 " +
-          "AND payload->>'status' = 'running' LIMIT 1",
+          "AND payload->>'status' = 'running' AND payload->>'kind' IS DISTINCT FROM 'staging_recovery' LIMIT 1",
         [targetSeasonIds, storageValue],
       );
       // …and a queued or running replace_request of the work, whichever season it is
@@ -998,12 +1035,14 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       const ownerStorage = (row.rows[0]?.connected_storage_id as string | null | undefined) ?? null;
       // A kind with no queue claimer can never leave `queued` — retrying it would
       // strand the run and re-block the season (see isQueueClaimableKind).
+      // A hidden kind is claimable by the worker but must not be reachable here.
       if (
         !run ||
         owner !== scope.accountId ||
         (scope.connectedStorageId != null && ownerStorage !== scope.connectedStorageId) ||
         run.status !== "failed" ||
-        !isQueueClaimableKind(run.kind)
+        !isQueueClaimableKind(run.kind) ||
+        !isUserVisibleWorkflowKind(run.kind)
       ) {
         return { status: "not_retriable" as const };
       }
@@ -1029,6 +1068,7 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       return null;
     }
     const season = row.payload as TrackedSeason;
+    // Hides rows the previous janitor wrote.
     if (isStagingJanitorId(season.id)) {
       return null;
     }
@@ -1055,6 +1095,7 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
     const states: TrackedSeasonState[] = [];
     for (const row of result.rows) {
       const season = row.payload as TrackedSeason;
+      // Hides rows the previous janitor wrote.
       if (isStagingJanitorId(season.id)) {
         continue;
       }
@@ -1077,6 +1118,7 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
     const states: TrackedSeasonState[] = [];
     for (const row of result.rows) {
       const season = row.payload as TrackedSeason;
+      // Hides rows the previous janitor wrote.
       if (isStagingJanitorId(season.id)) {
         continue;
       }
@@ -1129,8 +1171,9 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       "SELECT n.payload AS payload FROM notifications n " +
         "JOIN workflow_runs wr ON n.workflow_run_id = wr.id " +
         "WHERE wr.account_id = $1 AND ($2::text IS NULL OR wr.connected_storage_id = $2) " +
-        "AND ($3::text IS NULL OR (n.payload->>'createdAt') >= $3)",
-      [scope.accountId, scope.connectedStorageId, input?.since ?? null],
+        "AND ($3::text IS NULL OR (n.payload->>'createdAt') >= $3) " +
+        "AND COALESCE(n.payload->>'kind', '') <> ALL($4::text[])",
+      [scope.accountId, scope.connectedStorageId, input?.since ?? null, HIDDEN_NOTIFICATION_KINDS],
     );
     all.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
     return all.slice(0, input?.limit ?? 100);
@@ -1148,8 +1191,9 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       "SELECT n.payload AS payload, wr.account_id AS account_id, wr.connected_storage_id AS connected_storage_id FROM notifications n " +
         "JOIN workflow_runs wr ON n.workflow_run_id = wr.id " +
         "WHERE ($1::text IS NULL OR (n.payload->>'createdAt') >= $1) " +
+        "AND COALESCE(n.payload->>'kind', '') <> ALL($3::text[]) " +
         "ORDER BY (n.payload->>'createdAt') DESC LIMIT $2",
-      [input?.since ?? null, limit],
+      [input?.since ?? null, limit, HIDDEN_NOTIFICATION_KINDS],
     );
     return result.rows.map((row) => {
       const rawStorage = (row.connected_storage_id as string | null | undefined) ?? null;

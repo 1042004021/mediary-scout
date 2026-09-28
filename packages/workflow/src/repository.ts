@@ -1,6 +1,8 @@
 import {
   DEFAULT_ACCOUNT_ID,
   isStagingJanitorId,
+  isUserVisibleNotificationKind,
+  isUserVisibleWorkflowKind,
   type AgentDecision,
   type AgentStep,
   type EpisodeState,
@@ -68,17 +70,20 @@ export function seasonScopeKey(seasonId: string, connectedStorageId: string | nu
 }
 
 /** Which active runs of the same title refuse a reservation, or null when the
- *  reservation is not title-exclusive at all (see ReserveWorkflowRunInput). */
+ *  reservation is not title-exclusive at all (see ReserveWorkflowRunInput).
+ *  `blockIfTitleHasActiveRun` ignores `staging_recovery`: a leftover-staging run
+ *  must not pin the title against a user action. Callers that must also wait
+ *  for one (the janitor) pass it in `blockIfTitleHasActiveKinds`. */
 export function titleBlockFilter(
   input: Pick<ReserveWorkflowRunInput, "blockIfTitleHasActiveRun" | "blockIfTitleHasActiveKinds">,
 ): ((run: Pick<WorkflowRun, "kind">) => boolean) | null {
-  if (input.blockIfTitleHasActiveRun === true) return () => true;
+  if (input.blockIfTitleHasActiveRun === true) return (run) => run.kind !== "staging_recovery";
   const kinds = input.blockIfTitleHasActiveKinds;
   if (kinds && kinds.length > 0) return (run) => kinds.includes(run.kind);
   return null;
 }
 
-/** Whether the reservation refuses (`not_tracked`) a (season, drive) that is no longer
+/** Whether a reservation or a save refuses a (season, drive) that is no longer
  *  tracked: asked for directly, or implied by keepCurrentEpisodes (nothing to keep). */
 export function reservationRequiresTrackedSeason(
   input: Pick<ReserveWorkflowRunInput, "requireTrackedSeason" | "keepCurrentEpisodes">,
@@ -131,21 +136,27 @@ export interface TrackedSeasonState {
 export interface ReserveWorkflowRunInput extends PersistWorkflowRunSnapshotInput {
   blockIfEpisodeStatesExist?: boolean;
   /**
-   * Title-level mutual exclusion: refuse the reservation if ANY run for the
-   * same media title is already active, regardless of season or kind. All
-   * seasons of a title share one `Title (Year)/` show directory and staging
-   * parent, so two concurrent acquisition runs would race on directory
-   * creation, staging, and dedup. User-triggered acquisitions set this so a
-   * user clicking "get S1", "get S2", "get S3" in quick succession can never
-   * spawn overlapping writers on the same title.
+   * Title-level mutual exclusion: refuse the reservation if any user-visible run
+   * for the same media title is already active, regardless of season. A
+   * `staging_recovery` does not count, queued or running, so a leftover-staging run
+   * cannot pin the title against something the user asked for. That holds for
+   * queue-drained user runs because the worker runs one job at a time: the user's
+   * run starts after the recovery finishes, and a replace reservation writes no
+   * episodes. Patrols are not queue-drained; they keep themselves out via
+   * blockIfTitleHasActiveKinds. All seasons
+   * of a title share one `Title (Year)/` show directory
+   * and staging parent, so two concurrent acquisition runs would race on directory
+   * creation, staging, and dedup. User-triggered acquisitions set this so a user
+   * clicking "get S1", "get S2", "get S3" in quick succession can never spawn
+   * overlapping writers on the same title.
    */
   blockIfTitleHasActiveRun?: boolean;
   /**
    * Narrower title-level exclusion: refuse only if an active run of one of these
    * kinds exists for the same (account, drive, title). The patrol sets
-   * ["replace_request"]: a replace run works every season's directory, so a patrol
-   * run beside it would race it, while patrol runs of other seasons must not block
-   * each other. Checked under the same lock as blockIfTitleHasActiveRun.
+   * ["replace_request", "staging_recovery"]: either works the title's directories,
+   * so a patrol beside it would race it, while patrol runs of other seasons must
+   * not block each other. Checked under the same lock as blockIfTitleHasActiveRun.
    */
   blockIfTitleHasActiveKinds?: WorkflowKind[];
   /**
@@ -188,7 +199,16 @@ export type WorkflowRunReservationResult =
     };
 
 export interface WorkflowRepository extends DeadLinkStore, AgentMemoryStore, UserRequestStore {
-  saveWorkflowRunSnapshot(input: PersistWorkflowRunSnapshotInput): Promise<void>;
+  saveWorkflowRunSnapshot(
+    input: PersistWorkflowRunSnapshotInput & {
+      /** Write the run only. The season's episode bucket stays as stored.
+       *  Implies requireTrackedSeason: an untracked season has nothing to keep. */
+      keepCurrentEpisodes?: boolean;
+      /** Write nothing at all when this (season, drive) is no longer tracked.
+       *  A recovery's late sibling write must not undo the user's untrack. */
+      requireTrackedSeason?: boolean;
+    },
+  ): Promise<void>;
   reserveWorkflowRun(input: ReserveWorkflowRunInput): Promise<WorkflowRunReservationResult>;
   /** (account, storage)-scoped: returns null if the run belongs to a different
    *  account, or to a different storage when the scope pins one. Accepts a bare
@@ -229,6 +249,13 @@ export interface WorkflowRepository extends DeadLinkStore, AgentMemoryStore, Use
   /** Every queued/running run for the (account, storage) scope, newest first —
    *  drives the library "获取中" placeholders. Accepts accountId or WorkflowScope. */
   listActiveWorkflowRuns(scope?: ScopeArg): Promise<PersistedWorkflowRunSnapshot[]>;
+  /** Queued or running `staging_recovery` for this exact leftover dir, or null.
+   *  The janitor uses it so one staging dir is not queued twice. */
+  findActiveStagingRecovery(input: {
+    accountId: string;
+    connectedStorageId: string | null;
+    stagingDirectoryId: string;
+  }): Promise<PersistedWorkflowRunSnapshot | null>;
   /** Lightweight mid-run update of the live agent progress shown on the activity
    *  page; `percent` is clamped monotonic so retries never rewind the bar. No-op
    *  for an unknown run. */
@@ -970,10 +997,13 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     return out;
   }
 
-  async saveWorkflowRunSnapshot(input: PersistWorkflowRunSnapshotInput): Promise<void> {
-    validateWorkflowRunSnapshot(input);
+  async saveWorkflowRunSnapshot(
+    input: PersistWorkflowRunSnapshotInput & { keepCurrentEpisodes?: boolean; requireTrackedSeason?: boolean },
+  ): Promise<void> {
+    const { keepCurrentEpisodes, requireTrackedSeason: _requireTrackedSeason, ...snapshot } = input;
+    validateWorkflowRunSnapshot(snapshot);
 
-    const cloned = cloneWorkflowValue(input);
+    const cloned = cloneWorkflowValue(snapshot);
     cloned.accountId = cloned.accountId ?? DEFAULT_ACCOUNT_ID;
     // Mirror Postgres' upsert (connected_storage_id set on insert, PRESERVED on
     // conflict): a re-persist that omits the storage (the worker finalize path
@@ -982,11 +1012,25 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     const existing = this.workflowRuns.get(cloned.workflowRun.id);
     cloned.connectedStorageId =
       cloned.connectedStorageId ?? existing?.connectedStorageId ?? null;
+    // Synchronous with the write below: no await, so an untrack cannot land between them.
+    if (
+      reservationRequiresTrackedSeason({
+        ...(input.requireTrackedSeason === true ? { requireTrackedSeason: true } : {}),
+        ...(keepCurrentEpisodes === true ? { keepCurrentEpisodes: true } : {}),
+      }) &&
+      !this.isSeasonTracked(cloned.season.id, cloned.connectedStorageId)
+    ) {
+      return;
+    }
+    const bucketKey = seasonScopeKey(cloned.season.id, cloned.connectedStorageId);
+    if (keepCurrentEpisodes === true) {
+      const current = this.episodesBySeason.get(bucketKey);
+      if (current) cloned.episodes = cloneWorkflowValue(current);
+      this.workflowRuns.set(cloned.workflowRun.id, cloned);
+      return;
+    }
     this.workflowRuns.set(cloned.workflowRun.id, cloned);
-    this.episodesBySeason.set(
-      seasonScopeKey(cloned.season.id, cloned.connectedStorageId),
-      cloneWorkflowValue(cloned.episodes),
-    );
+    this.episodesBySeason.set(bucketKey, cloneWorkflowValue(cloned.episodes));
   }
 
   async reserveWorkflowRun(input: ReserveWorkflowRunInput): Promise<WorkflowRunReservationResult> {
@@ -1213,6 +1257,18 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
       .map((snapshot) => withDerivedEpisodeSummaries(cloneWorkflowValue(snapshot)));
   }
 
+  async findActiveStagingRecovery(input: {
+    accountId: string;
+    connectedStorageId: string | null;
+    stagingDirectoryId: string;
+  }): Promise<PersistedWorkflowRunSnapshot | null> {
+    const runs = await this.listActiveWorkflowRuns({
+      accountId: input.accountId,
+      connectedStorageId: input.connectedStorageId,
+    });
+    return findStagingRecoveryIn(runs, input.stagingDirectoryId);
+  }
+
   async updateWorkflowRunProgress(workflowRunId: string, progress: WorkflowRunProgress): Promise<void> {
     const stored = this.workflowRuns.get(workflowRunId);
     if (!stored) {
@@ -1316,11 +1372,14 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     const work = { accountId: scope.accountId ?? DEFAULT_ACCOUNT_ID, drive: userMessageDrive(scope.connectedStorageId), titleKey: states[0]!.title.id };
 
     // In-flight guard: a running run on any target season → refuse, delete nothing.
+    // A staging_recovery is hidden and cannot be cancelled from the activity page,
+    // so it must not block the untrack. Its later writes no-op if the season is gone.
     const hasRunning = Array.from(this.workflowRuns.values()).some(
       (snapshot) =>
         targetSeasonIds.has(snapshot.season.id) &&
         scopeMatches(scope, snapshot.accountId, snapshot.connectedStorageId) &&
-        snapshot.workflowRun.status === "running",
+        snapshot.workflowRun.status === "running" &&
+        snapshot.workflowRun.kind !== "staging_recovery",
     );
     // …and a queued or running replace_request of the work, whichever season it is recorded
     // on: it covers every season tracked when it starts and writes a record for each when it
@@ -1391,11 +1450,13 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     const stored = this.workflowRuns.get(workflowRunId);
     // A kind with no queue claimer can never leave `queued` — retrying it would
     // strand the run and re-block the season (see isQueueClaimableKind).
+    // A hidden kind is claimable by the worker but must not be reachable here.
     if (
       !stored ||
       !scopeMatches(scope, stored.accountId, stored.connectedStorageId) ||
       stored.workflowRun.status !== "failed" ||
-      !isQueueClaimableKind(stored.workflowRun.kind)
+      !isQueueClaimableKind(stored.workflowRun.kind) ||
+      !isUserVisibleWorkflowKind(stored.workflowRun.kind)
     ) {
       return { status: "not_retriable" };
     }
@@ -1544,6 +1605,7 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     const all = [...this.workflowRuns.values()]
       .filter((snapshot) => scopeMatches(scope, snapshot.accountId, snapshot.connectedStorageId))
       .flatMap((snapshot) => snapshot.notifications.map((notification) => ({ ...notification })))
+      .filter((notification) => isUserVisibleNotificationKind(notification.kind))
       .filter((notification) => since === undefined || notification.createdAt >= since);
     all.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
     return all.slice(0, input?.limit ?? 100);
@@ -1562,6 +1624,7 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
           notification: { ...notification },
         })),
       )
+      .filter((entry) => isUserVisibleNotificationKind(entry.notification.kind))
       .filter((entry) => since === undefined || entry.notification.createdAt >= since);
     all.sort((left, right) => right.notification.createdAt.localeCompare(left.notification.createdAt));
     return all.slice(0, input?.limit ?? 100);
@@ -1689,9 +1752,33 @@ export function isActiveWorkflowStatus(status: WorkflowStatus): boolean {
   return status === "queued" || status === "running";
 }
 
-/** The staging janitor's inbox run is a notification carrier, not a show. */
+/** Hides rows the previous janitor wrote. */
 function isVisibleTrackedSnapshot(snapshot: PersistWorkflowRunSnapshotInput): boolean {
   return !isStagingJanitorId(snapshot.workflowRun.id) && !isStagingJanitorId(snapshot.season.id);
+}
+
+/** The leftover dir id carried on a queued staging_recovery, or null. */
+export function stagingRecoveryDirectoryId(run: Pick<WorkflowRun, "auditEvents">): string | null {
+  for (let index = run.auditEvents.length - 1; index >= 0; index -= 1) {
+    const event = run.auditEvents[index];
+    if (event?.type !== "staging_recovery_queued") continue;
+    const id = event.data?.["stagingDirectoryId"];
+    if (typeof id === "string" && id.length > 0) return id;
+  }
+  return null;
+}
+
+export function findStagingRecoveryIn(
+  runs: readonly PersistedWorkflowRunSnapshot[],
+  stagingDirectoryId: string,
+): PersistedWorkflowRunSnapshot | null {
+  return (
+    runs.find(
+      (run) =>
+        run.workflowRun.kind === "staging_recovery" &&
+        stagingRecoveryDirectoryId(run.workflowRun) === stagingDirectoryId,
+    ) ?? null
+  );
 }
 
 export function workflowSnapshotFromReservation(input: ReserveWorkflowRunInput): PersistWorkflowRunSnapshotInput {
@@ -1783,6 +1870,7 @@ const KIND_HAS_QUEUE_CLAIMER: Record<WorkflowKind, boolean> = {
   movie_init: true,
   type3_monitor: false,
   replace_request: true,
+  staging_recovery: true,
 };
 
 /** Whether cancelling a queued run of this kind tears down its season's tracking.
@@ -1795,6 +1883,7 @@ const KIND_OWNS_TRACKING: Record<WorkflowKind, boolean> = {
   movie_init: true,
   type3_monitor: false,
   replace_request: false,
+  staging_recovery: false,
 };
 
 export function tearsDownTrackingOnCancel(kind: WorkflowKind): boolean {
@@ -1807,7 +1896,9 @@ export function tearsDownTrackingOnCancel(kind: WorkflowKind): boolean {
  *  enforced per write-site, not centrally. Callers that can move a run into
  *  `queued` must consult this predicate themselves — currently
  *  `recoverOrphanRunningRun` (crash recovery) and `retryFailedWorkflowRun` (all
- *  three repository implementations). Nothing structurally prevents a future
+ *  three repository implementations). `retryFailedWorkflowRun` also refuses a
+ *  kind `isUserVisibleWorkflowKind` rejects: `staging_recovery` is claimable, but
+ *  a user retry must not requeue a hidden run. Nothing structurally prevents a future
  *  write-site from forgetting. Candidates for a central fix, best first:
  *    1. The shared pure transitions themselves (`retriedWorkflowRun`,
  *       `recoverOrphanRunningRun`) — already one place each rather than three,

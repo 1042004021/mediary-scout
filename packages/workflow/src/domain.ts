@@ -8,8 +8,7 @@ import type { MergedSourceHealth } from "./resource-source-health.js";
  */
 export const DEFAULT_ACCOUNT_ID = "acct_default";
 
-/** Inbox rows the staging janitor writes so a leftover-dir notice has a workflow
- *  run to hang on. Not a tracked show — library/patrol listings skip these ids. */
+/** Hides rows the previous janitor wrote (`staging-janitor:<storageId>` inbox runs). */
 export function isStagingJanitorId(id: string): boolean {
   return id.startsWith("staging-janitor");
 }
@@ -21,7 +20,28 @@ export type AirStatus = "aired" | "unaired" | "unknown";
 export type MetadataStatus = "confirmed" | "provider_ahead" | "storage_only";
 /** `replace_request` = a user message asking the agent to swap a bad resource
  *  (packages/workflow/src/replace-request.ts); it covers every tracked season. */
-export type WorkflowKind = "type1_package_init" | "type2_init" | "type3_monitor" | "movie_init" | "replace_request";
+/** `staging_recovery` = a silent janitor run that judges one leftover staging dir.
+ *  Users never see it (no notification, no activity row). */
+export type WorkflowKind =
+  | "type1_package_init"
+  | "type2_init"
+  | "type3_monitor"
+  | "movie_init"
+  | "replace_request"
+  | "staging_recovery";
+
+/** Runs of this kind stay off every user-facing list (activity, library, show page). */
+export function isUserVisibleWorkflowKind(kind: WorkflowKind): boolean {
+  return kind !== "staging_recovery";
+}
+
+/** Notice kinds a user must never see. Applied inside the notification queries,
+ *  before the limit, so a leftover row cannot crowd out a real one. */
+export const HIDDEN_NOTIFICATION_KINDS = ["staging_leftover", "staging_recovery"] as const;
+
+export function isUserVisibleNotificationKind(kind: string): boolean {
+  return !(HIDDEN_NOTIFICATION_KINDS as readonly string[]).includes(kind);
+}
 export type WorkflowStatus =
   | "queued"
   | "running"

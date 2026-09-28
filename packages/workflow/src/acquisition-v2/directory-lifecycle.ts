@@ -63,6 +63,33 @@ export async function ensureSeasonAcquisitionDirectories(
 }
 
 /**
+ * A leftover staging dir is already the run's staging. Season dirs are resolved
+ * the same way as other runs (reuse `Season NN` when it is there, create it only
+ * when it is not). The show dir and the staging dir are not created.
+ */
+export async function bindRecoveryDirectories(input: {
+  executor: Pick<StorageExecutor, "createDirectory" | "listChildDirectories">;
+  showDirectoryId: string;
+  stagingDirectoryId: string;
+  seasons: number[];
+}): Promise<AcquisitionDirectories> {
+  const children = await input.executor.listChildDirectories(input.showDirectoryId);
+  const seasonDirectoryIds: Record<number, string> = {};
+  for (const season of input.seasons) {
+    const name = `Season ${String(season).padStart(2, "0")}`;
+    const existing = children.find((child) => child.name === name);
+    seasonDirectoryIds[season] = existing
+      ? existing.id
+      : await input.executor.createDirectory({ name, parentId: input.showDirectoryId });
+  }
+  return {
+    showDirectoryId: input.showDirectoryId,
+    seasonDirectoryIds,
+    stagingDirectoryId: input.stagingDirectoryId,
+  };
+}
+
+/**
  * Run an acquisition body, then ALWAYS discard the run's staging dir — on success,
  * failure, or honest no-coverage alike. The agent keeps its own discardStaging and
  * normally calls it; this finally is the HARNESS-level leak guard for the paths
@@ -250,6 +277,14 @@ export async function withStagingCleanup<T>(
     /** Non-null: files whose move failed are still only in staging. Do not remove
      *  the dir (a kept dir would also look like a leak, so skip the read-back). */
     keep?: () => { fileCount: number } | null;
+    /** A recovery adopted an existing leftover. A throw must leave that dir
+     *  where it is. */
+    preserveOnThrow?: boolean;
+    /** Recovery only. A normal return discards the adopted dir only when this
+     *  is true (the agent called finish or discardStaging). Anything else keeps
+     *  it for a later sweep. Absent on an ordinary run, whose fresh staging is
+     *  always discarded. */
+    discardOnNormalReturn?: () => boolean;
     onKept?: (event: StagingKeptUnmoved) => void;
   },
   run: () => Promise<T>,
@@ -275,6 +310,15 @@ export async function withStagingCleanup<T>(
         if (threw) {
           attachStagingKeptUnmoved(bodyError, [event]);
         }
+        return;
+      }
+      // No unmoved files to report. A thrown recovery must not delete the
+      // adopted leftover. A normal return deletes it only after finish or
+      // discardStaging; any other exit leaves it for the next sweep.
+      if (threw && args.preserveOnThrow) {
+        return;
+      }
+      if (!threw && args.discardOnNormalReturn && !args.discardOnNormalReturn()) {
         return;
       }
       let removalFailed = false;

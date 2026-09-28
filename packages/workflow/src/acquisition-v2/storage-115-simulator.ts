@@ -78,10 +78,10 @@ export interface StorageV2 {
    *  `transferUntilLanded` (which iterates on failure) accepts only "share"
    *  candidates and uses this to reject magnets/unknown links up front. */
   candidateLinkKind(candidateId: string): "share" | "magnet" | "unknown";
-  listTree(input: { directoryId: string }): Promise<SimTreeFile[]>;
+  listTree(input: { directoryId: string; maxDepth?: number }): Promise<SimTreeFile[]>;
   /** Recursive list of subdirectories under a directory (path relative to it) —
    *  the source of the wrapper-dir handle flatten removes. */
-  listSubdirectories(input: { directoryId: string }): Promise<Array<{ id: string; path: string }>>;
+  listSubdirectories(input: { directoryId: string; maxDepth?: number }): Promise<Array<{ id: string; path: string }>>;
   moveFiles(input: { fileIds: string[]; targetDirectoryId: string }): Promise<{ moved: string[] }>;
   /** Rename a single file in place (same directory) — the subtitle-rename exception. */
   renameFile(input: { directoryId: string; fileId: string; newName: string }): Promise<void>;
@@ -250,14 +250,18 @@ export class Storage115Simulator implements StorageV2 {
     return results;
   }
 
-  /** Recursive, path-preserving snapshot of everything under a directory. */
-  async listTree(input: { directoryId: string }): Promise<SimTreeFile[]> {
+  /** Recursive, path-preserving snapshot of everything under a directory.
+   *  Same walk as the real executors: the root is depth 1, and a directory
+   *  deeper than maxDepth is not opened. Default 6. */
+  async listTree(input: { directoryId: string; maxDepth?: number }): Promise<SimTreeFile[]> {
     if (!this.dirs.has(input.directoryId)) {
       throw new Error(`SIM_DIR_NOT_FOUND: ${input.directoryId}`);
     }
     this.spendBudget(1);
+    const maxDepth = input.maxDepth ?? 6;
     const out: SimTreeFile[] = [];
-    const walk = (dirId: string, prefix: string): void => {
+    const walk = (dirId: string, prefix: string, depth: number): void => {
+      if (depth > maxDepth) return;
       for (const file of this.files.values()) {
         if (file.parentId === dirId) {
           out.push({
@@ -271,11 +275,11 @@ export class Storage115Simulator implements StorageV2 {
       }
       for (const dir of this.dirs.values()) {
         if (dir.parentId === dirId) {
-          walk(dir.id, `${prefix}${dir.name}/`);
+          walk(dir.id, `${prefix}${dir.name}/`, depth + 1);
         }
       }
     };
-    walk(input.directoryId, "");
+    walk(input.directoryId, "", 1);
     return out.sort((a, b) => a.path.localeCompare(b.path));
   }
 
@@ -312,23 +316,26 @@ export class Storage115Simulator implements StorageV2 {
     file.name = input.newName;
   }
 
-  /** Recursive subdirectories of a directory, path-relative to it. */
-  async listSubdirectories(input: { directoryId: string }): Promise<Array<{ id: string; path: string }>> {
+  /** Recursive subdirectories of a directory, path-relative to it.
+   *  Root is depth 1; a directory past maxDepth is not opened. Default 6. */
+  async listSubdirectories(input: { directoryId: string; maxDepth?: number }): Promise<Array<{ id: string; path: string }>> {
     if (!this.dirs.has(input.directoryId)) {
       throw new Error(`SIM_DIR_NOT_FOUND: ${input.directoryId}`);
     }
     this.spendBudget(1);
+    const maxDepth = input.maxDepth ?? 6;
     const out: Array<{ id: string; path: string }> = [];
-    const walk = (dirId: string, prefix: string): void => {
+    const walk = (dirId: string, prefix: string, depth: number): void => {
+      if (depth > maxDepth) return;
       for (const dir of this.dirs.values()) {
         if (dir.parentId === dirId) {
           const path = `${prefix}${dir.name}`;
           out.push({ id: dir.id, path });
-          walk(dir.id, `${path}/`);
+          walk(dir.id, `${path}/`, depth + 1);
         }
       }
     };
-    walk(input.directoryId, "");
+    walk(input.directoryId, "", 1);
     return out.sort((a, b) => a.path.localeCompare(b.path));
   }
 
@@ -337,7 +344,10 @@ export class Storage115Simulator implements StorageV2 {
       throw new Error(`SIM_DIR_NOT_FOUND: ${input.directoryId}`);
     }
     // Collect the directory + all descendant dirs, then drop their files + the dirs.
-    const toRemove = [input.directoryId, ...(await this.listSubdirectories({ directoryId: input.directoryId })).map((d) => d.id)];
+    const toRemove = [
+      input.directoryId,
+      ...(await this.listSubdirectories({ directoryId: input.directoryId, maxDepth: Number.MAX_SAFE_INTEGER })).map((d) => d.id),
+    ];
     const removeSet = new Set(toRemove);
     const removed: string[] = [];
     this.spendBudget(toRemove.length);

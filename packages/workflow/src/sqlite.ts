@@ -1,6 +1,13 @@
 import { createRequire } from "node:module";
 import type Database from "better-sqlite3";
-import { DEFAULT_ACCOUNT_ID, episodeNumberFromCode, isStagingJanitorId } from "./domain.js";
+import {
+  DEFAULT_ACCOUNT_ID,
+  episodeNumberFromCode,
+  HIDDEN_NOTIFICATION_KINDS,
+  isStagingJanitorId,
+  isUserVisibleNotificationKind,
+  isUserVisibleWorkflowKind,
+} from "./domain.js";
 import type {
   AgentDecision,
   AgentStep,
@@ -75,6 +82,7 @@ import {
   titleBlockFilter,
   UNSCOPED_STORAGE,
   validateWorkflowRunSnapshot,
+  findStagingRecoveryIn,
   withDerivedEpisodeSummaries,
   workflowSnapshotFromReservation,
 } from "./repository.js";
@@ -311,12 +319,28 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
     this.db.close();
   }
 
-  async saveWorkflowRunSnapshot(input: PersistWorkflowRunSnapshotInput): Promise<void> {
-    validateWorkflowRunSnapshot(input);
-    const snapshot = cloneWorkflowValue(input);
-    // better-sqlite3 transactions are synchronous — the whole multi-table write
-    // commits atomically or rolls back on throw.
-    this.db.transaction(() => this.replaceWorkflowRunSnapshot(snapshot))();
+  async saveWorkflowRunSnapshot(
+    input: PersistWorkflowRunSnapshotInput & { keepCurrentEpisodes?: boolean; requireTrackedSeason?: boolean },
+  ): Promise<void> {
+    const { keepCurrentEpisodes, requireTrackedSeason, ...rest } = input;
+    validateWorkflowRunSnapshot(rest);
+    const snapshot = cloneWorkflowValue(rest);
+    const requireTracked = reservationRequiresTrackedSeason({
+      ...(requireTrackedSeason === true ? { requireTrackedSeason: true } : {}),
+      ...(keepCurrentEpisodes === true ? { keepCurrentEpisodes: true } : {}),
+    });
+    // better-sqlite3 transactions are synchronous — the check and the write
+    // commit together, so an untrack cannot land between them.
+    this.db.transaction(() => {
+      if (requireTracked) {
+        const connectedStorageId = snapshot.connectedStorageId ?? UNSCOPED_STORAGE;
+        const tracked = this.db
+          .prepare("SELECT 1 FROM tracked_seasons WHERE id = ? AND connected_storage_id = ?")
+          .get(snapshot.season.id, connectedStorageId);
+        if (tracked === undefined) return;
+      }
+      this.replaceWorkflowRunSnapshot(snapshot, { runOnly: keepCurrentEpisodes === true });
+    })();
   }
 
   async reserveWorkflowRun(input: ReserveWorkflowRunInput): Promise<WorkflowRunReservationResult> {
@@ -799,6 +823,18 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
     return snapshots;
   }
 
+  async findActiveStagingRecovery(input: {
+    accountId: string;
+    connectedStorageId: string | null;
+    stagingDirectoryId: string;
+  }): Promise<PersistedWorkflowRunSnapshot | null> {
+    const runs = await this.listActiveWorkflowRuns({
+      accountId: input.accountId,
+      connectedStorageId: input.connectedStorageId,
+    });
+    return findStagingRecoveryIn(runs, input.stagingDirectoryId);
+  }
+
   private allWorkflowRuns(): WorkflowRun[] {
     const rows = this.db.prepare("SELECT payload FROM workflow_runs").all() as Array<{
       payload: string;
@@ -1005,8 +1041,11 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
     return this.db.transaction(
       (): { status: "untracked" | "not_found" | "in_flight"; removedSeasons: number } => {
         // In-flight guard: a running run on any target season → refuse, delete nothing.
+        // A staging_recovery is hidden and cannot be cancelled, so it does not count.
         const hasRunning = targetSeasonIds.some((seasonId) =>
-          this.selectWorkflowRuns(seasonId, storageValue).some((run) => run.status === "running"),
+          this.selectWorkflowRuns(seasonId, storageValue).some(
+            (run) => run.status === "running" && run.kind !== "staging_recovery",
+          ),
         );
         // …and a queued or running replace_request of the work, whichever season it is
         // recorded on: it covers every season tracked when it starts and writes a record for
@@ -1091,11 +1130,13 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
       const ownerStorage = rawStorage === UNSCOPED_STORAGE ? null : rawStorage;
       // A kind with no queue claimer can never leave `queued` — retrying it would
       // strand the run and re-block the season (see isQueueClaimableKind).
+      // A hidden kind is claimable by the worker but must not be reachable here.
       if (
         !run ||
         !scopeMatches(scope, owner, ownerStorage) ||
         run.status !== "failed" ||
-        !isQueueClaimableKind(run.kind)
+        !isQueueClaimableKind(run.kind) ||
+        !isUserVisibleWorkflowKind(run.kind)
       ) {
         return { status: "not_retriable" as const };
       }
@@ -1179,6 +1220,7 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
     const rows = this.db
       .prepare("SELECT payload, account_id, connected_storage_id FROM workflow_runs")
       .all() as Array<{ payload: string; account_id: string; connected_storage_id: string | null }>;
+    // Hides rows the previous janitor wrote.
     return rows.map((row) => {
       const run = JSON.parse(row.payload) as WorkflowRun;
       const rawStorage = row.connected_storage_id ?? null;
@@ -1271,7 +1313,9 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
       .all(scope.accountId, scope.connectedStorageId, scope.connectedStorageId, since, since) as Array<{
       payload: string;
     }>;
-    const all = rows.map((row) => JSON.parse(row.payload) as NotificationEvent);
+    const all = rows
+      .map((row) => JSON.parse(row.payload) as NotificationEvent)
+      .filter((notification) => isUserVisibleNotificationKind(notification.kind));
     all.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
     return all.slice(0, input?.limit ?? 100);
   }
@@ -1284,14 +1328,20 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
     // since + ORDER BY + LIMIT in SQL so a large history cannot force a full scan into JS.
     const since = input?.since ?? null;
     const limit = input?.limit ?? 100;
+    const hiddenPlaceholders = HIDDEN_NOTIFICATION_KINDS.map(() => "?").join(", ");
     const rows = this.db
       .prepare(
         "SELECT n.payload AS payload, wr.account_id AS account_id, wr.connected_storage_id AS connected_storage_id " +
           "FROM notifications n JOIN workflow_runs wr ON n.workflow_run_id = wr.id " +
           "WHERE (? IS NULL OR json_extract(n.payload, '$.createdAt') >= ?) " +
+          `AND COALESCE(json_extract(n.payload, '$.kind'), '') NOT IN (${hiddenPlaceholders}) ` +
           "ORDER BY json_extract(n.payload, '$.createdAt') DESC LIMIT ?",
       )
-      .all(since, since, limit) as Array<{ payload: string; account_id: string; connected_storage_id: string | null }>;
+      .all(since, since, ...HIDDEN_NOTIFICATION_KINDS, limit) as Array<{
+      payload: string;
+      account_id: string;
+      connected_storage_id: string | null;
+    }>;
     return rows.map((row) => {
       const rawStorage = row.connected_storage_id ?? null;
       return {
