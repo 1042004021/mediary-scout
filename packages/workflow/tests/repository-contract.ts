@@ -2005,6 +2005,42 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         expect(recent[0]?.notification.id).toBe("notification_1");
       });
 
+      it("hidden notification kinds are dropped before the limit", async () => {
+        const repo = await fresh();
+        const base = workflowPersistenceFixture();
+        const ordinary = {
+          id: "note_real",
+          workflowRunId: base.workflowRun.id,
+          kind: "tracking_initialized",
+          title: "Show",
+          body: "real",
+          createdAt: "2026-09-01T00:00:00.000Z",
+        };
+        const hidden = Array.from({ length: 40 }, (_, index) => ({
+          id: `note_hidden_${index}`,
+          workflowRunId: base.workflowRun.id,
+          kind: "staging_leftover",
+          title: "hidden",
+          body: "hidden",
+          createdAt: `2026-09-28T00:${String(index).padStart(2, "0")}:00.000Z`,
+        }));
+        await repo.saveWorkflowRunSnapshot({
+          ...base,
+          accountId: "acct_default",
+          connectedStorageId: "cs_hidden",
+          notifications: [ordinary, ...hidden],
+        });
+        const listed = await repo.listNotifications({
+          accountId: "acct_default",
+          connectedStorageId: "cs_hidden",
+          limit: 30,
+        });
+        expect(listed.map((notification) => notification.id)).toEqual(["note_real"]);
+        const recent = await repo.listRecentNotificationsWithAccount({ limit: 30 });
+        expect(recent.map((row) => row.notification.id)).toEqual(["note_real"]);
+        expect(recent.some((row) => row.notification.kind === "staging_leftover" || row.notification.kind === "staging_recovery")).toBe(false);
+      });
+
       it("listRecentNotificationsWithAccount surfaces unscoped runs as null, never the internal sentinel", async () => {
         const repo = await fresh();
         await repo.saveWorkflowRunSnapshot({

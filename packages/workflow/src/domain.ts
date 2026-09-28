@@ -34,6 +34,14 @@ export type WorkflowKind =
 export function isUserVisibleWorkflowKind(kind: WorkflowKind): boolean {
   return kind !== "staging_recovery";
 }
+
+/** Notice kinds a user must never see. Applied inside the notification queries,
+ *  before the limit, so a leftover row cannot crowd out a real one. */
+export const HIDDEN_NOTIFICATION_KINDS = ["staging_leftover", "staging_recovery"] as const;
+
+export function isUserVisibleNotificationKind(kind: string): boolean {
+  return !(HIDDEN_NOTIFICATION_KINDS as readonly string[]).includes(kind);
+}
 export type WorkflowStatus =
   | "queued"
   | "running"

@@ -3,6 +3,7 @@ import type { Pool, PoolClient } from "pg";
 import {
   DEFAULT_ACCOUNT_ID,
   episodeNumberFromCode,
+  HIDDEN_NOTIFICATION_KINDS,
   isStagingJanitorId,
   type AgentDecision,
   type AgentStep,
@@ -1145,8 +1146,9 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       "SELECT n.payload AS payload FROM notifications n " +
         "JOIN workflow_runs wr ON n.workflow_run_id = wr.id " +
         "WHERE wr.account_id = $1 AND ($2::text IS NULL OR wr.connected_storage_id = $2) " +
-        "AND ($3::text IS NULL OR (n.payload->>'createdAt') >= $3)",
-      [scope.accountId, scope.connectedStorageId, input?.since ?? null],
+        "AND ($3::text IS NULL OR (n.payload->>'createdAt') >= $3) " +
+        "AND COALESCE(n.payload->>'kind', '') <> ALL($4::text[])",
+      [scope.accountId, scope.connectedStorageId, input?.since ?? null, HIDDEN_NOTIFICATION_KINDS],
     );
     all.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
     return all.slice(0, input?.limit ?? 100);
@@ -1164,8 +1166,9 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       "SELECT n.payload AS payload, wr.account_id AS account_id, wr.connected_storage_id AS connected_storage_id FROM notifications n " +
         "JOIN workflow_runs wr ON n.workflow_run_id = wr.id " +
         "WHERE ($1::text IS NULL OR (n.payload->>'createdAt') >= $1) " +
+        "AND COALESCE(n.payload->>'kind', '') <> ALL($3::text[]) " +
         "ORDER BY (n.payload->>'createdAt') DESC LIMIT $2",
-      [input?.since ?? null, limit],
+      [input?.since ?? null, limit, HIDDEN_NOTIFICATION_KINDS],
     );
     return result.rows.map((row) => {
       const rawStorage = (row.connected_storage_id as string | null | undefined) ?? null;

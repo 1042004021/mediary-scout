@@ -149,13 +149,7 @@ export async function getActivityView(input: {
       : {}),
   });
   const recentCompleted: ActivityCompletedItem[] = notifications
-    .filter(
-      (notification) =>
-        notification.kind !== "already_current" &&
-        notification.kind !== "staging_recovery" &&
-        notification.kind !== "staging_leftover" &&
-        notification.report !== undefined,
-    )
+    .filter((notification) => notification.kind !== "already_current" && notification.report !== undefined)
     .map((notification) => {
       const report = notification.report!;
       const size = landedSize(report);

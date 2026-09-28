@@ -18,13 +18,11 @@ export async function GET(request: NextRequest) {
   const activeRuns = (await repository.listActiveWorkflowRuns(accountId)).filter((snapshot) =>
     isUserVisibleWorkflowKind(snapshot.workflowRun.kind),
   );
-  const notifications = (
-    await repository.listNotifications({
-      accountId,
-      since: notificationWindowSince(),
-      limit,
-    })
-  ).filter((notification) => notification.kind !== "staging_recovery" && notification.kind !== "staging_leftover");
+  const notifications = await repository.listNotifications({
+    accountId,
+    since: notificationWindowSince(),
+    limit,
+  });
 
   const active = activeRuns.map((snapshot) => ({
     workflowRunId: snapshot.workflowRun.id,

@@ -1,6 +1,7 @@
 import {
   DEFAULT_ACCOUNT_ID,
   isStagingJanitorId,
+  isUserVisibleNotificationKind,
   type AgentDecision,
   type AgentStep,
   type EpisodeState,
@@ -1570,6 +1571,7 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     const all = [...this.workflowRuns.values()]
       .filter((snapshot) => scopeMatches(scope, snapshot.accountId, snapshot.connectedStorageId))
       .flatMap((snapshot) => snapshot.notifications.map((notification) => ({ ...notification })))
+      .filter((notification) => isUserVisibleNotificationKind(notification.kind))
       .filter((notification) => since === undefined || notification.createdAt >= since);
     all.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
     return all.slice(0, input?.limit ?? 100);
@@ -1588,6 +1590,7 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
           notification: { ...notification },
         })),
       )
+      .filter((entry) => isUserVisibleNotificationKind(entry.notification.kind))
       .filter((entry) => since === undefined || entry.notification.createdAt >= since);
     all.sort((left, right) => right.notification.createdAt.localeCompare(left.notification.createdAt));
     return all.slice(0, input?.limit ?? 100);

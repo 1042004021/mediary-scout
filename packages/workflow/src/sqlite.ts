@@ -1,6 +1,12 @@
 import { createRequire } from "node:module";
 import type Database from "better-sqlite3";
-import { DEFAULT_ACCOUNT_ID, episodeNumberFromCode, isStagingJanitorId } from "./domain.js";
+import {
+  DEFAULT_ACCOUNT_ID,
+  episodeNumberFromCode,
+  HIDDEN_NOTIFICATION_KINDS,
+  isStagingJanitorId,
+  isUserVisibleNotificationKind,
+} from "./domain.js";
 import type {
   AgentDecision,
   AgentStep,
@@ -1285,7 +1291,9 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
       .all(scope.accountId, scope.connectedStorageId, scope.connectedStorageId, since, since) as Array<{
       payload: string;
     }>;
-    const all = rows.map((row) => JSON.parse(row.payload) as NotificationEvent);
+    const all = rows
+      .map((row) => JSON.parse(row.payload) as NotificationEvent)
+      .filter((notification) => isUserVisibleNotificationKind(notification.kind));
     all.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
     return all.slice(0, input?.limit ?? 100);
   }
@@ -1298,14 +1306,20 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
     // since + ORDER BY + LIMIT in SQL so a large history cannot force a full scan into JS.
     const since = input?.since ?? null;
     const limit = input?.limit ?? 100;
+    const hiddenPlaceholders = HIDDEN_NOTIFICATION_KINDS.map(() => "?").join(", ");
     const rows = this.db
       .prepare(
         "SELECT n.payload AS payload, wr.account_id AS account_id, wr.connected_storage_id AS connected_storage_id " +
           "FROM notifications n JOIN workflow_runs wr ON n.workflow_run_id = wr.id " +
           "WHERE (? IS NULL OR json_extract(n.payload, '$.createdAt') >= ?) " +
+          `AND COALESCE(json_extract(n.payload, '$.kind'), '') NOT IN (${hiddenPlaceholders}) ` +
           "ORDER BY json_extract(n.payload, '$.createdAt') DESC LIMIT ?",
       )
-      .all(since, since, limit) as Array<{ payload: string; account_id: string; connected_storage_id: string | null }>;
+      .all(since, since, ...HIDDEN_NOTIFICATION_KINDS, limit) as Array<{
+      payload: string;
+      account_id: string;
+      connected_storage_id: string | null;
+    }>;
     return rows.map((row) => {
       const rawStorage = row.connected_storage_id ?? null;
       return {
