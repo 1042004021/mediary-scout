@@ -47,7 +47,11 @@ case "$*" in
   *--post-data*)
     log_call hold "$@"
     if [ -f "$STUB_DIR/fail-hold" ]; then exit 1; fi
-    printf '%s\\n' '{"ok":true}'
+    if [ -f "$STUB_DIR/odd-hold" ]; then printf '%s\\n' '<html>login</html>'; exit 0; fi
+    case "$*" in
+      *'{"hold":true}'*) printf '%s\\n' '{"hold":true}' ;;
+      *) printf '%s\\n' '{"hold":false}' ;;
+    esac
     exit 0
     ;;
 esac
@@ -254,6 +258,10 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     const hold = linesOf(log).find((line) => line.startsWith("hold "));
     expect(hold).toContain("http://web.test:3000/api/update/hold");
     expect(hold).toContain("Bearer t0k3n");
+    // busybox wget waits forever without a timeout.
+    for (const line of linesOf(log).filter((entry) => /^(wget|hold) /.test(entry))) {
+      expect(line).toMatch(/ -T 10 /);
+    }
     const dockerLines = linesOf(log).filter((line) => line.startsWith("docker "));
     const dumpAt = dockerLines.findIndex((line) => line.includes("pg_dump"));
     const buildAt = dockerLines.findIndex((line) => line.includes("build web"));
@@ -416,13 +424,19 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     expect(result.stdout).toContain("==> STILL_BUSY (unreachable)");
   });
 
-  it("still waits and swaps when taking the hold fails", async () => {
-    const { stubDir, log, env } = setup();
-    writeFileSync(join(stubDir, "fail-hold"), "1");
-    const result = await run(env);
-    expect(result.code).toBe(0);
-    expect(result.stdout).toContain("==> HOLD_FAILED");
-    expect(signatures(log).filter((step) => step === "release")).toEqual([]);
+  it("stops without swapping when it cannot take the hold, and checks the old commit back out", async () => {
+    for (const how of ["fail", "odd"]) {
+      const { stubDir, log, env } = setup();
+      writeFileSync(join(stubDir, how === "fail" ? "fail-hold" : "odd-hold"), "1");
+      const result = await run(env);
+      expect(result.code).toBe(40);
+      expect(result.stdout).toContain("==> HOLD_FAILED");
+      const steps = signatures(log);
+      expect(steps).not.toContain("up");
+      expect(steps).not.toContain("wget");
+      expect(steps.at(-1)).toBe(`checkout ${FROM}`);
+      expect(steps).not.toContain("release");
+    }
   });
 
   it("never takes the hold when the build fails", async () => {

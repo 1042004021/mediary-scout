@@ -2,7 +2,8 @@
 # One self-host update to a release tag. Runs inside the updater container.
 # The build happens BEFORE the swap, so a failed build never touches the running web container.
 # Paths default to the container layout and can be pointed at a temp dir by the unit test.
-# Exit: 0 ok · 10 rolled back · 20 rollback failed · 30 local edits (nothing touched).
+# Exit: 0 ok · 10 rolled back · 20 rollback failed · 30 local edits (nothing touched)
+#       · 40 could not pause new tasks before the swap (nothing swapped).
 #
 # When the updater restarts and finds an update that was cut off:
 #   `run-update.sh rollback <commit>` — the swap had begun: rebuild and swap back.
@@ -60,11 +61,13 @@ cd "$REPO"
 token() {
   if [ -r "$STATE/token" ]; then cat "$STATE/token"; fi
 }
+# -T: busybox wget has no timeout of its own; a web process that accepts the connection
+# and never answers would hang the update forever.
 web_get() {
-  wget -qO- --header "Authorization: Bearer $(token)" "${WEB%/}$1"
+  wget -q -T 10 -O- --header "Authorization: Bearer $(token)" "${WEB%/}$1"
 }
 web_post() {
-  wget -qO- --header "Authorization: Bearer $(token)" --header "content-type: application/json" \
+  wget -q -T 10 -O- --header "Authorization: Bearer $(token)" --header "content-type: application/json" \
     --post-data "$1" "${WEB%/}/api/update/hold"
 }
 
@@ -203,10 +206,14 @@ wait_idle() {
 
 # Stop the old version from starting new runs before the final wait, so nothing starts
 # between that wait and the swap. Queued runs stay queued and run on the new version.
-if web_post '{"hold":true}' >/dev/null 2>&1; then
+# Without the hold a run could start after the last check and be cut by the swap, so
+# stop here instead: the new image is built, but the running version is untouched.
+if HOLD="$(web_post '{"hold":true}' 2>/dev/null)" && [ "$HOLD" = '{"hold":true}' ]; then
   HELD=1
 else
-  echo "==> HOLD_FAILED — waiting for running tasks without it"
+  echo "==> HOLD_FAILED"
+  g -c advice.detachedHead=false checkout "$FROM"
+  exit 40
 fi
 wait_idle
 echo "==> STEP switching"

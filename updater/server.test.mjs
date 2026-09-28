@@ -1,6 +1,6 @@
 import { createServer, request as httpRequest } from "node:http";
 import { once } from "node:events";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -301,6 +301,60 @@ describe("updater", () => {
     await updater.idle();
     expect(calls).toEqual([["restore", "c".repeat(40)]]);
     expect(updater.status()).toMatchObject({ phase: "failed", message: "更新被中断了，原来的版本仍在运行。" });
+  });
+
+  it("retries a cut-off restore on the next start, and stops once it succeeded", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "updater-"));
+    writeFileSync(
+      join(dir, "status.json"),
+      JSON.stringify({ phase: "building", targetTag: "v2026.10.02", fromCommit: "c".repeat(40), startedAt: "x", finishedAt: null, message: "", logTail: "" }),
+    );
+    const boot = (code, calls) =>
+      createUpdater({
+        stateDir: dir,
+        runUpdate: (args) => {
+          calls.push(args);
+          return code === "hang" ? new Promise(() => {}) : Promise.resolve(code);
+        },
+        acquisitionsRunning: async () => false,
+        sleep: async () => {},
+        now: () => "2026-10-02T20:00:00.000Z",
+        waitPollMs: 1,
+        waitLimitMs: 1000,
+        repoCommit: () => "a".repeat(40),
+      });
+    // First start: the restore is killed before it finishes.
+    const first = [];
+    boot("hang", first);
+    expect(first).toEqual([["restore", "c".repeat(40)]]);
+    expect(JSON.parse(readFileSync(join(dir, "status.json"), "utf8"))).toMatchObject({ phase: "failed", pendingRestore: true });
+    // Second start: tried again, and it works.
+    const second = [];
+    const updater = boot(0, second);
+    await updater.idle();
+    expect(second).toEqual([["restore", "c".repeat(40)]]);
+    expect(JSON.parse(readFileSync(join(dir, "status.json"), "utf8")).pendingRestore).toBeUndefined();
+    // Third start: nothing left to do.
+    const third = [];
+    await boot(0, third).idle();
+    expect(third).toEqual([]);
+  });
+
+  it("writes status.json atomically, leaving no temp file behind", async () => {
+    const { updater, dir } = make();
+    updater.start("v2026.10.02");
+    await updater.idle();
+    expect(readdirSync(dir).sort()).toEqual(["status.json"]);
+  });
+
+  it("maps exit 40 (could not pause new tasks) to a failed update that says nothing was swapped", async () => {
+    const { updater } = make({ runUpdate: fakeRunner(["==> HOLD_FAILED"], 40) });
+    updater.start("v2026.10.02");
+    await updater.idle();
+    expect(updater.status()).toMatchObject({
+      phase: "failed",
+      message: "替换前没能让网页暂停开始新任务，这次先不更新了，原来的版本一直在运行。",
+    });
   });
 
   it("keeps a finished status across a restart", () => {

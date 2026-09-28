@@ -2,7 +2,7 @@
 // network only (no published port). One job at a time; status persisted to the state dir.
 import { execFileSync, spawn } from "node:child_process";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -96,6 +96,14 @@ export function readLimitedBody(stream, limit = MAX_BODY) {
   });
 }
 
+/** Write-then-rename in the same directory: a kill mid-write never leaves a truncated
+ *  status.json, which would drop the recorded commit a rollback needs. */
+function writeStatusFile(file, value) {
+  const tmp = `${file}.tmp`;
+  writeFileSync(tmp, JSON.stringify(value, null, 2));
+  renameSync(tmp, file);
+}
+
 export function createUpdater(opts) {
   const statusFile = join(opts.stateDir, "status.json");
   let status = idleStatus();
@@ -111,18 +119,28 @@ export function createUpdater(opts) {
   // decides what to do: after the swap began, the new version may be the one
   // serving, so go back to the recorded commit; before it, the old version never
   // stopped, but the deploy folder may be left on the new tag, so check it back out.
+  // `pendingRestore` stays in the file until the restore succeeds, so a second restart
+  // retries it; the phase already says the update failed and the old version kept running.
   let resume = null;
+  const from = typeof status.fromCommit === "string" && /^[0-9a-f]{40}$/.test(status.fromCommit) ? status.fromCommit : null;
   if (!TERMINAL_PHASES.has(status.phase)) {
-    const from = typeof status.fromCommit === "string" && /^[0-9a-f]{40}$/.test(status.fromCommit) ? status.fromCommit : null;
     const swapStarted = status.phase === "switching" || status.phase === "verifying";
     if (from && swapStarted) {
       resume = { mode: "rollback", commit: from };
       status = { ...status, phase: "switching", message: RESUME_ROLLBACK_MESSAGE, finishedAt: null };
     } else {
       if (from) resume = { mode: "restore", commit: from };
-      status = { ...status, phase: "failed", message: INTERRUPTED_MESSAGE, finishedAt: opts.now() };
+      status = {
+        ...status,
+        phase: "failed",
+        message: INTERRUPTED_MESSAGE,
+        finishedAt: opts.now(),
+        ...(from ? { pendingRestore: true } : {}),
+      };
     }
-    writeFileSync(statusFile, JSON.stringify(status, null, 2));
+    writeStatusFile(statusFile, status);
+  } else if (status.pendingRestore === true && from) {
+    resume = { mode: "restore", commit: from };
   }
   let job = null;
   const log = [];
@@ -133,7 +151,7 @@ export function createUpdater(opts) {
       status.message = PHASE_MESSAGES[patch.phase] ?? status.message;
     }
     status.logTail = log.slice(-40).join("\n");
-    writeFileSync(statusFile, JSON.stringify(status, null, 2));
+    writeStatusFile(statusFile, status);
   };
 
   // Whether the last probe failed, so the give-up message can say why.
@@ -156,6 +174,8 @@ export function createUpdater(opts) {
   }
 
   async function run(tag) {
+    const { pendingRestore: _stale, ...fresh } = status;
+    status = fresh;
     save({ phase: "waiting", targetTag: tag, fromCommit: null, startedAt: opts.now(), finishedAt: null });
     let waited = 0;
     while (await acquisitionsBusy()) {
@@ -191,7 +211,9 @@ export function createUpdater(opts) {
                   message:
                     "部署目录里有改过的文件，自动更新不会覆盖它们。请先还原或提交这些改动（git status 可以看到），再更新。",
                 }
-              : { phase: "failed" };
+              : code === 40
+                ? { phase: "failed", message: "替换前没能让网页暂停开始新任务，这次先不更新了，原来的版本一直在运行。" }
+                : { phase: "failed" };
     save({ ...outcome, finishedAt: opts.now() });
   }
 
@@ -202,7 +224,12 @@ export function createUpdater(opts) {
     });
     if (mode === "restore") {
       // The status already says the update was cut off and the old version kept running.
-      if (code !== 0) log.push("==> RESTORE_FAILED");
+      if (code === 0) {
+        const { pendingRestore: _done, ...rest } = status;
+        status = rest;
+      } else {
+        log.push("==> RESTORE_FAILED");
+      }
       save({});
       return;
     }
