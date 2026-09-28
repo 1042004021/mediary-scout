@@ -11,12 +11,20 @@ export const ACTIVE_UPDATER_PHASES: ReadonlySet<UpdaterPhase> = new Set<UpdaterP
   "verifying",
 ]);
 
+/**
+ * available — a newer release exists (see `available`).
+ * latest    — compared, nothing newer: running the newest release, or a build ahead of it.
+ * unknown   — could not compare: no stamped commit, or GitHub could not place the build.
+ * offline   — no release list (GitHub unreachable, or nothing released yet).
+ */
+export type UpdateStatus = "available" | "latest" | "unknown" | "offline";
+
 export interface UpdateView {
   current: { label: string; tag: string | null };
   /** The newest release strictly newer than what is running, or null. Never a downgrade. */
   available: ReleaseEntry | null;
+  status: UpdateStatus;
   releases: Array<ReleaseEntry & { isCurrent: boolean }>;
-  feedUnavailable: boolean;
   updater: UpdaterStatus | null;
 }
 
@@ -36,6 +44,13 @@ export function buildUpdateView(input: {
   } else if (newest && input.relation === "behind") {
     available = newest;
   }
+  const status: UpdateStatus = !newest
+    ? "offline"
+    : available
+      ? "available"
+      : currentRelease || input.relation === "ahead" || input.relation === "identical"
+        ? "latest"
+        : "unknown";
   return {
     current: currentRelease
       ? { label: currentRelease.tag, tag: currentRelease.tag }
@@ -46,8 +61,8 @@ export function buildUpdateView(input: {
           ? { label: `${short} · 比 ${newest.tag} 新的开发版本`, tag: null }
           : { label: `${short} · 开发版本`, tag: null },
     available,
+    status,
     releases: input.feed.map((release) => ({ ...release, isCurrent: release.tag === currentRelease?.tag })),
-    feedUnavailable: input.feed.length === 0,
     updater: input.updater,
   };
 }

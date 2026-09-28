@@ -47,8 +47,10 @@ export function UpdateTab({ view, desktop }: { view: UpdateView; desktop: boolea
           </div>
           {view.available ? (
             <span className="service-pill is-on">有新版本 {view.available.tag}</span>
-          ) : view.feedUnavailable ? (
+          ) : view.status === "offline" ? (
             <span className="service-pill is-off">暂时查不到新版本</span>
+          ) : view.status === "unknown" ? (
+            <span className="service-pill is-off">无法确认是否最新</span>
           ) : (
             <span className="service-pill">已是最新</span>
           )}
