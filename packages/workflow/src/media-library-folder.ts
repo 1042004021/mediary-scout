@@ -16,6 +16,14 @@ export function mediaLibraryFolderName(input: {
   return `${input.title} (${folderYear(input.year)}) {tmdb-${input.tmdbId}}`;
 }
 
+/** The `{tmdb-N}` suffix of a new-style folder, or null for a legacy name. */
+export function tmdbIdFromMediaLibraryFolderName(name: string): number | null {
+  const match = /\{tmdb-(\d+)\}$/.exec(name.trim());
+  if (!match?.[1]) return null;
+  const tmdbId = Number(match[1]);
+  return Number.isSafeInteger(tmdbId) ? tmdbId : null;
+}
+
 /** Pre-tmdb-suffix name. Kept so existing pan folders are reused, not duplicated. */
 export function legacyMediaLibraryFolderName(input: {
   title: string;

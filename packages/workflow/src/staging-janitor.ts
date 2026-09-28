@@ -1,7 +1,11 @@
 import type { WorkflowKind } from "./domain.js";
 import type { StorageExecutor } from "./ports.js";
 import { isActiveWorkflowStatus, type TrackedSeasonState, type WorkflowRepository } from "./repository.js";
-import { legacyMediaLibraryFolderName, mediaLibraryFolderName } from "./media-library-folder.js";
+import {
+  legacyMediaLibraryFolderName,
+  mediaLibraryFolderName,
+  tmdbIdFromMediaLibraryFolderName,
+} from "./media-library-folder.js";
 import { JANITOR_LIST_DEPTH } from "./staging-depth.js";
 
 /** Every kind. `blockIfTitleHasActiveRun` ignores staging_recovery so a user
@@ -185,14 +189,28 @@ function seasonsForShow(
   return byTitle.get(titleId)!.sort((a, b) => a.season.seasonNumber - b.season.seasonNumber);
 }
 
+/** tv and anime share TMDB's tv id namespace. A movie with the same number is a different title. */
+function tvNamespaceTitleIsTracked(states: TrackedSeasonState[], tmdbId: number): boolean {
+  return states.some(
+    (state) => state.title.tmdbId === tmdbId && (state.title.type === "tv" || state.title.type === "anime"),
+  );
+}
+
 async function sweepDrive(
   drive: StagingJanitorDrive,
   repository: SweepRepository,
   now: string,
   clock: StagingJanitorClock,
-): Promise<{ removed: number; queued: number; notRemoved: number; skippedDeep: number }> {
+): Promise<{
+  removed: number;
+  queued: number;
+  notRemoved: number;
+  skippedDeep: number;
+  removedUntracked: number;
+  skippedUnmatched: number;
+}> {
   if (drive.status !== "active" || !canSweep(drive.executor)) {
-    return { removed: 0, queued: 0, notRemoved: 0, skippedDeep: 0 };
+    return { removed: 0, queued: 0, notRemoved: 0, skippedDeep: 0, removedUntracked: 0, skippedUnmatched: 0 };
   }
   const executor = drive.executor;
   const pace = pacerFor(minIntervalMs(drive.provider), clock);
@@ -204,6 +222,8 @@ async function sweepDrive(
   let notRemoved = 0;
   let queued = 0;
   let skippedDeep = 0;
+  let removedUntracked = 0;
+  let skippedUnmatched = 0;
 
   const shows: Array<{ id: string; name: string; type: "tv" | "anime" }> = [];
   for (const category of [
@@ -253,9 +273,22 @@ async function sweepDrive(
           else notRemoved += 1;
           continue;
         }
-        if (queued >= RECOVERY_CAP) continue;
         const seasons = seasonsForShow(show, children, states, show.type);
-        if (!seasons || seasons.length === 0) continue;
+        // No season matched. A `{tmdb-N}` folder is untracked when this drive has
+        // no tv/anime season with that id. A legacy name, or a tracked id we
+        // failed to match, stays — deleting it might throw away a real title.
+        if (!seasons || seasons.length === 0) {
+          const tmdbId = tmdbIdFromMediaLibraryFolderName(show.name);
+          if (tmdbId !== null && !tvNamespaceTitleIsTracked(states, tmdbId)) {
+            const result = await pace(() => executor.removeDirectory(child.id));
+            if (result.removed) removedUntracked += 1;
+            else notRemoved += 1;
+          } else {
+            skippedUnmatched += 1;
+          }
+          continue;
+        }
+        if (queued >= RECOVERY_CAP) continue;
         if (busyTitles.has(seasons[0]!.title.id)) continue;
         const already = await repository.findActiveStagingRecovery({
           accountId: drive.accountId,
@@ -308,7 +341,7 @@ async function sweepDrive(
   }
 
   await repository.setAccountSetting(drive.accountId, cursorKey(drive.storageId), "");
-  return { removed, queued, notRemoved, skippedDeep };
+  return { removed, queued, notRemoved, skippedDeep, removedUntracked, skippedUnmatched };
 }
 
 /**
@@ -316,6 +349,8 @@ async function sweepDrive(
  * (empty wrapper folders included) is removed once its run is missing or finished
  * more than an hour ago. A non-empty one queues one silent `staging_recovery` run
  * — at most 5 per drive per sweep — and is never mentioned to the user.
+ * A non-empty leftover whose show folder is `{tmdb-N}`, and this drive no longer
+ * tracks that tv/anime id, is removed too (the staging dir only, not the show).
  *
  * ponytail: one fresh executor per drive, so the 115 guard still caps a single
  * sweep (~295 listings). A listing throw stores `staging_janitor_cursor:<storageId>`
@@ -338,8 +373,12 @@ export async function sweepOrphanStagingDirs(input: {
         counts.notRemoved > 0
           ? `removed ${counts.removed} empty (${counts.notRemoved} could not be removed)`
           : `removed ${counts.removed} empty`;
+      const untracked = counts.removedUntracked > 0 ? `, removed ${counts.removedUntracked} untracked` : "";
+      const unmatched = counts.skippedUnmatched > 0 ? `, skipped ${counts.skippedUnmatched} unmatched` : "";
       const deep = counts.skippedDeep > 0 ? `, skipped ${counts.skippedDeep} deep` : "";
-      log(`[patrol] staging janitor ${drive.storageId}: ${removal}, queued ${counts.queued} recovery${deep}`);
+      log(
+        `[patrol] staging janitor ${drive.storageId}: ${removal}, queued ${counts.queued} recovery${untracked}${unmatched}${deep}`,
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       log(`[patrol] staging janitor ${drive.storageId}: failed: ${message}`);

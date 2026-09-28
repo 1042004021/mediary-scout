@@ -1043,6 +1043,186 @@ describe("sweepOrphanStagingDirs", () => {
     expect(queued[0]?.workflowRun.auditEvents.some((event) => event.data?.["stagingDirectoryId"] === "stg-file")).toBe(true);
   });
 
+  it("removes a settled non-empty leftover under an untracked {tmdb-N} show and leaves the show", async () => {
+    const repo = new InMemoryWorkflowRepository();
+    const disk = memoryDrive({
+      dirs: [
+        { id: "tv", name: "TV", parentId: "root" },
+        { id: "show", name: "Gone Show (2020) {tmdb-77}", parentId: "tv" },
+        { id: "season", name: "Season 01", parentId: "show" },
+        { id: "stg", name: "staging-run-gone", parentId: "show" },
+      ],
+      files: [{ dirId: "stg", path: "a.mkv", providerFileId: "a", sizeBytes: 2 * 1024 * 1024 }],
+    });
+    const logs: string[] = [];
+    await sweepOrphanStagingDirs({
+      repository: repo,
+      now: NOW,
+      log: (line) => logs.push(line),
+      drives: [drive({ storageId: "drive-untracked", executor: disk.executor })],
+    });
+    expect(disk.removed).toEqual(["stg"]);
+    expect(disk.dirs.map((dir) => dir.id).sort()).toEqual(["season", "show", "tv"]);
+    expect(await recoveriesOf(repo, "drive-untracked")).toEqual([]);
+    expect(await repo.listNotifications({ accountId: "acct" })).toEqual([]);
+    expect(
+      logs.some((line) => /drive-untracked: removed 0 empty, queued 0 recovery, removed 1 untracked/.test(line)),
+    ).toBe(true);
+  });
+
+  it("does not remove a {tmdb-N} leftover when that id is tracked but the folder does not match", async () => {
+    const repo = new InMemoryWorkflowRepository();
+    await saveTracked(repo, "drive-mismatch", "other-show", "Real Show", 42);
+    const disk = memoryDrive({
+      dirs: [
+        { id: "tv", name: "TV", parentId: "root" },
+        { id: "show", name: "Wrong Name (1999) {tmdb-42}", parentId: "tv" },
+        { id: "season", name: "Season 01", parentId: "show" },
+        { id: "stg", name: "staging-run-old", parentId: "show" },
+      ],
+      files: [{ dirId: "stg", path: "a.mkv", providerFileId: "a", sizeBytes: 1024 * 1024 }],
+    });
+    const logs: string[] = [];
+    await sweepOrphanStagingDirs({
+      repository: repo,
+      now: NOW,
+      log: (line) => logs.push(line),
+      drives: [drive({ storageId: "drive-mismatch", executor: disk.executor })],
+    });
+    expect(disk.removed).toEqual([]);
+    expect(disk.dirs.some((dir) => dir.id === "stg")).toBe(true);
+    expect(await recoveriesOf(repo, "drive-mismatch")).toEqual([]);
+    expect(
+      logs.some((line) => /drive-mismatch: removed 0 empty, queued 0 recovery, skipped 1 unmatched/.test(line)),
+    ).toBe(true);
+  });
+
+  it("leaves a legacy show name with no {tmdb-N} and no match, and counts it as skipped", async () => {
+    const repo = new InMemoryWorkflowRepository();
+    const disk = memoryDrive({
+      dirs: [
+        { id: "tv", name: "TV", parentId: "root" },
+        { id: "show", name: "Legacy Show (2020)", parentId: "tv" },
+        { id: "stg", name: "staging-run-legacy", parentId: "show" },
+      ],
+      files: [{ dirId: "stg", path: "a.mkv", providerFileId: "a", sizeBytes: 1024 * 1024 }],
+    });
+    const logs: string[] = [];
+    await sweepOrphanStagingDirs({
+      repository: repo,
+      now: NOW,
+      log: (line) => logs.push(line),
+      drives: [drive({ storageId: "drive-legacy", executor: disk.executor })],
+    });
+    expect(disk.removed).toEqual([]);
+    expect(disk.dirs.some((dir) => dir.id === "stg")).toBe(true);
+    expect(await recoveriesOf(repo, "drive-legacy")).toEqual([]);
+    expect(
+      logs.some((line) => /drive-legacy: removed 0 empty, queued 0 recovery, skipped 1 unmatched/.test(line)),
+    ).toBe(true);
+  });
+
+  it("does not remove an untracked {tmdb-N} leftover that has a subdirectory at the depth limit", async () => {
+    const repo = new InMemoryWorkflowRepository();
+    const removed: string[] = [];
+    const logs: string[] = [];
+    const deepPath = Array.from({ length: 10 }, (_, index) => `L${index + 1}`).join("/");
+    await sweepOrphanStagingDirs({
+      repository: repo,
+      now: NOW,
+      log: (line) => logs.push(line),
+      drives: [
+        drive({
+          storageId: "drive-untracked-deep",
+          executor: {
+            async listChildDirectories(parentId: string) {
+              if (parentId === "tv") return [{ id: "show", name: "Gone Show (2020) {tmdb-77}" }];
+              if (parentId === "show") return [{ id: "stg-deep", name: "staging-run-deep" }];
+              return [];
+            },
+            async listTree() {
+              return [{ path: "a.mkv", providerFileId: "seen", sizeBytes: 1024 * 1024 }];
+            },
+            async listSubdirectories() {
+              return [{ id: "bottom", path: deepPath }];
+            },
+            async removeDirectory(id: string) {
+              removed.push(id);
+              return { removed: true };
+            },
+          },
+        }),
+      ],
+    });
+    expect(removed).toEqual([]);
+    expect(await recoveriesOf(repo, "drive-untracked-deep")).toEqual([]);
+    expect(
+      logs.some((line) => /drive-untracked-deep: removed 0 empty, queued 0 recovery, skipped 1 deep/.test(line)),
+    ).toBe(true);
+  });
+
+  it("does not remove a {tmdb-N} leftover when that id is still tracked as anime", async () => {
+    const repo = new InMemoryWorkflowRepository();
+    await repo.saveWorkflowRunSnapshot({
+      accountId: "acct",
+      connectedStorageId: "drive-anime-id",
+      title: {
+        id: "title_anime",
+        tmdbId: 77,
+        type: "anime",
+        title: "Anime Show",
+        originalTitle: "Anime Show",
+        year: 2024,
+        aliases: [],
+      },
+      season: {
+        id: "title_anime_s1",
+        mediaTitleId: "title_anime",
+        seasonNumber: 1,
+        status: "active",
+        qualityPreference: "1080p",
+        storageDirectoryId: "anime-show",
+        totalEpisodes: 1,
+        latestAiredEpisode: 1,
+        latestAiredSource: "metadata",
+      },
+      workflowRun: {
+        id: "done-anime",
+        kind: "type3_monitor",
+        status: "succeeded",
+        trackedSeasonId: "title_anime_s1",
+        startedAt: "2026-09-26T00:00:00.000Z",
+        finishedAt: "2026-09-26T01:00:00.000Z",
+        auditEvents: [],
+      },
+      episodes: [],
+      resourceSnapshots: [],
+      decisions: [],
+      transferAttempts: [],
+      notifications: [],
+    });
+    const disk = memoryDrive({
+      dirs: [
+        { id: "tv", name: "TV", parentId: "root" },
+        { id: "show", name: "Gone Show (2020) {tmdb-77}", parentId: "tv" },
+        { id: "stg", name: "staging-run-anime-id", parentId: "show" },
+      ],
+      files: [{ dirId: "stg", path: "a.mkv", providerFileId: "a", sizeBytes: 1024 * 1024 }],
+    });
+    const logs: string[] = [];
+    await sweepOrphanStagingDirs({
+      repository: repo,
+      now: NOW,
+      log: (line) => logs.push(line),
+      drives: [drive({ storageId: "drive-anime-id", executor: disk.executor })],
+    });
+    expect(disk.removed).toEqual([]);
+    expect(await recoveriesOf(repo, "drive-anime-id")).toEqual([]);
+    expect(
+      logs.some((line) => /drive-anime-id: removed 0 empty, queued 0 recovery, skipped 1 unmatched/.test(line)),
+    ).toBe(true);
+  });
+
   it("does not touch a drive whose executor cannot list and remove", async () => {
     const repo = new InMemoryWorkflowRepository();
     let listed = false;
