@@ -1,4 +1,15 @@
-import { app, BrowserWindow, Tray, Menu, dialog, nativeImage, type MenuItemConstructorOptions } from "electron";
+import {
+  app,
+  BrowserWindow,
+  Tray,
+  Menu,
+  Notification,
+  dialog,
+  nativeImage,
+  net,
+  shell,
+  type MenuItemConstructorOptions,
+} from "electron";
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -18,12 +29,29 @@ import {
   agentManifestPath,
   writeAgentManifest,
 } from "./agent-manifest.js";
+import { APP_ID } from "./app-identity.js";
+import { linkTarget } from "./external-links.js";
+import {
+  RELEASES_LATEST_URL,
+  decideUpdateNotice,
+  parseLatestRelease,
+  shouldCheckForUpdate,
+  type LatestRelease,
+} from "./update-check.js";
 
 let serverProc: ChildProcess | null = null;
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let isQuitting = false;
 let serverBooted = false;
+// A newer published release, once a check has found one (tray item + notification).
+let offeredUpdate: LatestRelease | null = null;
+let lastUpdateCheckAt: number | null = null;
+// Held so its click handler is not garbage-collected with it.
+let updateNotification: Notification | null = null;
+
+const FIRST_UPDATE_CHECK_DELAY_MS = 60_000;
+const UPDATE_TICK_MS = 60 * 60_000;
 
 // Single-instance lock: a 2nd launch focuses the existing window instead of
 // spawning a second server (which would fight over the SQLite DB + patrol).
@@ -31,6 +59,10 @@ const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
+  // Windows shows a notification only when this matches the AppUserModelID on the Start
+  // Menu shortcut, which electron-builder's NSIS sets to the appId.
+  if (process.platform === "win32") app.setAppUserModelId(APP_ID);
+
   app.on("second-instance", () => {
     if (mainWindow) {
       if (mainWindow.isMinimized()) mainWindow.restore();
@@ -70,6 +102,7 @@ async function bootstrap(): Promise<void> {
   const url = await startServer();
   createWindow(url);
   createTray();
+  startUpdateChecks();
 }
 
 async function startServer(): Promise<string> {
@@ -155,6 +188,19 @@ function createWindow(url: string): void {
     title: "巡影 · Mediary Scout",
     show: true,
   });
+  const serverOrigin = new URL(url).origin;
+  // Links out of the app (GitHub, 请作者喝杯咖啡, installer downloads) open in the system
+  // browser; Electron would otherwise open them in a new app window.
+  mainWindow.webContents.setWindowOpenHandler(({ url: target }) => {
+    const kind = linkTarget(target, serverOrigin);
+    if (kind === "external") void shell.openExternal(target).catch(() => undefined);
+    return kind === "app" ? { action: "allow" } : { action: "deny" };
+  });
+  mainWindow.webContents.on("will-navigate", (event) => {
+    if (linkTarget(event.url, serverOrigin) !== "external") return;
+    event.preventDefault();
+    void shell.openExternal(event.url).catch(() => undefined);
+  });
   mainWindow.on("close", (event) => {
     const decision = onWindowClose({ isQuitting });
     if (decision.preventDefault) event.preventDefault();
@@ -186,6 +232,7 @@ function refreshTray(): void {
     // spawn() returns (before the health check passes), so serverProc would falsely show
     // "running" during startup / after an early crash.
     serverReady: serverBooted,
+    update: offeredUpdate ? { tag: offeredUpdate.tag } : null,
   });
   const template: MenuItemConstructorOptions[] = state.items.map((item: TrayItem) => ({
     id: item.id,
@@ -204,6 +251,8 @@ function handleTrayClick(id: TrayItem["id"]): void {
   if (id === "open") {
     mainWindow?.show();
     mainWindow?.focus();
+  } else if (id === "update") {
+    if (offeredUpdate) void shell.openExternal(offeredUpdate.pageUrl).catch(() => undefined);
   } else if (id === "openAtLogin") {
     const next = !app.getLoginItemSettings().openAtLogin;
     app.setLoginItemSettings({ openAtLogin: next });
@@ -211,5 +260,67 @@ function handleTrayClick(id: TrayItem["id"]): void {
   } else if (id === "quit") {
     isQuitting = true;
     app.quit();
+  }
+}
+
+/** Packaged builds only: a dev build reports the repo's placeholder version. */
+function startUpdateChecks(): void {
+  if (!app.isPackaged) return;
+  setTimeout(() => void checkForUpdate(), FIRST_UPDATE_CHECK_DELAY_MS);
+  // Hourly against the wall clock: a laptop that slept through the day still checks when it wakes.
+  setInterval(() => {
+    if (shouldCheckForUpdate({ now: Date.now(), lastCheckedAt: lastUpdateCheckAt })) void checkForUpdate();
+  }, UPDATE_TICK_MS);
+}
+
+async function checkForUpdate(): Promise<void> {
+  try {
+    // Electron's network stack: follows the system proxy settings, unlike Node's fetch.
+    const response = await net.fetch(RELEASES_LATEST_URL, {
+      headers: { accept: "application/vnd.github+json", "user-agent": `mediary-scout-desktop/${app.getVersion()}` },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!response.ok) {
+      console.log(`[update] check failed: HTTP ${response.status}`);
+      return;
+    }
+    const latest = parseLatestRelease(await response.json());
+    lastUpdateCheckAt = Date.now();
+    const notice = decideUpdateNotice({ latest, currentVersion: app.getVersion(), notifiedTag: readNotifiedTag() });
+    offeredUpdate = notice.offer;
+    refreshTray();
+    console.log(`[update] ${notice.offer ? `offering ${notice.offer.tag}` : `up to date (${app.getVersion()})`}`);
+    if (notice.notify && notice.offer) showUpdateNotification(notice.offer);
+  } catch (error) {
+    // Offline or rate-limited: the hourly tick tries again.
+    console.log(`[update] check failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function showUpdateNotification(update: LatestRelease): void {
+  if (!Notification.isSupported()) return;
+  updateNotification = new Notification({ title: "巡影有新版本", body: `${update.tag} 已发布，点这里查看和下载。` });
+  updateNotification.on("click", () => void shell.openExternal(update.pageUrl).catch(() => undefined));
+  updateNotification.show();
+  writeNotifiedTag(update.tag);
+}
+
+function notifiedTagPath(): string {
+  return path.join(app.getPath("userData"), "update-notified-tag");
+}
+
+function readNotifiedTag(): string | null {
+  try {
+    return readFileSync(notifiedTagPath(), "utf8").trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function writeNotifiedTag(tag: string): void {
+  try {
+    writeFileSync(notifiedTagPath(), `${tag}\n`);
+  } catch {
+    // Not fatal: the notice would show once more on the next launch.
   }
 }
