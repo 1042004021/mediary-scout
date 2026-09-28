@@ -1,6 +1,7 @@
 import { Suspense } from "react";
 import { AppSidebar } from "../../components/app-sidebar";
 import { ActivityFeed } from "../../components/activity-feed";
+import { GitHubNameplate } from "../../components/github-nameplate";
 import { resolveGlobalWorkspace } from "../../lib/workflow-runtime";
 
 // `searchParams` (the active drive `?w`) is a dynamic input + a DB read. Reading it
@@ -44,6 +45,7 @@ async function ActivitySurface({ searchParams }: { searchParams: Promise<{ w?: s
             Suspense'd async server component — those don't hydrate, which froze the
             live poll). It self-fetches /api/activity on mount and polls. */}
         <ActivityFeed storageId={workspace.activeStorageId} />
+        <GitHubNameplate />
       </main>
     </div>
   );

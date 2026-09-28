@@ -1,11 +1,12 @@
 import Link from "next/link";
 import { SupportAuthorLink } from "./support-author-link";
 
-/** Small open-source nameplate at the bottom of the Settings page — a quiet
- * 暗记 + CTA: self-hosters who dig into Settings are exactly the audience for
- *  "this is open source, here's the repo". Shows on both demo and self-hosted
- *  (demo visitors are potential self-hosters too). No star count (new repo,
- *  thin numbers look bleak) — just the GitHub mark + a one-line pitch. */
+/** Small open-source nameplate at the bottom of every app page's main column
+ *  (search / library, show detail, activity, notifications, settings) — a quiet
+ *  暗记 + CTA: "this is open source, here's the repo", plus the tip link. Shows on
+ *  both demo and self-hosted (demo visitors are potential self-hosters too). No star
+ *  count (new repo, thin numbers look bleak) — just the GitHub mark + a one-line
+ *  pitch. Loading skeletons leave it out. */
 export function GitHubNameplate() {
   return (
     <footer className="github-nameplate">
