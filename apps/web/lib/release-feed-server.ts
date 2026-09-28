@@ -22,7 +22,7 @@ export interface ReleaseEntry {
   notes: ReleaseNote[];
 }
 
-/** The newest Release published on GitHub with installers: what desktop users can download. */
+/** The newest Release that already has both installers: what desktop users can download. */
 export interface DesktopRelease {
   tag: string;
   pageUrl: string;
@@ -115,7 +115,9 @@ export async function fetchReleaseFeed(fetchImpl: typeof fetch = fetch): Promise
   return feed;
 }
 
-/** Null when GitHub is unreachable or the latest release is not a date release (e.g. v1.4.1).
+/** Null when GitHub is unreachable, the latest release is not a date release (e.g. v1.4.1),
+ *  or it does not yet include both a .dmg and an .exe from this repo. The release is created
+ *  before the assets finish uploading.
  *  Cached like the feed: an hour after success, five minutes after a failure. */
 export async function fetchLatestDesktopRelease(fetchImpl: typeof fetch = fetch): Promise<DesktopRelease | null> {
   if (desktopCache && Date.now() - desktopCache.at < desktopCache.ttl) return desktopCache.release;
@@ -149,10 +151,14 @@ function desktopReleaseFrom(body: unknown): DesktopRelease | null {
     }
     return null;
   };
+  const dmgUrl = installer(".dmg");
+  const exeUrl = installer(".exe");
+  // One asset can be missing for a minute while the upload finishes, or for good if it failed.
+  if (!dmgUrl || !exeUrl) return null;
   return {
     tag: data.tag_name,
     pageUrl: `https://github.com/${REPO}/releases/tag/${data.tag_name}`,
-    dmgUrl: installer(".dmg"),
-    exeUrl: installer(".exe"),
+    dmgUrl,
+    exeUrl,
   };
 }

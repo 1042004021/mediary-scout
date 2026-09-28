@@ -11,15 +11,36 @@ export interface LatestRelease {
   pageUrl: string;
 }
 
-/** GitHub's releases/latest body → the release, or null when it is not a date release (v1.4.1).
- *  The page URL is built from the checked tag, never taken from the response. */
+/** Installers are only trusted from this repo's own release downloads. */
+const DOWNLOAD_PREFIX = "https://github.com/fancydirty/mediary-scout/releases/download/";
+
+/** GitHub's releases/latest body → the release, or null when it is not a date release (v1.4.1)
+ *  or it does not yet include both a .dmg and an .exe from this repo. The release is created
+ *  before the assets finish uploading. The page URL is built from the checked tag, never taken
+ *  from the response. */
 export function parseLatestRelease(body: unknown): LatestRelease | null {
   if (!body || typeof body !== "object") return null;
-  const tag = (body as { tag_name?: unknown }).tag_name;
+  const data = body as { tag_name?: unknown; assets?: unknown };
+  const tag = data.tag_name;
   if (typeof tag !== "string") return null;
   const version = appVersionFromTag(tag);
   if (!version) return null;
+  if (!hasOwnInstaller(data.assets, ".dmg") || !hasOwnInstaller(data.assets, ".exe")) return null;
   return { tag, version, pageUrl: `https://github.com/fancydirty/mediary-scout/releases/tag/${tag}` };
+}
+
+function hasOwnInstaller(assets: unknown, extension: string): boolean {
+  if (!Array.isArray(assets)) return false;
+  return assets.some((asset) => {
+    if (!asset || typeof asset !== "object") return false;
+    const item = asset as { name?: unknown; browser_download_url?: unknown };
+    return (
+      typeof item.name === "string" &&
+      item.name.endsWith(extension) &&
+      typeof item.browser_download_url === "string" &&
+      item.browser_download_url.startsWith(DOWNLOAD_PREFIX)
+    );
+  });
 }
 
 /** Offer only a newer release, and notify once per release. */

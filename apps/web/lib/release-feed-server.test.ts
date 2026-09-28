@@ -130,11 +130,27 @@ describe("fetchLatestDesktopRelease", () => {
         status: 200,
         body: JSON.stringify({
           tag_name: "v2026.10.02",
-          assets: [{ name: "a.dmg", browser_download_url: "https://elsewhere.example/a.dmg" }],
+          assets: [
+            { name: "a.dmg", browser_download_url: "https://elsewhere.example/a.dmg" },
+            { name: "a.exe", browser_download_url: "https://elsewhere.example/a.exe" },
+          ],
         }),
       },
     });
-    expect(await fetchLatestDesktopRelease(elsewhere)).toMatchObject({ tag: "v2026.10.02", dmgUrl: null, exeUrl: null });
+    expect(await fetchLatestDesktopRelease(elsewhere)).toBeNull();
+  });
+
+  it("returns null when only the .exe uploaded so far", async () => {
+    const onlyExe = fakeFetch({
+      [LATEST]: {
+        status: 200,
+        body: JSON.stringify({
+          tag_name: "v2026.10.02",
+          assets: [asset("Mediary.Scout.Setup.2026.1002.0.exe")],
+        }),
+      },
+    });
+    expect(await fetchLatestDesktopRelease(onlyExe)).toBeNull();
   });
 
   it("returns null when GitHub is unreachable, and caches the failure", async () => {

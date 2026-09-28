@@ -7,14 +7,34 @@ import {
 } from "../src/update-check.js";
 
 const PAGE = "https://github.com/fancydirty/mediary-scout/releases/tag/v2026.10.02";
+const DOWNLOAD = "https://github.com/fancydirty/mediary-scout/releases/download/v2026.10.02";
+const asset = (name: string, url = `${DOWNLOAD}/${name}`) => ({ name, browser_download_url: url });
 
 describe("parseLatestRelease", () => {
-  it("reads a date release and links its release page on GitHub", () => {
-    expect(parseLatestRelease({ tag_name: "v2026.10.02", html_url: "https://elsewhere.example/x" })).toEqual({
+  it("reads a date release that has both installers and links its release page on GitHub", () => {
+    expect(
+      parseLatestRelease({
+        tag_name: "v2026.10.02",
+        html_url: "https://elsewhere.example/x",
+        assets: [asset("Mediary.Scout-2026.1002.0-arm64.dmg"), asset("Mediary.Scout.Setup.2026.1002.0.exe")],
+      }),
+    ).toEqual({
       tag: "v2026.10.02",
       version: "2026.1002.0",
       pageUrl: PAGE,
     });
+  });
+
+  it("ignores a date release until both installers are on this repo's download URL", () => {
+    expect(parseLatestRelease({ tag_name: "v2026.10.02", assets: [] })).toBeNull();
+    expect(parseLatestRelease({ tag_name: "v2026.10.02", assets: [asset("a.dmg")] })).toBeNull();
+    expect(parseLatestRelease({ tag_name: "v2026.10.02", assets: [asset("a.exe")] })).toBeNull();
+    expect(
+      parseLatestRelease({
+        tag_name: "v2026.10.02",
+        assets: [asset("a.dmg", "https://elsewhere.example/a.dmg"), asset("a.exe", "https://elsewhere.example/a.exe")],
+      }),
+    ).toBeNull();
   });
 
   it("ignores anything that is not a date release", () => {
