@@ -93,6 +93,16 @@ describe("getInProgressTitles", () => {
     expect(await hub.getInProgressTitles()).toEqual([]);
   });
 
+  it("a staging recovery is not a 获取中 card and does not mark the show page acquiring", async () => {
+    const owned = title(42, "Owned");
+    await saveRun(repo, owned, season(owned, 1), { id: "seed_42", kind: "type2_init", status: "succeeded", obtained: true });
+    await saveRun(repo, owned, season(owned, 1), { id: "rec_42", kind: "staging_recovery", status: "running", obtained: true });
+
+    expect(await hub.getInProgressTitles()).toEqual([]);
+    const view = await hub.getTitleHubView(42);
+    expect(view?.acquiring).toBe(false);
+  });
+
   it("a title still being fetched is 获取中 — also when a replace run of it is queued too", async () => {
     const fresh = title(7, "Fresh");
     await saveRun(repo, fresh, season(fresh, 1), { id: "run_7", kind: "type2_init", status: "queued", obtained: false });

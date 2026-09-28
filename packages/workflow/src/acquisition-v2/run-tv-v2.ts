@@ -60,6 +60,8 @@ export interface RunTvAcquisitionV2Request {
   rejectedLookup?: RunAcquisitionV2WorkflowRequest["rejectedLookup"];
   /** See orchestrator.linkHistory. */
   linkHistory?: RunAcquisitionV2WorkflowRequest["linkHistory"];
+  /** Leftover staging dir adopted as this run's staging. See workflow-v2. */
+  stagingRecovery?: { showDirectoryId: string; stagingDirectoryId: string };
   onProgress?: (event: AgentToolEvent) => void;
   now?: () => string;
 }
@@ -109,12 +111,13 @@ export async function runTvAcquisitionV2(request: RunTvAcquisitionV2Request): Pr
     ...(request.protectExisting ? { protectExisting: request.protectExisting } : {}),
     ...(request.rejectedLookup ? { rejectedLookup: request.rejectedLookup } : {}),
     ...(request.linkHistory ? { linkHistory: request.linkHistory } : {}),
+    ...(request.stagingRecovery ? { stagingRecovery: request.stagingRecovery } : {}),
     ...(request.onProgress ? { onProgress: request.onProgress } : {}),
   });
 
   const bridged = bridgeV2WorkflowToResult({
     title: request.title,
-    mode: request.mode,
+    mode: request.stagingRecovery ? "staging_recovery" : request.mode,
     seasons: request.seasons,
     v2,
     workflowRunId: request.workflowRunId,

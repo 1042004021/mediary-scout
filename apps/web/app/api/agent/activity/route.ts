@@ -1,4 +1,5 @@
 import { connection, NextResponse, type NextRequest } from "next/server";
+import { isUserVisibleWorkflowKind } from "@media-track/workflow";
 import { agentApiGuard } from "../../../../lib/agent-api/guard";
 import { getOwnerAccountId } from "../../../../lib/agent-api/owner";
 import { getWorkflowRepository, notificationWindowSince } from "../../../../lib/workflow-runtime";
@@ -14,12 +15,16 @@ export async function GET(request: NextRequest) {
   const limit = Math.min(Number(url.searchParams.get("limit")) || 20, 100);
 
   const repository = getWorkflowRepository();
-  const activeRuns = await repository.listActiveWorkflowRuns(accountId);
-  const notifications = await repository.listNotifications({
-    accountId,
-    since: notificationWindowSince(),
-    limit,
-  });
+  const activeRuns = (await repository.listActiveWorkflowRuns(accountId)).filter((snapshot) =>
+    isUserVisibleWorkflowKind(snapshot.workflowRun.kind),
+  );
+  const notifications = (
+    await repository.listNotifications({
+      accountId,
+      since: notificationWindowSince(),
+      limit,
+    })
+  ).filter((notification) => notification.kind !== "staging_recovery" && notification.kind !== "staging_leftover");
 
   const active = activeRuns.map((snapshot) => ({
     workflowRunId: snapshot.workflowRun.id,

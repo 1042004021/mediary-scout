@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { InMemoryWorkflowRepository, sweepOrphanStagingDirs, type StagingJanitorDrive } from "../src/index.js";
 import type { WorkflowRun } from "../src/domain.js";
+import type { PersistedWorkflowRunSnapshot } from "../src/repository.js";
 
 const NOW = "2026-09-27T03:00:00.000Z";
 
@@ -115,6 +116,67 @@ async function saveRun(
   });
 }
 
+/** A finished run so the show dir id is a tracked season's storage dir, and the title is not active. */
+async function saveTracked(
+  repo: InMemoryWorkflowRepository,
+  storageId: string,
+  showId: string,
+  titleName: string,
+  tmdbId: number,
+): Promise<void> {
+  const titleId = `title_${tmdbId}`;
+  await repo.saveWorkflowRunSnapshot({
+    accountId: "acct",
+    connectedStorageId: storageId,
+    title: {
+      id: titleId,
+      tmdbId,
+      type: "tv",
+      title: titleName,
+      originalTitle: titleName,
+      year: 2024,
+      aliases: [],
+    },
+    season: {
+      id: `${titleId}_s1`,
+      mediaTitleId: titleId,
+      seasonNumber: 1,
+      status: "active",
+      qualityPreference: "1080p",
+      storageDirectoryId: showId,
+      totalEpisodes: 1,
+      latestAiredEpisode: 1,
+      latestAiredSource: "metadata",
+    },
+    workflowRun: {
+      id: `done-${tmdbId}`,
+      kind: "type3_monitor",
+      status: "succeeded",
+      trackedSeasonId: `${titleId}_s1`,
+      startedAt: "2026-09-26T00:00:00.000Z",
+      finishedAt: "2026-09-26T01:00:00.000Z",
+      auditEvents: [],
+    },
+    episodes: [],
+    resourceSnapshots: [],
+    decisions: [],
+    transferAttempts: [],
+    notifications: [],
+  });
+}
+
+function stagingDir(run: PersistedWorkflowRunSnapshot): string {
+  const event = run.workflowRun.auditEvents.find((item) => item.type === "staging_recovery_queued");
+  const id = event?.data?.["stagingDirectoryId"];
+  return typeof id === "string" ? id : "";
+}
+
+async function recoveriesOf(repo: InMemoryWorkflowRepository, storageId: string): Promise<PersistedWorkflowRunSnapshot[]> {
+  return (await repo.listActiveWorkflowRuns({ accountId: "acct", connectedStorageId: storageId })).filter(
+    (run) => run.workflowRun.kind === "staging_recovery",
+  );
+}
+
 function library() {
   return memoryDrive({
     dirs: [
@@ -137,7 +199,7 @@ function library() {
 }
 
 describe("sweepOrphanStagingDirs", () => {
-  it("removes empty orphans, keeps and reports a non-empty orphan once, and leaves an active run plus non-staging dirs alone", async () => {
+  it("removes empty orphans, does not queue a recovery while the title has an active run, and never notifies", async () => {
     const repo = new InMemoryWorkflowRepository();
     await saveRun(repo, { id: "run-active", status: "running" });
     const disk = library();
@@ -157,24 +219,18 @@ describe("sweepOrphanStagingDirs", () => {
     );
     expect(disk.dirs.some((dir) => dir.id === "stg-empty")).toBe(false);
 
-    const notes = (await repo.listNotifications({ accountId: "acct" })).filter(
-      (note) => note.kind === "staging_leftover",
+    expect(await repo.listNotifications({ accountId: "acct" })).toEqual([]);
+    const recoveries = (await repo.listActiveWorkflowRuns({ accountId: "acct", connectedStorageId: "drive-good" })).filter(
+      (run) => run.workflowRun.kind === "staging_recovery",
     );
-    expect(notes).toHaveLength(1);
-    expect(notes[0]?.title).toBe("网盘暂存目录残留（1 个）");
-    expect(notes[0]?.body).toContain("Show A / staging-run-full：2 个文件，3 MB");
-    expect(notes[0]?.body).toContain("这些文件不在季目录里，请到网盘手动处理。");
-
+    expect(recoveries).toEqual([]);
     const tracked = await repo.listTrackedSeasonStates("acct");
     expect(tracked.some((state) => state.title.id.startsWith("staging-janitor"))).toBe(false);
     expect(tracked.some((state) => state.title.id === "title_show")).toBe(true);
-    expect(logs.some((line) => /drive-good: removed 2 empty, reported 1 non-empty/.test(line))).toBe(true);
+    expect(logs.some((line) => /drive-good: removed 2 empty, queued 0 recovery/.test(line))).toBe(true);
 
     await sweepOrphanStagingDirs({ repository: repo, drives: [good], now: NOW, log: () => undefined });
-    const again = (await repo.listNotifications({ accountId: "acct" })).filter(
-      (note) => note.kind === "staging_leftover",
-    );
-    expect(again).toHaveLength(1);
+    expect(await repo.listNotifications({ accountId: "acct" })).toEqual([]);
     expect(disk.dirs.some((dir) => dir.id === "stg-full")).toBe(true);
     expect(disk.removed.filter((id) => id === "stg-full")).toEqual([]);
   });
@@ -212,7 +268,7 @@ describe("sweepOrphanStagingDirs", () => {
       ],
     });
     expect(disk.removed).toEqual(["stg-empty"]);
-    expect(logs.some((line) => /drive-next: removed 1 empty, reported 0 non-empty/.test(line))).toBe(true);
+    expect(logs.some((line) => /drive-next: removed 1 empty, queued 0 recovery/.test(line))).toBe(true);
     expect(logs.some((line) => /drive-broken: failed: drive down/.test(line))).toBe(true);
   });
 
@@ -234,7 +290,7 @@ describe("sweepOrphanStagingDirs", () => {
     expect(disk.dirs.some((dir) => dir.id === "stg-empty")).toBe(true);
   });
 
-  it("reports every newly found non-empty orphan of one drive in a single notification", async () => {
+  it("queues one staging_recovery for a settled non-empty orphan and does not queue it again", async () => {
     const repo = new InMemoryWorkflowRepository();
     const disk = memoryDrive({
       dirs: [
@@ -249,28 +305,21 @@ describe("sweepOrphanStagingDirs", () => {
         { dirId: "stg-b", path: "b.mkv", providerFileId: "b", sizeBytes: 1024 * 1024 },
       ],
     });
+    await saveTracked(repo, "drive-batch", "showA", "Show A", 11);
+    await saveTracked(repo, "drive-batch", "showB", "Show B", 12);
     const good = drive({ storageId: "drive-batch", executor: disk.executor });
     await sweepOrphanStagingDirs({ repository: repo, drives: [good], now: "2026-09-27T03:00:00.000Z" });
-    const first = (await repo.listNotifications({ accountId: "acct" })).filter((note) => note.kind === "staging_leftover");
-    expect(first).toHaveLength(1);
-    expect(first[0]?.title).toBe("网盘暂存目录残留（2 个）");
-    expect(first[0]?.body).toContain("Show A / staging-run-a：1 个文件，2 MB");
-    expect(first[0]?.body).toContain("Show B / staging-run-b：1 个文件，1 MB");
-    expect(first[0]?.id).toContain("2026-09-27T03:00:00.000Z");
+    const first = await recoveriesOf(repo, "drive-batch");
+    expect(first.map((run) => stagingDir(run)).sort()).toEqual(["stg-a", "stg-b"]);
+    expect(await repo.listNotifications({ accountId: "acct" })).toEqual([]);
 
-    disk.dirs.push({ id: "showC", name: "Show C", parentId: "tv" }, { id: "stg-c", name: "staging-run-c", parentId: "showC" });
-    disk.files.push({ dirId: "stg-c", path: "c.mkv", providerFileId: "c", sizeBytes: 1024 * 1024 });
     await sweepOrphanStagingDirs({ repository: repo, drives: [good], now: "2026-09-28T03:00:00.000Z" });
-    const all = (await repo.listNotifications({ accountId: "acct" })).filter((note) => note.kind === "staging_leftover");
-    expect(all).toHaveLength(2);
-    const second = all.find((note) => note.id.includes("2026-09-28"));
-    expect(second?.title).toBe("网盘暂存目录残留（1 个）");
-    expect(second?.body).toContain("Show C / staging-run-c");
-    expect(second?.body).not.toContain("Show A");
-    expect(second?.body).not.toContain("Show B");
+    const again = await recoveriesOf(repo, "drive-batch");
+    expect(again.map((run) => run.workflowRun.id).sort()).toEqual(first.map((run) => run.workflowRun.id).sort());
+    expect(await repo.listNotifications({ accountId: "acct" })).toEqual([]);
   });
 
-  it("folds more than ten directories into one notice with a total line", async () => {
+  it("queues at most 5 recovery runs per drive per sweep", async () => {
     const repo = new InMemoryWorkflowRepository();
     const dirs: Array<{ id: string; name: string; parentId: string }> = [{ id: "tv", name: "TV", parentId: "root" }];
     const files: Array<{ dirId: string; path: string; providerFileId: string; sizeBytes: number }> = [];
@@ -282,18 +331,18 @@ describe("sweepOrphanStagingDirs", () => {
       files.push({ dirId: stgId, path: "a.mkv", providerFileId: `f-${n}`, sizeBytes: 1024 * 1024 });
     }
     const disk = memoryDrive({ dirs, files });
+    for (let n = 1; n <= 6; n += 1) {
+      await saveTracked(repo, "drive-many", `show-${n}`, `Show ${n}`, n);
+    }
     await sweepOrphanStagingDirs({
       repository: repo,
       drives: [drive({ storageId: "drive-many", executor: disk.executor })],
       now: NOW,
     });
-    const [note] = (await repo.listNotifications({ accountId: "acct" })).filter((item) => item.kind === "staging_leftover");
-    expect(note?.title).toBe("网盘暂存目录残留（11 个）");
-    expect(note?.body).toContain("S01 / staging-run-1：1 个文件，1 MB");
-    expect(note?.body).toContain("S10 / staging-run-10：1 个文件，1 MB");
-    expect(note?.body).not.toContain("S11 /");
-    expect(note?.body).toContain("…等共 11 个目录，合计 11 MB");
-    expect(note?.body).toContain("这些文件不在季目录里，请到网盘手动处理。");
+    const queued = await recoveriesOf(repo, "drive-many");
+    expect(queued).toHaveLength(5);
+    expect(await repo.listNotifications({ accountId: "acct" })).toEqual([]);
+    expect(disk.dirs.some((dir) => dir.id === "stg-6")).toBe(true);
   });
 
   it("spaces pan123 calls by 1500ms and does not space other brands", async () => {
@@ -340,10 +389,11 @@ describe("sweepOrphanStagingDirs", () => {
         drive({ storageId: "d115", provider: "pan115", executor: pan115.executor }),
       ],
     });
-    // category, show, listTree, subdirectory check, removeDirectory — four gaps.
-    expect(pan123.times.slice(1).map((time, index) => time - pan123.times[index]!)).toEqual([1500, 1500, 1500, 1500]);
+    // category, show, listTree, removeDirectory — three gaps. An empty tree is empty
+    // even when a wrapper folder is inside it, so there is no extra listing.
+    expect(pan123.times.slice(1).map((time, index) => time - pan123.times[index]!)).toEqual([1500, 1500, 1500]);
     expect(pan115.times.every((time) => time === pan115.times[0])).toBe(true);
-    expect(sleeps).toEqual([1500, 1500, 1500, 1500]);
+    expect(sleeps).toEqual([1500, 1500, 1500]);
   });
 
   it("resumes a cut-short walk at the show that threw, and clears the cursor after a full walk", async () => {
@@ -421,11 +471,11 @@ describe("sweepOrphanStagingDirs", () => {
       drives: [drive({ storageId: "d-retry", provider: "pan115", executor })],
     });
     expect(trees).toBe(2);
-    expect(sleeps).toContain(3000);
-    expect(logs.some((line) => /d-retry: removed 1 empty, reported 0 non-empty/.test(line))).toBe(true);
+    expect(sleeps).toContain(30000);
+    expect(logs.some((line) => /d-retry: removed 1 empty, queued 0 recovery/.test(line))).toBe(true);
   });
 
-  it("propagates a 100011 after two retries and saves the resume cursor", async () => {
+  it("propagates a 100011 after three retries and saves the resume cursor", async () => {
     let now = 0;
     const sleeps: number[] = [];
     const clock = {
@@ -459,8 +509,8 @@ describe("sweepOrphanStagingDirs", () => {
       log: (line) => logs.push(line),
       drives: [drive({ storageId: "d-limit", provider: "pan115", executor })],
     });
-    expect(trees).toBe(3);
-    expect(sleeps).toEqual([3000, 6000]);
+    expect(trees).toBe(4);
+    expect(sleeps).toEqual([30000, 60000, 120000]);
     expect(await repo.getAccountSetting("acct", "staging_janitor_cursor:d-limit")).toBe("show");
     expect(logs.some((line) => /d-limit: failed: .*100011/.test(line))).toBe(true);
   });
@@ -492,11 +542,11 @@ describe("sweepOrphanStagingDirs", () => {
       ],
     });
     expect(logs).toContain(
-      "[patrol] staging janitor drive-stuck: removed 0 empty (1 could not be removed), reported 0 non-empty",
+      "[patrol] staging janitor drive-stuck: removed 0 empty (1 could not be removed), queued 0 recovery",
     );
   });
 
-  it("does not delete a staging dir whose files are below listTree depth, and reports it", async () => {
+  it("removes a wrapper-only orphan (one empty subdirectory, no files) and does not notify", async () => {
     const removed: string[] = [];
     const repo = new InMemoryWorkflowRepository();
     await sweepOrphanStagingDirs({
@@ -523,16 +573,11 @@ describe("sweepOrphanStagingDirs", () => {
         }),
       ],
     });
-    expect(removed).toEqual([]);
-    const notes = (await repo.listNotifications({ accountId: "acct" })).filter(
-      (note) => note.kind === "staging_leftover",
-    );
-    expect(notes).toHaveLength(1);
-    expect(notes[0]?.body).toContain("Deep Show / staging-run-deep：有子目录，文件数未知");
-    expect(notes[0]?.body).not.toContain("0 个文件");
+    expect(removed).toEqual(["stg-deep"]);
+    expect(await repo.listNotifications({ accountId: "acct" })).toEqual([]);
   });
 
-  it("asks listTree for maxDepth 20 and reports the files that depth reaches", async () => {
+  it("asks listTree for maxDepth 10", async () => {
     const depths: Array<number | undefined> = [];
     const repo = new InMemoryWorkflowRepository();
     await sweepOrphanStagingDirs({
@@ -549,7 +594,7 @@ describe("sweepOrphanStagingDirs", () => {
             },
             async listTree(input: { directoryId: string; maxDepth?: number }) {
               depths.push(input.maxDepth);
-              if ((input.maxDepth ?? 0) >= 20) {
+              if ((input.maxDepth ?? 0) >= 10) {
                 return [{ path: "pack/a.mkv", providerFileId: "f1", sizeBytes: 2 * 1024 * 1024 }];
               }
               return [];
@@ -561,13 +606,8 @@ describe("sweepOrphanStagingDirs", () => {
         }),
       ],
     });
-    expect(depths).toEqual([20]);
-    const notes = (await repo.listNotifications({ accountId: "acct" })).filter(
-      (note) => note.kind === "staging_leftover",
-    );
-    expect(notes).toHaveLength(1);
-    expect(notes[0]?.body).toContain("Deep Show / staging-run-deep：1 个文件，2 MB");
-    expect(notes[0]?.body).not.toContain("文件数未知");
+    expect(depths).toEqual([10]);
+    expect(await repo.listNotifications({ accountId: "acct" })).toEqual([]);
   });
 
   it("removes a staging dir that has no files and no subdirectories", async () => {
@@ -597,10 +637,7 @@ describe("sweepOrphanStagingDirs", () => {
       ],
     });
     expect(removed).toEqual(["stg-bare"]);
-    const notes = (await repo.listNotifications({ accountId: "acct" })).filter(
-      (note) => note.kind === "staging_leftover",
-    );
-    expect(notes).toHaveLength(0);
+    expect(await repo.listNotifications({ accountId: "acct" })).toEqual([]);
   });
 
   it("leaves a recently finished run's staging alone and removes one that settled over an hour ago", async () => {
@@ -633,10 +670,7 @@ describe("sweepOrphanStagingDirs", () => {
     });
     expect(disk.removed.sort()).toEqual(["stg-missing", "stg-old"]);
     expect(disk.dirs.some((dir) => dir.id === "stg-recent")).toBe(true);
-    const notes = (await repo.listNotifications({ accountId: "acct" })).filter(
-      (note) => note.kind === "staging_leftover",
-    );
-    expect(notes).toHaveLength(0);
+    expect(await repo.listNotifications({ accountId: "acct" })).toEqual([]);
   });
 
   it("does not remove a staging dir whose run becomes active before the delete", async () => {
@@ -661,6 +695,14 @@ describe("sweepOrphanStagingDirs", () => {
         inner.setAccountSetting(accountId, key, value),
       saveWorkflowRunSnapshot: (input: Parameters<InMemoryWorkflowRepository["saveWorkflowRunSnapshot"]>[0]) =>
         inner.saveWorkflowRunSnapshot(input),
+      listTrackedSeasonStates: (scope?: Parameters<InMemoryWorkflowRepository["listTrackedSeasonStates"]>[0]) =>
+        inner.listTrackedSeasonStates(scope),
+      listActiveWorkflowRuns: (scope?: Parameters<InMemoryWorkflowRepository["listActiveWorkflowRuns"]>[0]) =>
+        inner.listActiveWorkflowRuns(scope),
+      findActiveStagingRecovery: (input: Parameters<InMemoryWorkflowRepository["findActiveStagingRecovery"]>[0]) =>
+        inner.findActiveStagingRecovery(input),
+      reserveWorkflowRun: (input: Parameters<InMemoryWorkflowRepository["reserveWorkflowRun"]>[0]) =>
+        inner.reserveWorkflowRun(input),
     };
     const removed: string[] = [];
     await sweepOrphanStagingDirs({
@@ -690,7 +732,7 @@ describe("sweepOrphanStagingDirs", () => {
     expect(reads).toBeGreaterThanOrEqual(2);
   });
 
-  it("does not report a non-empty leftover whose run becomes active during the listing", async () => {
+  it("does not queue a non-empty leftover whose run becomes active during the listing", async () => {
     const inner = new InMemoryWorkflowRepository();
     await saveRun(inner, {
       id: "run-report",
@@ -712,6 +754,14 @@ describe("sweepOrphanStagingDirs", () => {
         inner.setAccountSetting(accountId, key, value),
       saveWorkflowRunSnapshot: (input: Parameters<InMemoryWorkflowRepository["saveWorkflowRunSnapshot"]>[0]) =>
         inner.saveWorkflowRunSnapshot(input),
+      listTrackedSeasonStates: (scope?: Parameters<InMemoryWorkflowRepository["listTrackedSeasonStates"]>[0]) =>
+        inner.listTrackedSeasonStates(scope),
+      listActiveWorkflowRuns: (scope?: Parameters<InMemoryWorkflowRepository["listActiveWorkflowRuns"]>[0]) =>
+        inner.listActiveWorkflowRuns(scope),
+      findActiveStagingRecovery: (input: Parameters<InMemoryWorkflowRepository["findActiveStagingRecovery"]>[0]) =>
+        inner.findActiveStagingRecovery(input),
+      reserveWorkflowRun: (input: Parameters<InMemoryWorkflowRepository["reserveWorkflowRun"]>[0]) =>
+        inner.reserveWorkflowRun(input),
     };
     await sweepOrphanStagingDirs({
       repository: repo,
@@ -735,10 +785,8 @@ describe("sweepOrphanStagingDirs", () => {
         }),
       ],
     });
-    const notes = (await inner.listNotifications({ accountId: "acct" })).filter(
-      (note) => note.kind === "staging_leftover",
-    );
-    expect(notes).toHaveLength(0);
+    expect(await inner.listNotifications({ accountId: "acct" })).toEqual([]);
+    expect(await recoveriesOf(inner, "drive-report")).toEqual([]);
     expect(reads).toBeGreaterThanOrEqual(2);
   });
 

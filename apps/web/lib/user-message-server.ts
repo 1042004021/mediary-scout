@@ -101,7 +101,12 @@ export function messageRunView(
   runs: ReadonlyArray<Pick<PersistedWorkflowRunSnapshot, "title" | "connectedStorageId" | "workflowRun">>,
   work: UserMessageScope,
 ): MessageRunView {
-  const mine = runs.filter((r) => r.title.id === work.titleKey && userMessageDrive(r.connectedStorageId) === work.drive);
+  const mine = runs.filter(
+    (r) =>
+      r.workflowRun.kind !== "staging_recovery" &&
+      r.title.id === work.titleKey &&
+      userMessageDrive(r.connectedStorageId) === work.drive,
+  );
   const replaceRunning = mine.find((r) => r.workflowRun.kind === "replace_request" && r.workflowRun.status === "running");
   return {
     running: replaceRunning !== undefined,

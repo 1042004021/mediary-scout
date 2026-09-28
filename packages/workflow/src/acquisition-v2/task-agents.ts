@@ -132,7 +132,13 @@ export interface TaskAgentPromptOptions {
    *  kept on purpose); "unknown" = they could not be read, the existing files are
    *  protected anyway. Absent/empty = no line. */
   protectExisting?: { episodes: string[] | "unknown" };
+  /** Leftover staging. Search and transfer are not this run's job. */
+  stagingRecovery?: boolean;
 }
+
+/** Shown to the agent for a leftover staging dir. Search and transfer tools are not registered. */
+export const STAGING_RECOVERY_PROMPT =
+  "This staging directory is left over from an earlier run. Nothing will be searched or transferred. Inspect this staging directory and each Season directory. For an episode whose Season directory has no video but this staging holds one, move that video and its subtitles into the season (flat) and markObtained it. If moveToSeason fails, those files did NOT move — do not markObtained their episodes this run. Everything else here is surplus. Then discardStaging and finish. Never delete anything outside staging.";
 
 /** The kept old + replacement copies, so keep-larger dedup does not undo a replacement. */
 function protectExistingLine(options: Pick<TaskAgentPromptOptions, "protectExisting">): string {
@@ -280,6 +286,13 @@ function subtitleSnapshotPointer(options: TaskAgentPromptOptions): string {
 }
 
 export function buildTvAnimeSystemPrompt(options: TaskAgentPromptOptions): string {
+  if (options.stagingRecovery) {
+    return `${SANDBOX_BOUNDARY}
+
+${STAGING_RECOVERY_PROMPT}
+${protectExistingLine(options)}
+The files already in each Season directory stay where they are. You judge which staging file is which episode from the files themselves.`;
+  }
   return `${SANDBOX_BOUNDARY}
 
 ${skillMandate("tv")}
@@ -407,18 +420,21 @@ export async function runTvAnimeTaskAgent(request: RunTvAnimeRequest): Promise<A
     target.missingEpisodes.length === 0 && promptOptions.userRequests
       ? "(none — this run is for the USER REQUESTS in your instructions)"
       : target.missingEpisodes.join(", ");
-  const prompt = `Acquire the missing episodes for "${target.title}"${target.aliases.length ? ` (aliases: ${target.aliases.join(", ")})` : ""}, ${seasonsLabel}.
+  const prompt = promptOptions.stagingRecovery
+    ? `${STAGING_RECOVERY_PROMPT}\n\nTitle: "${target.title}", ${seasonsLabel}.`
+    : `Acquire the missing episodes for "${target.title}"${target.aliases.length ? ` (aliases: ${target.aliases.join(", ")})` : ""}, ${seasonsLabel}.
 Missing episodes (the coverage need — may span multiple seasons): ${missingLine}.
 If one pack covers multiple seasons, distribute its files in ONE plan with a move per season (moveToSeason({moves:[{season,fileIds}]})) and take only still-missing episodes — never recopy a season already present. Cover every missing episode with the fewest reliable transfers, keep each season directory clean, mark what truly landed, then finish.${
-    promptOptions.userRequests
-      ? "\nUser requests: before you finish, call reportReplacement for every requested episode, then finish (finish is refused until they are all reported — and, for a message without episode tags, until you have identified its episodes with rejectCurrentSource)."
-      : ""
-  }`;
+        promptOptions.userRequests
+          ? "\nUser requests: before you finish, call reportReplacement for every requested episode, then finish (finish is refused until they are all reported — and, for a message without episode tags, until you have identified its episodes with rejectCurrentSource)."
+          : ""
+      }`;
   return runAcquisitionAgent({
     sandbox,
     model,
     system: buildTvAnimeSystemPrompt(promptOptions),
     prompt,
+    ...(promptOptions.stagingRecovery ? { stagingRecovery: true } : {}),
     ...(promptOptions.storageProvider === undefined ? {} : { storageProvider: promptOptions.storageProvider }),
     ...(promptOptions.subtitle ? { subtitle: true } : {}),
     ...(maxSteps === undefined ? {} : { maxSteps }),

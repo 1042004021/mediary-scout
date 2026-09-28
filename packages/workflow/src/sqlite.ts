@@ -1,6 +1,6 @@
 import { createRequire } from "node:module";
 import type Database from "better-sqlite3";
-import { DEFAULT_ACCOUNT_ID, episodeNumberFromCode, isStagingJanitorId } from "./domain.js";
+import { DEFAULT_ACCOUNT_ID, episodeNumberFromCode } from "./domain.js";
 import type {
   AgentDecision,
   AgentStep,
@@ -75,6 +75,7 @@ import {
   titleBlockFilter,
   UNSCOPED_STORAGE,
   validateWorkflowRunSnapshot,
+  findStagingRecoveryIn,
   withDerivedEpisodeSummaries,
   workflowSnapshotFromReservation,
 } from "./repository.js";
@@ -799,6 +800,18 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
     return snapshots;
   }
 
+  async findActiveStagingRecovery(input: {
+    accountId: string;
+    connectedStorageId: string | null;
+    stagingDirectoryId: string;
+  }): Promise<PersistedWorkflowRunSnapshot | null> {
+    const runs = await this.listActiveWorkflowRuns({
+      accountId: input.accountId,
+      connectedStorageId: input.connectedStorageId,
+    });
+    return findStagingRecoveryIn(runs, input.stagingDirectoryId);
+  }
+
   private allWorkflowRuns(): WorkflowRun[] {
     const rows = this.db.prepare("SELECT payload FROM workflow_runs").all() as Array<{
       payload: string;
@@ -1191,7 +1204,7 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
         kind: run.kind,
         status: run.status,
       };
-    }).filter((row) => !isStagingJanitorId(row.id) && !isStagingJanitorId(row.trackedSeasonId));
+    });
   }
 
   /** Keep only the latest (startedAt desc) run row per season id. */

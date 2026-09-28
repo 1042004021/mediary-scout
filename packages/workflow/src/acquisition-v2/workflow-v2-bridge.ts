@@ -43,7 +43,7 @@ function sizeInput(input: { fileCount?: number; totalBytes?: number }): {
 
 /** `replace` = a replace_request run (user message): multi-season like `series`, but
  *  its notification reports what was replaced, never "入库". */
-export type V2BridgeMode = "type2" | "series" | "type3" | "replace";
+export type V2BridgeMode = "type2" | "series" | "type3" | "replace" | "staging_recovery";
 
 export interface V2BridgeSeasonIntent {
   seasonNumber: number;
@@ -135,7 +135,8 @@ export function bridgeV2WorkflowToResult(input: {
     decisions: v2.outcome.decisions,
     transferAttempts: v2.outcome.transferAttempts,
     notification,
-    notifications: [notification],
+    // A leftover recovery is invisible: the run still reconciles, it does not tell anyone.
+    notifications: input.mode === "staging_recovery" ? [] : [notification],
     auditEvents: v2.auditEvents,
   };
 }

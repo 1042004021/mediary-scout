@@ -42,6 +42,7 @@ import {
   enqueueUrgentReplaceRequests,
   runQueuedMovieAcquisition,
   runQueuedReplaceRequest,
+  runQueuedStagingRecovery,
   runQueuedSeriesInitialization,
   runQueuedType2Workflow,
   resolveDriveSourceLabels,
@@ -1069,8 +1070,19 @@ export async function runNextQueuedWorkflow() {
   });
   if (replace.status !== "idle") {
     await pushNotificationsSince(repository, startedAt);
+    return replace;
   }
-  return replace;
+  // Leftover staging heals itself. No notification and no push.
+  return runQueuedStagingRecovery({
+    repository,
+    resourceProvider: await getWorkerResourceProvider(),
+    storage,
+    model,
+    ...language,
+    ...quality,
+    resolveAccountContext,
+    onAuthErrorFreeze,
+  });
 }
 
 /** The user's preferred subtitle language for acquisition search, or undefined

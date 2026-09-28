@@ -48,7 +48,6 @@ const kindIcon: Record<string, { tone: string; icon: typeof Bell }> = {
   transfer_failed: { tone: "amber", icon: XCircle },
   replacement_done: { tone: "indigo", icon: Repeat },
   foreign_work_detected: { tone: "amber", icon: Film },
-  staging_leftover: { tone: "amber", icon: TriangleAlert },
 };
 
 const statusMeta: Record<NotificationReportStatus, { label: string; tone: string; icon: typeof Bell }> = {
@@ -116,13 +115,15 @@ async function NotificationFeed({ connectedStorageId }: { connectedStorageId: st
   const repository = getWorkflowRepository();
   const accountId = await getCurrentAccountId();
   await ensureDemoSeeded(repository);
-  const notifications = await repository.listNotifications({
-    limit: 100,
-    accountId,
-    connectedStorageId,
-    // Only the last 7 days — old notifications shouldn't pile up forever.
-    since: notificationWindowSince(),
-  });
+  const notifications = (
+    await repository.listNotifications({
+      limit: 100,
+      accountId,
+      connectedStorageId,
+      // Only the last 7 days — old notifications shouldn't pile up forever.
+      since: notificationWindowSince(),
+    })
+  ).filter((notification) => notification.kind !== "staging_recovery" && notification.kind !== "staging_leftover");
 
   // Poster backfill: older notifications predate report.posterPath. Source the
   // poster from the still-tracked title (by tmdbId, then name) so cards show a

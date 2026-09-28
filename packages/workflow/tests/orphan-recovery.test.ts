@@ -25,6 +25,7 @@ describe("isQueueClaimableKind", () => {
     expect(isQueueClaimableKind("type1_package_init")).toBe(true);
     expect(isQueueClaimableKind("movie_init")).toBe(true);
     expect(isQueueClaimableKind("replace_request")).toBe(true);
+    expect(isQueueClaimableKind("staging_recovery")).toBe(true);
   });
 
   it("marks type3_monitor unclaimable (no worker claims queued type3)", () => {
@@ -37,7 +38,7 @@ describe("isQueueClaimableKind", () => {
   // What this test CAN pin down is the claimable/unclaimable split itself, so a
   // future edit that silently flips a kind is caught.
   it("pins the exact claimable/unclaimable split", () => {
-    const claimable: WorkflowKind[] = ["type1_package_init", "type2_init", "movie_init", "replace_request"];
+    const claimable: WorkflowKind[] = ["type1_package_init", "type2_init", "movie_init", "replace_request", "staging_recovery"];
     const unclaimable: WorkflowKind[] = ["type3_monitor"];
     expect(claimable.filter(isQueueClaimableKind)).toEqual(claimable);
     expect(unclaimable.filter(isQueueClaimableKind)).toEqual([]);

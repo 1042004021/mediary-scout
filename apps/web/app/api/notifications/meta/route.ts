@@ -22,11 +22,13 @@ export async function GET(request: NextRequest) {
   );
   // Mirror the 通知 page's 7-day window so the unread badge can't count items the
   // page won't show (otherwise the badge would be unclearable).
-  const notifications = await repository.listNotifications({
-    limit: 50,
-    accountId,
-    connectedStorageId,
-    since: notificationWindowSince(),
-  });
+  const notifications = (
+    await repository.listNotifications({
+      limit: 50,
+      accountId,
+      connectedStorageId,
+      since: notificationWindowSince(),
+    })
+  ).filter((notification) => notification.kind !== "staging_recovery" && notification.kind !== "staging_leftover");
   return NextResponse.json({ createdAts: notifications.map((notification) => notification.createdAt) });
 }

@@ -63,6 +63,33 @@ export async function ensureSeasonAcquisitionDirectories(
 }
 
 /**
+ * A leftover staging dir is already the run's staging. Season dirs are resolved
+ * the same way as other runs (reuse `Season NN` when it is there, create it only
+ * when it is not). The show dir and the staging dir are not created.
+ */
+export async function bindRecoveryDirectories(input: {
+  executor: Pick<StorageExecutor, "createDirectory" | "listChildDirectories">;
+  showDirectoryId: string;
+  stagingDirectoryId: string;
+  seasons: number[];
+}): Promise<AcquisitionDirectories> {
+  const children = await input.executor.listChildDirectories(input.showDirectoryId);
+  const seasonDirectoryIds: Record<number, string> = {};
+  for (const season of input.seasons) {
+    const name = `Season ${String(season).padStart(2, "0")}`;
+    const existing = children.find((child) => child.name === name);
+    seasonDirectoryIds[season] = existing
+      ? existing.id
+      : await input.executor.createDirectory({ name, parentId: input.showDirectoryId });
+  }
+  return {
+    showDirectoryId: input.showDirectoryId,
+    seasonDirectoryIds,
+    stagingDirectoryId: input.stagingDirectoryId,
+  };
+}
+
+/**
  * Run an acquisition body, then ALWAYS discard the run's staging dir — on success,
  * failure, or honest no-coverage alike. The agent keeps its own discardStaging and
  * normally calls it; this finally is the HARNESS-level leak guard for the paths

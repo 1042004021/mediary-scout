@@ -1,6 +1,5 @@
 import {
   DEFAULT_ACCOUNT_ID,
-  isStagingJanitorId,
   type AgentDecision,
   type AgentStep,
   type EpisodeState,
@@ -229,6 +228,13 @@ export interface WorkflowRepository extends DeadLinkStore, AgentMemoryStore, Use
   /** Every queued/running run for the (account, storage) scope, newest first —
    *  drives the library "获取中" placeholders. Accepts accountId or WorkflowScope. */
   listActiveWorkflowRuns(scope?: ScopeArg): Promise<PersistedWorkflowRunSnapshot[]>;
+  /** Queued or running `staging_recovery` for this exact leftover dir, or null.
+   *  The janitor uses it so one staging dir is not queued twice. */
+  findActiveStagingRecovery(input: {
+    accountId: string;
+    connectedStorageId: string | null;
+    stagingDirectoryId: string;
+  }): Promise<PersistedWorkflowRunSnapshot | null>;
   /** Lightweight mid-run update of the live agent progress shown on the activity
    *  page; `percent` is clamped monotonic so retries never rewind the bar. No-op
    *  for an unknown run. */
@@ -1213,6 +1219,18 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
       .map((snapshot) => withDerivedEpisodeSummaries(cloneWorkflowValue(snapshot)));
   }
 
+  async findActiveStagingRecovery(input: {
+    accountId: string;
+    connectedStorageId: string | null;
+    stagingDirectoryId: string;
+  }): Promise<PersistedWorkflowRunSnapshot | null> {
+    const runs = await this.listActiveWorkflowRuns({
+      accountId: input.accountId,
+      connectedStorageId: input.connectedStorageId,
+    });
+    return findStagingRecoveryIn(runs, input.stagingDirectoryId);
+  }
+
   async updateWorkflowRunProgress(workflowRunId: string, progress: WorkflowRunProgress): Promise<void> {
     const stored = this.workflowRuns.get(workflowRunId);
     if (!stored) {
@@ -1414,7 +1432,6 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     const latestSnapshot = Array.from(this.workflowRuns.values())
       .filter(
         (snapshot) =>
-          isVisibleTrackedSnapshot(snapshot) &&
           snapshot.season.id === trackedSeasonId &&
           scopeMatches(scope, snapshot.accountId, snapshot.connectedStorageId),
       )
@@ -1442,7 +1459,6 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     const snapshots = Array.from(this.workflowRuns.values())
       .filter(
         (snapshot) =>
-          isVisibleTrackedSnapshot(snapshot) &&
           scopeMatches(scope, snapshot.accountId, snapshot.connectedStorageId),
       )
       .sort((a, b) => b.workflowRun.startedAt.localeCompare(a.workflowRun.startedAt));
@@ -1473,9 +1489,9 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
 
   async listAllTrackedSeasonStates(): Promise<TrackedSeasonState[]> {
     const latestBySeason = new Map<string, PersistWorkflowRunSnapshotInput>();
-    const snapshots = Array.from(this.workflowRuns.values())
-      .filter((snapshot) => isVisibleTrackedSnapshot(snapshot))
-      .sort((a, b) => b.workflowRun.startedAt.localeCompare(a.workflowRun.startedAt));
+    const snapshots = Array.from(this.workflowRuns.values()).sort((a, b) =>
+      b.workflowRun.startedAt.localeCompare(a.workflowRun.startedAt),
+    );
     for (const snapshot of snapshots) {
       // Key by (season, drive): season.id is drive-independent, so the same season on
       // two drives is two distinct tracked entities — collapsing by season id alone
@@ -1689,9 +1705,28 @@ export function isActiveWorkflowStatus(status: WorkflowStatus): boolean {
   return status === "queued" || status === "running";
 }
 
-/** The staging janitor's inbox run is a notification carrier, not a show. */
-function isVisibleTrackedSnapshot(snapshot: PersistWorkflowRunSnapshotInput): boolean {
-  return !isStagingJanitorId(snapshot.workflowRun.id) && !isStagingJanitorId(snapshot.season.id);
+/** The leftover dir id carried on a queued staging_recovery, or null. */
+export function stagingRecoveryDirectoryId(run: Pick<WorkflowRun, "auditEvents">): string | null {
+  for (let index = run.auditEvents.length - 1; index >= 0; index -= 1) {
+    const event = run.auditEvents[index];
+    if (event?.type !== "staging_recovery_queued") continue;
+    const id = event.data?.["stagingDirectoryId"];
+    if (typeof id === "string" && id.length > 0) return id;
+  }
+  return null;
+}
+
+export function findStagingRecoveryIn(
+  runs: readonly PersistedWorkflowRunSnapshot[],
+  stagingDirectoryId: string,
+): PersistedWorkflowRunSnapshot | null {
+  return (
+    runs.find(
+      (run) =>
+        run.workflowRun.kind === "staging_recovery" &&
+        stagingRecoveryDirectoryId(run.workflowRun) === stagingDirectoryId,
+    ) ?? null
+  );
 }
 
 export function workflowSnapshotFromReservation(input: ReserveWorkflowRunInput): PersistWorkflowRunSnapshotInput {
@@ -1783,6 +1818,7 @@ const KIND_HAS_QUEUE_CLAIMER: Record<WorkflowKind, boolean> = {
   movie_init: true,
   type3_monitor: false,
   replace_request: true,
+  staging_recovery: true,
 };
 
 /** Whether cancelling a queued run of this kind tears down its season's tracking.
@@ -1795,6 +1831,7 @@ const KIND_OWNS_TRACKING: Record<WorkflowKind, boolean> = {
   movie_init: true,
   type3_monitor: false,
   replace_request: false,
+  staging_recovery: false,
 };
 
 export function tearsDownTrackingOnCancel(kind: WorkflowKind): boolean {

@@ -2,6 +2,7 @@ import {
   createTmdbMetadataProvider,
   getTrackedSeasonStatusView,
   isMovieUnreleased,
+  isUserVisibleWorkflowKind,
   prepareSeriesTarget,
   queueSeriesInitialization,
   queueTrackingInitialization,
@@ -271,7 +272,7 @@ export async function getTitleHubView(tmdbId: number, storageId?: string): Promi
   const airing = aggregateAiring(seasons);
 
   const acquiring = (await repository.listActiveWorkflowRuns(scope)).some(
-    (snapshot) => snapshot.title.tmdbId === tmdbId,
+    (snapshot) => snapshot.title.tmdbId === tmdbId && isUserVisibleWorkflowKind(snapshot.workflowRun.kind),
   );
 
   return {
@@ -309,7 +310,7 @@ export async function getDetailView(
   const movieState = trackedForTitle.find((state) => state.title.type === "movie");
   if (movieState) {
     const acquiring = (await repository.listActiveWorkflowRuns(scope)).some(
-      (snapshot) => snapshot.title.tmdbId === tmdbId,
+      (snapshot) => snapshot.title.tmdbId === tmdbId && isUserVisibleWorkflowKind(snapshot.workflowRun.kind),
     );
     const obtained = movieState.episodes.some((episode) => episode.obtained);
     const reserved = isMovieUnreleased(movieState.title.releaseDate, now);
@@ -531,7 +532,7 @@ export async function getInProgressTitles(storageId?: string): Promise<InProgres
   const repository = getWorkflowRepository();
   const scope = await getActiveWorkspaceScope(storageId);
   const active = (await repository.listActiveWorkflowRuns(scope)).filter(
-    (snapshot) => snapshot.workflowRun.kind !== "replace_request",
+    (snapshot) => snapshot.workflowRun.kind !== "replace_request" && isUserVisibleWorkflowKind(snapshot.workflowRun.kind),
   );
   const byTmdb = new Map<number, InProgressTitle>();
   for (const snapshot of active) {
