@@ -54,4 +54,23 @@ describe("docker-compose.yml web service config", () => {
     expect(webEnv.MEDIA_TRACK_AGENT_ADAPTER).toBeDefined();
     expect(() => validateRuntimeConfig(webEnv)).not.toThrow();
   });
+
+  it("gives the Docker socket only to updater, and the token volume to web read-only", () => {
+    const composePath = resolve(dirname(fileURLToPath(import.meta.url)), "../../../docker-compose.yml");
+    const compose = parse(readFileSync(composePath, "utf8")) as {
+      services: {
+        web: { volumes?: string[]; privileged?: boolean };
+        updater: { ports?: unknown; privileged?: boolean; volumes?: string[] };
+      };
+    };
+    const updater = compose.services.updater;
+    expect(updater).toBeTruthy();
+    expect(updater.ports).toBeUndefined();
+    expect(updater.privileged).toBeUndefined();
+    expect(updater.volumes).toContain("/var/run/docker.sock:/var/run/docker.sock");
+    const web = compose.services.web;
+    expect(web.privileged).toBeUndefined();
+    expect(web.volumes).toContain("updater-state:/updater-state:ro");
+    expect(web.volumes?.some((mount) => mount.includes("docker.sock"))).toBe(false);
+  });
 });
