@@ -104,6 +104,10 @@ import { resolveRegistration, deriveBootstrapState, canManageAccounts } from "./
 import { isDemoMode } from "./demo-mode";
 import { isUpdateHoldActive } from "./update-hold";
 
+/** Checked by the workflow package right before each claim or patrol reservation, not
+ *  only at entry: the updater can take the hold while a tick is still setting up. */
+const mayStartRun = () => !isUpdateHoldActive(Date.now());
+
 export type CandidateTrackingRequestResult =
   | {
       status: "queued" | "already_running" | "already_tracked";
@@ -1023,6 +1027,7 @@ export async function runNextQueuedWorkflow() {
     animeStorageParentDirectoryId: parents.anime,
     resolveAccountContext,
     onAuthErrorFreeze,
+    mayStartRun,
   });
   if (type2.status !== "idle") {
     await pushNotificationsSince(repository, startedAt);
@@ -1039,6 +1044,7 @@ export async function runNextQueuedWorkflow() {
     animeStorageParentDirectoryId: parents.anime,
     resolveAccountContext,
     onAuthErrorFreeze,
+    mayStartRun,
   });
   if (series.status !== "idle") {
     await pushNotificationsSince(repository, startedAt);
@@ -1054,6 +1060,7 @@ export async function runNextQueuedWorkflow() {
     moviesParentDirectoryId: parents.movies,
     resolveAccountContext,
     onAuthErrorFreeze,
+    mayStartRun,
   });
   if (movie.status !== "idle") {
     await pushNotificationsSince(repository, startedAt);
@@ -1071,6 +1078,7 @@ export async function runNextQueuedWorkflow() {
     moviesParentDirectoryId: parents.movies,
     resolveAccountContext,
     onAuthErrorFreeze,
+    mayStartRun,
     // A work with 待换 episodes skips the patrol, where TMDB sync normally happens.
     ...syncOption(),
   });
@@ -1088,6 +1096,7 @@ export async function runNextQueuedWorkflow() {
     ...quality,
     resolveAccountContext,
     onAuthErrorFreeze,
+    mayStartRun,
   });
 }
 
@@ -1805,6 +1814,7 @@ export async function runScheduledType3(options?: {
       resolveDriveId: defaultDriveIdOf,
       resolveAccountContext: buildAccountContextResolver(),
       onAuthErrorFreeze: (id, reason) => freezeConnectedStorage(id, reason),
+      mayStartRun,
       ...(sync ? { syncSeasonMetadata: sync } : {}),
     });
     try {

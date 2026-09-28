@@ -481,6 +481,21 @@ describe("runScheduledType3（per-slot 认领 + 合并补跑）", () => {
     }
   });
 
+  it("把 mayStartRun 传给巡检，让它在每次预约前再看一眼暂停", async () => {
+    await boot({ daily_sweep_times: TIMES }, "2026-07-09T06:30");
+    await rt.runScheduledType3({ force: true });
+    const passed = (monitor.mock.calls[0] as unknown as [{ mayStartRun?: () => boolean }])[0].mayStartRun;
+    expect(typeof passed).toBe("function");
+    expect(passed!()).toBe(true);
+    const { setUpdateHold, clearUpdateHold } = await import("./update-hold");
+    setUpdateHold(Date.now(), 60_000);
+    try {
+      expect(passed!()).toBe(false);
+    } finally {
+      clearUpdateHold();
+    }
+  });
+
   it("成功后写 last_sweep_completed_at（含定时路径）", async () => {
     const repository = await boot({ daily_sweep_times: TIMES }, "2026-07-09T06:30");
     await rt.runScheduledType3();

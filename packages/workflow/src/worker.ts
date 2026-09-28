@@ -141,6 +141,11 @@ export type SeasonMetadataSync = (input: {
  * language fall through to the globally-passed values. No resolver → the function
  * uses its input deps unchanged (single-user / tests).
  */
+/** Asked right before a run is claimed or reserved as running. False = start nothing
+ *  now (the web process is about to be replaced by an update); queued runs stay
+ *  queued. Absent = always allowed. */
+export type MayStartRun = () => boolean;
+
 export interface AccountWorkerContext {
   storage?: StorageExecutor;
   resourceProvider?: ResourceProvider;
@@ -343,8 +348,12 @@ export async function runQueuedType2Workflow(input: {
   /** §7: resolve the claimed run's per-account 115 creds + landing CIDs. */
   resolveAccountContext?: ResolveAccountWorkerContext;
   onAuthErrorFreeze?: (storageId: string, reason: string) => Promise<void>;
+  mayStartRun?: MayStartRun;
 }): Promise<QueuedType2WorkerResult> {
   const now = input.now ?? (() => new Date().toISOString());
+  if (input.mayStartRun && !input.mayStartRun()) {
+    return { status: "idle" };
+  }
   const claimed = await input.repository.claimNextQueuedWorkflowRun({
     kind: "type2_init",
     now: now(),
@@ -484,6 +493,9 @@ export async function runScheduledType3Monitoring(input: {
    *  to keep those shows off the same drive as its bound ones when running in
    *  parallel; null when the account has no drive. */
   resolveDriveId?: (accountId: string) => Promise<string | null>;
+  /** Checked before each show's run is reserved; a false stops the rest of the sweep
+   *  from starting (those shows are reported skipped_active). */
+  mayStartRun?: MayStartRun;
 }): Promise<ScheduledType3Outcome[]> {
   const now = input.now ?? (() => new Date().toISOString());
   // Cross-account: patrol EVERY user's tracked shows, each under its owner's creds.
@@ -622,6 +634,9 @@ async function patrolTrackedState(args: {
       input.staleActiveRunTimeoutMs,
     );
 
+    if (input.mayStartRun && !input.mayStartRun()) {
+      return { trackedSeasonId: season.id, status: "skipped_active" };
+    }
     const reservation = await input.repository.reserveWorkflowRun({
       accountId: state.accountId,
       connectedStorageId: state.connectedStorageId,
@@ -768,6 +783,7 @@ async function patrolMovie(args: {
     createWorkflowRunId?: () => string;
     staleActiveRunTimeoutMs?: number;
     onAuthErrorFreeze?: (storageId: string, reason: string) => Promise<void>;
+    mayStartRun?: MayStartRun;
   };
   deps: {
     resourceProvider: ResourceProvider;
@@ -812,6 +828,9 @@ async function patrolMovie(args: {
     startedAt,
     input.staleActiveRunTimeoutMs,
   );
+  if (input.mayStartRun && !input.mayStartRun()) {
+    return { trackedSeasonId: state.season.id, status: "skipped_active" };
+  }
   const reservation = await input.repository.reserveWorkflowRun({
     accountId: state.accountId,
     connectedStorageId: state.connectedStorageId,
@@ -977,8 +996,12 @@ export async function runQueuedMovieAcquisition(input: {
   /** §7: resolve the claimed run's per-account 115 creds + landing CIDs. */
   resolveAccountContext?: ResolveAccountWorkerContext;
   onAuthErrorFreeze?: (storageId: string, reason: string) => Promise<void>;
+  mayStartRun?: MayStartRun;
 }): Promise<QueuedType2WorkerResult> {
   const now = input.now ?? (() => new Date().toISOString());
+  if (input.mayStartRun && !input.mayStartRun()) {
+    return { status: "idle" };
+  }
   const claimed = await input.repository.claimNextQueuedWorkflowRun({
     kind: "movie_init",
     now: now(),
@@ -1065,8 +1088,12 @@ export async function runQueuedSeriesInitialization(input: {
   /** §7: resolve the claimed run's per-account 115 creds + landing CIDs. */
   resolveAccountContext?: ResolveAccountWorkerContext;
   onAuthErrorFreeze?: (storageId: string, reason: string) => Promise<void>;
+  mayStartRun?: MayStartRun;
 }): Promise<QueuedType2WorkerResult> {
   const now = input.now ?? (() => new Date().toISOString());
+  if (input.mayStartRun && !input.mayStartRun()) {
+    return { status: "idle" };
+  }
   const claimed = await input.repository.claimNextQueuedWorkflowRun({
     kind: "type1_package_init",
     now: now(),
