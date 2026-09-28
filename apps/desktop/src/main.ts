@@ -127,6 +127,8 @@ async function startServer(): Promise<string> {
     repoRoot: path.resolve(__dirname, "..", "..", ".."),
   });
   serverProc = spawn(process.execPath, [entry], {
+    // The standalone server reads BUILD_COMMIT relative to its own folder; Next's server.js also chdirs there, this just does not depend on it.
+    cwd: path.dirname(entry),
     env: {
       ...buildServerEnv({ port, sqlitePath, baseEnv: process.env }),
       MEDIA_TRACK_AGENT_TOKEN: agentToken,
@@ -197,9 +199,12 @@ function createWindow(url: string): void {
     return kind === "app" ? { action: "allow" } : { action: "deny" };
   });
   mainWindow.webContents.on("will-navigate", (event) => {
-    if (linkTarget(event.url, serverOrigin) !== "external") return;
+    const kind = linkTarget(event.url, serverOrigin);
+    // Only the app's own server may navigate this window. file:, javascript:, data:
+    // and other schemes are dropped; http(s) elsewhere opens in the system browser.
+    if (kind === "app") return;
     event.preventDefault();
-    void shell.openExternal(event.url).catch(() => undefined);
+    if (kind === "external") void shell.openExternal(event.url).catch(() => undefined);
   });
   mainWindow.on("close", (event) => {
     const decision = onWindowClose({ isQuitting });
