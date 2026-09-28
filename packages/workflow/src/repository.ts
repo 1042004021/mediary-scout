@@ -139,9 +139,11 @@ export interface ReserveWorkflowRunInput extends PersistWorkflowRunSnapshotInput
    * Title-level mutual exclusion: refuse the reservation if any user-visible run
    * for the same media title is already active, regardless of season. A
    * `staging_recovery` does not count, queued or running, so a leftover-staging run
-   * cannot pin the title against something the user asked for. That is safe
-   * because the worker runs one job at a time: the user's run starts after the
-   * recovery finishes, and a replace reservation writes no episodes. All seasons
+   * cannot pin the title against something the user asked for. That holds for
+   * queue-drained user runs because the worker runs one job at a time: the user's
+   * run starts after the recovery finishes, and a replace reservation writes no
+   * episodes. Patrols are not queue-drained; they keep themselves out via
+   * blockIfTitleHasActiveKinds. All seasons
    * of a title share one `Title (Year)/` show directory
    * and staging parent, so two concurrent acquisition runs would race on directory
    * creation, staging, and dedup. User-triggered acquisitions set this so a user
@@ -152,9 +154,9 @@ export interface ReserveWorkflowRunInput extends PersistWorkflowRunSnapshotInput
   /**
    * Narrower title-level exclusion: refuse only if an active run of one of these
    * kinds exists for the same (account, drive, title). The patrol sets
-   * ["replace_request"]: a replace run works every season's directory, so a patrol
-   * run beside it would race it, while patrol runs of other seasons must not block
-   * each other. Checked under the same lock as blockIfTitleHasActiveRun.
+   * ["replace_request", "staging_recovery"]: either works the title's directories,
+   * so a patrol beside it would race it, while patrol runs of other seasons must
+   * not block each other. Checked under the same lock as blockIfTitleHasActiveRun.
    */
   blockIfTitleHasActiveKinds?: WorkflowKind[];
   /**

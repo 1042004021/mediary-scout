@@ -276,8 +276,11 @@ async function sweepDrive(
         }
         const seasons = seasonsForShow(show, children, states, show.type);
         // No season matched. A `{tmdb-N}` folder is untracked when this drive has
-        // no tv/anime season with that id. A legacy name, or a tracked id we
-        // failed to match, stays — deleting it might throw away a real title.
+        // no tv/anime season with that id. Its files were for a title this drive
+        // no longer tracks: nothing will ever move them into a season, and keeping
+        // them leaves a half-finished folder in the library for good. A legacy
+        // name, or a tracked id we failed to match, stays — deleting it might
+        // throw away a real title.
         if (!seasons || seasons.length === 0) {
           const tmdbId = tmdbIdFromMediaLibraryFolderName(show.name);
           // The snapshot above is from the start of the sweep. A title the user

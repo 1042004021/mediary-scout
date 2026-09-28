@@ -507,14 +507,16 @@ export async function runScheduledType3Monitoring(input: {
       console.error(`[user-message] patrol could not queue a replace request for ${titleKey}: ${String(error)}`);
     }
   }
-  // Also skip works whose replace run is already in flight: a type3 run beside it
-  // would work the same directories at the same time. This filter is only the cheap
-  // path; a replace run queued after it is caught by the patrol reservation itself
-  // (blockIfTitleHasActiveKinds).
+  // Also skip a title whose replace run or leftover recovery is already active.
+  // Patrols run outside the queue drain, so either would move files in the same
+  // directories at the same time. This filter is only the cheap path; a run queued
+  // after it is caught by the patrol reservation (blockIfTitleHasActiveKinds).
+  // The janitor will not queue a recovery while any run of the title is active,
+  // so the exclusion holds both ways.
   const busyKeys = new Set((await input.repository.listWorksWithProcessingMessages()).map(workKey));
   for (const accountId of new Set(trackedStates.map((s) => s.accountId))) {
     for (const run of await input.repository.listActiveWorkflowRuns({ accountId, connectedStorageId: null })) {
-      if (run.workflowRun.kind !== "replace_request") continue;
+      if (run.workflowRun.kind !== "replace_request" && run.workflowRun.kind !== "staging_recovery") continue;
       busyKeys.add(workKey({ accountId, drive: userMessageDrive(run.connectedStorageId), titleKey: run.title.id }));
     }
   }
@@ -644,9 +646,11 @@ async function patrolTrackedState(args: {
       decisions: [],
       transferAttempts: [],
       notifications: [],
-      // The sweep's busy-work filter is not atomic with this reservation: a replace
-      // run queued in between (现在处理) would otherwise work the same directories.
-      blockIfTitleHasActiveKinds: ["replace_request"],
+      // Patrols run outside the queue drain. A replace, or a leftover recovery the
+      // drain can claim mid-patrol, moves files in the same directories. The
+      // janitor will not queue a recovery while this patrol is active, so the
+      // exclusion holds both ways.
+      blockIfTitleHasActiveKinds: ["replace_request", "staging_recovery"],
       // The state was read when the sweep started (then the drive's deps, a TMDB sync):
       // a season untracked since must not be tracked again by this reservation.
       requireTrackedSeason: true,
@@ -832,8 +836,8 @@ async function patrolMovie(args: {
     decisions: [],
     transferAttempts: [],
     notifications: [],
-    // Same race as the TV patrol: a replace run queued after the sweep's filter.
-    blockIfTitleHasActiveKinds: ["replace_request"],
+    // Same as the TV patrol: a replace or a leftover recovery queued after the filter.
+    blockIfTitleHasActiveKinds: ["replace_request", "staging_recovery"],
     // …and an untrack after the sweep read the film.
     requireTrackedSeason: true,
     ...(staleActiveRunStartedBefore === null

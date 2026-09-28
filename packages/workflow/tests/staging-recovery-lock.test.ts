@@ -194,7 +194,7 @@ describe("a queued staging_recovery does not pin the title", () => {
     expect(result.status).toBe("queued");
   });
 
-  it("still patrols a show and an unobtained movie that only have a queued recovery", async () => {
+  it("does not patrol a show or an unobtained movie that has a queued recovery", async () => {
     const repo = new InMemoryWorkflowRepository();
     const title = showTitle();
     const season: TrackedSeason = {
@@ -363,9 +363,12 @@ describe("a queued staging_recovery does not pin the title", () => {
       })(),
     });
 
-    expect(outcomes.map((outcome) => [outcome.trackedSeasonId, outcome.status]).sort()).toEqual([
-      [anchor.id, "failed"],
-      [season.id, "ran"],
+    expect(outcomes.filter((outcome) => outcome.trackedSeasonId === season.id || outcome.trackedSeasonId === anchor.id)).toEqual([]);
+    expect(await repo.getWorkflowRunSnapshot("run_patrol_1")).toBeNull();
+    expect(await repo.getWorkflowRunSnapshot("run_patrol_2")).toBeNull();
+    expect((await repo.listActiveWorkflowRuns()).map((run) => run.workflowRun.id).sort()).toEqual([
+      "recovery-film",
+      "recovery-show",
     ]);
   });
 
