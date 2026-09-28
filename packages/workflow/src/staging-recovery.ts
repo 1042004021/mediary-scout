@@ -52,8 +52,10 @@ export async function runQueuedStagingRecovery(
   const now = input.now ?? (() => new Date().toISOString());
   const claimed = await input.repository.claimNextQueuedWorkflowRun({ kind: "staging_recovery", now: now() });
   if (!claimed) return { status: "idle" };
-  const deps = await resolveWorkerDeps(input.resolveAccountContext, claimed.accountId, claimed.connectedStorageId, input);
   try {
+    // Claim already flipped the run to running. A throw here must take the
+    // same silent failure path, or the run stays running and blocks the dir.
+    const deps = await resolveWorkerDeps(input.resolveAccountContext, claimed.accountId, claimed.connectedStorageId, input);
     const target = stagingRecoveryTarget(claimed.workflowRun);
     if (!target) {
       throw new Error("STAGING_RECOVERY_PAYLOAD: queued run is missing its staging dir");

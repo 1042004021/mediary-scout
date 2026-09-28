@@ -379,6 +379,141 @@ describe("staging_recovery", () => {
     expect(active?.notifications).toEqual([]);
   });
 
+  it("a setup failure fails the claimed recovery instead of leaving it running", async () => {
+    const repo = new InMemoryWorkflowRepository();
+    await repo.saveWorkflowRunSnapshot({
+      accountId: "acct",
+      connectedStorageId: "drive",
+      title: {
+        id: "title_7",
+        tmdbId: 7,
+        type: "tv",
+        title: "Show",
+        originalTitle: "Show",
+        year: 2024,
+        aliases: [],
+      },
+      season: {
+        id: "title_7_s1",
+        mediaTitleId: "title_7",
+        seasonNumber: 1,
+        status: "active",
+        qualityPreference: "1080p",
+        storageDirectoryId: "season",
+        totalEpisodes: 1,
+        latestAiredEpisode: 1,
+        latestAiredSource: "metadata",
+      },
+      workflowRun: {
+        id: "recovery-setup",
+        kind: "staging_recovery",
+        status: "queued",
+        trackedSeasonId: "title_7_s1",
+        startedAt: "2026-09-28T03:00:00.000Z",
+        finishedAt: null,
+        auditEvents: [
+          {
+            type: "staging_recovery_queued",
+            message: "queued",
+            data: { stagingDirectoryId: "stg", showDirectoryId: "show", seasonNumbers: [1] },
+          },
+        ],
+      },
+      episodes: [],
+      resourceSnapshots: [],
+      decisions: [],
+      transferAttempts: [],
+      notifications: [],
+    });
+    const result = await runQueuedStagingRecovery({
+      repository: repo,
+      resourceProvider: {
+        async search() {
+          return { id: "snap", provider: "pansou", keyword: "Show", candidates: [], createdAt: "2026-09-28T03:00:00.000Z" };
+        },
+      },
+      storage: {} as StorageExecutor,
+      model: new MockLanguageModelV3({
+        doGenerate: async () => {
+          throw new Error("model should not be called");
+        },
+      }),
+      resolveAccountContext: async () => {
+        throw new Error("drive creds missing");
+      },
+      now: () => "2026-09-28T04:00:00.000Z",
+    });
+    expect(result).toMatchObject({ status: "failed", workflowRunId: "recovery-setup" });
+    const saved = await repo.getWorkflowRunSnapshot("recovery-setup", { accountId: "acct", connectedStorageId: "drive" });
+    expect(saved?.workflowRun.status).toBe("failed");
+    expect(saved?.notifications).toEqual([]);
+    expect(await repo.listNotifications({ accountId: "acct" })).toEqual([]);
+  });
+
+  it("a transient setup failure requeues the claimed recovery and writes no notification", async () => {
+    const repo = new InMemoryWorkflowRepository();
+    await repo.saveWorkflowRunSnapshot({
+      accountId: "acct",
+      connectedStorageId: "drive",
+      title: {
+        id: "title_7",
+        tmdbId: 7,
+        type: "tv",
+        title: "Show",
+        originalTitle: "Show",
+        year: 2024,
+        aliases: [],
+      },
+      season: {
+        id: "title_7_s1",
+        mediaTitleId: "title_7",
+        seasonNumber: 1,
+        status: "active",
+        qualityPreference: "1080p",
+        storageDirectoryId: "season",
+        totalEpisodes: 1,
+        latestAiredEpisode: 1,
+        latestAiredSource: "metadata",
+      },
+      workflowRun: {
+        id: "recovery-setup",
+        kind: "staging_recovery",
+        status: "queued",
+        trackedSeasonId: "title_7_s1",
+        startedAt: "2026-09-28T03:00:00.000Z",
+        finishedAt: null,
+        auditEvents: [],
+      },
+      episodes: [],
+      resourceSnapshots: [],
+      decisions: [],
+      transferAttempts: [],
+      notifications: [],
+    });
+    const result = await runQueuedStagingRecovery({
+      repository: repo,
+      resourceProvider: {
+        async search() {
+          return { id: "snap", provider: "pansou", keyword: "Show", candidates: [], createdAt: "2026-09-28T03:00:00.000Z" };
+        },
+      },
+      storage: {} as StorageExecutor,
+      model: new MockLanguageModelV3({
+        doGenerate: async () => {
+          throw new Error("model should not be called");
+        },
+      }),
+      resolveAccountContext: async () => {
+        throw new Error("socket hang up");
+      },
+      now: () => "2026-09-28T04:00:00.000Z",
+    });
+    expect(result).toMatchObject({ status: "ran", workflowRunId: "recovery-setup", workflowStatus: "queued" });
+    const saved = await repo.getWorkflowRunSnapshot("recovery-setup", { accountId: "acct", connectedStorageId: "drive" });
+    expect(saved?.workflowRun.status).toBe("queued");
+    expect(saved?.notifications).toEqual([]);
+  });
+
   it("an ordinary acquisition that throws still discards its own staging", async () => {
     const executor = new FakeStorageExecutor();
     const created: Array<{ id: string; name: string }> = [];
