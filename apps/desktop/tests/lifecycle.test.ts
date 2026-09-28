@@ -33,4 +33,16 @@ describe("trayMenuState", () => {
     expect(state.items.find((i) => i.id === "openAtLogin")?.type).toBe("checkbox");
     expect(state.items.find((i) => i.id === "open")?.type).toBe("normal");
   });
+  it("offers a newer release right under 「打开 巡影」, and nothing when there is none", () => {
+    const withUpdate = trayMenuState({ openAtLogin: false, serverReady: true, update: { tag: "v2026.10.02" } });
+    expect(ids(withUpdate.items)).toEqual(["open", "update", "status", "openAtLogin", "quit"]);
+    const item = withUpdate.items.find((i) => i.id === "update");
+    expect(item).toMatchObject({ label: "下载新版本 v2026.10.02", type: "normal", enabled: true });
+    expect(ids(trayMenuState({ openAtLogin: false, serverReady: true, update: null }).items)).toEqual([
+      "open",
+      "status",
+      "openAtLogin",
+      "quit",
+    ]);
+  });
 });
