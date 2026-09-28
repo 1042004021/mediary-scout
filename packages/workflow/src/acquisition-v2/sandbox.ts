@@ -421,6 +421,10 @@ export class TaskSandbox {
    *  move or deleteFiles has not cleared. The harness reads this and will not
    *  delete staging while it is non-empty — those files may be the only copies. */
   private readonly unmovedFileIds = new Set<string>();
+  /** Set only when the agent calls finish or discardStaging and that call returns.
+   *  The harness reads coverage with finish() after every loop; that read is not
+   *  a decision to delete an adopted leftover. */
+  private terminalCleanupReached = false;
 
   constructor(options: TaskSandboxOptions) {
     this.provider = options.provider;
@@ -1151,6 +1155,11 @@ export class TaskSandbox {
     return { deleted, directory: await this.listTreeOf(directoryId) };
   }
 
+  /** The agent called finish or discardStaging successfully in this run. */
+  reachedTerminalCleanup(): boolean {
+    return this.terminalCleanupReached;
+  }
+
   /** File ids still only in staging because their move failed. Read-only. */
   unmovedStagingFileIds(): string[] {
     return [...this.unmovedFileIds];
@@ -1214,7 +1223,9 @@ export class TaskSandbox {
         `SANDBOX_STAGING_HOLDS_UNMOVED: ${ids.length} file(s) whose move failed are still in staging (${ids.join(", ")}) — move them into their season with moveToSeason, or deleteFiles them on purpose, before discarding staging`,
       );
     }
-    return this.storage.removeDirectory({ directoryId: this.stagingDirectoryId });
+    const removed = await this.storage.removeDirectory({ directoryId: this.stagingDirectoryId });
+    this.terminalCleanupReached = true;
+    return removed;
   }
 
   /** Movie-only automatic flatten: the film landed nested inside its resource
@@ -1290,7 +1301,9 @@ export class TaskSandbox {
         );
       }
     }
-    return this.finish();
+    const result = await this.finish();
+    this.terminalCleanupReached = true;
+    return result;
   }
 
   /** Requested or rejected episodes with no reportReplacement yet, in request order. */

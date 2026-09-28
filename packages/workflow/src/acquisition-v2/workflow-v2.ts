@@ -141,6 +141,7 @@ export async function runAcquisitionV2Workflow(
   // Assigned inside runAcquisitionV2 the moment the sandbox exists, so a throw
   // from the agent loop still lets this finally see files whose move failed.
   const unmovedStaging: { read: (() => string[]) | null } = { read: null };
+  const terminalCleanup: { read: (() => boolean) | null } = { read: null };
   const result = await withStagingCleanup(
     {
       executor: request.executor,
@@ -152,8 +153,11 @@ export async function runAcquisitionV2Workflow(
         const fileCount = unmovedStaging.read?.().length ?? 0;
         return fileCount > 0 ? { fileCount } : null;
       },
-      // The adopted leftover can be the only copy. A throw must not delete it.
-      ...(request.stagingRecovery ? { preserveOnThrow: true } : {}),
+      // The adopted leftover can be the only copy. A throw must not delete it,
+      // and a normal exit deletes it only after finish or discardStaging.
+      ...(request.stagingRecovery
+        ? { preserveOnThrow: true, discardOnNormalReturn: () => terminalCleanup.read?.() ?? false }
+        : {}),
       onKept: (event) => kept.push(event),
     },
     async () => {
@@ -224,6 +228,7 @@ export async function runAcquisitionV2Workflow(
     ...(request.linkHistory ? { linkHistory: request.linkHistory } : {}),
     ...(request.onProgress ? { onProgress: request.onProgress } : {}),
     unmovedStaging,
+    ...(request.stagingRecovery ? { terminalCleanup } : {}),
   });
 
   // Reconcile from the AGENT'S coverage (its markObtained), NOT a 115 re-scan:

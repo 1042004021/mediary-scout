@@ -647,3 +647,60 @@ describe("staging_kept_unmoved_files persist", () => {
     expect(event?.data).toEqual({ stagingDirectoryId: "stg", showDirectoryId: "show", fileCount: 14 });
   });
 });
+
+function textStop(text = "stopping without a terminal tool") {
+  return new MockLanguageModelV3({
+    doGenerate: async () => ({
+      content: [{ type: "text" as const, text }],
+      finishReason: { unified: "stop" as const, raw: "stop" as const },
+      usage: USAGE,
+      warnings: [],
+    }),
+  });
+}
+
+function recoveryRequest(executor: StuckFileExecutor, model: MockLanguageModelV3) {
+  return {
+    ...workflowRequest(executor, model),
+    maxSteps: 2,
+    stagingRecovery: { showDirectoryId: "show-left", stagingDirectoryId: "stg-leftover" },
+  };
+}
+
+describe("recovery discards an adopted leftover only after finish or discardStaging", () => {
+  it("keeps the leftover when the model stops without calling finish or discardStaging", async () => {
+    const executor = new StuckFileExecutor();
+    const result = await runAcquisitionV2Workflow(recoveryRequest(executor, textStop()));
+    expect(result.directories.stagingDirectoryId).toBe("stg-leftover");
+    expect(executor.removed).not.toContain("stg-leftover");
+  });
+
+  it("discards the leftover when the recovery calls finish", async () => {
+    const executor = new StuckFileExecutor();
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => tool("finish", {}, 1),
+    });
+    await runAcquisitionV2Workflow(recoveryRequest(executor, model));
+    expect(executor.removed).toContain("stg-leftover");
+  });
+
+  it("discards the leftover when the recovery calls discardStaging, without throwing", async () => {
+    const executor = new StuckFileExecutor();
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => tool("discardStaging", {}, 1),
+    });
+    await expect(runAcquisitionV2Workflow(recoveryRequest(executor, model))).resolves.toMatchObject({
+      directories: { stagingDirectoryId: "stg-leftover" },
+    });
+    expect(executor.removed).toContain("stg-leftover");
+  });
+
+  it("still discards a fresh staging dir when an ordinary run stops without finish", async () => {
+    const executor = new StuckFileExecutor();
+    const result = await runAcquisitionV2Workflow({
+      ...workflowRequest(executor, textStop()),
+      maxSteps: 2,
+    });
+    expect(executor.removed).toContain(result.directories.stagingDirectoryId);
+  });
+});

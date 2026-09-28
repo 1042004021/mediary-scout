@@ -278,8 +278,13 @@ export async function withStagingCleanup<T>(
      *  the dir (a kept dir would also look like a leak, so skip the read-back). */
     keep?: () => { fileCount: number } | null;
     /** A recovery adopted an existing leftover. A throw must leave that dir
-     *  where it is; a normal return still discards it. */
+     *  where it is. */
     preserveOnThrow?: boolean;
+    /** Recovery only. A normal return discards the adopted dir only when this
+     *  is true (the agent called finish or discardStaging). Anything else keeps
+     *  it for a later sweep. Absent on an ordinary run, whose fresh staging is
+     *  always discarded. */
+    discardOnNormalReturn?: () => boolean;
     onKept?: (event: StagingKeptUnmoved) => void;
   },
   run: () => Promise<T>,
@@ -307,9 +312,13 @@ export async function withStagingCleanup<T>(
         }
         return;
       }
-      // No unmoved files to report. A thrown recovery still must not delete
-      // the adopted leftover; a normal return falls through and discards it.
+      // No unmoved files to report. A thrown recovery must not delete the
+      // adopted leftover. A normal return deletes it only after finish or
+      // discardStaging; any other exit leaves it for the next sweep.
       if (threw && args.preserveOnThrow) {
+        return;
+      }
+      if (!threw && args.discardOnNormalReturn && !args.discardOnNormalReturn()) {
         return;
       }
       let removalFailed = false;
