@@ -4000,6 +4000,15 @@ select.setting-control {
 .update-kind { position: absolute; left: 0; top: 2px; font-size: 10.5px; font-weight: 600; color: var(--text-faint); }
 .update-kind.is-add { color: var(--accent); }
 .update-kind.is-fix { color: var(--info); }
+.update-status-side { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.update-progress { margin-top: 12px; }
+.update-bar { height: 4px; border-radius: 2px; background: var(--bg-card); margin-top: 8px; overflow: hidden; }
+.update-bar > i { display: block; height: 100%; background: var(--accent); transition: width 0.4s var(--ease-out, ease-out); }
+.update-now { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+.update-cmd { margin: 8px 0 0; padding: 10px 12px; border-radius: var(--radius-card); background: var(--bg-raised); font-size: 12.5px; overflow-x: auto; }
+.update-warn { margin: 10px 0 0; font-size: 12.5px; line-height: 1.55; color: var(--warning); }
+.update-failure summary { cursor: pointer; font-size: 12.5px; color: var(--text-muted); }
+.update-migrate .ghost-button { margin-top: 8px; }
 
 /* 搜索页空态「近期热门」发现区(#95)。Tab 药丸复用 .filter-pill。 */
 .trending {
