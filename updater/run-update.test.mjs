@@ -95,7 +95,11 @@ case "$cmd" in
     ref=""
     for arg in "$@"; do ref="$arg"; done
     case "$ref" in
-      refs/tags/*) printf '%s\\n' "$GIT_TAG_COMMIT" > "$STUB_DIR/head" ;;
+      refs/tags/*)
+        printf '%s\\n' "$GIT_TAG_COMMIT" > "$STUB_DIR/head"
+        # A checkout that dies partway: the tree has moved, git still fails.
+        if [ -f "$STUB_DIR/fail-tag-checkout" ]; then exit 1; fi
+        ;;
       *) printf '%s\\n' "$ref" > "$STUB_DIR/head" ;;
     esac
     ;;
@@ -446,7 +450,7 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     expect(signatures(log).some((step) => step === "hold" || step === "release")).toBe(false);
   });
 
-  it("releases the hold when it stops after taking it and before the swap", async () => {
+  it("on an unexpected failure before the swap, releases the hold and checks the old commit back out", async () => {
     const { stubDir, log, env } = setup();
     // An error while waiting after the hold: `sleep` fails, and set -e ends the script.
     writeFileSync(join(stubDir, "wget-lines"), '{"busy":true}\n');
@@ -455,8 +459,36 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     expect(result.code).not.toBe(0);
     const steps = signatures(log);
     expect(steps).toContain("hold");
-    expect(steps.at(-1)).toBe("release");
     expect(steps).not.toContain("up");
+    expect(steps.slice(-2)).toEqual(["release", `checkout ${FROM}`]);
+    expect(readFileSync(join(stubDir, "head"), "utf8").trim()).toBe(FROM);
+  });
+
+  it("checks the old commit back out when the tag checkout itself fails partway", async () => {
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "fail-tag-checkout"), "1");
+    const result = await run(env);
+    expect(result.code).not.toBe(0);
+    expect(signatures(log).at(-1)).toBe(`checkout ${FROM}`);
+    expect(readFileSync(join(stubDir, "head"), "utf8").trim()).toBe(FROM);
+  });
+
+  it("rollback pauses the new version and waits for its running tasks before swapping back", async () => {
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "hide-shas"), `${TAG_COMMIT}\n`);
+    // First probe (before the swap): idle. After the swap the new version is busy once.
+    writeFileSync(join(stubDir, "wget-lines"), '{"busy":false}\n{"busy":true}\n{"busy":false}\n');
+    const result = await run(env);
+    expect(result.code).toBe(10);
+    const steps = signatures(log);
+    const holds = steps.map((step, index) => [step, index]).filter(([step]) => step === "hold").map(([, index]) => index);
+    const ups = steps.map((step, index) => [step, index]).filter(([step]) => step === "up").map(([, index]) => index);
+    expect(holds).toHaveLength(2);
+    expect(ups).toHaveLength(2);
+    // The second hold comes after the first swap and before the rollback swap.
+    expect(holds[1]).toBeGreaterThan(ups[0]);
+    expect(holds[1]).toBeLessThan(ups[1]);
+    expect(steps.slice(holds[1], ups[1]).filter((step) => step === "wget")).toHaveLength(2);
   });
 
   it("rolls back when `up` itself fails instead of exiting through set -e", async () => {
@@ -479,7 +511,7 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     expect(result.code).toBe(10);
     expect(result.stdout).toContain("==> RESUMED_ROLLBACK");
     expect(result.stdout).toContain("==> ROLLED_BACK");
-    expect(signatures(log)).toEqual(["status", "inspect", `checkout ${FROM}`, "build", "up", "cat_commit", "health"]);
+    expect(signatures(log)).toEqual(["status", "inspect", `checkout ${FROM}`, "hold", "wget", "build", "up", "cat_commit", "health"]);
     expect(gitShas(stubDir)).toEqual([FROM]);
   });
 

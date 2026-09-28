@@ -89,89 +89,6 @@ PROJECT="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.projec
 [ -n "$PROJECT" ] || { echo "==> ERROR cannot read compose project name"; exit 2; }
 compose() { docker compose -p "$PROJECT" --project-directory "$REPO" "$@"; }
 
-verify() {
-  i=0
-  while [ "$i" -lt 90 ]; do
-    RUNNING="$(compose exec -T web cat BUILD_COMMIT 2>/dev/null || true)"
-    if [ "$RUNNING" = "$1" ] && compose exec -T web node -e "fetch('http://127.0.0.1:3000/api/health',{signal:AbortSignal.timeout(5000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then
-      return 0
-    fi
-    i=$((i + 1))
-    sleep 2
-  done
-  return 1
-}
-
-# Back to $1: check it out, rebuild, swap, and check it serves. Exits 10 or 20.
-roll_back() {
-  g -c advice.detachedHead=false checkout "$1"
-  GIT_SHA="$1"
-  export GIT_SHA
-  if compose build web && compose up -d --no-deps web && verify "$1"; then
-    echo "==> ROLLED_BACK"
-    exit 10
-  fi
-  echo "==> ROLLBACK_FAILED"
-  exit 20
-}
-
-if [ "$MODE" = rollback ]; then
-  echo "==> STEP switching"
-  echo "==> RESUMED_ROLLBACK — the update stopped after the swap began; going back to $ROLLBACK_TO"
-  roll_back "$ROLLBACK_TO"
-fi
-if [ "$MODE" = restore ]; then
-  g -c advice.detachedHead=false checkout "$ROLLBACK_TO"
-  # The cut-off run may have taken the hold; the old version must start runs again.
-  web_post '{"hold":false}' >/dev/null 2>&1 || true
-  echo "==> RESTORED $ROLLBACK_TO"
-  exit 0
-fi
-
-FROM="$(g rev-parse HEAD)"
-echo "==> FROM $FROM"
-
-echo "==> STEP backing_up"
-mkdir -p ./backups
-chown "$OWNER" ./backups
-STAMP="$(date +%Y%m%d-%H%M%S)"
-# Dump to a temp file first: `pg_dump | gzip` would hide a failed dump behind gzip's exit 0.
-TMP="./backups/pre-update-${STAMP}.sql.tmp"
-HELD=0
-SWAPPED=0
-# shellcheck disable=SC2329 # invoked by the EXIT trap below
-cleanup() {
-  rm -f "$TMP"
-  # Stopped after taking the hold but before the swap: let the old version start runs
-  # again. After a swap the old process, and its hold, are gone. Best effort.
-  if [ "$HELD" = 1 ] && [ "$SWAPPED" = 0 ]; then
-    web_post '{"hold":false}' >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup EXIT
-compose exec -T postgres pg_dump -U mediatrack -d mediatrack > "$TMP"
-gzip -c "$TMP" > "./backups/pre-update-${STAMP}.sql.gz"
-chown "$OWNER" "./backups/pre-update-${STAMP}.sql.gz"
-rm -f "$TMP"
-# Keep the newest 5. `|| true`: the read loop's EOF status is 1, and `set -e` would
-# abort a successful backup. Not `xargs -r` — macOS xargs has no -r, and the unit
-# test runs this script there. Busybox find/sort/tail behave the same.
-find ./backups -name 'pre-update-*.sql.gz' -type f -print | sort -r | tail -n +6 | while IFS= read -r old; do
-  [ -n "$old" ] || continue
-  rm -f "$old"
-done || true
-
-echo "==> STEP building"
-g fetch --tags --force origin
-g -c advice.detachedHead=false checkout "refs/tags/$TAG"
-GIT_SHA="$(g rev-parse HEAD)"
-export GIT_SHA
-if ! compose build web; then
-  echo "==> BUILD_FAILED"
-  g -c advice.detachedHead=false checkout "$FROM"
-  exit 10
-fi
-
 # Only an explicit "busy":false means idle. A failed request, the login page, or any
 # other answer is "not idle yet": swapping on a failed probe would cut running tasks.
 wait_idle() {
@@ -204,6 +121,106 @@ wait_idle() {
   echo "==> STILL_BUSY ($last) — switching anyway; interrupted runs are requeued on start"
 }
 
+verify() {
+  i=0
+  while [ "$i" -lt 90 ]; do
+    RUNNING="$(compose exec -T web cat BUILD_COMMIT 2>/dev/null || true)"
+    if [ "$RUNNING" = "$1" ] && compose exec -T web node -e "fetch('http://127.0.0.1:3000/api/health',{signal:AbortSignal.timeout(5000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then
+      return 0
+    fi
+    i=$((i + 1))
+    sleep 2
+  done
+  return 1
+}
+
+# Back to $1: check it out, rebuild, swap, and check it serves. Exits 10 or 20.
+roll_back() {
+  g -c advice.detachedHead=false checkout "$1"
+  GIT_SHA="$1"
+  export GIT_SHA
+  # The version being replaced may have started its worker. If it answers, pause it and
+  # let its running tasks end before swapping it out; one that does not answer is not
+  # running tasks, and waiting on it would only delay getting the old version back.
+  if [ "$(web_post '{"hold":true}' 2>/dev/null || true)" = '{"hold":true}' ]; then
+    wait_idle
+  fi
+  if compose build web && compose up -d --no-deps web && verify "$1"; then
+    echo "==> ROLLED_BACK"
+    exit 10
+  fi
+  echo "==> ROLLBACK_FAILED"
+  exit 20
+}
+
+if [ "$MODE" = rollback ]; then
+  echo "==> STEP switching"
+  echo "==> RESUMED_ROLLBACK — the update stopped after the swap began; going back to $ROLLBACK_TO"
+  roll_back "$ROLLBACK_TO"
+fi
+if [ "$MODE" = restore ]; then
+  g -c advice.detachedHead=false checkout "$ROLLBACK_TO"
+  # The cut-off run may have taken the hold; the old version must start runs again.
+  web_post '{"hold":false}' >/dev/null 2>&1 || true
+  echo "==> RESTORED $ROLLBACK_TO"
+  exit 0
+fi
+
+FROM="$(g rev-parse HEAD)"
+echo "==> FROM $FROM"
+
+echo "==> STEP backing_up"
+mkdir -p ./backups
+chown "$OWNER" ./backups
+STAMP="$(date +%Y%m%d-%H%M%S)"
+# Dump to a temp file first: `pg_dump | gzip` would hide a failed dump behind gzip's exit 0.
+TMP="./backups/pre-update-${STAMP}.sql.tmp"
+HELD=0
+SWAPPED=0
+ON_TAG=0
+# shellcheck disable=SC2329 # invoked by the EXIT trap below
+cleanup() {
+  code=$?
+  rm -f "$TMP"
+  # Stopped after taking the hold but before the swap: let the old version start runs
+  # again. After a swap the old process, and its hold, are gone. Best effort.
+  if [ "$HELD" = 1 ] && [ "$SWAPPED" = 0 ]; then
+    web_post '{"hold":false}' >/dev/null 2>&1 || true
+  fi
+  # An unexpected failure before the swap (set -e) leaves the deploy folder on the new
+  # tag while the old version keeps serving: check the old commit back out. The paths
+  # that exit on purpose already did (ON_TAG=0), and after the swap roll_back owns it.
+  if [ "$code" != 0 ] && [ "$ON_TAG" = 1 ] && [ "$SWAPPED" = 0 ]; then
+    g -c advice.detachedHead=false checkout "$FROM" >/dev/null 2>&1 || echo "==> RESTORE_FAILED"
+  fi
+}
+trap cleanup EXIT
+compose exec -T postgres pg_dump -U mediatrack -d mediatrack > "$TMP"
+gzip -c "$TMP" > "./backups/pre-update-${STAMP}.sql.gz"
+chown "$OWNER" "./backups/pre-update-${STAMP}.sql.gz"
+rm -f "$TMP"
+# Keep the newest 5. `|| true`: the read loop's EOF status is 1, and `set -e` would
+# abort a successful backup. Not `xargs -r` — macOS xargs has no -r, and the unit
+# test runs this script there. Busybox find/sort/tail behave the same.
+find ./backups -name 'pre-update-*.sql.gz' -type f -print | sort -r | tail -n +6 | while IFS= read -r old; do
+  [ -n "$old" ] || continue
+  rm -f "$old"
+done || true
+
+echo "==> STEP building"
+g fetch --tags --force origin
+ON_TAG=1
+g -c advice.detachedHead=false checkout "refs/tags/$TAG"
+GIT_SHA="$(g rev-parse HEAD)"
+export GIT_SHA
+if ! compose build web; then
+  echo "==> BUILD_FAILED"
+  g -c advice.detachedHead=false checkout "$FROM"
+  ON_TAG=0
+  exit 10
+fi
+
+
 # Stop the old version from starting new runs before the final wait, so nothing starts
 # between that wait and the swap. Queued runs stay queued and run on the new version.
 # Without the hold a run could start after the last check and be cut by the swap, so
@@ -213,6 +230,7 @@ if HOLD="$(web_post '{"hold":true}' 2>/dev/null)" && [ "$HOLD" = '{"hold":true}'
 else
   echo "==> HOLD_FAILED"
   g -c advice.detachedHead=false checkout "$FROM"
+  ON_TAG=0
   exit 40
 fi
 wait_idle

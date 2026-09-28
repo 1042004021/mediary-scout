@@ -256,6 +256,17 @@ export function createUpdater(opts) {
     start(tag) {
       if (!isReleaseTag(tag)) return { accepted: false, reason: "bad_tag" };
       if (job) return { accepted: false, reason: "busy" };
+      // A cut-off update's checkout is not back on the old commit yet: try that again
+      // first. The new update runs only once it worked, from the right commit.
+      if (status.pendingRestore === true && typeof status.fromCommit === "string") {
+        const commit = status.fromCommit;
+        job = resumeAfterRestart({ mode: "restore", commit })
+          .then(() => (status.pendingRestore === true ? undefined : run(tag)))
+          .finally(() => {
+            job = null;
+          });
+        return { accepted: true };
+      }
       job = run(tag).finally(() => {
         job = null;
       });

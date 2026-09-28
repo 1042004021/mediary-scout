@@ -340,6 +340,53 @@ describe("updater", () => {
     expect(third).toEqual([]);
   });
 
+  it("a new update first retries a pending restore, and does not start while it keeps failing", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "updater-"));
+    writeFileSync(
+      join(dir, "status.json"),
+      JSON.stringify({
+        phase: "failed",
+        targetTag: "v2026.10.02",
+        fromCommit: "c".repeat(40),
+        startedAt: "x",
+        finishedAt: "y",
+        message: "更新被中断了，原来的版本仍在运行。",
+        logTail: "",
+        pendingRestore: true,
+      }),
+    );
+    const calls = [];
+    let restoreCode = 1;
+    const updater = createUpdater({
+      stateDir: dir,
+      runUpdate: (args) => {
+        calls.push(args);
+        if (Array.isArray(args)) return Promise.resolve(restoreCode);
+        return Promise.resolve(0);
+      },
+      acquisitionsRunning: async () => false,
+      sleep: async () => {},
+      now: () => "2026-10-02T20:00:00.000Z",
+      waitPollMs: 1,
+      waitLimitMs: 1000,
+      repoCommit: () => "a".repeat(40),
+    });
+    await updater.idle(); // the start-up retry, which fails
+    calls.length = 0;
+    expect(updater.start("v2026.10.03")).toEqual({ accepted: true });
+    await updater.idle();
+    expect(calls).toEqual([["restore", "c".repeat(40)]]); // failed again: no update ran
+    expect(updater.status().pendingRestore).toBe(true);
+
+    restoreCode = 0;
+    calls.length = 0;
+    updater.start("v2026.10.03");
+    await updater.idle();
+    expect(calls).toEqual([["restore", "c".repeat(40)], "v2026.10.03"]);
+    expect(updater.status()).toMatchObject({ phase: "done", targetTag: "v2026.10.03" });
+    expect(updater.status().pendingRestore).toBeUndefined();
+  });
+
   it("writes status.json atomically, leaving no temp file behind", async () => {
     const { updater, dir } = make();
     updater.start("v2026.10.02");
