@@ -296,9 +296,11 @@ export async function handleWorkflowRunFailure(input: {
   //    A replace_request is the exception: it runs on a library that already has
   //    files, and a failed replace must leave that library exactly as it was.
   // A staging recovery runs on a library that already has files, and its failure
-  // is not the user's problem: keep the episodes, write no notification.
+  // is not the user's problem: write no notification, and do not touch the
+  // episode bucket. The claimed copy is from queue time on InMemory, and a user
+  // run is allowed to mark episodes while this recovery sits queued.
   const silent = claimed.workflowRun.kind === "staging_recovery";
-  const keepEpisodes = willRetry || claimed.workflowRun.kind === "replace_request" || silent;
+  const keepEpisodes = willRetry || claimed.workflowRun.kind === "replace_request";
   await repository.saveWorkflowRunSnapshot({
     accountId: claimed.accountId,
     connectedStorageId: claimed.connectedStorageId,
@@ -310,6 +312,7 @@ export async function handleWorkflowRunFailure(input: {
     decisions: willRetry ? claimed.decisions : [],
     transferAttempts: willRetry ? claimed.transferAttempts : [],
     notifications: silent ? [] : [notification],
+    ...(silent ? { keepCurrentEpisodes: true } : {}),
   });
   // Brand auth (dead cookie/token) — freeze the drive so the queue refuses more
   // work until re-bound. LLM Unauthorized is NOT a brand AuthError; only the

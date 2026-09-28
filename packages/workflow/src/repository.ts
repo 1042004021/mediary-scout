@@ -196,7 +196,12 @@ export type WorkflowRunReservationResult =
     };
 
 export interface WorkflowRepository extends DeadLinkStore, AgentMemoryStore, UserRequestStore {
-  saveWorkflowRunSnapshot(input: PersistWorkflowRunSnapshotInput): Promise<void>;
+  saveWorkflowRunSnapshot(
+    input: PersistWorkflowRunSnapshotInput & {
+      /** Write the run only. The season's episode bucket stays as stored. */
+      keepCurrentEpisodes?: boolean;
+    },
+  ): Promise<void>;
   reserveWorkflowRun(input: ReserveWorkflowRunInput): Promise<WorkflowRunReservationResult>;
   /** (account, storage)-scoped: returns null if the run belongs to a different
    *  account, or to a different storage when the scope pins one. Accepts a bare
@@ -985,10 +990,13 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     return out;
   }
 
-  async saveWorkflowRunSnapshot(input: PersistWorkflowRunSnapshotInput): Promise<void> {
-    validateWorkflowRunSnapshot(input);
+  async saveWorkflowRunSnapshot(
+    input: PersistWorkflowRunSnapshotInput & { keepCurrentEpisodes?: boolean },
+  ): Promise<void> {
+    const { keepCurrentEpisodes, ...snapshot } = input;
+    validateWorkflowRunSnapshot(snapshot);
 
-    const cloned = cloneWorkflowValue(input);
+    const cloned = cloneWorkflowValue(snapshot);
     cloned.accountId = cloned.accountId ?? DEFAULT_ACCOUNT_ID;
     // Mirror Postgres' upsert (connected_storage_id set on insert, PRESERVED on
     // conflict): a re-persist that omits the storage (the worker finalize path
@@ -997,11 +1005,15 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     const existing = this.workflowRuns.get(cloned.workflowRun.id);
     cloned.connectedStorageId =
       cloned.connectedStorageId ?? existing?.connectedStorageId ?? null;
+    const bucketKey = seasonScopeKey(cloned.season.id, cloned.connectedStorageId);
+    if (keepCurrentEpisodes === true) {
+      const current = this.episodesBySeason.get(bucketKey);
+      if (current) cloned.episodes = cloneWorkflowValue(current);
+      this.workflowRuns.set(cloned.workflowRun.id, cloned);
+      return;
+    }
     this.workflowRuns.set(cloned.workflowRun.id, cloned);
-    this.episodesBySeason.set(
-      seasonScopeKey(cloned.season.id, cloned.connectedStorageId),
-      cloneWorkflowValue(cloned.episodes),
-    );
+    this.episodesBySeason.set(bucketKey, cloneWorkflowValue(cloned.episodes));
   }
 
   async reserveWorkflowRun(input: ReserveWorkflowRunInput): Promise<WorkflowRunReservationResult> {

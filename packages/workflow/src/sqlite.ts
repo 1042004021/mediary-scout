@@ -318,12 +318,15 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
     this.db.close();
   }
 
-  async saveWorkflowRunSnapshot(input: PersistWorkflowRunSnapshotInput): Promise<void> {
-    validateWorkflowRunSnapshot(input);
-    const snapshot = cloneWorkflowValue(input);
+  async saveWorkflowRunSnapshot(
+    input: PersistWorkflowRunSnapshotInput & { keepCurrentEpisodes?: boolean },
+  ): Promise<void> {
+    const { keepCurrentEpisodes, ...rest } = input;
+    validateWorkflowRunSnapshot(rest);
+    const snapshot = cloneWorkflowValue(rest);
     // better-sqlite3 transactions are synchronous — the whole multi-table write
     // commits atomically or rolls back on throw.
-    this.db.transaction(() => this.replaceWorkflowRunSnapshot(snapshot))();
+    this.db.transaction(() => this.replaceWorkflowRunSnapshot(snapshot, { runOnly: keepCurrentEpisodes === true }))();
   }
 
   async reserveWorkflowRun(input: ReserveWorkflowRunInput): Promise<WorkflowRunReservationResult> {

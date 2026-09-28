@@ -9,6 +9,7 @@ import type { Account } from "../src/account-credentials.js";
 import type { TransferAttempt } from "../src/domain.js";
 import { workflowPersistenceFixture } from "./workflow-fixtures.js";
 import { queueReplaceRequest } from "../src/replace-request.js";
+import { handleWorkflowRunFailure } from "../src/worker.js";
 
 /** A factory that yields a FRESH, empty repository and a teardown. Postgres/SQLite
  *  return async; InMemory is sync — accept both. */
@@ -2544,6 +2545,79 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         });
         expect(await repo.listTrackedSeasonStates(untrackedScope)).toEqual([]);
         expect(await repo.getWorkflowRunSnapshot("kc_gone_replace", untrackedScope)).toBeNull();
+      });
+
+      it("a failed or requeued staging_recovery does not roll back an episode marked while it was queued", async () => {
+        const markThenFail = async (id: string, error: Error) => {
+          const repo = await fresh();
+          const scope = { accountId: "acct_default", connectedStorageId: `cs_${id}` };
+          const seed = queuedRun({ id, status: "succeeded", connectedStorageId: `cs_${id}` });
+          await repo.saveWorkflowRunSnapshot(seed);
+          const [read] = await repo.listTrackedSeasonStates(scope);
+          expect(read!.episodes.find((episode) => episode.episodeCode === "S01E02")?.obtained).toBe(false);
+          const reserved = await repo.reserveWorkflowRun({
+            ...seed,
+            episodes: read!.episodes,
+            keepCurrentEpisodes: true,
+            requireTrackedSeason: true,
+            workflowRun: {
+              ...seed.workflowRun,
+              id: `${id}_recovery`,
+              kind: "staging_recovery",
+              status: "queued",
+              startedAt: "2026-09-27T00:00:00.000Z",
+              finishedAt: null,
+              auditEvents: [
+                {
+                  type: "staging_recovery_queued",
+                  message: "queued",
+                  data: { stagingDirectoryId: "stg", showDirectoryId: "show", seasonNumbers: [1] },
+                },
+              ],
+            },
+          });
+          expect(reserved.status).toBe("reserved");
+          await repo.saveWorkflowRunSnapshot({
+            ...seed,
+            episodes: read!.episodes.map((episode) => ({
+              ...episode,
+              obtained: true,
+              verifiedFileIds: [`file_${episode.episodeCode}`],
+            })),
+            workflowRun: {
+              ...seed.workflowRun,
+              id: `${id}_user`,
+              kind: "type3_monitor",
+              status: "succeeded",
+              startedAt: "2026-09-27T01:00:00.000Z",
+              finishedAt: "2026-09-27T01:10:00.000Z",
+            },
+          });
+          const claimed = await repo.claimNextQueuedWorkflowRun({
+            kind: "staging_recovery",
+            now: "2026-09-27T02:00:00.000Z",
+          });
+          expect(claimed?.workflowRun.id).toBe(`${id}_recovery`);
+          const handled = await handleWorkflowRunFailure({
+            claimed: claimed!,
+            error,
+            repository: repo,
+            now: () => "2026-09-27T02:01:00.000Z",
+          });
+          const after = await repo.getTrackedSeasonState(`season_${id}`, scope);
+          return {
+            handled,
+            obtained: after?.episodes.find((episode) => episode.episodeCode === "S01E02")?.obtained,
+          };
+        };
+
+        const permanent = await markThenFail("stale_fail", new Error("agent model unavailable"));
+        expect(permanent.handled.status).toBe("failed");
+        expect(permanent.obtained).toBe(true);
+
+        const transient = await markThenFail("stale_retry", new Error("socket disconnected"));
+        expect(transient.handled.status).toBe("auto_requeued");
+        expect(transient.obtained).toBe(true);
       });
 
       it("retryFailedWorkflowRun requeues a failed run so it becomes claimable", async () => {

@@ -460,10 +460,15 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
     return this.schemaReady;
   }
 
-  async saveWorkflowRunSnapshot(input: PersistWorkflowRunSnapshotInput): Promise<void> {
-    validateWorkflowRunSnapshot(input);
-    const snapshot = cloneWorkflowValue(input);
-    await this.withTransaction((client) => this.replaceWorkflowRunSnapshot(client, snapshot));
+  async saveWorkflowRunSnapshot(
+    input: PersistWorkflowRunSnapshotInput & { keepCurrentEpisodes?: boolean },
+  ): Promise<void> {
+    const { keepCurrentEpisodes, ...rest } = input;
+    validateWorkflowRunSnapshot(rest);
+    const snapshot = cloneWorkflowValue(rest);
+    await this.withTransaction((client) =>
+      this.replaceWorkflowRunSnapshot(client, snapshot, { runOnly: keepCurrentEpisodes === true }),
+    );
   }
 
   async reserveWorkflowRun(input: ReserveWorkflowRunInput): Promise<WorkflowRunReservationResult> {
