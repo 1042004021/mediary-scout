@@ -8,4 +8,4 @@
     - 新增 光鸭网盘支持转存别人分享的链接
     - 改进 转存中途失败留下的临时文件夹，系统会自己收拾干净
 
-只有在作者自己的实例上验证过的 main 提交才打标签。流程：写好本文件 → 合并到 main → 在该提交上 `git tag vYYYY.MM.DD && git push origin vYYYY.MM.DD`。
+只有在作者自己的实例上验证过的 main 提交才打标签。流程：写好本文件 → 合并到 main → 在该提交上 `git tag vYYYY.MM.DD && git push origin vYYYY.MM.DD`。用轻量标签，不要加 `-a` 或 `-m`：带注释的标签不会被识别成发布版本。

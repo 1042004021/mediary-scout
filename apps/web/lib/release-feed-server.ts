@@ -2,7 +2,10 @@ import { compareReleaseTags, parseReleaseNotes, parseReleaseTag, type ReleaseNot
 import { normalizeCommit } from "./deployment-update";
 
 const REPO = "fancydirty/mediary-scout";
-const TAGS_URL = `https://api.github.com/repos/${REPO}/tags?per_page=30`;
+/** Every tag starting with `v2` in one response (the tags list API pages at 30, which
+ *  would lose the running release once 30 newer ones exist). Release tags must be
+ *  lightweight: an annotated tag's ref points at a tag object, not a commit. */
+const TAGS_URL = `https://api.github.com/repos/${REPO}/git/matching-refs/tags/v2`;
 const OK_TTL_MS = 60 * 60 * 1000;
 const FAIL_TTL_MS = 5 * 60 * 1000;
 /** Notes fetched for the newest N releases only (the tab shows 3, "更早" expands to 10). */
@@ -68,11 +71,13 @@ export async function fetchReleaseFeed(fetchImpl: typeof fetch = fetch): Promise
   let ttl = FAIL_TTL_MS;
   try {
     const raw = await getText(fetchImpl, TAGS_URL);
-    const list = raw ? (JSON.parse(raw) as Array<{ name?: unknown; commit?: { sha?: unknown } }>) : [];
+    const list = raw ? (JSON.parse(raw) as Array<{ ref?: unknown; object?: { sha?: unknown; type?: unknown } }>) : [];
     const releases = list
       .map((item) => {
-        const parsed = typeof item.name === "string" ? parseReleaseTag(item.name) : null;
-        const commit = normalizeCommit(typeof item.commit?.sha === "string" ? item.commit.sha : null);
+        const name = typeof item.ref === "string" ? item.ref.replace(/^refs\/tags\//, "") : "";
+        const parsed = parseReleaseTag(name);
+        const commit =
+          item.object?.type === "commit" && typeof item.object.sha === "string" ? normalizeCommit(item.object.sha) : null;
         return parsed && commit ? { tag: parsed.tag, date: parsed.date, commit } : null;
       })
       .filter((item): item is { tag: string; date: string; commit: string } => item !== null)

@@ -9,7 +9,8 @@ function fakeFetch(routes: Record<string, { status: number; body: string }>) {
   }) as unknown as typeof fetch;
 }
 
-const TAGS = "https://api.github.com/repos/fancydirty/mediary-scout/tags?per_page=30";
+const TAGS = "https://api.github.com/repos/fancydirty/mediary-scout/git/matching-refs/tags/v2";
+const ref = (tag: string, sha: string, type = "commit") => ({ ref: `refs/tags/${tag}`, object: { sha, type } });
 const notes = (tag: string) =>
   `https://api.github.com/repos/fancydirty/mediary-scout/contents/release-notes/${tag}.md?ref=${tag}`;
 const compare = (base: string, head: string) =>
@@ -23,9 +24,9 @@ describe("fetchReleaseFeed", () => {
       [TAGS]: {
         status: 200,
         body: JSON.stringify([
-          { name: "v1.4.1", commit: { sha: "a".repeat(40) } },
-          { name: "v2026.09.28", commit: { sha: "b".repeat(40) } },
-          { name: "v2026.10.02", commit: { sha: "c".repeat(40) } },
+          ref("v2.0.0", "a".repeat(40)),
+          ref("v2026.09.28", "b".repeat(40)),
+          ref("v2026.10.02", "c".repeat(40)),
         ]),
       },
       [notes("v2026.10.02")]: { status: 200, body: "- 新增 一键更新" },
@@ -35,6 +36,26 @@ describe("fetchReleaseFeed", () => {
     expect(feed.map((r) => r.tag)).toEqual(["v2026.10.02", "v2026.09.28"]);
     expect(feed[0]).toMatchObject({ commit: "c".repeat(40), notes: [{ kind: "add", text: "一键更新" }] });
     expect(feed[1]!.notes).toEqual([]);
+  });
+
+  it("keeps every release, not just a first page, and fetches notes for the newest 10 only", async () => {
+    const tags = Array.from({ length: 45 }, (_, index) => {
+      const day = new Date(Date.UTC(2026, 9, 1) + index * 86_400_000).toISOString().slice(0, 10);
+      return ref(`v${day.replaceAll("-", ".")}`, index.toString(16).padStart(40, "0"));
+    });
+    const fetchImpl = fakeFetch({ [TAGS]: { status: 200, body: JSON.stringify(tags) } });
+    const feed = await fetchReleaseFeed(fetchImpl);
+    expect(feed).toHaveLength(45);
+    expect(feed.at(-1)?.tag).toBe("v2026.10.01");
+    const noteCalls = vi.mocked(fetchImpl).mock.calls.filter(([url]) => String(url).includes("/contents/"));
+    expect(noteCalls).toHaveLength(10);
+  });
+
+  it("skips annotated tags (their sha is a tag object, not a commit)", async () => {
+    const fetchImpl = fakeFetch({
+      [TAGS]: { status: 200, body: JSON.stringify([ref("v2026.10.02", "c".repeat(40), "tag"), ref("v2026.09.28", "b".repeat(40))]) },
+    });
+    expect((await fetchReleaseFeed(fetchImpl)).map((r) => r.tag)).toEqual(["v2026.09.28"]);
   });
 
   it("returns [] when GitHub is unreachable, and caches the failure", async () => {
