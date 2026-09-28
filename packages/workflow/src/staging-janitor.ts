@@ -235,18 +235,20 @@ async function sweepDrive(
         const tree = await pace(() => executor.listTree({ directoryId: child.id, maxDepth: JANITOR_LIST_DEPTH }));
         const again = await repository.getWorkflowRunSnapshot(runId, drive.accountId);
         if (runCameBack(snapshot, again)) continue;
-        // No files in the walk. A directory sitting at the depth limit was not
-        // opened, so a file below it would also look like this — leave it.
+        // A directory at the depth limit was not opened. A file below it is
+        // invisible here, and a recovery's discardStaging would delete it.
+        // Leave the orphan whether or not other files were visible.
+        const listSubdirectories = executor.listSubdirectories;
+        const subdirs =
+          typeof listSubdirectories === "function"
+            ? await pace(() => listSubdirectories({ directoryId: child.id, maxDepth: JANITOR_LIST_DEPTH }))
+            : null;
+        if (subdirs === null || subdirs.some((dir) => subdirectorySitsAtDepthLimit(dir.path))) {
+          skippedDeep += 1;
+          continue;
+        }
+        // No files anywhere in the walk, wrapper folders included.
         if (tree.length === 0) {
-          const listSubdirectories = executor.listSubdirectories;
-          const subdirs =
-            typeof listSubdirectories === "function"
-              ? await pace(() => listSubdirectories({ directoryId: child.id, maxDepth: JANITOR_LIST_DEPTH }))
-              : null;
-          if (subdirs === null || subdirs.some((dir) => subdirectorySitsAtDepthLimit(dir.path))) {
-            skippedDeep += 1;
-            continue;
-          }
           const result = await pace(() => executor.removeDirectory(child.id));
           if (result.removed) removed += 1;
           else notRemoved += 1;

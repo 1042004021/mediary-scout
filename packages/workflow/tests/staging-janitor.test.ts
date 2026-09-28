@@ -966,6 +966,47 @@ describe("sweepOrphanStagingDirs", () => {
     expect(removed).toEqual(["stg-wrap"]);
   });
 
+  it("does not queue a leftover that has a visible file and another file below the depth limit", async () => {
+    const repo = new InMemoryWorkflowRepository();
+    await saveTracked(repo, "drive-mixed", "show", "Show", 42);
+    const removed: string[] = [];
+    const logs: string[] = [];
+    const deepPath = Array.from({ length: 10 }, (_, index) => `L${index + 1}`).join("/");
+    await sweepOrphanStagingDirs({
+      repository: repo,
+      now: NOW,
+      log: (line) => logs.push(line),
+      drives: [
+        drive({
+          storageId: "drive-mixed",
+          executor: {
+            async listChildDirectories(parentId: string) {
+              if (parentId === "tv") return [{ id: "show", name: "Show" }];
+              if (parentId === "show") return [{ id: "stg-mixed", name: "staging-old" }];
+              return [];
+            },
+            async listTree() {
+              return [{ path: "Show.S01E01.mkv", providerFileId: "seen", sizeBytes: 1024 * 1024 }];
+            },
+            async listSubdirectories() {
+              return [
+                { id: "wrap", path: "双轨" },
+                { id: "bottom", path: deepPath },
+              ];
+            },
+            async removeDirectory(id: string) {
+              removed.push(id);
+              return { removed: true };
+            },
+          },
+        }),
+      ],
+    });
+    expect(removed).toEqual([]);
+    expect(await recoveriesOf(repo, "drive-mixed")).toEqual([]);
+    expect(logs.some((line) => /drive-mixed: removed 0 empty, queued 0 recovery, skipped 1 deep/.test(line))).toBe(true);
+  });
+
   it("still queues a recovery when the depth-limited walk sees a file", async () => {
     const repo = new InMemoryWorkflowRepository();
     await saveTracked(repo, "drive-seen", "show", "Show", 41);
