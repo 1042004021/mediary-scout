@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { clearUpdateHold, setUpdateHold } from "./update-hold";
 import {
   drainQueueOnce,
   startBackgroundWorker,
@@ -145,6 +146,26 @@ describe("startBackgroundWorker — the in-process worker loop (auto-drive)", ()
     const afterFirst = runtime.runNext.mock.calls.length;
     await vi.advanceTimersByTimeAsync(1000); // second tick fires
     expect(runtime.runNext.mock.calls.length).toBeGreaterThan(afterFirst);
+  });
+
+  it("starts nothing while the update hold is on, and resumes once it is released", async () => {
+    const runtime = {
+      recover: vi.fn(async () => 0),
+      runNext: vi.fn(async () => ({ status: "idle" })),
+      runScheduled: vi.fn(async () => undefined),
+    };
+    setUpdateHold(Date.now(), 60_000);
+    try {
+      startBackgroundWorker({ pollMs: 1000, runtime });
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(runtime.runNext).not.toHaveBeenCalled();
+      expect(runtime.runScheduled).not.toHaveBeenCalled();
+    } finally {
+      clearUpdateHold();
+    }
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(runtime.runNext).toHaveBeenCalled();
+    expect(runtime.runScheduled).toHaveBeenCalled();
   });
 });
 

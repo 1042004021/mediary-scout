@@ -20,6 +20,7 @@ vi.mock("../../../../lib/workflow-runtime", () => ({
   getWorkflowRepository: () => repository,
 }));
 
+import { clearUpdateHold, setUpdateHold } from "../../../../lib/update-hold";
 import { GET } from "./route";
 
 describe("GET /api/update/busy", () => {
@@ -40,6 +41,20 @@ describe("GET /api/update/busy", () => {
     const response = await GET(new Request("http://localhost/api/update/busy", { headers: { authorization: "Bearer t" } }));
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ busy: true });
-    expect(hasActiveWorkflowRuns).toHaveBeenCalledWith(repository);
+    expect(hasActiveWorkflowRuns).toHaveBeenCalledWith(repository, { holdStartedAt: null, now: expect.any(Number) });
+  });
+
+  it("passes the hold's start time once the updater has taken it", async () => {
+    isUpdaterToken.mockResolvedValue(true);
+    hasActiveWorkflowRuns.mockResolvedValue(false);
+    const takenAt = Date.now() - 20_000;
+    setUpdateHold(takenAt, 60_000);
+    try {
+      const response = await GET(new Request("http://localhost/api/update/busy", { headers: { authorization: "Bearer t" } }));
+      expect(await response.json()).toEqual({ busy: false });
+      expect(hasActiveWorkflowRuns).toHaveBeenCalledWith(repository, { holdStartedAt: takenAt, now: expect.any(Number) });
+    } finally {
+      clearUpdateHold();
+    }
   });
 });

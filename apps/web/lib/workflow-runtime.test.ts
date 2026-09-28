@@ -451,6 +451,36 @@ describe("runScheduledType3（per-slot 认领 + 合并补跑）", () => {
     expect(result.scheduledFor).toBe("21:00");
   });
 
+  it("更新暂停期间：定时和手动巡检都不跑、不认领时间点，暂停结束后照常补跑", async () => {
+    const repository = await boot({ daily_sweep_times: TIMES }, "2026-07-09T06:30");
+    const { setUpdateHold, clearUpdateHold } = await import("./update-hold");
+    setUpdateHold(Date.now(), 60_000);
+    try {
+      expect(await rt.runScheduledType3()).toEqual({ skipped: "update_in_progress", outcomes: [] });
+      expect(await rt.runScheduledType3({ force: true })).toEqual({ skipped: "update_in_progress", outcomes: [] });
+      expect(monitor).not.toHaveBeenCalled();
+      expect((await repository.getSetting(rt.LAST_SWEEP_CLAIMS_SETTING_KEY)) ?? null).toBeNull();
+    } finally {
+      clearUpdateHold();
+    }
+    const result = await rt.runScheduledType3();
+    expect(result.skipped).toBeUndefined();
+    expect(monitor).toHaveBeenCalledTimes(1);
+  });
+
+  it("更新暂停期间：runNextQueuedWorkflow 直接返回 idle，不认领排队任务", async () => {
+    const repository = await boot({}, "2026-07-09T06:30");
+    const claim = vi.spyOn(repository, "claimNextQueuedWorkflowRun");
+    const { setUpdateHold, clearUpdateHold } = await import("./update-hold");
+    setUpdateHold(Date.now(), 60_000);
+    try {
+      expect(await rt.runNextQueuedWorkflow()).toEqual({ status: "idle" });
+      expect(claim).not.toHaveBeenCalled();
+    } finally {
+      clearUpdateHold();
+    }
+  });
+
   it("成功后写 last_sweep_completed_at（含定时路径）", async () => {
     const repository = await boot({ daily_sweep_times: TIMES }, "2026-07-09T06:30");
     await rt.runScheduledType3();

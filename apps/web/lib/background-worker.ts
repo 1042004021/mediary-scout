@@ -1,3 +1,5 @@
+import { isUpdateHoldActive } from "./update-hold";
+
 /**
  * In-process queue drainer.
  *
@@ -127,7 +129,8 @@ export function startBackgroundWorker(options?: { pollMs?: number; runtime?: Wor
   const loadRuntime = options?.runtime ? async () => options.runtime! : defaultRuntime;
   let running = false;
   const tick = async () => {
-    if (running) {
+    // An update is about to replace this process: start nothing new (see update-hold.ts).
+    if (running || isUpdateHoldActive(Date.now())) {
       return;
     }
     running = true;

@@ -501,6 +501,9 @@ export async function runPatrolNowAction(): Promise<PushSettingsActionResult & {
   try {
     const { runScheduledType3 } = await import("../lib/workflow-runtime");
     const result = await runScheduledType3({ force: true });
+    if (result.skipped === "update_in_progress") {
+      return { success: false, message: "正在更新，更新完成后再巡检。" };
+    }
     return { success: true, checked: result.outcomes.length };
   } catch (error) {
     return { success: false, message: `巡检失败：${String(error)}` };

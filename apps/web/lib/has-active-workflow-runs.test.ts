@@ -1,6 +1,6 @@
 import { DEFAULT_ACCOUNT_ID, InMemoryWorkflowRepository, type WorkflowKind, type WorkflowStatus } from "@media-track/workflow";
 import { describe, expect, it } from "vitest";
-import { hasActiveWorkflowRuns } from "./has-active-workflow-runs";
+import { HOLD_GRACE_MS, hasActiveWorkflowRuns } from "./has-active-workflow-runs";
 
 async function saveRun(
   repo: InMemoryWorkflowRepository,
@@ -79,5 +79,35 @@ describe("hasActiveWorkflowRuns", () => {
     await saveRun(repo, { id: "run-default", accountId: DEFAULT_ACCOUNT_ID, status: "queued", kind: "type2_init" });
     expect(await repo.listAccounts()).toEqual([]);
     expect(await hasActiveWorkflowRuns(repo)).toBe(true);
+  });
+
+  describe("while the update hold is on", () => {
+    const heldLongAgo = { holdStartedAt: 1_000, now: 1_000 + HOLD_GRACE_MS };
+
+    it("does not wait for queued runs: nothing new starts, they run on the new version", async () => {
+      const repo = new InMemoryWorkflowRepository();
+      await saveRun(repo, { id: "run-queued", accountId: DEFAULT_ACCOUNT_ID, status: "queued", kind: "type2_init" });
+      expect(await hasActiveWorkflowRuns(repo, heldLongAgo)).toBe(false);
+    });
+
+    it("still waits for a running run on any account", async () => {
+      const repo = new InMemoryWorkflowRepository();
+      await repo.createAccount({
+        id: "acct_other",
+        username: "other",
+        passwordHash: "",
+        groupId: null,
+        isOwner: false,
+        createdAt: "2026-10-02T00:00:00.000Z",
+      });
+      await saveRun(repo, { id: "run-other", accountId: "acct_other", status: "running", kind: "staging_recovery" });
+      expect(await hasActiveWorkflowRuns(repo, heldLongAgo)).toBe(true);
+    });
+
+    it("stays busy for the grace period right after the hold was taken", async () => {
+      const repo = new InMemoryWorkflowRepository();
+      expect(await hasActiveWorkflowRuns(repo, { holdStartedAt: 1_000, now: 1_000 + HOLD_GRACE_MS - 1 })).toBe(true);
+      expect(await hasActiveWorkflowRuns(repo, heldLongAgo)).toBe(false);
+    });
   });
 });

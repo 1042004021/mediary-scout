@@ -102,6 +102,7 @@ import { findDemoCandidateById, findDemoCandidateByTmdbId } from "./demo-candida
 import { seedDemoWorkflowRepository } from "./demo-workflow";
 import { resolveRegistration, deriveBootstrapState, canManageAccounts } from "./account-bootstrap";
 import { isDemoMode } from "./demo-mode";
+import { isUpdateHoldActive } from "./update-hold";
 
 export type CandidateTrackingRequestResult =
   | {
@@ -981,6 +982,11 @@ export function __resetPanSouHealthCacheForTests(): void {
 }
 
 export async function runNextQueuedWorkflow() {
+  // An update is about to replace this process: start nothing new. Queued runs stay
+  // queued and run on the new version.
+  if (isUpdateHoldActive(Date.now())) {
+    return { status: "idle" as const };
+  }
   const repository = getWorkflowRepository();
   // §7 form B: the worker resolves each CLAIMED run's account credentials via
   // resolveAccountContext (claim-first), so bob's acquisition lands in bob's 115.
@@ -1725,9 +1731,14 @@ export async function runScheduledType3(options?: {
   force?: boolean;
 }): Promise<{
   outcomes: Awaited<ReturnType<typeof runScheduledType3Monitoring>>;
-  skipped?: "already_swept_today" | "before_scheduled_time";
+  skipped?: "already_swept_today" | "before_scheduled_time" | "update_in_progress";
   scheduledFor?: string;
 }> {
+  // Checked before any slot is claimed, so a scheduled patrol skipped here still runs
+  // on the new version once the update is done.
+  if (isUpdateHoldActive(Date.now())) {
+    return { skipped: "update_in_progress", outcomes: [] };
+  }
   const repository = getWorkflowRepository();
   let claimedNow: string[] = [];
   let priorClaims: string[] = [];
