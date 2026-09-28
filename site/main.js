@@ -21,12 +21,10 @@ async function wireDownloads() {
   try {
     release = await fetchJson(`https://api.github.com/repos/${REPO}/releases/latest`);
   } catch {
-    try {
-      release = await fetchJson("./data/release-fallback.json");
-    } catch {
-      console.warn("release info unavailable; keeping static download links");
-      return; // HTML's hardcoded hrefs (releases/latest page) stay usable
-    }
+    // No bundled fallback: it handed out an old installer long after newer ones shipped.
+    // The HTML's hardcoded hrefs (the releases/latest page) stay usable.
+    console.warn("release info unavailable; keeping static download links");
+    return;
   }
   const { version, items } = orderDownloads(release, detectPlatform(navigator.userAgent));
   // Map by platform NAME via each button's explicit data-dl-platform, not by DOM
