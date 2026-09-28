@@ -2210,6 +2210,43 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
         expect(await repo.listTrackedSeasonStates(scope)).toHaveLength(1);
       });
 
+      it("untrackTitle removes a season that only has a running staging_recovery, and a missing run's progress is a no-op", async () => {
+        const repo = await fresh();
+        const scope = { accountId: "acct_default", connectedStorageId: "cs_hid" };
+        const tracked = queuedRun({ id: "hid_seed", status: "succeeded", connectedStorageId: "cs_hid", tmdbId: 4410 });
+        await repo.saveWorkflowRunSnapshot(tracked);
+        await repo.saveWorkflowRunSnapshot({
+          ...tracked,
+          workflowRun: {
+            ...tracked.workflowRun,
+            id: "hid_recovery",
+            kind: "staging_recovery",
+            status: "running",
+            startedAt: "2026-09-28T03:00:00.000Z",
+            finishedAt: null,
+          },
+        });
+        expect(await repo.untrackTitle(4410, scope, "tv")).toEqual({ status: "untracked", removedSeasons: 1 });
+        expect(await repo.listTrackedSeasonStates(scope)).toEqual([]);
+        expect(await repo.getWorkflowRunSnapshot("hid_recovery", scope)).toBeNull();
+        await repo.updateWorkflowRunProgress("hid_recovery", {
+          activity: "整理",
+          phase: "organize",
+          percent: 40,
+          updatedAt: "2026-09-28T03:01:00.000Z",
+        });
+        await repo.appendAgentStep("hid_recovery", {
+          ordinal: 0,
+          toolName: "inspectStaging",
+          args: {},
+          activity: "查看暂存",
+          phase: "verify",
+          at: "2026-09-28T03:01:00.000Z",
+        });
+        expect(await repo.getWorkflowRunSnapshot("hid_recovery", scope)).toBeNull();
+        expect(await repo.listTrackedSeasonStates(scope)).toEqual([]);
+      });
+
       it("untrackTitle returns in_flight and removes nothing when a target season has a running run", async () => {
         const repo = await fresh();
         await repo.saveWorkflowRunSnapshot(

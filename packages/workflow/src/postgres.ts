@@ -937,9 +937,10 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       // finds the season gone (not_tracked) instead of tracking it again.
       await lockWorkflowTitle(client, workScope.accountId, scope.connectedStorageId, workScope.titleKey);
       // In-flight guard: a running run on any target season → refuse, delete nothing.
+      // A staging_recovery is hidden and cannot be cancelled, so it does not count.
       const running = await client.query(
         "SELECT 1 FROM workflow_runs WHERE tracked_season_id = ANY($1) AND connected_storage_id = $2 " +
-          "AND payload->>'status' = 'running' LIMIT 1",
+          "AND payload->>'status' = 'running' AND payload->>'kind' IS DISTINCT FROM 'staging_recovery' LIMIT 1",
         [targetSeasonIds, storageValue],
       );
       // …and a queued or running replace_request of the work, whichever season it is

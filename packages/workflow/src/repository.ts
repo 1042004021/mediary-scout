@@ -1372,11 +1372,14 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     const work = { accountId: scope.accountId ?? DEFAULT_ACCOUNT_ID, drive: userMessageDrive(scope.connectedStorageId), titleKey: states[0]!.title.id };
 
     // In-flight guard: a running run on any target season → refuse, delete nothing.
+    // A staging_recovery is hidden and cannot be cancelled from the activity page,
+    // so it must not block the untrack. Its later writes no-op if the season is gone.
     const hasRunning = Array.from(this.workflowRuns.values()).some(
       (snapshot) =>
         targetSeasonIds.has(snapshot.season.id) &&
         scopeMatches(scope, snapshot.accountId, snapshot.connectedStorageId) &&
-        snapshot.workflowRun.status === "running",
+        snapshot.workflowRun.status === "running" &&
+        snapshot.workflowRun.kind !== "staging_recovery",
     );
     // …and a queued or running replace_request of the work, whichever season it is recorded
     // on: it covers every season tracked when it starts and writes a record for each when it

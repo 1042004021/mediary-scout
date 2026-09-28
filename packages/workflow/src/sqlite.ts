@@ -1041,8 +1041,11 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
     return this.db.transaction(
       (): { status: "untracked" | "not_found" | "in_flight"; removedSeasons: number } => {
         // In-flight guard: a running run on any target season → refuse, delete nothing.
+        // A staging_recovery is hidden and cannot be cancelled, so it does not count.
         const hasRunning = targetSeasonIds.some((seasonId) =>
-          this.selectWorkflowRuns(seasonId, storageValue).some((run) => run.status === "running"),
+          this.selectWorkflowRuns(seasonId, storageValue).some(
+            (run) => run.status === "running" && run.kind !== "staging_recovery",
+          ),
         );
         // …and a queued or running replace_request of the work, whichever season it is
         // recorded on: it covers every season tracked when it starts and writes a record for
