@@ -16,7 +16,7 @@ export async function UpdateSection() {
   return <UpdateTab view={await loadUpdateView()} desktop={resolveIsDesktop()} />;
 }
 
-function ReleaseBlock({ release }: { release: UpdateView["releases"][number] }) {
+export function ReleaseBlock({ release }: { release: UpdateView["releases"][number] }) {
   return (
     <div className="update-release">
       <div className="update-release-head">
@@ -25,8 +25,8 @@ function ReleaseBlock({ release }: { release: UpdateView["releases"][number] }) 
         {release.isCurrent ? <span className="service-pill">当前</span> : null}
       </div>
       <ul>
-        {release.notes.map((note) => (
-          <li key={note.text}>
+        {release.notes.map((note, index) => (
+          <li key={`${index}:${note.text}`}>
             <span className={`update-kind is-${note.kind}`}>{KIND_LABEL[note.kind]}</span>
             {note.text}
           </li>
@@ -77,6 +77,15 @@ export function UpdateTab({ view, desktop }: { view: UpdateView; desktop: boolea
             {view.releases.slice(3, 10).map((release) => (
               <ReleaseBlock key={release.tag} release={release} />
             ))}
+            {view.releases.length > 10 ? (
+              <p className="update-muted">
+                这里只列最近 10 个版本，更早的见{" "}
+                <a href="https://github.com/fancydirty/mediary-scout/tree/main/release-notes" target="_blank" rel="noopener noreferrer">
+                  全部发布说明
+                </a>
+                。
+              </p>
+            ) : null}
           </details>
         ) : null}
       </section>
