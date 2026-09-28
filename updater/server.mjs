@@ -51,21 +51,23 @@ function idleStatus() {
   };
 }
 
-/** A non-200 or unparsable busy probe is not busy (fail open) and is logged. */
+/** Only a 200 JSON `{"busy": false}` means idle. A failed or odd answer counts as busy
+ *  (keep waiting) and is logged: starting on a failed probe could cut running tasks. */
 export function interpretBusyResponse(status, body) {
   if (status !== 200) {
     return {
-      busy: false,
+      busy: true,
+      failed: true,
       log: status ? `==> BUSY_CHECK http ${status}` : "==> BUSY_CHECK unreachable",
     };
   }
   try {
     const parsed = JSON.parse(body);
-    if (parsed && typeof parsed.busy === "boolean") return { busy: parsed.busy };
+    if (parsed && typeof parsed.busy === "boolean") return { busy: parsed.busy, failed: false };
   } catch {
     // fall through
   }
-  return { busy: false, log: "==> BUSY_CHECK unparsable" };
+  return { busy: true, failed: true, log: "==> BUSY_CHECK unparsable" };
 }
 
 export function readLimitedBody(stream, limit = MAX_BODY) {
@@ -121,13 +123,19 @@ export function createUpdater(opts) {
     writeFileSync(statusFile, JSON.stringify(status, null, 2));
   };
 
+  // Whether the last probe failed, so the give-up message can say why.
+  let lastProbeFailed = false;
   async function acquisitionsBusy() {
     const result = await opts.acquisitionsRunning();
-    if (typeof result === "boolean") return result;
+    if (typeof result === "boolean") {
+      lastProbeFailed = false;
+      return result;
+    }
     const code = result && typeof result.status === "number" ? result.status : 0;
     const body = result && typeof result.body === "string" ? result.body : "";
     const interpreted = interpretBusyResponse(code, body);
-    if (interpreted.log) {
+    lastProbeFailed = interpreted.failed;
+    if (interpreted.log && log.at(-1) !== interpreted.log) {
       log.push(interpreted.log);
       save({});
     }
@@ -139,7 +147,8 @@ export function createUpdater(opts) {
     let waited = 0;
     while (await acquisitionsBusy()) {
       if (waited >= opts.waitLimitMs) {
-        save({ phase: "failed", message: "有任务一直没结束，这次先不更新了。", finishedAt: opts.now() });
+        const message = lastProbeFailed ? "连不上网页服务，这次先不更新了。" : "有任务一直没结束，这次先不更新了。";
+        save({ phase: "failed", message, finishedAt: opts.now() });
         return;
       }
       await opts.sleep(opts.waitPollMs);

@@ -6,20 +6,48 @@
 set -eu
 
 TAG="${1-}"
-# Whole-string match. Rejects `main` and anything with a shell metacharacter
-# before git, docker, or the deploy folder are touched.
-case "$TAG" in
-  v[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]|v[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9].[0-9]*) ;;
-  *)
-    echo "==> ERROR not a release tag: $TAG"
-    exit 2
-    ;;
-esac
+# Same rule as apps/web/lib/release-version.ts: vYYYY.MM.DD or vYYYY.MM.DD.N (N >= 2),
+# and a real calendar date. Checked before git, docker, or the deploy folder are touched.
+is_release_tag() {
+  # A newline inside the tag would let grep match one line of it.
+  case "$1" in *"
+"*) return 1 ;; esac
+  printf '%s' "$1" | grep -Eq '^v[0-9]{4}\.(0[1-9]|1[0-2])\.(0[1-9]|[12][0-9]|3[01])(\.([2-9]|[1-9][0-9]+))?$' || return 1
+  y=$(printf '%s' "$1" | cut -c2-5)
+  m=$(printf '%s' "$1" | cut -c7-8)
+  d=$(printf '%s' "$1" | cut -c10-11)
+  # Leading zeros would read as octal in $(( )).
+  m=${m#0}
+  d=${d#0}
+  case "$m" in
+    4|6|9|11) max=30 ;;
+    2)
+      if [ $((y % 4)) -eq 0 ] && { [ $((y % 100)) -ne 0 ] || [ $((y % 400)) -eq 0 ]; }; then max=29; else max=28; fi
+      ;;
+    *) max=31 ;;
+  esac
+  [ "$d" -le "$max" ]
+}
+if ! is_release_tag "$TAG"; then
+  echo "==> ERROR not a release tag: $TAG"
+  exit 2
+fi
 
 REPO="${UPDATER_REPO_DIR:-/repo}"
 STATE="${UPDATER_STATE_DIR:-/state}"
 WEB="${UPDATER_WEB_BASE:-http://web:3000}"
 cd "$REPO"
+
+token() {
+  if [ -r "$STATE/token" ]; then cat "$STATE/token"; fi
+}
+web_get() {
+  wget -qO- --header "Authorization: Bearer $(token)" "${WEB%/}$1"
+}
+web_post() {
+  wget -qO- --header "Authorization: Bearer $(token)" --header "content-type: application/json" \
+    --post-data "$1" "${WEB%/}/api/update/hold"
+}
 
 # The container runs as root. Run git as whoever owns the deploy folder, so the
 # files it writes stay editable by that user (a root-owned .git breaks the next pull).
@@ -48,7 +76,18 @@ chown "$OWNER" ./backups
 STAMP="$(date +%Y%m%d-%H%M%S)"
 # Dump to a temp file first: `pg_dump | gzip` would hide a failed dump behind gzip's exit 0.
 TMP="./backups/pre-update-${STAMP}.sql.tmp"
-trap 'rm -f "$TMP"' EXIT
+HELD=0
+SWAPPED=0
+# shellcheck disable=SC2329 # invoked by the EXIT trap below
+cleanup() {
+  rm -f "$TMP"
+  # Stopped after taking the hold but before the swap: let the old version start runs
+  # again. After a swap the old process, and its hold, are gone. Best effort.
+  if [ "$HELD" = 1 ] && [ "$SWAPPED" = 0 ]; then
+    web_post '{"hold":false}' >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
 compose exec -T postgres pg_dump -U mediatrack -d mediatrack > "$TMP"
 gzip -c "$TMP" > "./backups/pre-update-${STAMP}.sql.gz"
 chown "$OWNER" "./backups/pre-update-${STAMP}.sql.gz"
@@ -72,25 +111,34 @@ if ! compose build web; then
   exit 10
 fi
 
+# Only an explicit "busy":false means idle. A failed request, the login page, or any
+# other answer is "not idle yet": swapping on a failed probe would cut running tasks.
 wait_idle() {
   i=0
+  last=""
   while [ "$i" -lt 60 ]; do
-    TOKEN=""
-    if [ -r "$STATE/token" ]; then
-      TOKEN="$(cat "$STATE/token")"
+    if BUSY="$(web_get /api/update/busy 2>/dev/null)"; then
+      case "$BUSY" in
+        *'"busy":false'*) return 0 ;;
+        *'"busy":true'*) seen=busy ;;
+        *) seen=unexpected ;;
+      esac
+    else
+      seen=unreachable
     fi
-    BUSY="$(wget -qO- --header "Authorization: Bearer ${TOKEN}" "${WEB%/}/api/update/busy" 2>/dev/null || true)"
-    case "$BUSY" in
-      *'"busy":true'*) ;;
-      *) return 0 ;;
-    esac
     if [ "$i" -eq 0 ]; then
       echo "==> STEP waiting"
+    fi
+    if [ "$seen" != "$last" ]; then
+      echo "==> BUSY_CHECK $seen"
+      last="$seen"
     fi
     i=$((i + 1))
     sleep 30
   done
-  echo "==> STILL_BUSY — switching anyway; interrupted runs are requeued on start"
+  # Same policy as before: interrupted runs are requeued on start and the janitor
+  # cleans their staging, so a stuck task does not block updates forever.
+  echo "==> STILL_BUSY ($last) — switching anyway; interrupted runs are requeued on start"
 }
 
 verify() {
@@ -106,19 +154,30 @@ verify() {
   return 1
 }
 
+# Stop the old version from starting new runs before the final wait, so nothing starts
+# between that wait and the swap. Queued runs stay queued and run on the new version.
+if web_post '{"hold":true}' >/dev/null 2>&1; then
+  HELD=1
+else
+  echo "==> HOLD_FAILED — waiting for running tasks without it"
+fi
 wait_idle
 echo "==> STEP switching"
+SWAPPED=1
 # Only web. Recreating any other service from /repo would resolve bind mounts
 # inside the updater, not on the host, and start a second empty stack.
-compose up -d --no-deps web
-
-echo "==> STEP verifying"
-if verify "$GIT_SHA"; then
-  echo "==> DONE $TAG"
-  exit 0
+# Not left to set -e: the old container may already be stopped, so a failed `up`
+# goes to the rollback below like a failed check.
+if compose up -d --no-deps web; then
+  echo "==> STEP verifying"
+  if verify "$GIT_SHA"; then
+    echo "==> DONE $TAG"
+    exit 0
+  fi
+  echo "==> VERIFY_FAILED — rolling back to $FROM"
+else
+  echo "==> UP_FAILED — rolling back to $FROM"
 fi
-
-echo "==> VERIFY_FAILED — rolling back to $FROM"
 g -c advice.detachedHead=false checkout "$FROM"
 GIT_SHA="$FROM"
 export GIT_SHA

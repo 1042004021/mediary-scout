@@ -43,6 +43,14 @@ function installStubs(bin) {
     "wget",
     `#!/bin/sh
 ${LOG_FN}
+case "$*" in
+  *--post-data*)
+    log_call hold "$@"
+    if [ -f "$STUB_DIR/fail-hold" ]; then exit 1; fi
+    printf '%s\\n' '{"ok":true}'
+    exit 0
+    ;;
+esac
 log_call wget "$@"
 n=0
 if [ -f "$STUB_DIR/wget-n" ]; then n=$(cat "$STUB_DIR/wget-n"); fi
@@ -51,10 +59,11 @@ printf '%s\\n' "$n" > "$STUB_DIR/wget-n"
 if [ -f "$STUB_DIR/wget-lines" ]; then
   line=$(sed -n "\${n}p" "$STUB_DIR/wget-lines" || true)
   if [ -z "$line" ]; then line=$(tail -n 1 "$STUB_DIR/wget-lines" || true); fi
-  printf '%s\\n' "$line"
 else
-  printf '%s\\n' '{"busy":false}'
+  line='{"busy":false}'
 fi
+if [ "$line" = FAIL ]; then exit 1; fi
+printf '%s\\n' "$line"
 `,
   );
   writeExe(
@@ -115,6 +124,11 @@ if printf '%s' "$args" | grep -q 'build web'; then
   exit 0
 fi
 if printf '%s' "$args" | grep -q ' up '; then
+  n=0
+  if [ -f "$STUB_DIR/up-n" ]; then n=$(cat "$STUB_DIR/up-n"); fi
+  n=$((n + 1))
+  printf '%s\\n' "$n" > "$STUB_DIR/up-n"
+  if [ -f "$STUB_DIR/fail-first-up" ] && [ "$n" = 1 ]; then exit 1; fi
   exit 0
 fi
 if printf '%s' "$args" | grep -q 'BUILD_COMMIT'; then
@@ -190,8 +204,9 @@ function linesOf(log) {
 /** docker / git / wget calls, in order, reduced to the step the script meant. */
 function signatures(log) {
   return linesOf(log)
-    .filter((line) => /^(docker|git|wget) /.test(line))
+    .filter((line) => /^(docker|git|wget|hold) /.test(line))
     .map((line) => {
+      if (line.startsWith("hold ")) return line.includes('{"hold":true}') ? "hold" : "release";
       if (line.startsWith("wget ")) return "wget";
       if (line.includes("pg_dump")) return "pg_dump";
       if (line.includes("build web")) return "build";
@@ -226,11 +241,15 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
       `checkout refs/tags/${TAG}`,
       "rev-parse",
       "build",
+      "hold",
       "wget",
       "up",
       "cat_commit",
       "health",
     ]);
+    const hold = linesOf(log).find((line) => line.startsWith("hold "));
+    expect(hold).toContain("http://web.test:3000/api/update/hold");
+    expect(hold).toContain("Bearer t0k3n");
     const dockerLines = linesOf(log).filter((line) => line.startsWith("docker "));
     const dumpAt = dockerLines.findIndex((line) => line.includes("pg_dump"));
     const buildAt = dockerLines.findIndex((line) => line.includes("build web"));
@@ -319,6 +338,37 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     expect(steps).toContain(`checkout ${FROM}`);
   });
 
+  it("accepts only real release tags, the same rule as the web", async () => {
+    const accepted = ["v2026.10.02", "v2026.10.02.2", "v2026.10.02.12", "v2028.02.29", "v2000.02.29", "v2026.12.31"];
+    const rejected = [
+      "main",
+      "v2026.10.02;rm -rf /",
+      "v2026.10.02.2foo",
+      "v2026.10.02.1",
+      "v2026.10.02.01",
+      "v2026.02.29",
+      "v2026.02.30",
+      "v2026.04.31",
+      "v2026.13.01",
+      "v2026.00.10",
+      "v1900.02.29",
+      "v2026.10.02 ",
+      "v2026.10.02\nx",
+      "",
+    ];
+    for (const tag of accepted) {
+      const { env } = setup();
+      const result = await run(env, tag);
+      expect({ tag, code: result.code }).toEqual({ tag, code: 0 });
+    }
+    for (const tag of rejected) {
+      const { log, env } = setup();
+      const result = await run(env, tag);
+      expect({ tag, code: result.code }).toEqual({ tag, code: 2 });
+      expect(linesOf(log)).toEqual([]);
+    }
+  });
+
   it("rejects a non-release tag before calling anything", async () => {
     for (const tag of ["main", "v2026.10.02;rm -rf /"]) {
       const { log, env } = setup();
@@ -337,6 +387,68 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     expect(result.stdout.split("\n").filter((line) => line === "==> STEP waiting")).toHaveLength(1);
     expect(result.stdout.indexOf("==> STEP waiting")).toBeLessThan(result.stdout.indexOf("==> STEP switching"));
     expect(signatures(log).filter((step) => step === "wget")).toHaveLength(3);
+  });
+
+  it("keeps waiting while the probe fails or answers something unexpected", async () => {
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "wget-lines"), 'FAIL\n<html>login</html>\n{"busy":true}\n{"busy":false}\n');
+    const result = await run(env);
+    expect(result.code).toBe(0);
+    const checks = result.stdout.split("\n").filter((line) => line.startsWith("==> BUSY_CHECK"));
+    expect(checks).toEqual(["==> BUSY_CHECK unreachable", "==> BUSY_CHECK unexpected", "==> BUSY_CHECK busy"]);
+    expect(signatures(log).filter((step) => step === "wget")).toHaveLength(4);
+    expect(result.stdout.indexOf("==> BUSY_CHECK busy")).toBeLessThan(result.stdout.indexOf("==> STEP switching"));
+  });
+
+  it("switches after the wait limit when the probe never works, and says why", async () => {
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "wget-lines"), "FAIL\n");
+    const result = await run(env);
+    expect(result.code).toBe(0);
+    expect(signatures(log).filter((step) => step === "wget")).toHaveLength(60);
+    expect(result.stdout).toContain("==> STILL_BUSY (unreachable)");
+  });
+
+  it("still waits and swaps when taking the hold fails", async () => {
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "fail-hold"), "1");
+    const result = await run(env);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("==> HOLD_FAILED");
+    expect(signatures(log).filter((step) => step === "release")).toEqual([]);
+  });
+
+  it("never takes the hold when the build fails", async () => {
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "fail-build"), "1");
+    await run(env);
+    expect(signatures(log).some((step) => step === "hold" || step === "release")).toBe(false);
+  });
+
+  it("releases the hold when it stops after taking it and before the swap", async () => {
+    const { stubDir, log, env } = setup();
+    // An error while waiting after the hold: `sleep` fails, and set -e ends the script.
+    writeFileSync(join(stubDir, "wget-lines"), '{"busy":true}\n');
+    writeExe(join(stubDir, "..", "bin"), "sleep", "#!/bin/sh\nexit 1\n");
+    const result = await run(env);
+    expect(result.code).not.toBe(0);
+    const steps = signatures(log);
+    expect(steps).toContain("hold");
+    expect(steps.at(-1)).toBe("release");
+    expect(steps).not.toContain("up");
+  });
+
+  it("rolls back when `up` itself fails instead of exiting through set -e", async () => {
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "fail-first-up"), "1");
+    const result = await run(env);
+    expect(result.code).toBe(10);
+    expect(result.stdout).toContain("==> UP_FAILED");
+    expect(result.stdout).toContain("==> ROLLED_BACK");
+    expect(signatures(log).filter((step) => step === "up")).toHaveLength(2);
+    expect(gitShas(stubDir)).toEqual([TAG_COMMIT, FROM]);
+    // The swap was attempted, so the old process and its hold may be gone: no release.
+    expect(signatures(log)).not.toContain("release");
   });
 
   it("stops before checkout or build when pg_dump fails, and leaves no temp dump", async () => {

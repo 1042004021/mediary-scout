@@ -248,33 +248,66 @@ describe("updater", () => {
     expect(updater.status().message).toBe("更新完成。");
   });
 
-  it("logs non-200 and unparsable busy responses into the job log and does not treat them as busy", async () => {
+  it("keeps waiting through failed and unparsable busy answers, logging each once, then updates", async () => {
     const replies = [
       { status: 500, body: "nope" },
+      { status: 500, body: "nope" },
       { status: 200, body: "<html>login</html>" },
+      { status: 0, body: "" },
+      { status: 200, body: '{"busy":false}' },
     ];
     let n = 0;
+    let started = false;
     const { updater } = make({
       acquisitionsRunning: async () => replies[n++],
+      runUpdate: (_tag, onLine) => {
+        started = true;
+        onLine("==> DONE v2026.10.02");
+        return Promise.resolve(0);
+      },
     });
     updater.start("v2026.10.02");
     await updater.idle();
+    expect(n).toBe(5);
+    expect(started).toBe(true);
     expect(updater.status().phase).toBe("done");
-    expect(updater.status().logTail).toContain("==> BUSY_CHECK http 500");
+    const checks = updater.status().logTail.split("\n").filter((line) => line.startsWith("==> BUSY_CHECK"));
+    expect(checks).toEqual(["==> BUSY_CHECK http 500", "==> BUSY_CHECK unparsable", "==> BUSY_CHECK unreachable"]);
+  });
+
+  it("gives up with a web-service message when the probe never works", async () => {
+    let started = false;
+    const { updater } = make({
+      acquisitionsRunning: async () => ({ status: 0, body: "" }),
+      waitLimitMs: 0,
+      runUpdate: () => {
+        started = true;
+        return Promise.resolve(0);
+      },
+    });
     updater.start("v2026.10.02");
     await updater.idle();
-    expect(updater.status().phase).toBe("done");
-    expect(updater.status().logTail).toContain("==> BUSY_CHECK unparsable");
+    expect(started).toBe(false);
+    expect(updater.status()).toMatchObject({ phase: "failed", message: "连不上网页服务，这次先不更新了。" });
+  });
+
+  it("gives up with the busy message when the web keeps saying busy", async () => {
+    const { updater } = make({ acquisitionsRunning: async () => ({ status: 200, body: '{"busy":true}' }), waitLimitMs: 0 });
+    updater.start("v2026.10.02");
+    await updater.idle();
+    expect(updater.status()).toMatchObject({ phase: "failed", message: "有任务一直没结束，这次先不更新了。" });
   });
 });
 
 describe("interpretBusyResponse", () => {
-  it("trusts only a 200 JSON boolean and logs everything else", () => {
-    expect(interpretBusyResponse(200, '{"busy":true}')).toEqual({ busy: true });
-    expect(interpretBusyResponse(200, '{"busy":false}')).toEqual({ busy: false });
-    expect(interpretBusyResponse(401, '{"busy":true}')).toMatchObject({ busy: false, log: "==> BUSY_CHECK http 401" });
-    expect(interpretBusyResponse(200, '<html>{"busy":true}')).toMatchObject({ busy: false, log: "==> BUSY_CHECK unparsable" });
-    expect(interpretBusyResponse(0, "")).toMatchObject({ busy: false, log: "==> BUSY_CHECK unreachable" });
+  it("trusts only a 200 JSON boolean; everything else counts as busy and is logged", () => {
+    expect(interpretBusyResponse(200, '{"busy":true}')).toEqual({ busy: true, failed: false });
+    expect(interpretBusyResponse(200, '{"busy":false}')).toEqual({ busy: false, failed: false });
+    expect(interpretBusyResponse(401, '{"busy":false}')).toMatchObject({ busy: true, failed: true, log: "==> BUSY_CHECK http 401" });
+    expect(interpretBusyResponse(302, "")).toMatchObject({ busy: true, failed: true, log: "==> BUSY_CHECK http 302" });
+    expect(interpretBusyResponse(200, '<html>{"busy":false}')).toMatchObject({ busy: true, failed: true, log: "==> BUSY_CHECK unparsable" });
+    expect(interpretBusyResponse(200, '{"busy":"no"}')).toMatchObject({ busy: true, failed: true });
+    expect(interpretBusyResponse(0, "")).toMatchObject({ busy: true, failed: true, log: "==> BUSY_CHECK unreachable" });
   });
 });
 
