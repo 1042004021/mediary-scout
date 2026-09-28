@@ -85,6 +85,13 @@ export function desktopFeed(feed: ReleaseEntry[], publishedTag: string | null): 
   return publishedTag ? feed.filter((release) => compareReleaseTags(release.tag, publishedTag) <= 0) : [];
 }
 
+/** No readable published release (GitHub hiccup, or latest is not a complete date release):
+ *  keep the changelog, but do not offer an update. The tab then says it cannot tell. */
+export function desktopView(view: UpdateView, published: DesktopRelease | null): UpdateView {
+  if (published || !view.available) return view;
+  return { ...view, available: null, status: "unknown" };
+}
+
 export function desktopDownload(release: DesktopRelease, platform: string): DesktopDownload {
   if (platform === "darwin" && release.dmgUrl) return { url: release.dmgUrl, file: "dmg" };
   if (platform === "win32" && release.exeUrl) return { url: release.exeUrl, file: "exe" };

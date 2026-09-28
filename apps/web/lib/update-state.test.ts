@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildUpdateView, desktopDownload, desktopFeed } from "./update-state";
+import { buildUpdateView, desktopDownload, desktopFeed, desktopView } from "./update-state";
 
 const feed = [
   { tag: "v2026.10.02", date: "2026-10-02", commit: "c".repeat(40), notes: [] },
@@ -71,6 +71,34 @@ describe("desktopFeed", () => {
     expect(view.available).toBeNull();
     expect(view.status).toBe("latest");
     expect(view.releases.map((r) => r.tag)).toEqual(["v2026.09.28"]);
+  });
+});
+
+describe("desktopView", () => {
+  const published = {
+    tag: "v2026.10.02",
+    pageUrl: "https://github.com/fancydirty/mediary-scout/releases/tag/v2026.10.02",
+    dmgUrl: "https://github.com/fancydirty/mediary-scout/releases/download/v2026.10.02/a.dmg",
+    exeUrl: "https://github.com/fancydirty/mediary-scout/releases/download/v2026.10.02/a.exe",
+  };
+
+  it("lists the changelog but offers nothing when the published release cannot be read", () => {
+    const view = buildUpdateView({ ...base, currentCommit: "b".repeat(40) });
+    const settled = desktopView(view, null);
+    expect(settled.available).toBeNull();
+    expect(settled.status).toBe("unknown");
+    expect(settled.releases.map((release) => release.tag)).toEqual(["v2026.10.02", "v2026.09.28"]);
+  });
+
+  it("leaves an up-to-date desktop unchanged", () => {
+    const view = buildUpdateView({ ...base, currentCommit: "c".repeat(40) });
+    expect(view.status).toBe("latest");
+    expect(desktopView(view, null)).toBe(view);
+  });
+
+  it("leaves the view unchanged when a published release was found", () => {
+    const view = buildUpdateView({ ...base, currentCommit: "b".repeat(40) });
+    expect(desktopView(view, published)).toBe(view);
   });
 });
 
