@@ -252,8 +252,6 @@ async function sweepDrive(
         // requeued on this same id and recreate this directory.
         if (!settledForSweep(snapshot, now)) continue;
         const tree = await pace(() => executor.listTree({ directoryId: child.id, maxDepth: JANITOR_LIST_DEPTH }));
-        const again = await repository.getWorkflowRunSnapshot(runId, drive.accountId);
-        if (runCameBack(snapshot, again)) continue;
         // A directory at the depth limit was not opened. A file below it is
         // invisible here, and a recovery's discardStaging would delete it.
         // Leave the orphan whether or not other files were visible.
@@ -266,6 +264,10 @@ async function sweepDrive(
           skippedDeep += 1;
           continue;
         }
+        // Re-read after both listings, right before any delete or queue: the run
+        // can be requeued on this id while the provider walks the tree.
+        const again = await repository.getWorkflowRunSnapshot(runId, drive.accountId);
+        if (runCameBack(snapshot, again)) continue;
         // No files anywhere in the walk, wrapper folders included.
         if (tree.length === 0) {
           const result = await pace(() => executor.removeDirectory(child.id));

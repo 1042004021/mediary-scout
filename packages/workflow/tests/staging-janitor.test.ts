@@ -823,6 +823,9 @@ describe("sweepOrphanStagingDirs", () => {
             async listTree() {
               return [];
             },
+            async listSubdirectories() {
+              return [];
+            },
             async removeDirectory(id: string) {
               removed.push(id);
               return { removed: true };
@@ -833,6 +836,69 @@ describe("sweepOrphanStagingDirs", () => {
     });
     expect(removed).toEqual([]);
     expect(reads).toBeGreaterThanOrEqual(2);
+  });
+
+  it("does not remove a staging dir whose run becomes active during the subdirectory listing", async () => {
+    const inner = new InMemoryWorkflowRepository();
+    await saveRun(inner, {
+      id: "run-late",
+      status: "failed",
+      startedAt: "2026-09-27T00:30:00.000Z",
+      finishedAt: "2026-09-27T01:00:00.000Z",
+    });
+    // The run is requeued while the janitor walks the subdirectories: every read
+    // after that walk sees it running again.
+    let flipped = false;
+    const repo = {
+      getWorkflowRunSnapshot: async (id: string, scope?: string) => {
+        const snapshot = await inner.getWorkflowRunSnapshot(id, scope);
+        if (id !== "run-late" || !snapshot || !flipped) return snapshot;
+        return { ...snapshot, workflowRun: { ...snapshot.workflowRun, status: "running" as const } };
+      },
+      getAccountSetting: (accountId: string, key: string) => inner.getAccountSetting(accountId, key),
+      setAccountSetting: (accountId: string, key: string, value: string) =>
+        inner.setAccountSetting(accountId, key, value),
+      saveWorkflowRunSnapshot: (input: Parameters<InMemoryWorkflowRepository["saveWorkflowRunSnapshot"]>[0]) =>
+        inner.saveWorkflowRunSnapshot(input),
+      listTrackedSeasonStates: (scope?: Parameters<InMemoryWorkflowRepository["listTrackedSeasonStates"]>[0]) =>
+        inner.listTrackedSeasonStates(scope),
+      listActiveWorkflowRuns: (scope?: Parameters<InMemoryWorkflowRepository["listActiveWorkflowRuns"]>[0]) =>
+        inner.listActiveWorkflowRuns(scope),
+      findActiveStagingRecovery: (input: Parameters<InMemoryWorkflowRepository["findActiveStagingRecovery"]>[0]) =>
+        inner.findActiveStagingRecovery(input),
+      reserveWorkflowRun: (input: Parameters<InMemoryWorkflowRepository["reserveWorkflowRun"]>[0]) =>
+        inner.reserveWorkflowRun(input),
+    };
+    const removed: string[] = [];
+    await sweepOrphanStagingDirs({
+      repository: repo,
+      now: NOW,
+      drives: [
+        drive({
+          storageId: "drive-late",
+          executor: {
+            async listChildDirectories(parentId: string) {
+              if (parentId === "tv") return [{ id: "show", name: "Show" }];
+              if (parentId === "show") return [{ id: "stg-late", name: "staging-run-late" }];
+              return [];
+            },
+            async listTree() {
+              return [];
+            },
+            async listSubdirectories() {
+              flipped = true;
+              return [];
+            },
+            async removeDirectory(id: string) {
+              removed.push(id);
+              return { removed: true };
+            },
+          },
+        }),
+      ],
+    });
+    expect(flipped).toBe(true);
+    expect(removed).toEqual([]);
   });
 
   it("does not queue a non-empty leftover whose run becomes active during the listing", async () => {
@@ -880,6 +946,9 @@ describe("sweepOrphanStagingDirs", () => {
             },
             async listTree() {
               return [{ path: "a.mkv", providerFileId: "f1", sizeBytes: 1024 * 1024 }];
+            },
+            async listSubdirectories() {
+              return [];
             },
             async removeDirectory() {
               return { removed: true };
