@@ -1,5 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fetchCommitRelation, fetchReleaseFeed, invalidateReleaseFeedCache } from "./release-feed-server";
+import {
+  fetchCommitRelation,
+  fetchLatestDesktopRelease,
+  fetchReleaseFeed,
+  invalidateReleaseFeedCache,
+} from "./release-feed-server";
 
 function fakeFetch(routes: Record<string, { status: number; body: string }>) {
   return vi.fn(async (url: string) => {
@@ -86,5 +91,108 @@ describe("fetchCommitRelation", () => {
     const odd = fakeFetch({ [compare(base, head)]: { status: 200, body: JSON.stringify({ status: "weird" }) } });
     invalidateReleaseFeedCache();
     expect(await fetchCommitRelation(base, head, odd)).toBeNull();
+  });
+});
+
+const LATEST = "https://api.github.com/repos/fancydirty/mediary-scout/releases/latest";
+const asset = (name: string) => ({
+  name,
+  browser_download_url: `https://github.com/fancydirty/mediary-scout/releases/download/v2026.10.02/${name}`,
+});
+
+describe("fetchLatestDesktopRelease", () => {
+  beforeEach(() => invalidateReleaseFeedCache());
+
+  it("reads the latest date release and its two installers", async () => {
+    const fetchImpl = fakeFetch({
+      [LATEST]: {
+        status: 200,
+        body: JSON.stringify({
+          tag_name: "v2026.10.02",
+          assets: [asset("Mediary.Scout-2026.1002.0-arm64.dmg"), asset("Mediary.Scout.Setup.2026.1002.0.exe"), asset("notes.txt")],
+        }),
+      },
+    });
+    expect(await fetchLatestDesktopRelease(fetchImpl)).toEqual({
+      tag: "v2026.10.02",
+      pageUrl: "https://github.com/fancydirty/mediary-scout/releases/tag/v2026.10.02",
+      dmgUrl: asset("Mediary.Scout-2026.1002.0-arm64.dmg").browser_download_url,
+      exeUrl: asset("Mediary.Scout.Setup.2026.1002.0.exe").browser_download_url,
+    });
+  });
+
+  it("ignores an old semver release, and installers served from anywhere else", async () => {
+    const old = fakeFetch({ [LATEST]: { status: 200, body: JSON.stringify({ tag_name: "v1.4.1", assets: [] }) } });
+    expect(await fetchLatestDesktopRelease(old)).toBeNull();
+    invalidateReleaseFeedCache();
+    const elsewhere = fakeFetch({
+      [LATEST]: {
+        status: 200,
+        body: JSON.stringify({
+          tag_name: "v2026.10.02",
+          assets: [
+            { name: "a.dmg", browser_download_url: "https://elsewhere.example/a.dmg" },
+            { name: "a.exe", browser_download_url: "https://elsewhere.example/a.exe" },
+          ],
+        }),
+      },
+    });
+    expect(await fetchLatestDesktopRelease(elsewhere)).toBeNull();
+  });
+
+  it("returns null when only the .exe uploaded so far", async () => {
+    const onlyExe = fakeFetch({
+      [LATEST]: {
+        status: 200,
+        body: JSON.stringify({
+          tag_name: "v2026.10.02",
+          assets: [asset("Mediary.Scout.Setup.2026.1002.0.exe")],
+        }),
+      },
+    });
+    expect(await fetchLatestDesktopRelease(onlyExe)).toBeNull();
+  });
+
+  it("treats a release that is still missing an installer as a five-minute failure", async () => {
+    const failTtl = 5 * 60 * 1000;
+    const onlyExe = JSON.stringify({
+      tag_name: "v2026.10.02",
+      assets: [asset("Mediary.Scout.Setup.2026.1002.0.exe")],
+    });
+    const both = JSON.stringify({
+      tag_name: "v2026.10.02",
+      assets: [asset("Mediary.Scout-2026.1002.0-arm64.dmg"), asset("Mediary.Scout.Setup.2026.1002.0.exe")],
+    });
+    let body = onlyExe;
+    const fetchImpl = vi.fn(async () => new Response(body, { status: 200 })) as unknown as typeof fetch;
+    vi.useFakeTimers();
+    try {
+      const start = new Date("2026-10-02T00:00:00.000Z");
+      vi.setSystemTime(start);
+      expect(await fetchLatestDesktopRelease(fetchImpl)).toBeNull();
+      vi.setSystemTime(new Date(start.getTime() + failTtl - 1));
+      expect(await fetchLatestDesktopRelease(fetchImpl)).toBeNull();
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      body = both;
+      vi.setSystemTime(new Date(start.getTime() + failTtl));
+      expect(await fetchLatestDesktopRelease(fetchImpl)).toEqual({
+        tag: "v2026.10.02",
+        pageUrl: "https://github.com/fancydirty/mediary-scout/releases/tag/v2026.10.02",
+        dmgUrl: asset("Mediary.Scout-2026.1002.0-arm64.dmg").browser_download_url,
+        exeUrl: asset("Mediary.Scout.Setup.2026.1002.0.exe").browser_download_url,
+      });
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("returns null when GitHub is unreachable, and caches the failure", async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new Error("offline");
+    }) as unknown as typeof fetch;
+    expect(await fetchLatestDesktopRelease(fetchImpl)).toBeNull();
+    expect(await fetchLatestDesktopRelease(fetchImpl)).toBeNull();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 });

@@ -1,4 +1,4 @@
-import type { CommitRelation, ReleaseEntry } from "./release-feed-server";
+import type { CommitRelation, DesktopRelease, ReleaseEntry } from "./release-feed-server";
 import { compareReleaseTags } from "./release-version";
 import type { UpdaterPhase, UpdaterStatus } from "./updater-client";
 
@@ -19,6 +19,12 @@ export const ACTIVE_UPDATER_PHASES: ReadonlySet<UpdaterPhase> = new Set<UpdaterP
  */
 export type UpdateStatus = "available" | "latest" | "unknown" | "offline";
 
+/** Where the desktop app gets the newer release: this platform's installer, or the release page. */
+export interface DesktopDownload {
+  url: string;
+  file: "dmg" | "exe" | null;
+}
+
 export interface UpdateView {
   current: { label: string; tag: string | null };
   /** The newest release strictly newer than what is running, or null. Never a downgrade. */
@@ -26,6 +32,8 @@ export interface UpdateView {
   status: UpdateStatus;
   releases: Array<ReleaseEntry & { isCurrent: boolean }>;
   updater: UpdaterStatus | null;
+  /** Desktop only, and only while a newer release is offered. */
+  download: DesktopDownload | null;
 }
 
 export function buildUpdateView(input: {
@@ -67,5 +75,25 @@ export function buildUpdateView(input: {
     status,
     releases: input.feed.map((release) => ({ ...release, isCurrent: release.tag === currentRelease?.tag })),
     updater: input.updater,
+    download: null,
   };
+}
+
+/** Desktop users can install only what was published with installers. A newer tag whose build
+ *  is still running (or failed) is left out, so it is neither offered nor listed. */
+export function desktopFeed(feed: ReleaseEntry[], publishedTag: string | null): ReleaseEntry[] {
+  return publishedTag ? feed.filter((release) => compareReleaseTags(release.tag, publishedTag) <= 0) : [];
+}
+
+/** No readable published release (GitHub hiccup, or latest is not a complete date release):
+ *  keep the changelog, but do not offer an update. The tab then says it cannot tell. */
+export function desktopView(view: UpdateView, published: DesktopRelease | null): UpdateView {
+  if (published || !view.available) return view;
+  return { ...view, available: null, status: "unknown" };
+}
+
+export function desktopDownload(release: DesktopRelease, platform: string): DesktopDownload {
+  if (platform === "darwin" && release.dmgUrl) return { url: release.dmgUrl, file: "dmg" };
+  if (platform === "win32" && release.exeUrl) return { url: release.exeUrl, file: "exe" };
+  return { url: release.pageUrl, file: null };
 }

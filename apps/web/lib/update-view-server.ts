@@ -1,19 +1,29 @@
 import { readBuildCommit } from "./deployment-update-server";
-import { fetchCommitRelation, fetchReleaseFeed } from "./release-feed-server";
-import { buildUpdateView, type UpdateView } from "./update-state";
+import { fetchCommitRelation, fetchLatestDesktopRelease, fetchReleaseFeed } from "./release-feed-server";
+import { buildUpdateView, desktopDownload, desktopFeed, desktopView, type UpdateView } from "./update-state";
 import { getUpdaterStatus } from "./updater-client";
+import { resolveIsDesktop } from "./workflow-runtime";
 
 /** Shared by the 「更新」 tab, 「立即更新」, the daily auto-update and the settings badge.
- *  The badge polls every 8 s per open tab, so it passes `{ updaterStatus: false }` to skip the updater call. */
+ *  The badge polls every 8 s per open tab, so it passes `{ updaterStatus: false }` to skip the updater call.
+ *  On desktop only a release published with installers counts: a tag whose build is still
+ *  running, or failed, is never offered. If the published release cannot be read, the
+ *  changelog stays and nothing is offered. */
 export async function loadUpdateView(options: { updaterStatus?: boolean } = {}): Promise<UpdateView> {
-  const [currentCommit, feed, updater] = await Promise.all([
+  const desktop = resolveIsDesktop();
+  const [currentCommit, releases, updater, published] = await Promise.all([
     readBuildCommit(),
     fetchReleaseFeed(),
     options.updaterStatus === false ? Promise.resolve(null) : getUpdaterStatus(),
+    desktop ? fetchLatestDesktopRelease() : Promise.resolve(null),
   ]);
+  const feed = desktop && published ? desktopFeed(releases, published.tag) : releases;
   const newest = feed[0];
   const tagged = feed.some((release) => release.commit === currentCommit);
   const relation =
     newest && currentCommit && !tagged ? await fetchCommitRelation(newest.commit, currentCommit) : null;
-  return buildUpdateView({ currentCommit, feed, updater, relation });
+  const view = buildUpdateView({ currentCommit, feed, updater, relation });
+  if (!desktop) return view;
+  const settled = desktopView(view, published);
+  return published && settled.available ? { ...settled, download: desktopDownload(published, process.platform) } : settled;
 }

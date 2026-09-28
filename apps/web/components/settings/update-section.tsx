@@ -7,8 +7,15 @@ import { resolveCurrentIsOwner } from "../../lib/settings-attention-server";
 
 const KIND_LABEL = { add: "新增", improve: "改进", fix: "修复" } as const;
 
+/** How to install the download, by installer type ("page" = the release page). */
+const INSTALL_HINT = {
+  dmg: "下载后打开 .dmg，先从菜单栏图标退出巡影，再把新版拖进「应用程序」替换。数据和设置都会保留。",
+  exe: "下载后运行安装包，它会先关掉正在运行的巡影再安装。数据和设置都会保留。",
+  page: "在发布页下载对应系统的安装包。数据和设置都会保留。",
+} as const;
+
 /* Hallmark · component: update-tab · genre: modern-minimal · theme: project (apps/web/DESIGN.md, Spotify)
- * states: up-to-date · update-available · updating · waiting · rolled-back · no-updater · offline feed
+ * states: up-to-date · update-available · desktop-download · updating · waiting · rolled-back · no-updater · offline feed
  * 方向 A：状态卡在上 · 更新日志在下。 */
 export async function UpdateSection() {
   await connection();
@@ -36,6 +43,30 @@ export function ReleaseBlock({ release }: { release: UpdateView["releases"][numb
   );
 }
 
+/** Desktop: a newer published release → download it here; cannot tell → the release page; up to date → nothing. */
+function DesktopUpdateHint({ view }: { view: UpdateView }) {
+  if (view.download) {
+    return (
+      <div className="update-download">
+        <a className="primary-button" href={view.download.url} target="_blank" rel="noopener noreferrer">
+          下载新版本
+        </a>
+        <p className="update-muted">{INSTALL_HINT[view.download.file ?? "page"]}</p>
+      </div>
+    );
+  }
+  if (view.status === "latest") return null;
+  return (
+    <p className="update-muted">
+      桌面版在{" "}
+      <a href="https://github.com/fancydirty/mediary-scout/releases/latest" target="_blank" rel="noopener noreferrer">
+        发布页
+      </a>{" "}
+      下载新版本安装包。
+    </p>
+  );
+}
+
 export function UpdateTab({ view, desktop }: { view: UpdateView; desktop: boolean }) {
   return (
     <div className="update-tab">
@@ -55,15 +86,7 @@ export function UpdateTab({ view, desktop }: { view: UpdateView; desktop: boolea
             <span className="service-pill">已是最新</span>
           )}
         </div>
-        {desktop ? (
-          <p className="update-muted">
-            桌面版在{" "}
-            <a href="https://github.com/fancydirty/mediary-scout/releases/latest" target="_blank" rel="noopener noreferrer">
-              发布页
-            </a>{" "}
-            下载新版本安装包。
-          </p>
-        ) : null}
+        {desktop ? <DesktopUpdateHint view={view} /> : null}
       </section>
       <section className="panel update-log">
         <h3 className="update-log-title">更新日志</h3>

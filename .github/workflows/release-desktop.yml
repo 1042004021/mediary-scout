@@ -7,31 +7,92 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Version tag to publish (e.g. v0.1.0)"
+        description: "Release tag (e.g. v2026.09.28)"
         required: true
+      dry_run:
+        description: "Build the branch selected in Run workflow, not the tag's commit. The tag only sets the version number and which release-notes file to check. Does not publish a Release."
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+
+# Releases publish one at a time. If tags are pushed faster than a release takes (~40 min), only the newest waiting one runs, so the newest tag ends up as Latest.
+concurrency:
+  group: release-desktop
+  cancel-in-progress: false
 
 env:
   ELECTRON_VERSION: "33.4.11"
 
 jobs:
+  # Seconds, before the 30-minute builds: the tag must be a release tag and its
+  # release notes must exist. Resolves which commit every job builds.
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      ref: ${{ steps.resolve.outputs.ref }}
+    steps:
+      - name: Resolve tag and commit
+        id: resolve
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then TAG="$INPUT_TAG"; else TAG="$GITHUB_REF_NAME"; fi
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]{4}\.(0[1-9]|1[0-2])\.(0[1-9]|[12][0-9]|3[01])(\.([2-9]|[1-9][0-9]+))?$'; then
+            echo "::error::$TAG is not a release tag (vYYYY.MM.DD or vYYYY.MM.DD.N)"
+            exit 1
+          fi
+          # GNU date rejects a day that does not exist; a rollover would print a different date.
+          YYYY=${TAG:1:4} MM=${TAG:6:2} DD=${TAG:9:2}
+          if [ "$(date -u -d "$YYYY-$MM-$DD" +%F 2>/dev/null || true)" != "$YYYY-$MM-$DD" ]; then
+            echo "::error::$TAG is not a release tag (vYYYY.MM.DD or vYYYY.MM.DD.N)"
+            exit 1
+          fi
+          # A dry run builds the dispatched branch, which has no tag. A real release's ref must
+          # point at a commit: an annotated tag is invisible to the 「更新」 feed.
+          if [ "$DRY_RUN" != "true" ]; then
+            TYPE=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .object.type)
+            if [ "$TYPE" != "commit" ]; then
+              echo "::error::$TAG is an annotated tag. Release tags must be lightweight: git tag -d $TAG && git push origin :refs/tags/$TAG, then git tag $TAG <commit> && git push origin $TAG"
+              exit 1
+            fi
+          fi
+          # A dry run builds the dispatched branch; a release builds the tag.
+          if [ "$DRY_RUN" = "true" ]; then REF="$GITHUB_SHA"; else REF="$TAG"; fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "Building $TAG from $REF"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve.outputs.ref }}
+
+      - name: Require release notes
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          NOTES="release-notes/$TAG.md"
+          if [ ! -f "$NOTES" ]; then
+            echo "::error::$NOTES is missing. Write the release notes before tagging."
+            exit 1
+          fi
+          if ! grep -Eq '^[[:space:]]*[-*][[:space:]]+(新增|改进|修复)[[:space:]]+' "$NOTES"; then
+            echo "::error::$NOTES has no 新增 / 改进 / 修复 lines."
+            exit 1
+          fi
+
   build-macos:
+    needs: preflight
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-
-      - name: Checkout tag commit (workflow_dispatch)
-        if: github.event_name == 'workflow_dispatch'
-        run: |
-          git fetch --tags
-          if git rev-parse "refs/tags/${{ inputs.tag }}" >/dev/null 2>&1; then
-            git checkout "${{ inputs.tag }}"
-          else
-            echo "::error::Tag ${{ inputs.tag }} does not exist. Create it first: git tag ${{ inputs.tag }} && git push origin ${{ inputs.tag }}"
-            exit 1
-          fi
+        with:
+          ref: ${{ needs.preflight.outputs.ref }}
 
       - uses: actions/setup-node@v4
         with:
@@ -45,6 +106,15 @@ jobs:
 
       - name: Build desktop TypeScript
         run: npm run build --workspace @media-track/desktop
+
+      # App version from the tag (v2026.09.28 → 2026.928.0), and the commit into the
+      # standalone server as BUILD_COMMIT, which the settings 「更新」 tab reads.
+      - name: Stamp release version and build commit
+        id: stamp
+        shell: bash
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: node apps/desktop/scripts/stamp-release.cjs "$TAG"
 
       # Turbopack also emits a hashed copy of better-sqlite3 under
       # standalone/apps/web/.next/node_modules/ and the generated server code
@@ -127,6 +197,25 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: npm run dist --workspace @media-track/desktop
 
+      - name: Check the version and commit inside the app
+        env:
+          APP_VERSION: ${{ steps.stamp.outputs.app_version }}
+        run: |
+          APP=$(find apps/desktop/dist-app -maxdepth 2 -type d -name "Mediary Scout.app" | head -1)
+          [ -n "$APP" ] || { echo "::error::no Mediary Scout.app under apps/desktop/dist-app"; exit 1; }
+          GOT_COMMIT=$(tr -d '[:space:]' < "$APP/Contents/Resources/app/apps/web/BUILD_COMMIT")
+          [ "$GOT_COMMIT" = "$(git rev-parse HEAD)" ] || { echo "::error::BUILD_COMMIT $GOT_COMMIT is not HEAD"; exit 1; }
+          GOT_VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "$APP/Contents/Info.plist")
+          [ "$GOT_VERSION" = "$APP_VERSION" ] || { echo "::error::app version $GOT_VERSION is not $APP_VERSION"; exit 1; }
+          found=
+          for f in apps/desktop/dist-app/*.dmg; do
+            case "$f" in
+              *"-${APP_VERSION}-"*) found=1 ;;
+            esac
+          done
+          [ -n "$found" ] || { echo "::error::no .dmg named with $APP_VERSION"; exit 1; }
+          echo "STAMP OK: $GOT_VERSION $GOT_COMMIT"
+
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
@@ -136,21 +225,12 @@ jobs:
           retention-days: 7
 
   build-windows:
+    needs: preflight
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Checkout tag commit (workflow_dispatch)
-        if: github.event_name == 'workflow_dispatch'
-        shell: pwsh
-        run: |
-          git fetch --tags
-          if (git rev-parse "refs/tags/${{ inputs.tag }}" 2>$null) {
-            git checkout "${{ inputs.tag }}"
-          } else {
-            Write-Error "Tag ${{ inputs.tag }} does not exist"
-            exit 1
-          }
+        with:
+          ref: ${{ needs.preflight.outputs.ref }}
 
       - uses: actions/setup-node@v4
         with:
@@ -164,6 +244,15 @@ jobs:
 
       - name: Build desktop TypeScript
         run: npm run build --workspace @media-track/desktop
+
+      # App version from the tag (v2026.09.28 → 2026.928.0), and the commit into the
+      # standalone server as BUILD_COMMIT, which the settings 「更新」 tab reads.
+      - name: Stamp release version and build commit
+        id: stamp
+        shell: bash
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: node apps/desktop/scripts/stamp-release.cjs "$TAG"
 
       # Turbopack also emits a hashed copy of better-sqlite3 under
       # standalone/apps/web/.next/node_modules/ and the generated server code
@@ -289,6 +378,22 @@ jobs:
           if (-not $healthy) { throw "installed app never answered 200 on its baseUrl within 120s" }
           Write-Host "SMOKE OK: $baseUrl answered 200"
 
+      - name: Check the version and commit inside the installed app
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.stamp.outputs.app_version }}
+        run: |
+          $exe = Get-ChildItem -Path "$env:LOCALAPPDATA\Programs" -Recurse -Depth 2 -Filter "Mediary Scout.exe" -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $exe) { throw "installed Mediary Scout.exe not found under $env:LOCALAPPDATA\Programs" }
+          $stamp = Join-Path (Split-Path $exe) "resources\app\apps\web\BUILD_COMMIT"
+          if (-not (Test-Path $stamp)) { throw "BUILD_COMMIT missing in the installed app: $stamp" }
+          $got = (Get-Content $stamp -Raw).Trim()
+          $head = (git rev-parse HEAD).Trim()
+          if ($got -ne $head) { throw "installed BUILD_COMMIT $got is not HEAD $head" }
+          $productVersion = (Get-Item $exe).VersionInfo.ProductVersion
+          if (-not $productVersion -or -not $productVersion.StartsWith($env:APP_VERSION)) { throw "exe ProductVersion '$productVersion' does not start with $env:APP_VERSION" }
+          Write-Host "STAMP OK: $productVersion $got"
+
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
@@ -303,19 +408,31 @@ jobs:
   # state where a fresh DMG sits next to a stale EXE because one
   # platform's gate failed after the other had already uploaded.
   release:
-    needs: [build-macos, build-windows]
+    needs: [preflight, build-macos, build-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Determine release tag
-        id: tag
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.ref }}
+
+      - name: Compose release notes
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-          fi
+          BODY="$RUNNER_TEMP/release-body.md"
+          # The Release title carries the version: drop the file's "# vYYYY.MM.DD" heading.
+          sed '1{/^# /d;}' "release-notes/$TAG.md" > "$BODY"
+          cat >> "$BODY" <<'EOF'
+
+          ---
+
+          **桌面版**：macOS（Apple 芯片）下载 `.dmg`，Windows 下载 `.exe`。覆盖安装，数据和设置都会保留。
+
+          **Docker 自部署**：按[升级说明](https://github.com/fancydirty/mediary-scout/blob/main/docs/deploy.md#升级)更新。
+          EOF
+          cat "$BODY"
 
       - name: Download platform artifacts
         uses: actions/download-artifact@v4
@@ -323,12 +440,36 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # A newly created Release becomes Latest unless we say otherwise. Re-publishing an
+      # older tag must not steal Latest from a newer date release.
+      - name: Decide whether this release is Latest
+        id: latest
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          CURRENT=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || true)
+          MAKE_LATEST=true
+          if printf '%s' "$CURRENT" | grep -Eq '^v[0-9]{4}\.(0[1-9]|1[0-2])\.(0[1-9]|[12][0-9]|3[01])(\.([2-9]|[1-9][0-9]+))?$'; then
+            NEWER=$(printf '%s\n%s\n' "$TAG" "$CURRENT" | sort -V | tail -1)
+            if [ "$NEWER" = "$CURRENT" ] && [ "$CURRENT" != "$TAG" ]; then
+              MAKE_LATEST=false
+            fi
+          fi
+          echo "make_latest=$MAKE_LATEST (current: ${CURRENT:-none})"
+          echo "make_latest=$MAKE_LATEST" >> "$GITHUB_OUTPUT"
+
       - name: Upload DMG + installer to GitHub Release
+        if: ${{ !inputs.dry_run }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
+          tag_name: ${{ needs.preflight.outputs.tag }}
+          name: 巡影 ${{ needs.preflight.outputs.tag }}
+          body_path: ${{ runner.temp }}/release-body.md
+          make_latest: ${{ steps.latest.outputs.make_latest }}
           files: |
             dist/*.dmg
             dist/*.exe
           fail_on_unmatched_files: true
-          generate_release_notes: true
+          generate_release_notes: false

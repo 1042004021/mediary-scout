@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="https://github.com/fancydirty/mediary-scout/actions/workflows/ci.yml"><img src="https://github.com/fancydirty/mediary-scout/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/fancydirty/mediary-scout/releases"><img src="https://img.shields.io/github/v/release/fancydirty/mediary-scout?display_name=tag&sort=semver" alt="Latest Release"></a>
+  <a href="https://github.com/fancydirty/mediary-scout/releases"><img src="https://img.shields.io/github/v/release/fancydirty/mediary-scout?display_name=tag" alt="Latest Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-0BSD-blue" alt="license"></a>
   <a href="https://github.com/fancydirty/mediary-scout/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs welcome"></a>
 </p>

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildUpdateView } from "./update-state";
+import { buildUpdateView, desktopDownload, desktopFeed, desktopView } from "./update-state";
 
 const feed = [
   { tag: "v2026.10.02", date: "2026-10-02", commit: "c".repeat(40), notes: [] },
@@ -16,6 +16,7 @@ describe("buildUpdateView", () => {
       ["v2026.10.02", false],
       ["v2026.09.28", true],
     ]);
+    expect(view.download).toBeNull();
   });
   it("is up to date on the newest release", () => {
     const view = buildUpdateView({ ...base, currentCommit: "c".repeat(40) });
@@ -55,5 +56,67 @@ describe("buildUpdateView", () => {
     expect(view.status).toBe("offline");
     // Without the release list we cannot tell a release from a dev build.
     expect(view.current).toEqual({ label: "dddddddd", tag: null });
+  });
+});
+
+describe("desktopFeed", () => {
+  it("keeps only releases up to the latest one published with installers", () => {
+    expect(desktopFeed(feed, "v2026.09.28").map((r) => r.tag)).toEqual(["v2026.09.28"]);
+    expect(desktopFeed(feed, "v2026.10.02").map((r) => r.tag)).toEqual(["v2026.10.02", "v2026.09.28"]);
+    expect(desktopFeed(feed, null)).toEqual([]);
+  });
+
+  it("so a tag whose installers are not out yet is neither offered nor listed", () => {
+    const view = buildUpdateView({ ...base, feed: desktopFeed(feed, "v2026.09.28"), currentCommit: "b".repeat(40) });
+    expect(view.available).toBeNull();
+    expect(view.status).toBe("latest");
+    expect(view.releases.map((r) => r.tag)).toEqual(["v2026.09.28"]);
+  });
+});
+
+describe("desktopView", () => {
+  const published = {
+    tag: "v2026.10.02",
+    pageUrl: "https://github.com/fancydirty/mediary-scout/releases/tag/v2026.10.02",
+    dmgUrl: "https://github.com/fancydirty/mediary-scout/releases/download/v2026.10.02/a.dmg",
+    exeUrl: "https://github.com/fancydirty/mediary-scout/releases/download/v2026.10.02/a.exe",
+  };
+
+  it("lists the changelog but offers nothing when the published release cannot be read", () => {
+    const view = buildUpdateView({ ...base, currentCommit: "b".repeat(40) });
+    const settled = desktopView(view, null);
+    expect(settled.available).toBeNull();
+    expect(settled.status).toBe("unknown");
+    expect(settled.releases.map((release) => release.tag)).toEqual(["v2026.10.02", "v2026.09.28"]);
+  });
+
+  it("leaves an up-to-date desktop unchanged", () => {
+    const view = buildUpdateView({ ...base, currentCommit: "c".repeat(40) });
+    expect(view.status).toBe("latest");
+    expect(desktopView(view, null)).toBe(view);
+  });
+
+  it("leaves the view unchanged when a published release was found", () => {
+    const view = buildUpdateView({ ...base, currentCommit: "b".repeat(40) });
+    expect(desktopView(view, published)).toBe(view);
+  });
+});
+
+describe("desktopDownload", () => {
+  const release = {
+    tag: "v2026.10.02",
+    pageUrl: "https://github.com/fancydirty/mediary-scout/releases/tag/v2026.10.02",
+    dmgUrl: "https://github.com/fancydirty/mediary-scout/releases/download/v2026.10.02/a.dmg",
+    exeUrl: "https://github.com/fancydirty/mediary-scout/releases/download/v2026.10.02/a.exe",
+  };
+
+  it("picks this platform's installer", () => {
+    expect(desktopDownload(release, "darwin")).toEqual({ url: release.dmgUrl, file: "dmg" });
+    expect(desktopDownload(release, "win32")).toEqual({ url: release.exeUrl, file: "exe" });
+  });
+
+  it("falls back to the release page", () => {
+    expect(desktopDownload({ ...release, dmgUrl: null }, "darwin")).toEqual({ url: release.pageUrl, file: null });
+    expect(desktopDownload(release, "linux")).toEqual({ url: release.pageUrl, file: null });
   });
 });
