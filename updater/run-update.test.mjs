@@ -100,7 +100,10 @@ case "$cmd" in
         # A checkout that dies partway: the tree has moved, git still fails.
         if [ -f "$STUB_DIR/fail-tag-checkout" ]; then exit 1; fi
         ;;
-      *) printf '%s\\n' "$ref" > "$STUB_DIR/head" ;;
+      *)
+        if [ -f "$STUB_DIR/fail-checkout-from" ]; then exit 1; fi
+        printf '%s\\n' "$ref" > "$STUB_DIR/head"
+        ;;
     esac
     ;;
   *)
@@ -253,6 +256,7 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
       `checkout refs/tags/${TAG}`,
       "rev-parse",
       "build",
+      "hold",
       "hold",
       "wget",
       "up",
@@ -481,14 +485,15 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     const result = await run(env);
     expect(result.code).toBe(10);
     const steps = signatures(log);
-    const holds = steps.map((step, index) => [step, index]).filter(([step]) => step === "hold").map(([, index]) => index);
     const ups = steps.map((step, index) => [step, index]).filter(([step]) => step === "up").map(([, index]) => index);
-    expect(holds).toHaveLength(2);
     expect(ups).toHaveLength(2);
-    // The second hold comes after the first swap and before the rollback swap.
-    expect(holds[1]).toBeGreaterThan(ups[0]);
-    expect(holds[1]).toBeLessThan(ups[1]);
-    expect(steps.slice(holds[1], ups[1]).filter((step) => step === "wget")).toHaveLength(2);
+    // Between the first swap and the rollback swap: a hold is taken, then the rollback
+    // waits (two probes: busy, then idle), refreshing the hold on each.
+    const between = steps.slice(ups[0] + 1, ups[1]);
+    expect(between.indexOf("hold")).toBeGreaterThanOrEqual(0);
+    expect(between.filter((step) => step === "wget")).toHaveLength(2);
+    expect(between.filter((step) => step === "hold")).toHaveLength(3);
+    expect(between.indexOf("hold")).toBeLessThan(between.indexOf("wget"));
   });
 
   it("rolls back when `up` itself fails instead of exiting through set -e", async () => {
@@ -511,7 +516,7 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     expect(result.code).toBe(10);
     expect(result.stdout).toContain("==> RESUMED_ROLLBACK");
     expect(result.stdout).toContain("==> ROLLED_BACK");
-    expect(signatures(log)).toEqual(["status", "inspect", `checkout ${FROM}`, "hold", "wget", "build", "up", "cat_commit", "health"]);
+    expect(signatures(log)).toEqual(["status", "inspect", `checkout ${FROM}`, "hold", "hold", "wget", "build", "up", "cat_commit", "health"]);
     expect(gitShas(stubDir)).toEqual([FROM]);
   });
 
@@ -532,6 +537,35 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
         expect(linesOf(log)).toEqual([]);
       }
     }
+  });
+
+  it("refreshes the hold on every busy poll, so a long wait does not let it expire", async () => {
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "wget-lines"), '{"busy":true}\n{"busy":true}\n{"busy":true}\n{"busy":false}\n');
+    const result = await run(env);
+    expect(result.code).toBe(0);
+    const steps = signatures(log);
+    const waitSteps = steps.slice(steps.indexOf("build") + 1, steps.indexOf("up"));
+    // One hold to take it, then one refresh before each of the four probes.
+    expect(waitSteps).toEqual(["hold", "hold", "wget", "hold", "wget", "hold", "wget", "hold", "wget"]);
+  });
+
+  it("reaches the rollback-failed state when the rollback checkout itself fails", async () => {
+    const { stubDir, env } = setup();
+    writeFileSync(join(stubDir, "hide-shas"), `${TAG_COMMIT}\n`);
+    writeFileSync(join(stubDir, "fail-checkout-from"), "1");
+    const result = await run(env);
+    expect(result.code).toBe(20);
+    expect(result.stdout).toContain("==> ROLLBACK_FAILED");
+  });
+
+  it("leaves no partial backup when compression fails", async () => {
+    const { repo, stubDir, env } = setup();
+    writeExe(join(stubDir, "..", "bin"), "gzip", "#!/bin/sh\nprintf partial\nexit 1\n");
+    const result = await run(env);
+    expect(result.code).not.toBe(0);
+    const backups = readdirSync(join(repo, "backups"));
+    expect(backups).toEqual([]);
   });
 
   it("stops before checkout or build when pg_dump fails, and leaves no temp dump", async () => {

@@ -95,6 +95,9 @@ wait_idle() {
   i=0
   last=""
   while [ "$i" -lt 60 ]; do
+    # Refresh the hold each poll: it expires 40 minutes after the last refresh, and this
+    # wait alone can take that long. Best effort; a lost hold shows up as busy below.
+    if [ "$HELD" = 1 ]; then web_post '{"hold":true}' >/dev/null 2>&1 || true; fi
     if BUSY="$(web_get /api/update/busy 2>/dev/null)"; then
       # The whole body, exactly as the route sends it (Response.json); `$(...)` drops
       # the trailing newline. Anything around it (HTML, a proxy page) is unexpected.
@@ -136,13 +139,17 @@ verify() {
 
 # Back to $1: check it out, rebuild, swap, and check it serves. Exits 10 or 20.
 roll_back() {
-  g -c advice.detachedHead=false checkout "$1"
+  if ! g -c advice.detachedHead=false checkout "$1"; then
+    echo "==> ROLLBACK_FAILED — could not check out $1"
+    exit 20
+  fi
   GIT_SHA="$1"
   export GIT_SHA
   # The version being replaced may have started its worker. If it answers, pause it and
   # let its running tasks end before swapping it out; one that does not answer is not
   # running tasks, and waiting on it would only delay getting the old version back.
   if [ "$(web_post '{"hold":true}' 2>/dev/null || true)" = '{"hold":true}' ]; then
+    HELD=1
     wait_idle
   fi
   if compose build web && compose up -d --no-deps web && verify "$1"; then
@@ -153,6 +160,9 @@ roll_back() {
   exit 20
 }
 
+HELD=0
+SWAPPED=0
+ON_TAG=0
 if [ "$MODE" = rollback ]; then
   echo "==> STEP switching"
   echo "==> RESUMED_ROLLBACK — the update stopped after the swap began; going back to $ROLLBACK_TO"
@@ -175,13 +185,10 @@ chown "$OWNER" ./backups
 STAMP="$(date +%Y%m%d-%H%M%S)"
 # Dump to a temp file first: `pg_dump | gzip` would hide a failed dump behind gzip's exit 0.
 TMP="./backups/pre-update-${STAMP}.sql.tmp"
-HELD=0
-SWAPPED=0
-ON_TAG=0
 # shellcheck disable=SC2329 # invoked by the EXIT trap below
 cleanup() {
   code=$?
-  rm -f "$TMP"
+  rm -f "$TMP" "$TMP.gz"
   # Stopped after taking the hold but before the swap: let the old version start runs
   # again. After a swap the old process, and its hold, are gone. Best effort.
   if [ "$HELD" = 1 ] && [ "$SWAPPED" = 0 ]; then
@@ -196,7 +203,10 @@ cleanup() {
 }
 trap cleanup EXIT
 compose exec -T postgres pg_dump -U mediatrack -d mediatrack > "$TMP"
-gzip -c "$TMP" > "./backups/pre-update-${STAMP}.sql.gz"
+# Compress next to it and rename: a full disk must not leave a truncated .sql.gz that
+# the keep-5 rule would count as a backup.
+gzip -c "$TMP" > "$TMP.gz"
+mv "$TMP.gz" "./backups/pre-update-${STAMP}.sql.gz"
 chown "$OWNER" "./backups/pre-update-${STAMP}.sql.gz"
 rm -f "$TMP"
 # Keep the newest 5. `|| true`: the read loop's EOF status is 1, and `set -e` would
