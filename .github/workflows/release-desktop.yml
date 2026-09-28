@@ -40,6 +40,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           INPUT_TAG: ${{ inputs.tag }}
           DRY_RUN: ${{ inputs.dry_run }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [ "$EVENT" = "workflow_dispatch" ]; then TAG="$INPUT_TAG"; else TAG="$GITHUB_REF_NAME"; fi
           if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]{4}\.(0[1-9]|1[0-2])\.(0[1-9]|[12][0-9]|3[01])(\.([2-9]|[1-9][0-9]+))?$'; then
@@ -51,6 +52,15 @@ jobs:
           if [ "$(date -u -d "$YYYY-$MM-$DD" +%F 2>/dev/null || true)" != "$YYYY-$MM-$DD" ]; then
             echo "::error::$TAG is not a release tag (vYYYY.MM.DD or vYYYY.MM.DD.N)"
             exit 1
+          fi
+          # A dry run builds the dispatched branch, which has no tag. A real release's ref must
+          # point at a commit: an annotated tag is invisible to the 「更新」 feed.
+          if [ "$DRY_RUN" != "true" ]; then
+            TYPE=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .object.type)
+            if [ "$TYPE" != "commit" ]; then
+              echo "::error::$TAG is an annotated tag. Release tags must be lightweight: git tag -d $TAG && git push origin :refs/tags/$TAG, then git tag $TAG <commit> && git push origin $TAG"
+              exit 1
+            fi
           fi
           # A dry run builds the dispatched branch; a release builds the tag.
           if [ "$DRY_RUN" = "true" ]; then REF="$GITHUB_SHA"; else REF="$TAG"; fi
