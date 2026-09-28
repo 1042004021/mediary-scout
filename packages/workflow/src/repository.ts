@@ -134,10 +134,12 @@ export interface ReserveWorkflowRunInput extends PersistWorkflowRunSnapshotInput
   blockIfEpisodeStatesExist?: boolean;
   /**
    * Title-level mutual exclusion: refuse the reservation if any user-visible run
-   * for the same media title is already active, regardless of season. A queued
-   * `staging_recovery` does not count, so a leftover-staging run cannot pin the
-   * title; that recovery stays queued and the worker claims it once user-facing
-   * work is done. All seasons of a title share one `Title (Year)/` show directory
+   * for the same media title is already active, regardless of season. A
+   * `staging_recovery` does not count, queued or running, so a leftover-staging run
+   * cannot pin the title against something the user asked for. That is safe
+   * because the worker runs one job at a time: the user's run starts after the
+   * recovery finishes, and a replace reservation writes no episodes. All seasons
+   * of a title share one `Title (Year)/` show directory
    * and staging parent, so two concurrent acquisition runs would race on directory
    * creation, staging, and dedup. User-triggered acquisitions set this so a user
    * clicking "get S1", "get S2", "get S3" in quick succession can never spawn
