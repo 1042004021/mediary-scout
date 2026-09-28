@@ -185,3 +185,31 @@ describe("Storage115Simulator — transferSubtitleUrls (batch cost 1 + N, same �
     expect(results[1]!.providerMessage).toBe("dead link");
   });
 });
+
+describe("Storage115Simulator — list depth", () => {
+  it("hides a file at depth 8 with the default and shows it at maxDepth 10", async () => {
+    const deepFile = [...Array.from({ length: 7 }, (_, index) => `L${index + 1}`), "deep.mkv"].join("/");
+    const deepDir = deepFile.split("/").slice(0, -1).join("/");
+    const sim = new Storage115Simulator({
+      packs: {
+        pack: {
+          files: [
+            { path: "shallow.mkv", sizeBytes: 10 },
+            { path: deepFile, sizeBytes: 10 },
+          ],
+        },
+      },
+    });
+    const staging = await sim.createDirectory({ name: "staging", parentId: "root" });
+    await sim.transferCandidate({ candidateId: "pack", intoDirectoryId: staging });
+
+    const shallow = await sim.listTree({ directoryId: staging });
+    expect(shallow.map((file) => file.path)).toContain("shallow.mkv");
+    expect(shallow.map((file) => file.path)).not.toContain(deepFile);
+    expect((await sim.listSubdirectories({ directoryId: staging })).map((dir) => dir.path)).not.toContain(deepDir);
+
+    const deep = await sim.listTree({ directoryId: staging, maxDepth: 10 });
+    expect(deep.map((file) => file.path)).toContain(deepFile);
+    expect((await sim.listSubdirectories({ directoryId: staging, maxDepth: 10 })).map((dir) => dir.path)).toContain(deepDir);
+  });
+});
