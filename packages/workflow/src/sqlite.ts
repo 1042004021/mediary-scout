@@ -1,6 +1,6 @@
 import { createRequire } from "node:module";
 import type Database from "better-sqlite3";
-import { DEFAULT_ACCOUNT_ID, episodeNumberFromCode } from "./domain.js";
+import { DEFAULT_ACCOUNT_ID, episodeNumberFromCode, isStagingJanitorId } from "./domain.js";
 import type {
   AgentDecision,
   AgentStep,
@@ -1192,6 +1192,7 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
     const rows = this.db
       .prepare("SELECT payload, account_id, connected_storage_id FROM workflow_runs")
       .all() as Array<{ payload: string; account_id: string; connected_storage_id: string | null }>;
+    // Hides rows the previous janitor wrote.
     return rows.map((row) => {
       const run = JSON.parse(row.payload) as WorkflowRun;
       const rawStorage = row.connected_storage_id ?? null;
@@ -1204,7 +1205,7 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
         kind: run.kind,
         status: run.status,
       };
-    });
+    }).filter((row) => !isStagingJanitorId(row.id) && !isStagingJanitorId(row.trackedSeasonId));
   }
 
   /** Keep only the latest (startedAt desc) run row per season id. */
