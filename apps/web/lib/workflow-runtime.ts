@@ -1793,6 +1793,9 @@ export async function runScheduledType3(options?: {
     );
   }
   let result: Awaited<ReturnType<typeof runScheduledType3Monitoring>>;
+  // Set when an update hold stopped a show from being reserved mid-sweep: the sweep is
+  // then not complete, and its slots must stay open for the new version.
+  let heldBack = false;
   try {
     await hydratePan115CookieFromDb();
     const sync = tmdbSeasonMetadataSync();
@@ -1814,9 +1817,26 @@ export async function runScheduledType3(options?: {
       resolveDriveId: defaultDriveIdOf,
       resolveAccountContext: buildAccountContextResolver(),
       onAuthErrorFreeze: (id, reason) => freezeConnectedStorage(id, reason),
-      mayStartRun,
+      mayStartRun: () => {
+        const allowed = mayStartRun();
+        if (!allowed) heldBack = true;
+        return allowed;
+      },
       ...(sync ? { syncSeasonMetadata: sync } : {}),
     });
+    if (heldBack) {
+      // Release this call's slots (as on a failure) and do not stamp a completed sweep,
+      // so the new version patrols the rest today. Seasons that did run are only
+      // re-checked; the janitor also waits for the next full sweep.
+      if (claimedNow.length > 0) {
+        await repository.setSetting(
+          LAST_SWEEP_CLAIMS_SETTING_KEY,
+          JSON.stringify({ date: claimDate, slots: priorClaims }),
+        );
+      }
+      await pushNotificationsSince(repository, startedAt, { sweep: true });
+      return { skipped: "update_in_progress", outcomes: result };
+    }
     try {
       await sweepOrphanStagingDirs({
         repository,

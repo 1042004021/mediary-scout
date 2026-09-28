@@ -496,6 +496,29 @@ describe("runScheduledType3（per-slot 认领 + 合并补跑）", () => {
     }
   });
 
+  it("更新暂停在巡检途中生效：释放本次认领的时间点、不记完成，新版本当天补跑", async () => {
+    const repository = await boot({ daily_sweep_times: TIMES }, "2026-07-09T06:30");
+    const { setUpdateHold, clearUpdateHold } = await import("./update-hold");
+    // The hold is taken after the entry check, while the sweep runs.
+    monitor.mockImplementation((async (input: { mayStartRun?: () => boolean }) => {
+      setUpdateHold(Date.now(), 60_000);
+      expect(input.mayStartRun!()).toBe(false);
+      return [];
+    }) as never);
+    try {
+      const result = await rt.runScheduledType3();
+      expect(result.skipped).toBe("update_in_progress");
+      expect(await claims(repository)).toEqual({ date: "2026-07-09", slots: [] });
+      expect((await repository.getSetting(rt.LAST_SWEEP_COMPLETED_AT_SETTING_KEY)) ?? null).toBeNull();
+    } finally {
+      clearUpdateHold();
+    }
+    monitor.mockImplementation(async () => []);
+    const again = await rt.runScheduledType3();
+    expect(again.skipped).toBeUndefined();
+    expect(await claims(repository)).toEqual({ date: "2026-07-09", slots: ["06:00"] });
+  });
+
   it("成功后写 last_sweep_completed_at（含定时路径）", async () => {
     const repository = await boot({ daily_sweep_times: TIMES }, "2026-07-09T06:30");
     await rt.runScheduledType3();
