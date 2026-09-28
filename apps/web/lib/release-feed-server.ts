@@ -2,10 +2,11 @@ import { compareReleaseTags, parseReleaseNotes, parseReleaseTag, type ReleaseNot
 import { normalizeCommit } from "./deployment-update";
 
 const REPO = "fancydirty/mediary-scout";
-/** Every tag starting with `v2` in one response (the tags list API pages at 30, which
- *  would lose the running release once 30 newer ones exist). Release tags must be
- *  lightweight: an annotated tag's ref points at a tag object, not a commit. */
-const TAGS_URL = `https://api.github.com/repos/${REPO}/git/matching-refs/tags/v2`;
+/** Every `v…` tag in one response (the tags list API pages at 30, which would lose the
+ *  running release once 30 newer ones exist). Old semver tags come back too and are
+ *  dropped by parseReleaseTag. Release tags must be lightweight: an annotated tag's
+ *  ref points at a tag object, not a commit. */
+const TAGS_URL = `https://api.github.com/repos/${REPO}/git/matching-refs/tags/v`;
 const OK_TTL_MS = 60 * 60 * 1000;
 const FAIL_TTL_MS = 5 * 60 * 1000;
 /** Notes fetched for the newest N releases only (the tab shows 3, "更早" expands to 10). */

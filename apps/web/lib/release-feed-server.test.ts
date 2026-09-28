@@ -9,7 +9,7 @@ function fakeFetch(routes: Record<string, { status: number; body: string }>) {
   }) as unknown as typeof fetch;
 }
 
-const TAGS = "https://api.github.com/repos/fancydirty/mediary-scout/git/matching-refs/tags/v2";
+const TAGS = "https://api.github.com/repos/fancydirty/mediary-scout/git/matching-refs/tags/v";
 const ref = (tag: string, sha: string, type = "commit") => ({ ref: `refs/tags/${tag}`, object: { sha, type } });
 const notes = (tag: string) =>
   `https://api.github.com/repos/fancydirty/mediary-scout/contents/release-notes/${tag}.md?ref=${tag}`;
@@ -24,7 +24,8 @@ describe("fetchReleaseFeed", () => {
       [TAGS]: {
         status: 200,
         body: JSON.stringify([
-          ref("v2.0.0", "a".repeat(40)),
+          ref("v1.4.1", "a".repeat(40)),
+          ref("v3000.01.01", "d".repeat(40)),
           ref("v2026.09.28", "b".repeat(40)),
           ref("v2026.10.02", "c".repeat(40)),
         ]),
@@ -33,9 +34,9 @@ describe("fetchReleaseFeed", () => {
       [notes("v2026.09.28")]: { status: 404, body: "" },
     });
     const feed = await fetchReleaseFeed(fetchImpl);
-    expect(feed.map((r) => r.tag)).toEqual(["v2026.10.02", "v2026.09.28"]);
-    expect(feed[0]).toMatchObject({ commit: "c".repeat(40), notes: [{ kind: "add", text: "一键更新" }] });
-    expect(feed[1]!.notes).toEqual([]);
+    expect(feed.map((r) => r.tag)).toEqual(["v3000.01.01", "v2026.10.02", "v2026.09.28"]);
+    expect(feed[1]).toMatchObject({ commit: "c".repeat(40), notes: [{ kind: "add", text: "一键更新" }] });
+    expect(feed[2]!.notes).toEqual([]);
   });
 
   it("keeps every release, not just a first page, and fetches notes for the newest 10 only", async () => {

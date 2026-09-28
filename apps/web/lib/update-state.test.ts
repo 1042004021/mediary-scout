@@ -49,9 +49,11 @@ describe("buildUpdateView", () => {
     expect(view.available).toBeNull();
     expect(view.status).toBe("unknown");
   });
-  it("offers nothing when the feed is empty (offline)", () => {
+  it("offers nothing when the feed is empty (offline), and does not call the build a dev build", () => {
     const view = buildUpdateView({ ...base, currentCommit: "d".repeat(40), feed: [] });
     expect(view.available).toBeNull();
     expect(view.status).toBe("offline");
+    // Without the release list we cannot tell a release from a dev build.
+    expect(view.current).toEqual({ label: "dddddddd", tag: null });
   });
 });

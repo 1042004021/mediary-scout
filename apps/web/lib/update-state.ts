@@ -57,9 +57,12 @@ export function buildUpdateView(input: {
       : !short
         ? // Built without GIT_SHA (plain `docker compose up -d --build`): no stamped commit.
           { label: "未知版本", tag: null }
-        : newest && input.relation === "ahead"
-          ? { label: `${short} · 比 ${newest.tag} 新的开发版本`, tag: null }
-          : { label: `${short} · 开发版本`, tag: null },
+        : !newest
+          ? // No release list: it may be a release or a dev build; say only what we know.
+            { label: short, tag: null }
+          : input.relation === "ahead"
+            ? { label: `${short} · 比 ${newest.tag} 新的开发版本`, tag: null }
+            : { label: `${short} · 开发版本`, tag: null },
     available,
     status,
     releases: input.feed.map((release) => ({ ...release, isCurrent: release.tag === currentRelease?.tag })),
