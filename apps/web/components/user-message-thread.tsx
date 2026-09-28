@@ -50,6 +50,7 @@ import {
   type ThreadMessage,
 } from "../lib/user-message-state";
 import { useSwapKeep } from "./swap-keep";
+import { copyText } from "../lib/copy-text";
 
 /** How long 撤销 stays on screen after 「不换了」 (saved at once; 撤销 puts it back). */
 const UNDO_MS = 6000;
@@ -838,34 +839,6 @@ function CopyPathButton({ path, describedBy }: { path: string; describedBy: stri
       {state === "copied" ? "已复制" : state === "failed" ? "复制失败" : "复制路径"}
     </button>
   );
-}
-
-async function copyText(text: string): Promise<boolean> {
-  if (window.isSecureContext && navigator.clipboard) {
-    try {
-      await navigator.clipboard.writeText(text);
-      return true;
-    } catch {
-      // Fall back below.
-    }
-  }
-  // Plain http on the LAN — a common self-hosted setup — has no Clipboard API.
-  const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-  const area = document.createElement("textarea");
-  area.value = text;
-  area.setAttribute("readonly", "");
-  area.style.position = "fixed";
-  area.style.opacity = "0";
-  document.body.append(area);
-  area.select();
-  try {
-    return document.execCommand("copy");
-  } catch {
-    return false;
-  } finally {
-    area.remove();
-    previous?.focus({ preventScroll: true });
-  }
 }
 
 // The mockup's icon set, 16×16, drawn in currentColor.

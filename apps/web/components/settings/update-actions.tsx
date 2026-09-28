@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { checkForUpdatesAction, startUpdateAction } from "../../app/update-actions";
+import { copyText } from "../../lib/copy-text";
 import { ACTIVE_UPDATER_PHASES as ACTIVE } from "../../lib/update-state";
 import type { UpdaterStatus } from "../../lib/updater-client";
 
@@ -114,13 +115,10 @@ export function CopyCommandButton({ command }: { command: string }) {
       type="button"
       className="ghost-button"
       onClick={() => {
-        void navigator.clipboard.writeText(command).then(
-          () => {
-            setCopied(true);
-            window.setTimeout(() => setCopied(false), 1500);
-          },
-          () => setCopied(false),
-        );
+        void copyText(command).then((ok) => {
+          setCopied(ok);
+          if (ok) window.setTimeout(() => setCopied(false), 1500);
+        });
       }}
     >
       {copied ? "已复制" : "复制"}
