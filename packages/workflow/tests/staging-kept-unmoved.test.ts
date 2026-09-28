@@ -440,6 +440,42 @@ describe("runAcquisitionV2Workflow does not delete files whose move failed", () 
     expect(executor.removed).toEqual([]);
   });
 
+  it("recovery throw path: attaches the kept event and does not remove the leftover", async () => {
+    // Recovery protects every file already in a season. The stuck file must
+    // appear only in the leftover listing, or the move is refused before it is recorded.
+    class LeftoverStuckExecutor extends StuckFileExecutor {
+      override async listTree(input?: { directoryId?: string }) {
+        if (input?.directoryId && input.directoryId !== "stg-leftover") return [];
+        return [{ path: "ep.mkv", providerFileId: "stuck-1", sizeBytes: 10 }];
+      }
+    }
+    const executor = new LeftoverStuckExecutor();
+    let step = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => {
+        step += 1;
+        if (step === 1) return tool("moveToSeason", { moves: [{ season: 1, fileIds: ["stuck-1"] }] }, step);
+        throw new Error("agent model unavailable");
+      },
+    });
+    let caught: unknown;
+    try {
+      await runAcquisitionV2Workflow({
+        ...workflowRequest(executor, model),
+        stagingRecovery: { showDirectoryId: "show-left", stagingDirectoryId: "stg-leftover" },
+      });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain("agent model unavailable");
+    const kept = stagingKeptUnmovedOf(caught);
+    expect(kept).toHaveLength(1);
+    expect(kept[0]?.fileCount).toBe(1);
+    expect(stagingFailureAuditEvents(caught).map((event) => event.type)).toEqual(["staging_kept_unmoved_files"]);
+    expect(executor.removed).not.toContain("stg-leftover");
+  });
+
   it("a later successful move of the same file allows normal cleanup", async () => {
     const executor = new StuckFileExecutor();
     let step = 0;

@@ -294,9 +294,6 @@ export async function withStagingCleanup<T>(
     throw error;
   } finally {
     const cleanup = async (): Promise<void> => {
-      if (threw && args.preserveOnThrow) {
-        return;
-      }
       const kept = args.keep?.() ?? null;
       if (kept) {
         const event: StagingKeptUnmoved = {
@@ -308,6 +305,11 @@ export async function withStagingCleanup<T>(
         if (threw) {
           attachStagingKeptUnmoved(bodyError, [event]);
         }
+        return;
+      }
+      // No unmoved files to report. A thrown recovery still must not delete
+      // the adopted leftover; a normal return falls through and discards it.
+      if (threw && args.preserveOnThrow) {
         return;
       }
       let removalFailed = false;
