@@ -6,6 +6,7 @@ import { isMovieUnreleased, type EpisodeDisplayState } from "@media-track/workfl
 import { AcquiringPoller } from "../../../components/acquiring-poller";
 import { AcquisitionLockProvider } from "../../../components/acquisition-lock";
 import { AppSidebar } from "../../../components/app-sidebar";
+import { GitHubNameplate } from "../../../components/github-nameplate";
 import { BackLink } from "../../../components/back-link";
 import { MovieSynopsis } from "../../../components/movie-synopsis";
 import { RequestTrackButton } from "../../../components/request-track-button";
@@ -163,6 +164,7 @@ async function ShowContent({
           <span>回到搜索页重新查找。</span>
         </div>
       )}
+      <GitHubNameplate />
     </ShowShell>
   );
 }

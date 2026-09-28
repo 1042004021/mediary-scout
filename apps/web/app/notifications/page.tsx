@@ -22,6 +22,7 @@ import { landedSize } from "@media-track/workflow";
 import { NotificationsSeenMarker } from "../../components/notifications-seen-marker";
 import { DemoSessionNotifications } from "../../components/demo-session-notifications";
 import { AppSidebar } from "../../components/app-sidebar";
+import { GitHubNameplate } from "../../components/github-nameplate";
 import {
   ensureDemoSeeded,
   getCurrentAccountId,
@@ -104,6 +105,7 @@ async function NotificationsSurface({ searchParams }: { searchParams: Promise<{ 
         <Suspense fallback={<FeedSkeleton />}>
           <NotificationFeed connectedStorageId={workspace.connectedStorageId} />
         </Suspense>
+        <GitHubNameplate />
       </main>
     </div>
   );

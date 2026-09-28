@@ -11,6 +11,7 @@ import { SearchForm } from "../components/search-form";
 import { SeasonRequestMenu } from "../components/season-request-menu";
 import { TrendingRow } from "../components/trending-row";
 import { ConnectNoticeBanner } from "../components/connect-notice-banner";
+import { GitHubNameplate } from "../components/github-nameplate";
 import type { TrendingKind } from "../lib/trending";
 import { getSearchView } from "../lib/search-page";
 import {
@@ -136,6 +137,7 @@ async function HomeSurface({
             </Suspense>
           </>
         )}
+        <GitHubNameplate />
       </main>
     </div>
   );
