@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import type { UpdateView } from "../../lib/update-state";
 import type { UpdaterStatus } from "../../lib/updater-client";
+import { nextPollStep } from "./update-actions";
 import { ReleaseBlock, UpdateTab } from "./update-section";
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: () => undefined }) }));
@@ -203,5 +204,29 @@ describe("UpdateTab one-click update", () => {
     expect(html).not.toContain("检查更新");
     expect(html).not.toContain("./scripts/deploy.sh");
     expect(html).not.toContain("上次更新");
+  });
+});
+
+describe("nextPollStep", () => {
+  const status = (phase: UpdaterStatus["phase"]): UpdaterStatus => ({
+    phase,
+    targetTag: "v2026.10.02",
+    fromCommit: null,
+    startedAt: null,
+    finishedAt: null,
+    message: "",
+    logTail: "",
+  });
+  it("keeps waiting when the updater does not answer, instead of dropping the progress", () => {
+    expect(nextPollStep(null, false)).toBe("wait");
+    expect(nextPollStep(null, true)).toBe("wait");
+  });
+  it("reloads once the update is over, or once the page came back after being down", () => {
+    expect(nextPollStep(status("done"), false)).toBe("reload");
+    expect(nextPollStep(status("rolled_back"), false)).toBe("reload");
+    expect(nextPollStep(status("verifying"), true)).toBe("reload");
+  });
+  it("shows the new step while the update runs", () => {
+    expect(nextPollStep(status("building"), false)).toBe("show");
   });
 });

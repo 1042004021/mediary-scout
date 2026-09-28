@@ -93,6 +93,14 @@ describe("loadUpdateView", () => {
     expect(view.available?.tag).toBe("v2026.10.02");
   });
 
+  it("does not reach the updater for the deploy folder commit either when asked not to", async () => {
+    vi.mocked(readBuildCommit).mockResolvedValue(null);
+    vi.mocked(getCachedRepoCommit).mockResolvedValue("d".repeat(40));
+    const view = await loadUpdateView({ updaterStatus: false });
+    expect(getCachedRepoCommit).not.toHaveBeenCalled();
+    expect(view.current.label).toBe("未知版本");
+  });
+
   it("uses the deploy folder commit when the image has none, and offers a release it is behind", async () => {
     const older = "d".repeat(40);
     vi.mocked(readBuildCommit).mockResolvedValue(null);

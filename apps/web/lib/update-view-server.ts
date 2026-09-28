@@ -18,8 +18,10 @@ export async function loadUpdateView(options: { updaterStatus?: boolean } = {}):
     desktop ? fetchLatestDesktopRelease() : Promise.resolve(null),
   ]);
   // No stamped commit (built without GIT_SHA): the deploy folder's HEAD is the next best
-  // answer. Desktop installs from GitHub and must not call the updater for this.
-  const currentCommit = buildCommit ?? (desktop ? null : await getCachedRepoCommit());
+  // answer. It comes from the updater, so skip it when the caller asked not to call the
+  // updater (the badge poll). Desktop installs from GitHub and never calls the updater.
+  const currentCommit =
+    buildCommit ?? (desktop || options.updaterStatus === false ? null : await getCachedRepoCommit());
   const feed = desktop && published ? desktopFeed(releases, published.tag) : releases;
   const newest = feed[0];
   const tagged = feed.some((release) => release.commit === currentCommit);

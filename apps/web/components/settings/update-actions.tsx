@@ -29,8 +29,13 @@ export function UpdateNowButton({ tag, initial }: { tag: string | null; initial:
           if (!response.ok) throw new Error(String(response.status));
           const next = ((await response.json()) as { updater: UpdaterStatus | null }).updater;
           if (stopped) return;
-          if (sawDown || (next && !ACTIVE.has(next.phase))) window.location.reload();
-          setStatus(next);
+          const step = nextPollStep(next, sawDown);
+          if (step === "reload") window.location.reload();
+          else if (step === "wait") {
+            // The updater did not answer (it may be restarting): keep the bar and keep polling.
+            sawDown = true;
+            setMessage("正在重启…");
+          } else setStatus(next);
         } catch {
           if (stopped) return;
           sawDown = true;
@@ -121,6 +126,15 @@ export function CopyCommandButton({ command }: { command: string }) {
       {copied ? "已复制" : "复制"}
     </button>
   );
+}
+
+/** What the progress poller does with one /api/update/status answer. A null status is
+ *  not "done": the updater may be restarting, and clearing the status would unmount the
+ *  poller, which would then never reload the page. */
+export function nextPollStep(next: UpdaterStatus | null, sawDown: boolean): "reload" | "wait" | "show" {
+  if (!next) return "wait";
+  if (sawDown || !ACTIVE.has(next.phase)) return "reload";
+  return "show";
 }
 
 function emptyStatus(): UpdaterStatus {
