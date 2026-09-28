@@ -3,7 +3,9 @@
 # The build happens BEFORE the swap, so a failed build never touches the running web container.
 # Paths default to the container layout and can be pointed at a temp dir by the unit test.
 # Exit: 0 ok · 10 rolled back · 20 rollback failed · 30 local edits (nothing touched)
-#       · 40 could not pause new tasks before the swap (nothing swapped).
+#       · 40 could not pause new tasks before the swap (nothing swapped)
+#       · 50 stopped before the swap and could not check the old commit back out
+#         (the old version is still serving; the updater retries the checkout).
 #
 # When the updater restarts and finds an update that was cut off:
 #   `run-update.sh rollback <commit>` — the swap had begun: rebuild and swap back.
@@ -96,8 +98,16 @@ wait_idle() {
   last=""
   while [ "$i" -lt 60 ]; do
     # Refresh the hold each poll: it expires 40 minutes after the last refresh, and this
-    # wait alone can take that long. Best effort; a lost hold shows up as busy below.
-    if [ "$HELD" = 1 ]; then web_post '{"hold":true}' >/dev/null 2>&1 || true; fi
+    # wait alone can take that long. Before the first swap a failed refresh stops the
+    # update (the hold could lapse); the rollback keeps going, since it must restore.
+    if [ "$HELD" = 1 ]; then
+      if ! [ "$(web_post '{"hold":true}' 2>/dev/null || true)" = '{"hold":true}' ]; then
+        if [ "$SWAPPED" = 0 ]; then
+          echo "==> HOLD_FAILED — could not refresh the pause"
+          back_to_from 40
+        fi
+      fi
+    fi
     if BUSY="$(web_get /api/update/busy 2>/dev/null)"; then
       # The whole body, exactly as the route sends it (Response.json); `$(...)` drops
       # the trailing newline. Anything around it (HTML, a proxy page) is unexpected.
@@ -135,6 +145,18 @@ verify() {
     sleep 2
   done
   return 1
+}
+
+# Before any swap: put the deploy folder back on the commit that is serving, then exit
+# with $1. If that checkout fails, exit 50 so the updater keeps retrying it.
+back_to_from() {
+  if g -c advice.detachedHead=false checkout "$FROM"; then
+    ON_TAG=0
+    exit "$1"
+  fi
+  echo "==> RESTORE_FAILED"
+  ON_TAG=0
+  exit 50
 }
 
 # Back to $1: check it out, rebuild, swap, and check it serves. Exits 10 or 20.
@@ -198,7 +220,10 @@ cleanup() {
   # tag while the old version keeps serving: check the old commit back out. The paths
   # that exit on purpose already did (ON_TAG=0), and after the swap roll_back owns it.
   if [ "$code" != 0 ] && [ "$ON_TAG" = 1 ] && [ "$SWAPPED" = 0 ]; then
-    g -c advice.detachedHead=false checkout "$FROM" >/dev/null 2>&1 || echo "==> RESTORE_FAILED"
+    if ! g -c advice.detachedHead=false checkout "$FROM" >/dev/null 2>&1; then
+      echo "==> RESTORE_FAILED"
+      exit 50
+    fi
   fi
 }
 trap cleanup EXIT
@@ -225,9 +250,7 @@ GIT_SHA="$(g rev-parse HEAD)"
 export GIT_SHA
 if ! compose build web; then
   echo "==> BUILD_FAILED"
-  g -c advice.detachedHead=false checkout "$FROM"
-  ON_TAG=0
-  exit 10
+  back_to_from 10
 fi
 
 
@@ -239,9 +262,7 @@ if HOLD="$(web_post '{"hold":true}' 2>/dev/null)" && [ "$HOLD" = '{"hold":true}'
   HELD=1
 else
   echo "==> HOLD_FAILED"
-  g -c advice.detachedHead=false checkout "$FROM"
-  ON_TAG=0
-  exit 40
+  back_to_from 40
 fi
 wait_idle
 echo "==> STEP switching"

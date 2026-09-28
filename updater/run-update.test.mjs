@@ -48,6 +48,11 @@ case "$*" in
     log_call hold "$@"
     if [ -f "$STUB_DIR/fail-hold" ]; then exit 1; fi
     if [ -f "$STUB_DIR/odd-hold" ]; then printf '%s\\n' '<html>login</html>'; exit 0; fi
+    hn=0
+    if [ -f "$STUB_DIR/hold-n" ]; then hn=$(cat "$STUB_DIR/hold-n"); fi
+    hn=$((hn + 1))
+    printf '%s\\n' "$hn" > "$STUB_DIR/hold-n"
+    if [ -f "$STUB_DIR/fail-hold-after" ] && [ "$hn" -gt "$(cat "$STUB_DIR/fail-hold-after")" ]; then exit 1; fi
     case "$*" in
       *'{"hold":true}'*) printf '%s\\n' '{"hold":true}' ;;
       *) printf '%s\\n' '{"hold":false}' ;;
@@ -548,6 +553,39 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     const waitSteps = steps.slice(steps.indexOf("build") + 1, steps.indexOf("up"));
     // One hold to take it, then one refresh before each of the four probes.
     expect(waitSteps).toEqual(["hold", "hold", "wget", "hold", "wget", "hold", "wget", "hold", "wget"]);
+  });
+
+  it("stops before the swap when refreshing the hold fails, and goes back to the old commit", async () => {
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "wget-lines"), '{"busy":true}\n{"busy":false}\n');
+    // The first hold works; the first refresh does not.
+    writeFileSync(join(stubDir, "fail-hold-after"), "1");
+    const result = await run(env);
+    expect(result.code).toBe(40);
+    expect(result.stdout).toContain("==> HOLD_FAILED — could not refresh the pause");
+    const steps = signatures(log);
+    expect(steps).not.toContain("up");
+    // Back on the old commit, and the pause released for the old version.
+    expect(steps.slice(-2).sort()).toEqual([`checkout ${FROM}`, "release"].sort());
+    expect(readFileSync(join(stubDir, "head"), "utf8").trim()).toBe(FROM);
+  });
+
+  it("exits 50 when it stops before the swap and cannot check the old commit back out", async () => {
+    for (const setupCase of ["build", "hold"]) {
+      const { stubDir, env } = setup();
+      writeFileSync(join(stubDir, setupCase === "build" ? "fail-build" : "fail-hold"), "1");
+      writeFileSync(join(stubDir, "fail-checkout-from"), "1");
+      const result = await run(env);
+      expect({ setupCase, code: result.code }).toEqual({ setupCase, code: 50 });
+      expect(result.stdout).toContain("==> RESTORE_FAILED");
+    }
+    // An unexpected failure (set -e) after the tag checkout, and the restore fails too.
+    const { stubDir, env } = setup();
+    writeFileSync(join(stubDir, "wget-lines"), '{"busy":true}\n');
+    writeExe(join(stubDir, "..", "bin"), "sleep", "#!/bin/sh\nexit 1\n");
+    writeFileSync(join(stubDir, "fail-checkout-from"), "1");
+    const result = await run(env);
+    expect(result.code).toBe(50);
   });
 
   it("reaches the rollback-failed state when the rollback checkout itself fails", async () => {

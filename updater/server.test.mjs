@@ -387,6 +387,31 @@ describe("updater", () => {
     expect(updater.status().pendingRestore).toBeUndefined();
   });
 
+  it("exit 50 records a pending restore and retries it right away", async () => {
+    const calls = [];
+    let restoreCode = 1;
+    const { updater } = make({
+      runUpdate: (args, onLine) => {
+        calls.push(args);
+        if (Array.isArray(args)) return Promise.resolve(restoreCode);
+        onLine(`==> FROM ${"c".repeat(40)}`);
+        onLine("==> RESTORE_FAILED");
+        return Promise.resolve(50);
+      },
+    });
+    updater.start("v2026.10.02");
+    await updater.idle();
+    expect(calls).toEqual(["v2026.10.02", ["restore", "c".repeat(40)]]);
+    expect(updater.status()).toMatchObject({ phase: "failed", pendingRestore: true, message: "更新被中断了，原来的版本仍在运行。" });
+
+    restoreCode = 0;
+    calls.length = 0;
+    updater.start("v2026.10.03");
+    await updater.idle();
+    expect(calls[0]).toEqual(["restore", "c".repeat(40)]);
+    expect(updater.status().pendingRestore).toBeUndefined();
+  });
+
   it("writes status.json atomically, leaving no temp file behind", async () => {
     const { updater, dir } = make();
     updater.start("v2026.10.02");

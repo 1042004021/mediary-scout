@@ -213,8 +213,12 @@ export function createUpdater(opts) {
                 }
               : code === 40
                 ? { phase: "failed", message: "替换前没能让网页暂停开始新任务，这次先不更新了，原来的版本一直在运行。" }
-                : { phase: "failed" };
+                : code === 50
+                  ? // Still serving the old version, but the checkout is left on the new tag: retry it.
+                    { phase: "failed", message: INTERRUPTED_MESSAGE, pendingRestore: true }
+                  : { phase: "failed" };
     save({ ...outcome, finishedAt: opts.now() });
+    if (code === 50 && status.fromCommit) await resumeAfterRestart({ mode: "restore", commit: status.fromCommit });
   }
 
   async function resumeAfterRestart({ mode, commit }) {
