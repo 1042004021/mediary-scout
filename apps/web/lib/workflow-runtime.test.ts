@@ -551,6 +551,19 @@ describe("runScheduledType3（per-slot 认领 + 合并补跑）", () => {
     }
   });
 
+  it("巡检整个过程都算「进行中」，更新助手的忙碌检查会等它", async () => {
+    await boot({ daily_sweep_times: TIMES }, "2026-07-09T06:30");
+    const { inFlightCount } = await import("./update-hold");
+    let seen = -1;
+    janitor.mockImplementation((async () => {
+      seen = inFlightCount();
+      return { held: false };
+    }) as never);
+    await rt.runScheduledType3({ force: true });
+    expect(seen).toBeGreaterThan(0);
+    expect(inFlightCount()).toBe(0);
+  });
+
   it("成功后写 last_sweep_completed_at（含定时路径）", async () => {
     const repository = await boot({ daily_sweep_times: TIMES }, "2026-07-09T06:30");
     await rt.runScheduledType3();

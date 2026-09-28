@@ -2,9 +2,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   UPDATE_HOLD_MAX_MS,
   clearUpdateHold,
+  inFlightCount,
   isUpdateHoldActive,
   setUpdateHold,
   updateHoldStartedAt,
+  whileInFlight,
 } from "./update-hold";
 
 afterEach(() => clearUpdateHold());
@@ -40,6 +42,18 @@ describe("update hold", () => {
     expect(isUpdateHoldActive(80_000)).toBe(true);
     setUpdateHold(200_000, 60_000);
     expect(updateHoldStartedAt(200_000)).toBe(200_000);
+  });
+
+  it("counts work in flight until it settles, including when it throws", async () => {
+    expect(inFlightCount()).toBe(0);
+    let release!: () => void;
+    const pending = whileInFlight(() => new Promise<void>((resolve) => (release = resolve)));
+    expect(inFlightCount()).toBe(1);
+    release();
+    await pending;
+    expect(inFlightCount()).toBe(0);
+    await expect(whileInFlight(async () => { throw new Error("boom"); })).rejects.toThrow("boom");
+    expect(inFlightCount()).toBe(0);
   });
 
   it("is shared through globalThis, so separately bundled modules see the same hold", async () => {

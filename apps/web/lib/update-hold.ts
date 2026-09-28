@@ -14,12 +14,36 @@ interface HoldState {
   until: number;
 }
 
+interface Slot {
+  hold: HoldState | null;
+  /** Work in this process that must finish before a swap: a worker tick (claiming and
+   *  reserving runs) or a patrol (reservations, staging cleanup). */
+  inFlight: number;
+}
+
 const KEY = Symbol.for("mediary-scout.update-hold");
 
-function slot(): { hold: HoldState | null } {
-  const store = globalThis as typeof globalThis & { [KEY]?: { hold: HoldState | null } };
-  store[KEY] ??= { hold: null };
+function slot(): Slot {
+  const store = globalThis as typeof globalThis & { [KEY]?: Slot };
+  store[KEY] ??= { hold: null, inFlight: 0 };
+  store[KEY].inFlight ??= 0;
   return store[KEY];
+}
+
+/** Count `work` as in flight until it settles. /api/update/busy reports busy meanwhile,
+ *  so a swap never lands between a "may I start?" check and the database write it
+ *  guards, or in the middle of a staging cleanup. */
+export async function whileInFlight<T>(work: () => Promise<T>): Promise<T> {
+  slot().inFlight += 1;
+  try {
+    return await work();
+  } finally {
+    slot().inFlight -= 1;
+  }
+}
+
+export function inFlightCount(): number {
+  return slot().inFlight;
 }
 
 /** Take or refresh the hold. A refresh keeps the original start time. */

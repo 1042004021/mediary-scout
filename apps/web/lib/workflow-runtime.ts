@@ -102,7 +102,7 @@ import { findDemoCandidateById, findDemoCandidateByTmdbId } from "./demo-candida
 import { seedDemoWorkflowRepository } from "./demo-workflow";
 import { resolveRegistration, deriveBootstrapState, canManageAccounts } from "./account-bootstrap";
 import { isDemoMode } from "./demo-mode";
-import { isUpdateHoldActive } from "./update-hold";
+import { isUpdateHoldActive, whileInFlight } from "./update-hold";
 
 /** Checked by the workflow package right before each claim or patrol reservation, not
  *  only at entry: the updater can take the hold while a tick is still setting up. */
@@ -991,6 +991,11 @@ export async function runNextQueuedWorkflow() {
   if (isUpdateHoldActive(Date.now())) {
     return { status: "idle" as const };
   }
+  // In flight for the updater's busy check, from here to the claim it guards.
+  return whileInFlight(runNextQueuedWorkflowNow);
+}
+
+async function runNextQueuedWorkflowNow() {
   const repository = getWorkflowRepository();
   // §7 form B: the worker resolves each CLAIMED run's account credentials via
   // resolveAccountContext (claim-first), so bob's acquisition lands in bob's 115.
@@ -1736,18 +1741,24 @@ export function beijingDateTime(): { date: string; hhmm: string } {
  * 容器同一语义（原 ignoreTimeGate 特例已退役）。`force` 跑完整 sweep 但不认领任何
  * slot（run-now 不得吞掉计划任务）。
  */
-export async function runScheduledType3(options?: {
-  force?: boolean;
-}): Promise<{
+type ScheduledType3Result = {
   outcomes: Awaited<ReturnType<typeof runScheduledType3Monitoring>>;
   skipped?: "already_swept_today" | "before_scheduled_time" | "update_in_progress";
   scheduledFor?: string;
-}> {
+};
+
+export async function runScheduledType3(options?: { force?: boolean }): Promise<ScheduledType3Result> {
   // Checked before any slot is claimed, so a scheduled patrol skipped here still runs
   // on the new version once the update is done.
   if (isUpdateHoldActive(Date.now())) {
     return { skipped: "update_in_progress", outcomes: [] };
   }
+  // In flight for the updater's busy check: reservations and staging cleanup must not
+  // be cut by a swap. The manual 立即巡检 and cron routes come through here too.
+  return whileInFlight(() => runScheduledType3Now(options));
+}
+
+async function runScheduledType3Now(options?: { force?: boolean }): Promise<ScheduledType3Result> {
   const repository = getWorkflowRepository();
   let claimedNow: string[] = [];
   let priorClaims: string[] = [];

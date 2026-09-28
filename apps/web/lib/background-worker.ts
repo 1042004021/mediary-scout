@@ -1,4 +1,4 @@
-import { isUpdateHoldActive } from "./update-hold";
+import { isUpdateHoldActive, whileInFlight } from "./update-hold";
 
 /**
  * In-process queue drainer.
@@ -135,15 +135,19 @@ export function startBackgroundWorker(options?: { pollMs?: number; runtime?: Wor
     }
     running = true;
     try {
-      const runtime = await loadRuntime();
-      const drained = await drainQueueOnce({
-        runNext: runtime.runNext,
-        runScheduled: runtime.runScheduled,
-        isDriveConfigured: runtime.isDriveConfigured,
+      // In flight for the updater's busy check: a tick may be between its hold check
+      // and claiming a run, or cleaning staging at the end of a patrol.
+      await whileInFlight(async () => {
+        const runtime = await loadRuntime();
+        const drained = await drainQueueOnce({
+          runNext: runtime.runNext,
+          runScheduled: runtime.runScheduled,
+          isDriveConfigured: runtime.isDriveConfigured,
+        });
+        if (drained > 0) {
+          console.log(`[background-worker] drained ${drained} queued run(s) this tick`);
+        }
       });
-      if (drained > 0) {
-        console.log(`[background-worker] drained ${drained} queued run(s) this tick`);
-      }
     } finally {
       running = false;
     }

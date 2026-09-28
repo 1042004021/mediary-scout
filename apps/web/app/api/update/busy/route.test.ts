@@ -20,7 +20,7 @@ vi.mock("../../../../lib/workflow-runtime", () => ({
   getWorkflowRepository: () => repository,
 }));
 
-import { clearUpdateHold, setUpdateHold } from "../../../../lib/update-hold";
+import { clearUpdateHold, setUpdateHold, whileInFlight } from "../../../../lib/update-hold";
 import { GET } from "./route";
 
 describe("GET /api/update/busy", () => {
@@ -42,6 +42,21 @@ describe("GET /api/update/busy", () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ busy: true });
     expect(hasActiveWorkflowRuns).toHaveBeenCalledWith(repository, { holdStartedAt: null, now: expect.any(Number) });
+  });
+
+  it("is busy while a worker tick or patrol is in flight, without asking the database", async () => {
+    isUpdaterToken.mockResolvedValue(true);
+    hasActiveWorkflowRuns.mockResolvedValue(false);
+    let release!: () => void;
+    const pending = whileInFlight(() => new Promise<void>((resolve) => (release = resolve)));
+    try {
+      const response = await GET(new Request("http://localhost/api/update/busy", { headers: { authorization: "Bearer t" } }));
+      expect(await response.json()).toEqual({ busy: true });
+      expect(hasActiveWorkflowRuns).not.toHaveBeenCalled();
+    } finally {
+      release();
+      await pending;
+    }
   });
 
   it("passes the hold's start time once the updater has taken it", async () => {

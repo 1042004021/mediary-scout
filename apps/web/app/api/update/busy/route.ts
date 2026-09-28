@@ -1,6 +1,6 @@
 import { connection } from "next/server";
 import { hasActiveWorkflowRuns } from "../../../../lib/has-active-workflow-runs";
-import { updateHoldStartedAt } from "../../../../lib/update-hold";
+import { inFlightCount, updateHoldStartedAt } from "../../../../lib/update-hold";
 import { isUpdaterToken } from "../../../../lib/updater-client";
 import { getWorkflowRepository } from "../../../../lib/workflow-runtime";
 
@@ -12,6 +12,9 @@ export async function GET(request: Request) {
     return new Response(null, { status: 401 });
   }
   const now = Date.now();
+  // A worker tick or patrol still running in this process may be between its hold check
+  // and the write it guards: wait for it.
+  if (inFlightCount() > 0) return Response.json({ busy: true });
   const busy = await hasActiveWorkflowRuns(getWorkflowRepository(), { holdStartedAt: updateHoldStartedAt(now), now });
   return Response.json({ busy });
 }
