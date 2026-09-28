@@ -13,6 +13,10 @@ const TAG_RE = /^v(\d{4})\.(0[1-9]|1[0-2])\.(0[1-9]|[12]\d|3[01])(?:\.([2-9]|[1-
 export function parseReleaseTag(value: string): ReleaseTag | null {
   const match = TAG_RE.exec(value);
   if (!match) return null;
+  const [year, month, day] = [Number(match[1]), Number(match[2]), Number(match[3])];
+  // The pattern allows 31 for every month; a date that rolls over (02.31 → 03.03) does not exist.
+  const calendar = new Date(Date.UTC(year, month - 1, day));
+  if (calendar.getUTCMonth() !== month - 1 || calendar.getUTCDate() !== day) return null;
   return { tag: value, date: `${match[1]}-${match[2]}-${match[3]}`, seq: match[4] ? Number(match[4]) : 0 };
 }
 

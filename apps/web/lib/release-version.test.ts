@@ -11,6 +11,12 @@ describe("parseReleaseTag", () => {
       expect(parseReleaseTag(bad)).toBeNull();
     }
   });
+  it("rejects dates that do not exist", () => {
+    for (const bad of ["v2026.02.31", "v2026.02.29", "v2026.04.31", "v2026.11.31"]) {
+      expect(parseReleaseTag(bad)).toBeNull();
+    }
+    expect(parseReleaseTag("v2028.02.29")?.date).toBe("2028-02-29");
+  });
 });
 
 describe("compareReleaseTags", () => {
