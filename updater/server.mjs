@@ -26,6 +26,7 @@ const PHASE_MESSAGES = {
 const TERMINAL_PHASES = new Set(["idle", "done", "rolled_back", "failed"]);
 const STEP_PHASES = new Set(["waiting", "backing_up", "building", "switching", "verifying"]);
 const INTERRUPTED_MESSAGE = "更新被中断了，原来的版本仍在运行。";
+const RESUME_ROLLBACK_MESSAGE = "更新中途被打断，正在回到原来的版本。";
 const MAX_BODY = 1024;
 
 export function isReleaseTag(value) {
@@ -106,9 +107,21 @@ export function createUpdater(opts) {
       status = idleStatus();
     }
   }
-  // A job interrupted by an updater restart is not running any more.
+  // A job cut off by an updater restart is not running any more. Where it stopped
+  // decides what to do: after the swap began, the new version may be the one
+  // serving, so go back to the recorded commit; before it, the old version never
+  // stopped, but the deploy folder may be left on the new tag, so check it back out.
+  let resume = null;
   if (!TERMINAL_PHASES.has(status.phase)) {
-    status = { ...status, phase: "failed", message: INTERRUPTED_MESSAGE, finishedAt: opts.now() };
+    const from = typeof status.fromCommit === "string" && /^[0-9a-f]{40}$/.test(status.fromCommit) ? status.fromCommit : null;
+    const swapStarted = status.phase === "switching" || status.phase === "verifying";
+    if (from && swapStarted) {
+      resume = { mode: "rollback", commit: from };
+      status = { ...status, phase: "switching", message: RESUME_ROLLBACK_MESSAGE, finishedAt: null };
+    } else {
+      if (from) resume = { mode: "restore", commit: from };
+      status = { ...status, phase: "failed", message: INTERRUPTED_MESSAGE, finishedAt: opts.now() };
+    }
     writeFileSync(statusFile, JSON.stringify(status, null, 2));
   }
   let job = null;
@@ -182,6 +195,33 @@ export function createUpdater(opts) {
     save({ ...outcome, finishedAt: opts.now() });
   }
 
+  async function resumeAfterRestart({ mode, commit }) {
+    const code = await opts.runUpdate([mode, commit], (line) => {
+      log.push(line);
+      save({});
+    });
+    if (mode === "restore") {
+      // The status already says the update was cut off and the old version kept running.
+      if (code !== 0) log.push("==> RESTORE_FAILED");
+      save({});
+      return;
+    }
+    save({
+      ...(code === 10
+        ? { phase: "rolled_back", message: "更新中途被打断，已自动回到原来的版本，一切照常。" }
+        : {
+            phase: "failed",
+            message: "更新中途被打断，自动回退也没成功。请在部署目录运行 ./scripts/deploy.sh 恢复。",
+          }),
+      finishedAt: opts.now(),
+    });
+  }
+  if (resume) {
+    job = resumeAfterRestart(resume).finally(() => {
+      job = null;
+    });
+  }
+
   return {
     // repoCommit is read fresh: it is the deploy folder's HEAD, which the web falls back
     // to when its image has no BUILD_COMMIT (built without GIT_SHA).
@@ -242,10 +282,12 @@ export function createUpdaterHttp(updater, token) {
   };
 }
 
+/** Runs run-update.sh with a release tag, or with ["rollback" | "restore", commit]. */
 function shellRunner(scriptPath) {
-  return (tag, onLine) =>
+  return (args, onLine) =>
     new Promise((resolve) => {
-      const child = spawn("sh", [scriptPath, tag], { cwd: process.env.UPDATER_REPO_DIR ?? "/repo" });
+      const argv = Array.isArray(args) ? args : [args];
+      const child = spawn("sh", [scriptPath, ...argv], { cwd: process.env.UPDATER_REPO_DIR ?? "/repo" });
       let buffer = "";
       const feed = (chunk) => {
         buffer += chunk.toString();

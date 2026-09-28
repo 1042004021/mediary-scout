@@ -183,8 +183,12 @@ function setup() {
 }
 
 function run(env, tag = TAG) {
+  return runArgs(env, [tag]);
+}
+
+function runArgs(env, args) {
   return new Promise((resolve) => {
-    const child = spawn("sh", [SCRIPT, tag], { env });
+    const child = spawn("sh", [SCRIPT, ...args], { env });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk) => {
@@ -391,12 +395,15 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
 
   it("keeps waiting while the probe fails or answers something unexpected", async () => {
     const { stubDir, log, env } = setup();
-    writeFileSync(join(stubDir, "wget-lines"), 'FAIL\n<html>login</html>\n{"busy":true}\n{"busy":false}\n');
+    writeFileSync(
+      join(stubDir, "wget-lines"),
+      'FAIL\n<html>{"busy":false}</html>\n{"busy":false}garbage\n{"busy":true}\n{"busy":false}\n',
+    );
     const result = await run(env);
     expect(result.code).toBe(0);
     const checks = result.stdout.split("\n").filter((line) => line.startsWith("==> BUSY_CHECK"));
     expect(checks).toEqual(["==> BUSY_CHECK unreachable", "==> BUSY_CHECK unexpected", "==> BUSY_CHECK busy"]);
-    expect(signatures(log).filter((step) => step === "wget")).toHaveLength(4);
+    expect(signatures(log).filter((step) => step === "wget")).toHaveLength(5);
     expect(result.stdout.indexOf("==> BUSY_CHECK busy")).toBeLessThan(result.stdout.indexOf("==> STEP switching"));
   });
 
@@ -449,6 +456,36 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     expect(gitShas(stubDir)).toEqual([TAG_COMMIT, FROM]);
     // The swap was attempted, so the old process and its hold may be gone: no release.
     expect(signatures(log)).not.toContain("release");
+  });
+
+  it("rollback mode rebuilds and swaps back to the given commit, without a backup or a tag", async () => {
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "head"), `${TAG_COMMIT}\n`);
+    const result = await runArgs(env, ["rollback", FROM]);
+    expect(result.code).toBe(10);
+    expect(result.stdout).toContain("==> RESUMED_ROLLBACK");
+    expect(result.stdout).toContain("==> ROLLED_BACK");
+    expect(signatures(log)).toEqual(["status", "inspect", `checkout ${FROM}`, "build", "up", "cat_commit", "health"]);
+    expect(gitShas(stubDir)).toEqual([FROM]);
+  });
+
+  it("restore mode checks the old commit out and releases the hold", async () => {
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "head"), `${TAG_COMMIT}\n`);
+    const result = await runArgs(env, ["restore", FROM]);
+    expect(result.code).toBe(0);
+    expect(signatures(log)).toEqual(["status", "inspect", `checkout ${FROM}`, "release"]);
+  });
+
+  it("rollback and restore refuse anything but a full commit id", async () => {
+    for (const bad of ["main", "abc", `${FROM};id`, `${FROM}0`, ""]) {
+      for (const mode of ["rollback", "restore"]) {
+        const { log, env } = setup();
+        const result = await runArgs(env, [mode, bad]);
+        expect({ mode, bad, code: result.code }).toEqual({ mode, bad, code: 2 });
+        expect(linesOf(log)).toEqual([]);
+      }
+    }
   });
 
   it("stops before checkout or build when pg_dump fails, and leaves no temp dump", async () => {

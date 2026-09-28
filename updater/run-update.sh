@@ -3,7 +3,26 @@
 # The build happens BEFORE the swap, so a failed build never touches the running web container.
 # Paths default to the container layout and can be pointed at a temp dir by the unit test.
 # Exit: 0 ok · 10 rolled back · 20 rollback failed · 30 local edits (nothing touched).
+#
+# When the updater restarts and finds an update that was cut off:
+#   `run-update.sh rollback <commit>` — the swap had begun: rebuild and swap back.
+#     Exit: 10 rolled back · 20 rollback failed.
+#   `run-update.sh restore <commit>` — before the swap: the old version never stopped,
+#     only the deploy folder is left on the new tag; check the old commit back out and
+#     release the hold if that run had taken it.
+#     Exit: 0 restored.
+# Either exits 2 on a bad commit.
 set -eu
+
+MODE=update
+if [ "${1-}" = rollback ] || [ "${1-}" = restore ]; then
+  MODE="$1"
+  ROLLBACK_TO="${2-}"
+  case "$ROLLBACK_TO" in
+    *[!0-9a-f]*|"") echo "==> ERROR not a commit: $ROLLBACK_TO"; exit 2 ;;
+  esac
+  [ "${#ROLLBACK_TO}" -eq 40 ] || { echo "==> ERROR not a commit: $ROLLBACK_TO"; exit 2; }
+fi
 
 TAG="${1-}"
 # Same rule as apps/web/lib/release-version.ts: vYYYY.MM.DD or vYYYY.MM.DD.N (N >= 2),
@@ -28,7 +47,7 @@ is_release_tag() {
   esac
   [ "$d" -le "$max" ]
 }
-if ! is_release_tag "$TAG"; then
+if [ "$MODE" = update ] && ! is_release_tag "$TAG"; then
   echo "==> ERROR not a release tag: $TAG"
   exit 2
 fi
@@ -66,6 +85,45 @@ fi
 PROJECT="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' "$(hostname)")"
 [ -n "$PROJECT" ] || { echo "==> ERROR cannot read compose project name"; exit 2; }
 compose() { docker compose -p "$PROJECT" --project-directory "$REPO" "$@"; }
+
+verify() {
+  i=0
+  while [ "$i" -lt 90 ]; do
+    RUNNING="$(compose exec -T web cat BUILD_COMMIT 2>/dev/null || true)"
+    if [ "$RUNNING" = "$1" ] && compose exec -T web node -e "fetch('http://127.0.0.1:3000/api/health',{signal:AbortSignal.timeout(5000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then
+      return 0
+    fi
+    i=$((i + 1))
+    sleep 2
+  done
+  return 1
+}
+
+# Back to $1: check it out, rebuild, swap, and check it serves. Exits 10 or 20.
+roll_back() {
+  g -c advice.detachedHead=false checkout "$1"
+  GIT_SHA="$1"
+  export GIT_SHA
+  if compose build web && compose up -d --no-deps web && verify "$1"; then
+    echo "==> ROLLED_BACK"
+    exit 10
+  fi
+  echo "==> ROLLBACK_FAILED"
+  exit 20
+}
+
+if [ "$MODE" = rollback ]; then
+  echo "==> STEP switching"
+  echo "==> RESUMED_ROLLBACK — the update stopped after the swap began; going back to $ROLLBACK_TO"
+  roll_back "$ROLLBACK_TO"
+fi
+if [ "$MODE" = restore ]; then
+  g -c advice.detachedHead=false checkout "$ROLLBACK_TO"
+  # The cut-off run may have taken the hold; the old version must start runs again.
+  web_post '{"hold":false}' >/dev/null 2>&1 || true
+  echo "==> RESTORED $ROLLBACK_TO"
+  exit 0
+fi
 
 FROM="$(g rev-parse HEAD)"
 echo "==> FROM $FROM"
@@ -118,9 +176,11 @@ wait_idle() {
   last=""
   while [ "$i" -lt 60 ]; do
     if BUSY="$(web_get /api/update/busy 2>/dev/null)"; then
+      # The whole body, exactly as the route sends it (Response.json); `$(...)` drops
+      # the trailing newline. Anything around it (HTML, a proxy page) is unexpected.
       case "$BUSY" in
-        *'"busy":false'*) return 0 ;;
-        *'"busy":true'*) seen=busy ;;
+        '{"busy":false}') return 0 ;;
+        '{"busy":true}') seen=busy ;;
         *) seen=unexpected ;;
       esac
     else
@@ -139,19 +199,6 @@ wait_idle() {
   # Same policy as before: interrupted runs are requeued on start and the janitor
   # cleans their staging, so a stuck task does not block updates forever.
   echo "==> STILL_BUSY ($last) — switching anyway; interrupted runs are requeued on start"
-}
-
-verify() {
-  i=0
-  while [ "$i" -lt 90 ]; do
-    RUNNING="$(compose exec -T web cat BUILD_COMMIT 2>/dev/null || true)"
-    if [ "$RUNNING" = "$1" ] && compose exec -T web node -e "fetch('http://127.0.0.1:3000/api/health',{signal:AbortSignal.timeout(5000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then
-      return 0
-    fi
-    i=$((i + 1))
-    sleep 2
-  done
-  return 1
 }
 
 # Stop the old version from starting new runs before the final wait, so nothing starts
@@ -178,12 +225,4 @@ if compose up -d --no-deps web; then
 else
   echo "==> UP_FAILED — rolling back to $FROM"
 fi
-g -c advice.detachedHead=false checkout "$FROM"
-GIT_SHA="$FROM"
-export GIT_SHA
-if compose build web && compose up -d --no-deps web && verify "$FROM"; then
-  echo "==> ROLLED_BACK"
-  exit 10
-fi
-echo "==> ROLLBACK_FAILED"
-exit 20
+roll_back "$FROM"

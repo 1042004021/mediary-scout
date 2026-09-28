@@ -220,6 +220,89 @@ describe("updater", () => {
     expect(JSON.parse(readFileSync(join(dir, "status.json"), "utf8")).phase).toBe("failed");
   });
 
+  it("after a restart during the swap, goes back to the recorded commit", async () => {
+    for (const phase of ["switching", "verifying"]) {
+      const dir = mkdtempSync(join(tmpdir(), "updater-"));
+      writeFileSync(
+        join(dir, "status.json"),
+        JSON.stringify({ phase, targetTag: "v2026.10.02", fromCommit: "c".repeat(40), startedAt: "x", finishedAt: null, message: "", logTail: "" }),
+      );
+      const calls = [];
+      const updater = createUpdater({
+        stateDir: dir,
+        runUpdate: (args, onLine) => {
+          calls.push(args);
+          onLine("==> ROLLED_BACK");
+          return Promise.resolve(10);
+        },
+        acquisitionsRunning: async () => false,
+        sleep: async () => {},
+        now: () => "2026-10-02T20:00:00.000Z",
+        waitPollMs: 1,
+        waitLimitMs: 1000,
+        repoCommit: () => "a".repeat(40),
+      });
+      // Busy while the rollback runs: a new update must not start on top of it.
+      expect(updater.start("v2026.10.03")).toEqual({ accepted: false, reason: "busy" });
+      await updater.idle();
+      expect(calls).toEqual([["rollback", "c".repeat(40)]]);
+      expect(updater.status()).toMatchObject({
+        phase: "rolled_back",
+        message: "更新中途被打断，已自动回到原来的版本，一切照常。",
+        finishedAt: "2026-10-02T20:00:00.000Z",
+      });
+      expect(updater.status().logTail).toContain("==> ROLLED_BACK");
+    }
+  });
+
+  it("says a person is needed when that rollback fails too", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "updater-"));
+    writeFileSync(
+      join(dir, "status.json"),
+      JSON.stringify({ phase: "verifying", targetTag: "v2026.10.02", fromCommit: "c".repeat(40), startedAt: "x", finishedAt: null, message: "", logTail: "" }),
+    );
+    const updater = createUpdater({
+      stateDir: dir,
+      runUpdate: () => Promise.resolve(20),
+      acquisitionsRunning: async () => false,
+      sleep: async () => {},
+      now: () => "2026-10-02T20:00:00.000Z",
+      waitPollMs: 1,
+      waitLimitMs: 1000,
+      repoCommit: () => "a".repeat(40),
+    });
+    await updater.idle();
+    expect(updater.status()).toMatchObject({
+      phase: "failed",
+      message: "更新中途被打断，自动回退也没成功。请在部署目录运行 ./scripts/deploy.sh 恢复。",
+    });
+  });
+
+  it("after a restart before the swap, only checks the old commit back out", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "updater-"));
+    writeFileSync(
+      join(dir, "status.json"),
+      JSON.stringify({ phase: "building", targetTag: "v2026.10.02", fromCommit: "c".repeat(40), startedAt: "x", finishedAt: null, message: "", logTail: "" }),
+    );
+    const calls = [];
+    const updater = createUpdater({
+      stateDir: dir,
+      runUpdate: (args) => {
+        calls.push(args);
+        return Promise.resolve(0);
+      },
+      acquisitionsRunning: async () => false,
+      sleep: async () => {},
+      now: () => "2026-10-02T20:00:00.000Z",
+      waitPollMs: 1,
+      waitLimitMs: 1000,
+      repoCommit: () => "a".repeat(40),
+    });
+    await updater.idle();
+    expect(calls).toEqual([["restore", "c".repeat(40)]]);
+    expect(updater.status()).toMatchObject({ phase: "failed", message: "更新被中断了，原来的版本仍在运行。" });
+  });
+
   it("keeps a finished status across a restart", () => {
     const dir = mkdtempSync(join(tmpdir(), "updater-"));
     writeFileSync(
