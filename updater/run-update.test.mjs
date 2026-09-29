@@ -545,6 +545,45 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     }
   });
 
+  it("in a rollback, stops waiting on a new version that fails to answer twice in a row", async () => {
+    for (const answer of ["FAIL", "<html>500</html>"]) {
+      const { stubDir, log, env } = setup();
+      writeFileSync(join(stubDir, "head"), `${TAG_COMMIT}\n`);
+      writeFileSync(join(stubDir, "wget-lines"), `${answer}\n`);
+      const result = await runArgs(env, ["rollback", FROM]);
+      expect({ answer, code: result.code }).toEqual({ answer, code: 10 });
+      expect(signatures(log).filter((step) => step === "wget")).toHaveLength(2);
+      // One 30-second sleep between the two probes, not the 30-minute limit.
+      const clock = Number(readFileSync(join(stubDir, "clock"), "utf8"));
+      expect(clock).toBeGreaterThanOrEqual(30);
+      expect(clock).toBeLessThan(60);
+      expect(result.stdout).toContain("==> BUSY_CHECK the new version does not answer");
+      expect(result.stdout).toContain("==> ROLLED_BACK");
+    }
+  });
+
+  it("in a rollback, an explicit busy answer keeps waiting and restarts the count of failures", async () => {
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "head"), `${TAG_COMMIT}\n`);
+    writeFileSync(join(stubDir, "wget-lines"), 'FAIL\n{"busy":true}\nFAIL\n{"busy":true}\n{"busy":true}\n{"busy":false}\n');
+    const result = await runArgs(env, ["rollback", FROM]);
+    expect(result.code).toBe(10);
+    expect(signatures(log).filter((step) => step === "wget")).toHaveLength(6);
+    expect(result.stdout).not.toContain("does not answer");
+  });
+
+  it("after the swap in update mode, a new version that cannot answer does not hold the rollback up either", async () => {
+    const { stubDir, log, env } = setup();
+    // The first probe (before the swap) says idle; every later one fails.
+    writeFileSync(join(stubDir, "wget-lines"), '{"busy":false}\nFAIL\n');
+    writeFileSync(join(stubDir, "fail-first-up"), "1");
+    const result = await run(env);
+    expect(result.code).toBe(10);
+    expect(signatures(log).filter((step) => step === "wget")).toHaveLength(3);
+    expect(result.stdout).toContain("==> BUSY_CHECK the new version does not answer");
+    expect(result.stdout).toContain("==> ROLLED_BACK");
+  });
+
   it("rolls back when `up` itself fails instead of exiting through set -e", async () => {
     const { stubDir, log, env } = setup();
     writeFileSync(join(stubDir, "fail-first-up"), "1");

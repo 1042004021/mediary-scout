@@ -99,6 +99,7 @@ WAIT_LIMIT_S="${UPDATER_WAIT_LIMIT_S:-1800}"
 wait_idle() {
   i=0
   last=""
+  unanswered=0
   deadline=$(( $(date +%s) + WAIT_LIMIT_S ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
     # Refresh the hold each poll: it expires 40 minutes after the last refresh, and this
@@ -132,6 +133,17 @@ wait_idle() {
     if [ "$seen" != "$last" ]; then
       echo "==> BUSY_CHECK $seen"
       last="$seen"
+    fi
+    # After the swap began, the version being waited on is the new one, which just failed its
+    # check. One that fails to answer twice in a row is not running tasks, and waiting out the
+    # limit would only keep the broken version serving. An explicit busy:true still waits.
+    # The wait before the swap is unchanged.
+    if [ "$MODE" = rollback ] || [ "$SWAPPED" = 1 ]; then
+      if [ "$seen" = busy ]; then unanswered=0; else unanswered=$((unanswered + 1)); fi
+      if [ "$unanswered" -ge 2 ]; then
+        echo "==> BUSY_CHECK the new version does not answer — the rollback goes ahead"
+        return 0
+      fi
     fi
     i=$((i + 1))
     sleep 30
