@@ -280,6 +280,18 @@ describe("queueReplaceRequest", () => {
     expect((await repository.listPendingReplacements(unbound)).map((p) => p.episode)).toEqual(["S01E01"]);
   });
 
+  it("claims nothing while mayStartRun says no; the replace request stays queued", async () => {
+    const { repository } = await trackedShow();
+    const storage = new FakeStorageExecutor();
+    await repository.createUserMessage({ ...WORK, body: "1 集发蓝", episodeTags: ["S01E01"], now: NOW });
+    const queued = await queueReplaceRequest({ repository, work: WORK, now: fixedNow, createWorkflowRunId: () => "run_rr_held" });
+    expect(queued).toEqual({ status: "queued", workflowRunId: "run_rr_held" });
+    const result = await runQueuedReplaceRequest({ ...baseRun(repository, storage, throwingModel()), mayStartRun: () => false });
+    expect(result).toEqual({ status: "idle" });
+    const run = await repository.getWorkflowRunSnapshot("run_rr_held", { accountId: "acct_1", connectedStorageId: DRIVE });
+    expect(run!.workflowRun.status).toBe("queued");
+  });
+
   it("a work that is not tracked on that drive is not queued", async () => {
     const { repository } = await trackedShow();
     const result = await queueReplaceRequest({ repository, work: { ...WORK, drive: "other_drive" }, now: fixedNow });

@@ -410,12 +410,31 @@ docker compose build --build-arg NPM_REGISTRY=https://registry.npmmirror.com
 >
 > 手动等价执行 + 校验:
 > ```bash
+> # 一键更新后部署目录停在发布标签上,pull 需要一个分支(deploy.sh 自己也会先做这一步):
+> git checkout main
 > git pull --ff-only
 > GIT_SHA=$(git rev-parse HEAD) docker compose up -d --build
 > # 核对容器真在跑新代码(应等于上面的 HEAD):
 > docker compose exec web cat BUILD_COMMIT
 > ```
 
+### 在网页里一键更新
+
+设置 → 更新会列出新的发布版本，自托管实例上有「立即更新」。
+
+第一次要先手动升级一次，更新助手容器才会起来。在部署目录运行：
+
+```bash
+./scripts/deploy.sh
+```
+
+一次更新会等正在跑的任务结束，把数据库备份到 `backups/pre-update-*.sql.gz`（只留最近 5 份），然后构建新版本——这段时间旧版本继续服务。构建好了先暂停开始新任务（已经排队的会留到新版本再跑），等正在跑的任务结束再替换，网页大约有一分钟打不开。接着检查新版本，没通过就自动回到旧版本；更新助手中途被重启，也会在重新启动后自动回到旧版本。
+
+它不会覆盖你改过的已跟踪文件。配置写在 `.env`。
+
+从 GitHub 下载新版本时，设了 `.env` 里的 `HTTPS_PROXY` / `HTTP_PROXY` 就走它——和应用其余出站请求（TMDB / PanSou 等）同一个代理；没设就直连。改了 `.env` 要在部署目录运行 `docker compose up -d` 才会生效。
+
+只有更新助手容器挂 Docker socket。它不映射任何端口，只接受「更新到这个发布标签」，令牌只有 web 容器能读。更新助手不会更新自己：一键更新只替换 web 容器。某个版本如果改了 `updater/`，发布说明会写明，那时在部署目录运行 `docker compose up -d --build updater`；运行 `./scripts/deploy.sh` 时它也会一并重建。
 
 ## 备份与恢复（pgdata）
 

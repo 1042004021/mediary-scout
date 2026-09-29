@@ -30,7 +30,9 @@ describe("fetchReleaseFeed", () => {
         status: 200,
         body: JSON.stringify([
           ref("v1.4.1", "a".repeat(40)),
-          ref("v3000.01.01", "d".repeat(40)),
+          ref("v2099.12.31", "d".repeat(40)),
+          // Outside 2000–2099: not a release tag.
+          ref("v3000.01.01", "e".repeat(40)),
           ref("v2026.09.28", "b".repeat(40)),
           ref("v2026.10.02", "c".repeat(40)),
         ]),
@@ -39,7 +41,7 @@ describe("fetchReleaseFeed", () => {
       [notes("v2026.09.28")]: { status: 404, body: "" },
     });
     const feed = await fetchReleaseFeed(fetchImpl);
-    expect(feed.map((r) => r.tag)).toEqual(["v3000.01.01", "v2026.10.02", "v2026.09.28"]);
+    expect(feed.map((r) => r.tag)).toEqual(["v2099.12.31", "v2026.10.02", "v2026.09.28"]);
     expect(feed[1]).toMatchObject({ commit: "c".repeat(40), notes: [{ kind: "add", text: "一键更新" }] });
     expect(feed[2]!.notes).toEqual([]);
   });

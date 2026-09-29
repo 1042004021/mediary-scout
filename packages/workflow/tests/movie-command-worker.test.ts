@@ -78,6 +78,28 @@ describe("movie acquisition command + worker", () => {
     expect(second.status).toBe("already_running");
   });
 
+  it("worker claims nothing while mayStartRun says no; the queued movie waits", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    await queueMovieAcquisition({
+      title: movieTitle(),
+      keyword: "奥本海默 4K",
+      repository,
+      createWorkflowRunId: () => "run_movie_held",
+      now: fixedNow,
+    });
+    const result = await runQueuedMovieAcquisition({
+      repository,
+      resourceProvider: new FakeResourceProvider({ keywordResults: {} }),
+      storage: new FakeStorageExecutor(),
+      model: inspectAndMarkModel(),
+      moviesParentDirectoryId: "movies_root",
+      now: fixedNow,
+      mayStartRun: () => false,
+    });
+    expect(result).toEqual({ status: "idle" });
+    expect((await repository.getWorkflowRunSnapshot("run_movie_held"))!.workflowRun.status).toBe("queued");
+  });
+
   it("worker claims, runs, and persists a movie acquisition (already in 115 → agent marks from evidence → succeeded)", async () => {
     const repository = new InMemoryWorkflowRepository();
     const title = movieTitle();

@@ -93,6 +93,32 @@ describe("runQueuedType2Workflow (V2 engine)", () => {
     expect(result).toEqual({ status: "idle" });
   });
 
+  it("claims nothing while mayStartRun says no: the run stays queued for the new version", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    const { title, season } = trackedFixture();
+    await queueTrackingInitialization({
+      title,
+      season,
+      keyword: "Show 4K",
+      repository,
+      createWorkflowRunId: () => "run_held",
+      now: fixedNow,
+    });
+
+    const result = await runQueuedType2Workflow({
+      repository,
+      resourceProvider: emptyProvider(),
+      storage: new FakeStorageExecutor(),
+      model: throwingModel(),
+      storageParentDirectoryId: "library_root",
+      now: fixedNow,
+      mayStartRun: () => false,
+    });
+
+    expect(result).toEqual({ status: "idle" });
+    expect((await repository.getWorkflowRunSnapshot("run_held"))!.workflowRun.status).toBe("queued");
+  });
+
   it("claims one queued type2 run, executes it on the V2 engine, and persists a type2_init snapshot", async () => {
     const repository = new InMemoryWorkflowRepository();
     const { title, season } = trackedFixture();

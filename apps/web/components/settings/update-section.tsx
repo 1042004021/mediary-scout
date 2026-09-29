@@ -1,9 +1,13 @@
 import { connection } from "next/server";
 import { isDemoMode } from "../../lib/demo-mode";
 import { resolveIsDesktop } from "../../lib/workflow-runtime";
-import type { UpdateView } from "../../lib/update-state";
+import { ACTIVE_UPDATER_PHASES, type UpdateView } from "../../lib/update-state";
 import { loadUpdateView } from "../../lib/update-view-server";
 import { resolveCurrentIsOwner } from "../../lib/settings-attention-server";
+import type { UpdaterPhase } from "../../lib/updater-client";
+import { CheckUpdatesButton, CopyCommandButton, UpdateNowButton } from "./update-actions";
+
+const MIGRATE_COMMAND = "./scripts/deploy.sh";
 
 const KIND_LABEL = { add: "新增", improve: "改进", fix: "修复" } as const;
 
@@ -67,7 +71,29 @@ function DesktopUpdateHint({ view }: { view: UpdateView }) {
   );
 }
 
+function outcomeLabel(phase: UpdaterPhase): string {
+  if (phase === "done") return "成功";
+  if (phase === "rolled_back") return "已回滚";
+  return "没成功";
+}
+
+export function formatUpdateFinishedAt(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return iso;
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).format(date);
+}
+
 export function UpdateTab({ view, desktop }: { view: UpdateView; desktop: boolean }) {
+  const updating = Boolean(view.updater && ACTIVE_UPDATER_PHASES.has(view.updater.phase));
+  const failed = Boolean(view.updater && (view.updater.phase === "rolled_back" || view.updater.phase === "failed"));
   return (
     <div className="update-tab">
       <section className="panel update-status">
@@ -76,17 +102,47 @@ export function UpdateTab({ view, desktop }: { view: UpdateView; desktop: boolea
             <div className="update-faint">当前版本</div>
             <div className="update-version">{view.current.label}</div>
           </div>
-          {view.available ? (
-            <span className="service-pill is-on">有新版本 {view.available.tag}</span>
-          ) : view.status === "offline" ? (
-            <span className="service-pill is-off">暂时查不到新版本</span>
-          ) : view.status === "unknown" ? (
-            <span className="service-pill is-off">无法确认是否最新</span>
-          ) : (
-            <span className="service-pill">已是最新</span>
-          )}
+          <div className="update-status-side">
+            {view.available ? (
+              <span className="service-pill is-on">有新版本 {view.available.tag}</span>
+            ) : view.status === "offline" ? (
+              <span className="service-pill is-off">暂时查不到新版本</span>
+            ) : view.status === "unknown" ? (
+              <span className="service-pill is-off">无法确认是否最新</span>
+            ) : (
+              <span className="service-pill">已是最新</span>
+            )}
+            {!desktop && !updating && !view.available ? <CheckUpdatesButton /> : null}
+          </div>
         </div>
         {desktop ? <DesktopUpdateHint view={view} /> : null}
+        {!desktop && view.updater && (updating || (view.available && !view.updater.needsManualRecovery)) ? (
+          <UpdateNowButton tag={updating ? null : (view.available?.tag ?? null)} initial={view.updater} />
+        ) : null}
+        {!desktop && !updating && view.available && !view.updater && view.updaterInstalled ? (
+          <p className="update-muted">更新助手暂时没有回应，稍后刷新再试。</p>
+        ) : null}
+        {!desktop && !updating && view.available && !view.updater && !view.updaterInstalled ? (
+          <div className="update-migrate">
+            <p className="update-muted">一键更新需要先完成一次手动升级。在部署目录运行：</p>
+            <pre className="update-cmd">{MIGRATE_COMMAND}</pre>
+            <CopyCommandButton command={MIGRATE_COMMAND} />
+          </div>
+        ) : null}
+        {!desktop && failed && view.updater ? (
+          <div className="update-failure">
+            <p className="update-warn">{view.updater.message}</p>
+            <details>
+              <summary>查看详情</summary>
+              <pre className="update-cmd">{view.updater.logTail}</pre>
+            </details>
+          </div>
+        ) : null}
+        {!desktop && view.updater?.finishedAt ? (
+          <p className="update-muted">
+            上次更新：{formatUpdateFinishedAt(view.updater.finishedAt)} · {outcomeLabel(view.updater.phase)}
+          </p>
+        ) : null}
       </section>
       <section className="panel update-log">
         <h3 className="update-log-title">更新日志</h3>

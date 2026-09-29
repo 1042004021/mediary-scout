@@ -7,6 +7,7 @@ import {
   handleWorkflowRunFailure,
   resolveWorkerDeps,
   type AccountWorkerContext,
+  type MayStartRun,
   type QueuedType2WorkerResult,
   type ResolveAccountWorkerContext,
 } from "./worker.js";
@@ -47,9 +48,11 @@ export async function runQueuedStagingRecovery(
     now?: () => string;
     resolveAccountContext?: ResolveAccountWorkerContext;
     onAuthErrorFreeze?: (storageId: string, reason: string) => Promise<void>;
+    mayStartRun?: MayStartRun;
   },
 ): Promise<QueuedType2WorkerResult> {
   const now = input.now ?? (() => new Date().toISOString());
+  if (input.mayStartRun && !input.mayStartRun()) return { status: "idle" };
   const claimed = await input.repository.claimNextQueuedWorkflowRun({ kind: "staging_recovery", now: now() });
   if (!claimed) return { status: "idle" };
   try {

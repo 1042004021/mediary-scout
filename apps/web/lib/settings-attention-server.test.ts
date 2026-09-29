@@ -19,6 +19,7 @@ import {
   dismissSettingsAttentionItem,
   loadSettingsAttentionSummary,
   markSettingsAttentionSeen,
+  resolveCurrentIsOwner,
 } from "./settings-attention-server";
 import {
   getAccountScopedSettings,
@@ -270,6 +271,31 @@ describe("loadSettingsAttentionSummary — per-account state", () => {
     const summary = await loadSettingsAttentionSummary({ origin: "https://o.example" });
     expect(summary).toEqual({ count: 0, severity: null, items: [] });
     expect(repository.listConnectedStorages).not.toHaveBeenCalled();
+  });
+});
+
+describe("resolveCurrentIsOwner — single-user mode", () => {
+  // 单用户下经隧道来的匿名访客带一个随便什么 mt_session 也能过 proxy(只查有无),
+  // getCurrentAccountId() 会给这样的请求哨兵账号。哨兵绝不能被当成站主。
+  it("is not the owner for the unauthenticated sentinel", async () => {
+    makeRepository([]);
+    (getCurrentAccountId as ReturnType<typeof vi.fn>).mockResolvedValue("acct_unauthenticated");
+    expect(await resolveCurrentIsOwner()).toBe(false);
+  });
+
+  it("is the owner for acct_default (LAN, or a valid remote session)", async () => {
+    makeRepository([]);
+    (getCurrentAccountId as ReturnType<typeof vi.fn>).mockResolvedValue("acct_default");
+    expect(await resolveCurrentIsOwner()).toBe(true);
+  });
+
+  it("gives the sentinel no update item and no update probe in the attention summary", async () => {
+    (loadDeploymentUpdateState as ReturnType<typeof vi.fn>).mockResolvedValue(UPDATE_BEHIND);
+    (getCurrentAccountId as ReturnType<typeof vi.fn>).mockResolvedValue("acct_unauthenticated");
+    makeRepository([]);
+    const summary = await loadSettingsAttentionSummary({ origin: "https://o.example" });
+    expect(loadDeploymentUpdateState).not.toHaveBeenCalled();
+    expect(summary.items.some((i) => i.kind === "update_available")).toBe(false);
   });
 });
 

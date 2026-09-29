@@ -524,6 +524,49 @@ describe("sweepOrphanStagingDirs", () => {
     expect(await repo.getAccountSetting("acct", "staging_janitor_cursor:drive-resume")).toBe("");
   });
 
+  it("stops before the next show when an update hold starts, and resumes there next time", async () => {
+    const repo = new InMemoryWorkflowRepository();
+    const visited: string[] = [];
+    const executor = {
+      async listChildDirectories(parentId: string) {
+        if (parentId === "tv") {
+          return [
+            { id: "showA", name: "A" },
+            { id: "showB", name: "B" },
+          ];
+        }
+        visited.push(parentId);
+        return [];
+      },
+      async listTree() {
+        return [];
+      },
+      async removeDirectory() {
+        return { removed: true };
+      },
+    };
+    const first = drive({ storageId: "drive-held", executor });
+    const second = drive({ storageId: "drive-after", executor });
+    const logs: string[] = [];
+    const result = await sweepOrphanStagingDirs({
+      repository: repo,
+      drives: [first, second],
+      now: NOW,
+      log: (line) => logs.push(line),
+      // The hold is taken while showA is being looked at.
+      mayStartRun: () => !visited.includes("showA"),
+    });
+    expect(result).toEqual({ held: true });
+    expect(visited).toEqual(["showA"]);
+    expect(await repo.getAccountSetting("acct", "staging_janitor_cursor:drive-held")).toBe("showB");
+    expect(logs.some((line) => line.includes("an update is about to replace this process"))).toBe(true);
+
+    const again = await sweepOrphanStagingDirs({ repository: repo, drives: [first], now: NOW, mayStartRun: () => true });
+    expect(again).toEqual({ held: false });
+    expect(visited).toEqual(["showA", "showB"]);
+    expect(await repo.getAccountSetting("acct", "staging_janitor_cursor:drive-held")).toBe("");
+  });
+
   it("retries a 100011 inside one listTree, then finishes the walk", async () => {
     let now = 0;
     const sleeps: number[] = [];

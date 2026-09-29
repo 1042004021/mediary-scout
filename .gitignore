@@ -61,3 +61,9 @@ docs/images/devto-cover.*
 
 # 根目录截图残留（agent 浏览器会话产物，不该入库）
 /*.png
+
+# Database dumps from ./scripts/pg-backup.sh and the updater (backups/pre-update-*.sql.gz).
+/backups/
+
+# The updater/deploy shared lock file (scripts/deploy.sh + updater/run-update.sh).
+/.update.lock

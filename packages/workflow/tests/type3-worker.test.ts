@@ -189,6 +189,34 @@ describe("runScheduledType3Monitoring (V2 engine)", () => {
     expect(saved?.workflowRun.kind).toBe("type3_monitor");
   });
 
+  it("reserves nothing once mayStartRun says no, even if it said yes when the sweep began", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    const { title, season } = trackedFixture();
+    await seedTrackedSeason({ repository, title, season, obtainedCodes: ["S01E01", "S01E02"] });
+    const storage = new FakeStorageExecutor();
+    await seedV2Season(storage, title, season, ["S01E01"]);
+    // The hold is taken while the sweep is still setting up: only the check right
+    // before the reservation sees it.
+    let calls = 0;
+    const outcomes = await runScheduledType3Monitoring({
+      repository,
+      resourceProvider: emptyProvider(),
+      storage,
+      model: noCoverageModel(),
+      storageParentDirectoryId: "library_root",
+      now: fixedNow,
+      createWorkflowRunId: () => "run_held_patrol",
+      mayStartRun: () => {
+        calls += 1;
+        return false;
+      },
+    });
+
+    expect(calls).toBeGreaterThan(0);
+    expect(outcomes).toEqual([{ trackedSeasonId: season.id, status: "skipped_active" }]);
+    expect(await repository.getWorkflowRunSnapshot("run_held_patrol")).toBeNull();
+  });
+
   it("persists staging_leaked on the FAILED type3 run when the agent dies and the staging dir survives cleanup", async () => {
     // The patrol's inline catch builds the failed run's audit events by hand; a
     // leak carried on the error must land there too (Copilot #260 r1).
@@ -396,6 +424,20 @@ describe("runScheduledType3Monitoring (V2 engine)", () => {
     expect(outcomes[0]).toMatchObject({ trackedSeasonId: `${movie.id}_movie`, status: "ran", workflowRunId: "run_movie_patrol" });
     const saved = await repository.getWorkflowRunSnapshot("run_movie_patrol");
     expect(saved?.workflowRun.kind).toBe("movie_init");
+
+    const held = await runScheduledType3Monitoring({
+      repository,
+      resourceProvider: emptyProvider(),
+      storage: new FakeStorageExecutor(),
+      model: noCoverageModel(),
+      storageParentDirectoryId: "tv_root",
+      moviesParentDirectoryId: "movies_root",
+      now: fixedNow,
+      createWorkflowRunId: () => "run_movie_held",
+      mayStartRun: () => false,
+    });
+    expect(held).toEqual([{ trackedSeasonId: `${movie.id}_movie`, status: "skipped_active" }]);
+    expect(await repository.getWorkflowRunSnapshot("run_movie_held")).toBeNull();
   });
 
   it("a movie patrol is skipped_active when a replace_request for the film is reserved after the sweep's filter", async () => {

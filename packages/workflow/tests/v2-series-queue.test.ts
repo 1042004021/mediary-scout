@@ -133,6 +133,19 @@ describe("queueSeriesInitialization + runQueuedSeriesInitialization (live series
     });
     expect(again.status).toBe("already_running");
 
+    // An update hold: nothing is claimed, the run stays queued.
+    const held = await runQueuedSeriesInitialization({
+      repository,
+      resourceProvider: new FakeResourceProvider({ keywordResults: {} }),
+      storage: new FakeStorageExecutor(),
+      model: inspectAndMarkModel([]),
+      storageParentDirectoryId: "library_root",
+      now: () => "2026-06-13T00:02:00.000Z",
+      mayStartRun: () => false,
+    });
+    expect(held).toEqual({ status: "idle" });
+    expect((await repository.getWorkflowRunSnapshot("run_series_q"))!.workflowRun.status).toBe("queued");
+
     // Seed both seasons' canonical V2 dirs as already complete (all aired
     // episodes present in 115). The agent inspects, sees them, and marks them
     // from that evidence (§6b#8) — succeeded. S1: 2/2 aired; S2: 2/3 aired.

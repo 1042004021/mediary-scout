@@ -23,6 +23,7 @@ import {
   resolveWorkerDeps,
   storageParentForTitle,
   type AccountWorkerContext,
+  type MayStartRun,
   type QueuedType2WorkerResult,
   type ResolveAccountWorkerContext,
   type SeasonMetadataSync,
@@ -194,10 +195,12 @@ export async function runQueuedReplaceRequest(
     now?: () => string;
     resolveAccountContext?: ResolveAccountWorkerContext;
     onAuthErrorFreeze?: (storageId: string, reason: string) => Promise<void>;
+    mayStartRun?: MayStartRun;
   },
 ): Promise<QueuedType2WorkerResult> {
   const now = input.now ?? (() => new Date().toISOString());
   const repository = input.repository;
+  if (input.mayStartRun && !input.mayStartRun()) return { status: "idle" };
   const claimed = await repository.claimNextQueuedWorkflowRun({ kind: "replace_request", now: now() });
   if (!claimed) return { status: "idle" };
   const runId = claimed.workflowRun.id;

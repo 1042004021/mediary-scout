@@ -3,12 +3,13 @@
 # TMDB 经 §1 CF Worker 开箱即用;LLM key / 自己的 TMDB key / Prowlarr 在设置页填。
 # ---- Docker Hub 镜像源(墙内必读) ----
 #
-# 本文件里三个镜像来自 Docker Hub:postgres、node(见 Dockerfile)、cloudflared。
+# 本文件里四个镜像来自 Docker Hub:postgres、node(见 Dockerfile)、cloudflared、
+# updater 的 docker:27-cli(见 updater/Dockerfile)。
 # **在中国大陆,Docker Hub 经常拉不动** —— 表现为
 # `failed to fetch anonymous token: ... EOF` 或 `connection reset by peer`。
 # 这不是你的配置错了,是 registry-1.docker.io / auth.docker.io 不可达。
 #
-# 解决:在 .env 里设一个镜像源前缀,三处会一起生效:
+# 解决:在 .env 里设一个镜像源前缀,四处会一起生效:
 #
 #   DOCKER_MIRROR=docker.1ms.run
 #
@@ -106,6 +107,9 @@ services:
     env_file:
       - path: .env
         required: false
+    # 更新令牌和状态。只读：web 不挂 Docker socket，socket 只给下面的 updater。
+    volumes:
+      - updater-state:/updater-state:ro
     # Host port configurable (WEB_PORT) in case 3000 is taken on the host.
     ports:
       - "${WEB_PORT:-3000}:3000"
@@ -122,6 +126,27 @@ services:
       timeout: 5s
       retries: 3
       start_period: 40s
+    logging: *default-logging
+    restart: unless-stopped
+
+  # 一键更新的执行者。只有它能操作 Docker；不映射任何端口，只在 compose 内网。
+  # 网页通过共享卷里的令牌让它「更新到某个发布标签」，其它什么都不做。
+  # 它不会更新自己：改了 updater/ 要手动 `docker compose up -d --build updater`。
+  updater:
+    build:
+      context: ./updater
+      args:
+        DOCKER_MIRROR: ${DOCKER_MIRROR:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/repo
+      - updater-state:/state
+    environment:
+      UPDATER_WEB_BASE: http://web:3000
+      # Only git (the release download) uses these; calls to the web stay direct. The web
+      # reads HTTP(S)_PROXY on its own, but the updater is a separate container that does not.
+      UPDATER_HTTPS_PROXY: ${HTTPS_PROXY:-}
+      UPDATER_HTTP_PROXY: ${HTTP_PROXY:-}
     logging: *default-logging
     restart: unless-stopped
 
@@ -164,3 +189,4 @@ services:
 
 volumes:
   pgdata:
+  updater-state:

@@ -102,6 +102,17 @@ import { findDemoCandidateById, findDemoCandidateByTmdbId } from "./demo-candida
 import { seedDemoWorkflowRepository } from "./demo-workflow";
 import { resolveRegistration, deriveBootstrapState, canManageAccounts } from "./account-bootstrap";
 import { isDemoMode } from "./demo-mode";
+import { isUpdateHoldActive, whileInFlight } from "./update-hold";
+
+/** Checked by the workflow package right before each claim or patrol reservation, not
+ *  only at entry: the updater can take the hold while a tick is still setting up. */
+const mayStartRun = () => !isUpdateHoldActive(Date.now());
+
+/** True while the updater holds new work before a container swap. Lets server actions
+ *  (e.g. importForeignWorkAction) refuse upfront without importing update-hold directly. */
+export function isUpdateInProgress(): boolean {
+  return isUpdateHoldActive(Date.now());
+}
 
 export type CandidateTrackingRequestResult =
   | {
@@ -484,6 +495,16 @@ export class UnauthenticatedAccountError extends Error {
   constructor(message = "未登录，请先登录后再操作。") {
     super(message);
     this.name = "UnauthenticatedAccountError";
+  }
+}
+
+/** Thrown when a drive mutation is refused because an update is about to swap the web
+ *  container. Rechecked INSIDE the in-flight guard so the updater's busy check cannot miss
+ *  it: the caller turns it into a "try again after the update" message. */
+export class UpdateInProgressError extends Error {
+  constructor(message = "正在更新，更新完成后再试。") {
+    super(message);
+    this.name = "UpdateInProgressError";
   }
 }
 
@@ -981,6 +1002,16 @@ export function __resetPanSouHealthCacheForTests(): void {
 }
 
 export async function runNextQueuedWorkflow() {
+  // An update is about to replace this process: start nothing new. Queued runs stay
+  // queued and run on the new version.
+  if (isUpdateHoldActive(Date.now())) {
+    return { status: "idle" as const };
+  }
+  // In flight for the updater's busy check, from here to the claim it guards.
+  return whileInFlight(runNextQueuedWorkflowNow);
+}
+
+async function runNextQueuedWorkflowNow() {
   const repository = getWorkflowRepository();
   // §7 form B: the worker resolves each CLAIMED run's account credentials via
   // resolveAccountContext (claim-first), so bob's acquisition lands in bob's 115.
@@ -1017,6 +1048,7 @@ export async function runNextQueuedWorkflow() {
     animeStorageParentDirectoryId: parents.anime,
     resolveAccountContext,
     onAuthErrorFreeze,
+    mayStartRun,
   });
   if (type2.status !== "idle") {
     await pushNotificationsSince(repository, startedAt);
@@ -1033,6 +1065,7 @@ export async function runNextQueuedWorkflow() {
     animeStorageParentDirectoryId: parents.anime,
     resolveAccountContext,
     onAuthErrorFreeze,
+    mayStartRun,
   });
   if (series.status !== "idle") {
     await pushNotificationsSince(repository, startedAt);
@@ -1048,6 +1081,7 @@ export async function runNextQueuedWorkflow() {
     moviesParentDirectoryId: parents.movies,
     resolveAccountContext,
     onAuthErrorFreeze,
+    mayStartRun,
   });
   if (movie.status !== "idle") {
     await pushNotificationsSince(repository, startedAt);
@@ -1065,6 +1099,7 @@ export async function runNextQueuedWorkflow() {
     moviesParentDirectoryId: parents.movies,
     resolveAccountContext,
     onAuthErrorFreeze,
+    mayStartRun,
     // A work with 待换 episodes skips the patrol, where TMDB sync normally happens.
     ...syncOption(),
   });
@@ -1082,6 +1117,7 @@ export async function runNextQueuedWorkflow() {
     ...quality,
     resolveAccountContext,
     onAuthErrorFreeze,
+    mayStartRun,
   });
 }
 
@@ -1721,13 +1757,24 @@ export function beijingDateTime(): { date: string; hhmm: string } {
  * 容器同一语义（原 ignoreTimeGate 特例已退役）。`force` 跑完整 sweep 但不认领任何
  * slot（run-now 不得吞掉计划任务）。
  */
-export async function runScheduledType3(options?: {
-  force?: boolean;
-}): Promise<{
+type ScheduledType3Result = {
   outcomes: Awaited<ReturnType<typeof runScheduledType3Monitoring>>;
-  skipped?: "already_swept_today" | "before_scheduled_time";
+  skipped?: "already_swept_today" | "before_scheduled_time" | "update_in_progress";
   scheduledFor?: string;
-}> {
+};
+
+export async function runScheduledType3(options?: { force?: boolean }): Promise<ScheduledType3Result> {
+  // Checked before any slot is claimed, so a scheduled patrol skipped here still runs
+  // on the new version once the update is done.
+  if (isUpdateHoldActive(Date.now())) {
+    return { skipped: "update_in_progress", outcomes: [] };
+  }
+  // In flight for the updater's busy check: reservations and staging cleanup must not
+  // be cut by a swap. The manual 立即巡检 and cron routes come through here too.
+  return whileInFlight(() => runScheduledType3Now(options));
+}
+
+async function runScheduledType3Now(options?: { force?: boolean }): Promise<ScheduledType3Result> {
   const repository = getWorkflowRepository();
   let claimedNow: string[] = [];
   let priorClaims: string[] = [];
@@ -1773,6 +1820,9 @@ export async function runScheduledType3(options?: {
     );
   }
   let result: Awaited<ReturnType<typeof runScheduledType3Monitoring>>;
+  // Set when an update hold stopped a show from being reserved mid-sweep: the sweep is
+  // then not complete, and its slots must stay open for the new version.
+  let heldBack = false;
   try {
     await hydratePan115CookieFromDb();
     const sync = tmdbSeasonMetadataSync();
@@ -1794,19 +1844,42 @@ export async function runScheduledType3(options?: {
       resolveDriveId: defaultDriveIdOf,
       resolveAccountContext: buildAccountContextResolver(),
       onAuthErrorFreeze: (id, reason) => freezeConnectedStorage(id, reason),
+      mayStartRun: () => {
+        const allowed = mayStartRun();
+        if (!allowed) heldBack = true;
+        return allowed;
+      },
       ...(sync ? { syncSeasonMetadata: sync } : {}),
     });
+    // Release this call's slots (as on a failure) and do not stamp a completed sweep,
+    // so the new version patrols the rest today. Seasons that did run are only re-checked.
+    const stopForUpdate = async () => {
+      if (claimedNow.length > 0) {
+        await repository.setSetting(
+          LAST_SWEEP_CLAIMS_SETTING_KEY,
+          JSON.stringify({ date: claimDate, slots: priorClaims }),
+        );
+      }
+      await pushNotificationsSince(repository, startedAt, { sweep: true });
+      return { skipped: "update_in_progress" as const, outcomes: result };
+    };
+    if (heldBack) return await stopForUpdate();
     try {
-      await sweepOrphanStagingDirs({
+      const janitor = await sweepOrphanStagingDirs({
         repository,
         drives: await stagingJanitorDrives(),
         now: new Date().toISOString(),
+        mayStartRun,
       });
+      if (janitor.held) heldBack = true;
     } catch (error) {
       console.error(
         `[patrol] staging janitor failed: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
+    // The janitor stopped for an update, or the hold started after both had passed their
+    // checks: either way the new version should run today's sweep, so do not mark it done.
+    if (heldBack || !mayStartRun()) return await stopForUpdate();
     await repository.setSetting(LAST_SWEEP_COMPLETED_AT_SETTING_KEY, new Date().toISOString());
     await pushNotificationsSince(repository, startedAt, { sweep: true });
     return { outcomes: result };
@@ -2725,17 +2798,27 @@ export async function importForeignWorkFiles(input: {
   movieTitle: string;
   year: number;
 }): Promise<{ movieDirectoryId: string; movedFileIds: string[] }> {
-  // Foreign-work UI is free-text title/year only (no TMDB id). Folder stays the
-  // legacy `Title (Year)` form on purpose — `importForeignWorkAsMovie` supports
-  // `{tmdb-N}` only when a caller passes tmdbId.
-  const accountId = await getCurrentAccountId();
-  const parents = await getWorkerStorageParents(accountId);
-  return importForeignWorkAsMovie({
-    storage: await getWorkerStorageExecutor(accountId),
-    providerFileIds: input.providerFileIds,
-    movieTitle: input.movieTitle,
-    year: input.year,
-    moviesParentDirectoryId: parents.movies,
+  // Count as in flight: this creates a folder and moves files on the drive. A container
+  // swap mid-way would leave the folder made and the files half moved, and the retry
+  // then fails. /api/update/busy waits for this to settle before the updater swaps.
+  return whileInFlight(async () => {
+    // Recheck the hold now that this import is counted in flight. The action checks it too,
+    // but between that check and this increment the updater could take the hold and see
+    // inFlightCount() === 0 (busy:false), then swap mid-move. Ordering the increment before
+    // this check closes that gap: if the hold is on here, the swap has not been cleared yet.
+    if (isUpdateHoldActive(Date.now())) throw new UpdateInProgressError();
+    // Foreign-work UI is free-text title/year only (no TMDB id). Folder stays the
+    // legacy `Title (Year)` form on purpose — `importForeignWorkAsMovie` supports
+    // `{tmdb-N}` only when a caller passes tmdbId.
+    const accountId = await getCurrentAccountId();
+    const parents = await getWorkerStorageParents(accountId);
+    return importForeignWorkAsMovie({
+      storage: await getWorkerStorageExecutor(accountId),
+      providerFileIds: input.providerFileIds,
+      movieTitle: input.movieTitle,
+      year: input.year,
+      moviesParentDirectoryId: parents.movies,
+    });
   });
 }
 

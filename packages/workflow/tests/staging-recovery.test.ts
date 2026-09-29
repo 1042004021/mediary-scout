@@ -262,6 +262,21 @@ async function stage(failMove: boolean) {
 }
 
 describe("staging_recovery", () => {
+  it("claims nothing while mayStartRun says no; the recovery stays queued", async () => {
+    const staged = await stage(false);
+    const result = await runQueuedStagingRecovery({
+      repository: staged.repo,
+      resourceProvider: staged.resourceProvider,
+      storage: staged.executor,
+      model: recoveryModel(new Set<string>(), false, { value: false }),
+      now: () => "2026-09-28T04:00:00.000Z",
+      mayStartRun: () => false,
+    });
+    expect(result).toEqual({ status: "idle" });
+    const saved = await staged.repo.getWorkflowRunSnapshot("recovery-1", { accountId: "acct", connectedStorageId: "drive" });
+    expect(saved?.workflowRun.status).toBe("queued");
+  });
+
   it("moves the episode the season lacks, discards the duplicate with staging, and does not notify", async () => {
     const staged = await stage(false);
     const offered = new Set<string>();

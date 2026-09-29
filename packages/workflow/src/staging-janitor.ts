@@ -7,6 +7,7 @@ import {
   tmdbIdFromMediaLibraryFolderName,
 } from "./media-library-folder.js";
 import { JANITOR_LIST_DEPTH } from "./staging-depth.js";
+import type { MayStartRun } from "./worker.js";
 
 /** Every kind. `blockIfTitleHasActiveRun` ignores staging_recovery so a user
  *  action can proceed; this reservation must still wait for one. */
@@ -201,6 +202,7 @@ async function sweepDrive(
   repository: SweepRepository,
   now: string,
   clock: StagingJanitorClock,
+  mayStartRun: MayStartRun | undefined,
 ): Promise<{
   removed: number;
   queued: number;
@@ -208,9 +210,10 @@ async function sweepDrive(
   skippedDeep: number;
   removedUntracked: number;
   skippedUnmatched: number;
+  held: boolean;
 }> {
   if (drive.status !== "active" || !canSweep(drive.executor)) {
-    return { removed: 0, queued: 0, notRemoved: 0, skippedDeep: 0, removedUntracked: 0, skippedUnmatched: 0 };
+    return { removed: 0, queued: 0, notRemoved: 0, skippedDeep: 0, removedUntracked: 0, skippedUnmatched: 0, held: false };
   }
   const executor = drive.executor;
   const pace = pacerFor(minIntervalMs(drive.provider), clock);
@@ -241,8 +244,16 @@ async function sweepDrive(
   const start = cursorIndex < 0 ? 0 : cursorIndex;
   const startedFromSavedCursor = cursorIndex >= 0;
 
+  let held = false;
   for (let index = start; index < shows.length; index += 1) {
     const show = shows[index]!;
+    // An update is about to replace this process: stop before the next show's deletes,
+    // and resume from this show on the next sweep.
+    if (mayStartRun && !mayStartRun()) {
+      held = true;
+      await repository.setAccountSetting(drive.accountId, cursorKey(drive.storageId), show.id);
+      break;
+    }
     try {
       const children = await pace(() => executor.listChildDirectories(show.id));
       for (const child of children) {
@@ -354,8 +365,8 @@ async function sweepDrive(
     }
   }
 
-  await repository.setAccountSetting(drive.accountId, cursorKey(drive.storageId), "");
-  return { removed, queued, notRemoved, skippedDeep, removedUntracked, skippedUnmatched };
+  if (!held) await repository.setAccountSetting(drive.accountId, cursorKey(drive.storageId), "");
+  return { removed, queued, notRemoved, skippedDeep, removedUntracked, skippedUnmatched, held };
 }
 
 /**
@@ -378,12 +389,17 @@ export async function sweepOrphanStagingDirs(input: {
   now: string;
   clock?: StagingJanitorClock;
   log?: (line: string) => void;
-}): Promise<void> {
+  /** Checked before each show folder. A false stops the sweep there. */
+  mayStartRun?: MayStartRun;
+}): Promise<{ held: boolean }> {
   const log = input.log ?? ((line: string) => console.log(line));
   const clock = input.clock ?? realtimeClock;
+  let held = false;
   for (const drive of input.drives) {
+    if (held) break;
     try {
-      const counts = await sweepDrive(drive, input.repository, input.now, clock);
+      const counts = await sweepDrive(drive, input.repository, input.now, clock, input.mayStartRun);
+      held = counts.held;
       const removal =
         counts.notRemoved > 0
           ? `removed ${counts.removed} empty (${counts.notRemoved} could not be removed)`
@@ -399,4 +415,6 @@ export async function sweepOrphanStagingDirs(input: {
       log(`[patrol] staging janitor ${drive.storageId}: failed: ${message}`);
     }
   }
+  if (held) log("[patrol] staging janitor stopped: an update is about to replace this process");
+  return { held };
 }

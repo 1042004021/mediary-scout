@@ -29,6 +29,8 @@ import {
   JEV_PREFILTER_ENABLED_SETTING_KEY,
   JEV_HEALTH_SETTING_KEY,
   TMDB_API_KEY_SETTING_KEY,
+  importForeignWorkFiles,
+  UpdateInProgressError,
 } from "./workflow-runtime";
 
 describe("resolveIsDesktop", () => {
@@ -319,12 +321,15 @@ describe("runScheduledType3（per-slot 认领 + 合并补跑）", () => {
   // Harness 沿用旧 desktop describe：内存 SQLite 真 get/setSetting、fake Date 钉
   // 北京钟（UTC+8）、stub runScheduledType3Monitoring 免真盘真模型。
   const monitor = vi.fn(async () => []);
+  const janitor = vi.fn(async () => ({ held: false }));
   const prevPg = process.env.MEDIA_TRACK_POSTGRES_URL;
   let rt: typeof import("./workflow-runtime");
 
   const boot = async (settings: Record<string, string>, beijingISO: string) => {
     monitor.mockClear();
     monitor.mockImplementation(async () => []);
+    janitor.mockClear();
+    janitor.mockImplementation(async () => ({ held: false }));
     process.env.MEDIA_TRACK_SQLITE_PATH = ":memory:";
     delete process.env.MEDIA_TRACK_POSTGRES_URL;
     vi.useFakeTimers({ toFake: ["Date"] });
@@ -332,7 +337,7 @@ describe("runScheduledType3（per-slot 认领 + 合并补跑）", () => {
     vi.resetModules();
     vi.doMock("@media-track/workflow", async () => {
       const actual = await vi.importActual<typeof import("@media-track/workflow")>("@media-track/workflow");
-      return { ...actual, runScheduledType3Monitoring: monitor };
+      return { ...actual, runScheduledType3Monitoring: monitor, sweepOrphanStagingDirs: janitor };
     });
     rt = await import("./workflow-runtime");
     const repository = rt.getWorkflowRepository();
@@ -449,6 +454,116 @@ describe("runScheduledType3（per-slot 认领 + 合并补跑）", () => {
     expect(monitor).not.toHaveBeenCalled(); // 升级当日绝不按新语义重扫
     expect(result.skipped).toBe("before_scheduled_time"); // 21:00 今天还会照常跑
     expect(result.scheduledFor).toBe("21:00");
+  });
+
+  it("更新暂停期间：定时和手动巡检都不跑、不认领时间点，暂停结束后照常补跑", async () => {
+    const repository = await boot({ daily_sweep_times: TIMES }, "2026-07-09T06:30");
+    const { setUpdateHold, clearUpdateHold } = await import("./update-hold");
+    setUpdateHold(Date.now(), 60_000);
+    try {
+      expect(await rt.runScheduledType3()).toEqual({ skipped: "update_in_progress", outcomes: [] });
+      expect(await rt.runScheduledType3({ force: true })).toEqual({ skipped: "update_in_progress", outcomes: [] });
+      expect(monitor).not.toHaveBeenCalled();
+      expect((await repository.getSetting(rt.LAST_SWEEP_CLAIMS_SETTING_KEY)) ?? null).toBeNull();
+    } finally {
+      clearUpdateHold();
+    }
+    const result = await rt.runScheduledType3();
+    expect(result.skipped).toBeUndefined();
+    expect(monitor).toHaveBeenCalledTimes(1);
+  });
+
+  it("更新暂停期间：runNextQueuedWorkflow 直接返回 idle，不认领排队任务", async () => {
+    const repository = await boot({}, "2026-07-09T06:30");
+    const claim = vi.spyOn(repository, "claimNextQueuedWorkflowRun");
+    const { setUpdateHold, clearUpdateHold } = await import("./update-hold");
+    setUpdateHold(Date.now(), 60_000);
+    try {
+      expect(await rt.runNextQueuedWorkflow()).toEqual({ status: "idle" });
+      expect(claim).not.toHaveBeenCalled();
+    } finally {
+      clearUpdateHold();
+    }
+  });
+
+  it("把 mayStartRun 传给巡检，让它在每次预约前再看一眼暂停", async () => {
+    await boot({ daily_sweep_times: TIMES }, "2026-07-09T06:30");
+    await rt.runScheduledType3({ force: true });
+    const passed = (monitor.mock.calls[0] as unknown as [{ mayStartRun?: () => boolean }])[0].mayStartRun;
+    expect(typeof passed).toBe("function");
+    expect(passed!()).toBe(true);
+    const { setUpdateHold, clearUpdateHold } = await import("./update-hold");
+    setUpdateHold(Date.now(), 60_000);
+    try {
+      expect(passed!()).toBe(false);
+    } finally {
+      clearUpdateHold();
+    }
+  });
+
+  it("更新暂停在巡检途中生效：释放本次认领的时间点、不记完成，新版本当天补跑", async () => {
+    const repository = await boot({ daily_sweep_times: TIMES }, "2026-07-09T06:30");
+    const { setUpdateHold, clearUpdateHold } = await import("./update-hold");
+    // The hold is taken after the entry check, while the sweep runs.
+    monitor.mockImplementation((async (input: { mayStartRun?: () => boolean }) => {
+      setUpdateHold(Date.now(), 60_000);
+      expect(input.mayStartRun!()).toBe(false);
+      return [];
+    }) as never);
+    try {
+      const result = await rt.runScheduledType3();
+      expect(result.skipped).toBe("update_in_progress");
+      expect(await claims(repository)).toEqual({ date: "2026-07-09", slots: [] });
+      expect((await repository.getSetting(rt.LAST_SWEEP_COMPLETED_AT_SETTING_KEY)) ?? null).toBeNull();
+    } finally {
+      clearUpdateHold();
+    }
+    monitor.mockImplementation(async () => []);
+    const again = await rt.runScheduledType3();
+    expect(again.skipped).toBeUndefined();
+    expect(await claims(repository)).toEqual({ date: "2026-07-09", slots: ["06:00"] });
+  });
+
+  it("staging 清理因更新暂停停下：同样释放时间点、不记完成", async () => {
+    const repository = await boot({ daily_sweep_times: TIMES }, "2026-07-09T06:30");
+    janitor.mockImplementation((async () => ({ held: true })) as never);
+    const result = await rt.runScheduledType3();
+    expect(result.skipped).toBe("update_in_progress");
+    expect(await claims(repository)).toEqual({ date: "2026-07-09", slots: [] });
+    expect((await repository.getSetting(rt.LAST_SWEEP_COMPLETED_AT_SETTING_KEY)) ?? null).toBeNull();
+    const passed = (janitor.mock.calls[0] as unknown as [{ mayStartRun?: () => boolean }])[0].mayStartRun;
+    expect(typeof passed).toBe("function");
+  });
+
+  it("暂停在巡检和清理都查过之后才生效：也释放时间点、不记完成", async () => {
+    const repository = await boot({ daily_sweep_times: TIMES }, "2026-07-09T06:30");
+    const { setUpdateHold, clearUpdateHold } = await import("./update-hold");
+    // No reservation candidates and no shows to clean: neither ever asks mayStartRun.
+    janitor.mockImplementation((async () => {
+      setUpdateHold(Date.now(), 60_000);
+      return { held: false };
+    }) as never);
+    try {
+      const result = await rt.runScheduledType3();
+      expect(result.skipped).toBe("update_in_progress");
+      expect(await claims(repository)).toEqual({ date: "2026-07-09", slots: [] });
+      expect((await repository.getSetting(rt.LAST_SWEEP_COMPLETED_AT_SETTING_KEY)) ?? null).toBeNull();
+    } finally {
+      clearUpdateHold();
+    }
+  });
+
+  it("巡检整个过程都算「进行中」，更新助手的忙碌检查会等它", async () => {
+    await boot({ daily_sweep_times: TIMES }, "2026-07-09T06:30");
+    const { inFlightCount } = await import("./update-hold");
+    let seen = -1;
+    janitor.mockImplementation((async () => {
+      seen = inFlightCount();
+      return { held: false };
+    }) as never);
+    await rt.runScheduledType3({ force: true });
+    expect(seen).toBeGreaterThan(0);
+    expect(inFlightCount()).toBe(0);
   });
 
   it("成功后写 last_sweep_completed_at（含定时路径）", async () => {
@@ -865,5 +980,22 @@ describe("resolveJevJudge (the single go/no-go for wrapping the provider)", () =
     expect(isJevPrefilterActive({ ...active, health: "fail" })).toBe(false);
     expect(isJevPrefilterActive({ ...active, enabled: false })).toBe(false);
     expect(isJevPrefilterActive({ ...active, apiKey: undefined })).toBe(false);
+  });
+});
+
+
+describe("importForeignWorkFiles rechecks the update hold inside the in-flight guard", () => {
+  it("throws UpdateInProgressError before any storage work when the hold is on", async () => {
+    const { setUpdateHold, clearUpdateHold, inFlightCount } = await import("./update-hold");
+    setUpdateHold(Date.now(), 60_000);
+    try {
+      await expect(
+        importForeignWorkFiles({ providerFileIds: ["1"], movieTitle: "沙丘", year: 2021 }),
+      ).rejects.toBeInstanceOf(UpdateInProgressError);
+      // The guard released even though the work threw.
+      expect(inFlightCount()).toBe(0);
+    } finally {
+      clearUpdateHold();
+    }
   });
 });

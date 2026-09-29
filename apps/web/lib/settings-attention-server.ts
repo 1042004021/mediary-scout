@@ -42,6 +42,10 @@ async function resolveIsOwner(
   repository: WorkflowRepository,
   accountId: string,
 ): Promise<boolean> {
+  // 单用户下经隧道来的匿名访客只要带任意 mt_session cookie 就能过 proxy(它只查
+  // 有无),getCurrentAccountId() 会把这样的请求解析成这个哨兵账号。哨兵绝不是站主——
+  // 否则匿名访客就能读更新日志尾、点「立即更新」。必须在放行单用户之前先挡掉。
+  if (accountId === UNAUTHENTICATED_ACCOUNT_ID) return false;
   if (!isMultiUserEnabled()) return true;
   const account = await repository.getAccountById(accountId);
   return account?.isOwner ?? false;
