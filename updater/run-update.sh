@@ -6,18 +6,23 @@
 #       · 40 could not pause new tasks before the swap (nothing swapped)
 #       · 50 stopped before the swap and could not check the old commit back out
 #         (the old version is still serving; the updater retries the checkout).
+#       · 60 the deploy folder was changed by someone else (left as it is; nothing swapped)
+#       · 70 could not download the new version from GitHub (nothing touched)
 #
 # When the updater restarts and finds an update that was cut off:
-#   `run-update.sh rollback <commit>` — the swap had begun: rebuild and swap back.
-#     Exit: 10 rolled back · 20 rollback failed.
-#   `run-update.sh restore <commit>` — before the swap: the old version never stopped,
+#   `run-update.sh rollback <commit> [to]` — the swap had begun: rebuild and swap back.
+#     Exit: 10 rolled back · 20 rollback failed · 60 the folder was changed by someone else.
+#   `run-update.sh restore <commit> [to]` — before the swap: the old version never stopped,
 #     only the deploy folder is left on the new tag; check the old commit back out and
 #     release the hold if that run had taken it.
 #     Exit: 0 restored.
+# The optional [to] is the commit that update was moving to: it tells a folder still on the
+# new tag (safe to move) from one a person has changed since (left as it is).
 # Either exits 2 on a bad commit.
 set -eu
 
 MODE=update
+RESUME_TO=""
 if [ "${1-}" = rollback ] || [ "${1-}" = restore ]; then
   MODE="$1"
   ROLLBACK_TO="${2-}"
@@ -25,6 +30,15 @@ if [ "${1-}" = rollback ] || [ "${1-}" = restore ]; then
     *[!0-9a-f]*|"") echo "==> ERROR not a commit: $ROLLBACK_TO"; exit 2 ;;
   esac
   [ "${#ROLLBACK_TO}" -eq 40 ] || { echo "==> ERROR not a commit: $ROLLBACK_TO"; exit 2; }
+  # Optional third argument: the commit the interrupted update was moving to. Absent is fine;
+  # anything present that is not a full commit id is a bad argument, like the second one.
+  RESUME_TO="${3-}"
+  if [ -n "$RESUME_TO" ]; then
+    case "$RESUME_TO" in
+      *[!0-9a-f]*) echo "==> ERROR not a commit: $RESUME_TO"; exit 2 ;;
+    esac
+    [ "${#RESUME_TO}" -eq 40 ] || { echo "==> ERROR not a commit: $RESUME_TO"; exit 2; }
+  fi
 fi
 
 TAG="${1-}"
@@ -169,6 +183,15 @@ verify() {
 # Before any swap: put the deploy folder back on the commit that is serving, then exit
 # with $1. If that checkout fails, exit 50 so the updater keeps retrying it.
 back_to_from() {
+  # Only undo a tree the updater itself moved: still on FROM, or on the tag it just checked
+  # out (TO). If HEAD is some other commit, a person changed the folder — leave it alone.
+  # An unreadable HEAD falls through to the checkout, today's behaviour.
+  HEAD_NOW="$(g rev-parse HEAD 2>/dev/null || true)"
+  if [ -n "$HEAD_NOW" ] && [ "$HEAD_NOW" != "$FROM" ] && [ "$HEAD_NOW" != "$TO" ]; then
+    echo "==> FOLDER_CHANGED — the deploy folder was changed by someone else; leaving it as it is"
+    ON_TAG=0
+    exit "$1"
+  fi
   if g -c advice.detachedHead=false checkout "$FROM"; then
     ON_TAG=0
     exit "$1"
@@ -208,16 +231,35 @@ roll_back() {
 HELD=0
 SWAPPED=0
 ON_TAG=0
+TO=""
 if [ "$MODE" = rollback ]; then
   echo "==> STEP switching"
   echo "==> RESUMED_ROLLBACK — the update stopped after the swap began; going back to $ROLLBACK_TO"
+  # If a person changed the deploy folder to some third commit after the interruption,
+  # do not rebuild the old version over theirs; leave it and let a person decide.
+  if [ -n "$RESUME_TO" ]; then
+    HEAD_NOW="$(g rev-parse HEAD)"
+    if [ "$HEAD_NOW" != "$RESUME_TO" ] && [ "$HEAD_NOW" != "$ROLLBACK_TO" ]; then
+      echo "==> FOLDER_CHANGED — the deploy folder was changed by someone else; leaving it as it is"
+      web_post '{"hold":false}' >/dev/null 2>&1 || true
+      exit 60
+    fi
+  fi
   roll_back "$ROLLBACK_TO"
 fi
 if [ "$MODE" = restore ]; then
-  g -c advice.detachedHead=false checkout "$ROLLBACK_TO"
+  HEAD_NOW="$(g rev-parse HEAD)"
+  if [ "$HEAD_NOW" = "$ROLLBACK_TO" ]; then
+    : # already on the old commit; nothing to check out
+  elif [ -n "$RESUME_TO" ] && [ "$HEAD_NOW" != "$RESUME_TO" ]; then
+    # A person changed the folder off the new tag: leave whatever they put there.
+    echo "==> FOLDER_CHANGED — the deploy folder was changed by someone else; leaving it as it is"
+  else
+    g -c advice.detachedHead=false checkout "$ROLLBACK_TO"
+    echo "==> RESTORED $ROLLBACK_TO"
+  fi
   # The cut-off run may have taken the hold; the old version must start runs again.
   web_post '{"hold":false}' >/dev/null 2>&1 || true
-  echo "==> RESTORED $ROLLBACK_TO"
   exit 0
 fi
 
@@ -243,7 +285,12 @@ cleanup() {
   # tag while the old version keeps serving: check the old commit back out. The paths
   # that exit on purpose already did (ON_TAG=0), and after the swap roll_back owns it.
   if [ "$code" != 0 ] && [ "$ON_TAG" = 1 ] && [ "$SWAPPED" = 0 ]; then
-    if ! g -c advice.detachedHead=false checkout "$FROM" >/dev/null 2>&1; then
+    # As in back_to_from: only undo a tree the updater moved (FROM or the tag TO). If a
+    # person changed HEAD to some other commit, leave it; an unreadable HEAD tries the checkout.
+    HEAD_NOW="$(g rev-parse HEAD 2>/dev/null || true)"
+    if [ -n "$HEAD_NOW" ] && [ "$HEAD_NOW" != "$FROM" ] && [ "$HEAD_NOW" != "$TO" ]; then
+      echo "==> FOLDER_CHANGED — the deploy folder was changed by someone else; leaving it as it is"
+    elif ! g -c advice.detachedHead=false checkout "$FROM" >/dev/null 2>&1; then
       echo "==> RESTORE_FAILED"
       exit 50
     fi
@@ -267,6 +314,10 @@ done || true
 
 echo "==> STEP building"
 g fetch --tags --force origin
+# The commit this tag points at. A missing tag after a successful fetch means the download
+# did not bring it: treat it as a download failure (exit 70), nothing checked out yet.
+TO="$(g rev-parse -q --verify "refs/tags/$TAG^{commit}")" || { echo "==> FETCH_FAILED"; exit 70; }
+echo "==> TO $TO"
 ON_TAG=1
 g -c advice.detachedHead=false checkout "refs/tags/$TAG"
 GIT_SHA="$(g rev-parse HEAD)"
@@ -288,6 +339,13 @@ else
   back_to_from 40
 fi
 wait_idle
+# A person may have run deploy.sh / git pull during the wait. Do not swap their commit out:
+# leave the folder as it is (nothing built here is lost) and let the running version stay.
+if [ "$(g rev-parse HEAD)" != "$GIT_SHA" ]; then
+  echo "==> FOLDER_CHANGED — the deploy folder was changed by someone else; leaving it as it is"
+  ON_TAG=0
+  exit 60
+fi
 echo "==> STEP switching"
 SWAPPED=1
 # Only web. Recreating any other service from /repo would resolve bind mounts

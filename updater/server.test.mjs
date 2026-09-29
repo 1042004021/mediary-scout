@@ -360,6 +360,73 @@ describe("updater", () => {
     });
   });
 
+  it("passes the commit an interrupted update was moving to when it resumes a rollback", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "updater-"));
+    writeFileSync(
+      join(dir, "status.json"),
+      JSON.stringify({ phase: "verifying", targetTag: "v2026.10.02", fromCommit: "c".repeat(40), toCommit: "d".repeat(40), startedAt: "x", finishedAt: null, message: "", logTail: "" }),
+    );
+    const calls = [];
+    const updater = createUpdater({
+      stateDir: dir,
+      runUpdate: (args) => {
+        calls.push(args);
+        return Promise.resolve(10);
+      },
+      acquisitionsRunning: async () => false,
+      sleep: async () => {},
+      now: () => "2026-10-02T20:00:00.000Z",
+      waitPollMs: 1,
+      waitLimitMs: 1000,
+      repoCommit: () => "a".repeat(40),
+    });
+    await updater.idle();
+    expect(calls).toEqual([["rollback", "c".repeat(40), "d".repeat(40)]]);
+  });
+
+  it("maps a resumed rollback that finds the folder changed to failed, needing a person", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "updater-"));
+    writeFileSync(
+      join(dir, "status.json"),
+      JSON.stringify({ phase: "switching", targetTag: "v2026.10.02", fromCommit: "c".repeat(40), toCommit: "d".repeat(40), startedAt: "x", finishedAt: null, message: "", logTail: "" }),
+    );
+    const updater = createUpdater({
+      stateDir: dir,
+      runUpdate: () => Promise.resolve(60),
+      acquisitionsRunning: async () => false,
+      sleep: async () => {},
+      now: () => "2026-10-02T20:00:00.000Z",
+      waitPollMs: 1,
+      waitLimitMs: 1000,
+      repoCommit: () => "a".repeat(40),
+      servingCommit: async () => null,
+    });
+    await updater.idle();
+    expect(updater.status()).toMatchObject({
+      phase: "failed",
+      needsManualRecovery: true,
+      message: "更新中途部署目录被人手动换过版本，更新助手没有再改动它。如果网页不正常，请在部署目录运行 ./scripts/deploy.sh。",
+    });
+  });
+
+  it("maps an update that finds the folder changed to a plain failed, no person needed", async () => {
+    const { updater } = make({
+      runUpdate: (_tag, onLine) => {
+        onLine(`==> FROM ${"a".repeat(40)}`);
+        onLine(`==> TO ${"b".repeat(40)}`);
+        return Promise.resolve(60);
+      },
+    });
+    updater.start("v2026.10.02");
+    await updater.idle();
+    expect(updater.status()).toMatchObject({
+      phase: "failed",
+      toCommit: "b".repeat(40),
+      message: "更新途中部署目录被人手动换过版本，这次先不更新了，更新助手没有再改动它。",
+    });
+    expect(updater.status().needsManualRecovery).toBeUndefined();
+  });
+
   it("after a restart before the swap, only checks the old commit back out", async () => {
     const dir = mkdtempSync(join(tmpdir(), "updater-"));
     writeFileSync(

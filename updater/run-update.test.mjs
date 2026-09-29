@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 const SCRIPT = fileURLToPath(new URL("./run-update.sh", import.meta.url));
 const FROM = "a".repeat(40);
 const TAG_COMMIT = "b".repeat(40);
+const FOREIGN = "f".repeat(40); // a commit the updater did not put there (someone else's)
 const TAG = "v2026.10.02";
 
 function writeExe(dir, name, body) {
@@ -71,6 +72,9 @@ case "$*" in
     ;;
 esac
 log_call wget "$@"
+# A person changing the deploy folder during the wait: on each busy poll, move HEAD to the
+# commit in move-head (one the updater did not put there).
+if [ -f "$STUB_DIR/move-head" ]; then cat "$STUB_DIR/move-head" > "$STUB_DIR/head"; fi
 n=0
 if [ -f "$STUB_DIR/wget-n" ]; then n=$(cat "$STUB_DIR/wget-n"); fi
 n=$((n + 1))
@@ -107,7 +111,17 @@ case "$cmd" in
     if [ -f "$STUB_DIR/status-out" ]; then cat "$STUB_DIR/status-out"; fi
     ;;
   rev-parse)
-    cat "$STUB_DIR/head"
+    case "$*" in
+      *refs/tags/*)
+        # rev-parse -q --verify refs/tags/X^{commit}: the tag's commit, or a failure when
+        # the tag is missing (fetch did not bring it).
+        if [ -f "$STUB_DIR/missing-tag" ]; then exit 1; fi
+        printf '%s\\n' "$GIT_TAG_COMMIT"
+        ;;
+      *)
+        cat "$STUB_DIR/head"
+        ;;
+    esac
     ;;
   fetch)
     ;;
@@ -273,12 +287,14 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
       "rev-parse",
       "pg_dump",
       "fetch",
+      "rev-parse",
       `checkout refs/tags/${TAG}`,
       "rev-parse",
       "build",
       "hold",
       "hold",
       "wget",
+      "rev-parse",
       "up",
       "cat_commit",
       "health",
@@ -333,9 +349,11 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
       "rev-parse",
       "pg_dump",
       "fetch",
+      "rev-parse",
       `checkout refs/tags/${TAG}`,
       "rev-parse",
       "build",
+      "rev-parse",
       `checkout ${FROM}`,
     ]);
     expect(gitShas(stubDir)).toEqual([TAG_COMMIT]);
@@ -489,7 +507,10 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     const steps = signatures(log);
     expect(steps).toContain("hold");
     expect(steps).not.toContain("up");
-    expect(steps.slice(-2)).toEqual(["release", `checkout ${FROM}`]);
+    // Releases the hold, then checks the old commit back out (a HEAD read sits between them).
+    expect(steps.at(-1)).toBe(`checkout ${FROM}`);
+    expect(steps).toContain("release");
+    expect(steps.indexOf("release")).toBeLessThan(steps.lastIndexOf(`checkout ${FROM}`));
     expect(readFileSync(join(stubDir, "head"), "utf8").trim()).toBe(FROM);
   });
 
@@ -613,7 +634,66 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     writeFileSync(join(stubDir, "head"), `${TAG_COMMIT}\n`);
     const result = await runArgs(env, ["restore", FROM]);
     expect(result.code).toBe(0);
-    expect(signatures(log)).toEqual(["status", "inspect", `checkout ${FROM}`, "release"]);
+    expect(signatures(log)).toEqual(["status", "inspect", "rev-parse", `checkout ${FROM}`, "release"]);
+  });
+
+  it("restore leaves a folder someone else changed alone, and still exits 0", async () => {
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "head"), `${FOREIGN}\n`);
+    const result = await runArgs(env, ["restore", FROM, TAG_COMMIT]);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("==> FOLDER_CHANGED");
+    expect(signatures(log).some((step) => step.startsWith("checkout"))).toBe(false);
+    expect(signatures(log)).toContain("release");
+    expect(readFileSync(join(stubDir, "head"), "utf8").trim()).toBe(FOREIGN);
+  });
+
+  it("rollback leaves a folder someone else changed alone, exiting 60 without building", async () => {
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "head"), `${FOREIGN}\n`);
+    const result = await runArgs(env, ["rollback", FROM, TAG_COMMIT]);
+    expect(result.code).toBe(60);
+    expect(result.stdout).toContain("==> FOLDER_CHANGED");
+    expect(signatures(log)).not.toContain("build");
+    expect(signatures(log)).toContain("release");
+    expect(readFileSync(join(stubDir, "head"), "utf8").trim()).toBe(FOREIGN);
+  });
+
+  it("in update mode, does not swap when the folder is changed during the wait, exiting 60", async () => {
+    const { stubDir, log, env } = setup();
+    // Idle so the wait ends, but a person moves HEAD to a third commit during the poll.
+    writeFileSync(join(stubDir, "wget-lines"), '{"busy":true}\n{"busy":false}\n');
+    writeFileSync(join(stubDir, "move-head"), `${FOREIGN}\n`);
+    const result = await run(env);
+    expect(result.code).toBe(60);
+    expect(result.stdout).toContain("==> FOLDER_CHANGED");
+    expect(signatures(log)).not.toContain("up");
+    // The hold it took is released, and the changed folder is left as it is.
+    expect(signatures(log)).toContain("release");
+    expect(readFileSync(join(stubDir, "head"), "utf8").trim()).toBe(FOREIGN);
+  });
+
+  it("the EXIT trap and back_to_from leave a folder someone else changed alone", async () => {
+    // Trap: an unexpected error (sleep fails) after HEAD was moved during a poll.
+    // back_to_from: refreshing the hold fails after HEAD was moved during the first poll.
+    for (const how of ["trap", "back_to_from"]) {
+      const { stubDir, log, env } = setup();
+      writeFileSync(join(stubDir, "move-head"), `${FOREIGN}\n`);
+      if (how === "trap") {
+        writeFileSync(join(stubDir, "wget-lines"), '{"busy":true}\n');
+        writeExe(join(stubDir, "..", "bin"), "sleep", "#!/bin/sh\nexit 1\n");
+      } else {
+        writeFileSync(join(stubDir, "wget-lines"), '{"busy":true}\n{"busy":false}\n');
+        // First hold (take) and first refresh work; the second refresh fails.
+        writeFileSync(join(stubDir, "fail-hold-after"), "2");
+      }
+      const result = await run(env);
+      expect({ how, code: result.code }).toEqual({ how, code: how === "trap" ? 1 : 40 });
+      expect(result.stdout).toContain("==> FOLDER_CHANGED");
+      expect(signatures(log)).not.toContain(`checkout ${FROM}`);
+      expect(signatures(log)).toContain("release");
+      expect(readFileSync(join(stubDir, "head"), "utf8").trim()).toBe(FOREIGN);
+    }
   });
 
   it("rollback and restore refuse anything but a full commit id", async () => {
@@ -622,6 +702,15 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
         const { log, env } = setup();
         const result = await runArgs(env, [mode, bad]);
         expect({ mode, bad, code: result.code }).toEqual({ mode, bad, code: 2 });
+        expect(linesOf(log)).toEqual([]);
+      }
+    }
+    // A present but malformed third argument (the "to" commit) is refused the same way.
+    for (const badTo of ["main", `${FROM}0`, `${FROM};id`]) {
+      for (const mode of ["rollback", "restore"]) {
+        const { log, env } = setup();
+        const result = await runArgs(env, [mode, FROM, badTo]);
+        expect({ mode, badTo, code: result.code }).toEqual({ mode, badTo, code: 2 });
         expect(linesOf(log)).toEqual([]);
       }
     }
@@ -634,8 +723,9 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     expect(result.code).toBe(0);
     const steps = signatures(log);
     const waitSteps = steps.slice(steps.indexOf("build") + 1, steps.indexOf("up"));
-    // One hold to take it, then one refresh before each of the four probes.
-    expect(waitSteps).toEqual(["hold", "hold", "wget", "hold", "wget", "hold", "wget", "hold", "wget"]);
+    // One hold to take it, then one refresh before each of the four probes, then the
+    // pre-swap HEAD check just before the swap.
+    expect(waitSteps).toEqual(["hold", "hold", "wget", "hold", "wget", "hold", "wget", "hold", "wget", "rev-parse"]);
   });
 
   it("stops before the swap when refreshing the hold fails, and goes back to the old commit", async () => {

@@ -49,6 +49,7 @@ function idleStatus() {
     phase: "idle",
     targetTag: null,
     fromCommit: null,
+    toCommit: null,
     startedAt: null,
     finishedAt: null,
     message: "",
@@ -127,13 +128,16 @@ export function createUpdater(opts) {
   // retries it; the phase already says the update failed and the old version kept running.
   let resume = null;
   const from = typeof status.fromCommit === "string" && /^[0-9a-f]{40}$/.test(status.fromCommit) ? status.fromCommit : null;
+  // The commit the interrupted update was moving to, when it was recorded: passed on so the
+  // resume can tell a deploy folder still on the new tag from one a person has changed since.
+  const to = typeof status.toCommit === "string" && /^[0-9a-f]{40}$/.test(status.toCommit) ? status.toCommit : null;
   if (!TERMINAL_PHASES.has(status.phase)) {
     const swapStarted = status.phase === "switching" || status.phase === "verifying";
     if (from && swapStarted) {
-      resume = { mode: "rollback", commit: from };
+      resume = { mode: "rollback", commit: from, to };
       status = { ...status, phase: "switching", message: RESUME_ROLLBACK_MESSAGE, finishedAt: null };
     } else {
-      if (from) resume = { mode: "restore", commit: from };
+      if (from) resume = { mode: "restore", commit: from, to };
       status = {
         ...status,
         phase: "failed",
@@ -144,7 +148,7 @@ export function createUpdater(opts) {
     }
     writeStatusFile(statusFile, status);
   } else if (status.pendingRestore === true && from) {
-    resume = { mode: "restore", commit: from };
+    resume = { mode: "restore", commit: from, to };
   }
   let job = null;
   // Seeded from the saved tail, so a recovery after a restart adds to the lines that
@@ -183,7 +187,7 @@ export function createUpdater(opts) {
     const { pendingRestore: _stale, ...fresh } = status;
     status = fresh;
     log.length = 0;
-    save({ phase: "waiting", targetTag: tag, fromCommit: null, startedAt: opts.now(), finishedAt: null });
+    save({ phase: "waiting", targetTag: tag, fromCommit: null, toCommit: null, startedAt: opts.now(), finishedAt: null });
     let waited = 0;
     while (await acquisitionsBusy()) {
       if (waited >= opts.waitLimitMs) {
@@ -204,6 +208,8 @@ export function createUpdater(opts) {
       if (line.startsWith("==> BUILD_FAILED")) buildFailed = true;
       const from = /^==> FROM ([0-9a-f]{40})/.exec(line);
       if (from) save({ fromCommit: from[1] });
+      const to = /^==> TO ([0-9a-f]{40})/.exec(line);
+      if (to) save({ toCommit: to[1] });
       if (line.startsWith("==> VERIFY_FAILED") || line.startsWith("==> UP_FAILED")) {
         pastSwap = true;
         save({ phase: "switching", message: ROLLING_BACK_MESSAGE });
@@ -239,13 +245,20 @@ export function createUpdater(opts) {
                 : code === 50
                   ? // Still serving the old version, but the checkout is left on the new tag: retry it.
                     { phase: "failed", message: INTERRUPTED_MESSAGE, pendingRestore: true }
-                  : { phase: "failed" };
+                  : code === 60
+                    ? { phase: "failed", message: "更新途中部署目录被人手动换过版本，这次先不更新了，更新助手没有再改动它。" }
+                    : { phase: "failed" };
     save({ ...outcome, finishedAt: opts.now() });
-    if (code === 50 && status.fromCommit) await resumeAfterRestart({ mode: "restore", commit: status.fromCommit });
+    if (code === 50 && status.fromCommit) {
+      await resumeAfterRestart({ mode: "restore", commit: status.fromCommit, to: status.toCommit });
+    }
   }
 
-  async function resumeAfterRestart({ mode, commit }) {
-    const code = await opts.runUpdate([mode, commit], (line) => {
+  async function resumeAfterRestart({ mode, commit, to }) {
+    // Pass the "to" commit only when it is a real commit id, so the script can tell a folder
+    // still on the new tag from one a person changed; the script treats a missing one as today.
+    const args = typeof to === "string" && /^[0-9a-f]{40}$/.test(to) ? [mode, commit, to] : [mode, commit];
+    const code = await opts.runUpdate(args, (line) => {
       log.push(line);
       save({});
     });
@@ -263,11 +276,18 @@ export function createUpdater(opts) {
     save({
       ...(code === 10
         ? { phase: "rolled_back", message: "更新中途被打断，已自动回到原来的版本，一切照常。" }
-        : {
-            phase: "failed",
-            message: "更新中途被打断，自动回退也没成功。请在部署目录运行 ./scripts/deploy.sh 恢复。",
-            needsManualRecovery: true,
-          }),
+        : code === 60
+          ? {
+              phase: "failed",
+              message:
+                "更新中途部署目录被人手动换过版本，更新助手没有再改动它。如果网页不正常，请在部署目录运行 ./scripts/deploy.sh。",
+              needsManualRecovery: true,
+            }
+          : {
+              phase: "failed",
+              message: "更新中途被打断，自动回退也没成功。请在部署目录运行 ./scripts/deploy.sh 恢复。",
+              needsManualRecovery: true,
+            }),
       finishedAt: opts.now(),
     });
   }
@@ -312,8 +332,9 @@ export function createUpdater(opts) {
       // restore keeps failing, stop and ask for a person rather than update from a wrong tree.
       if (status.pendingRestore === true && typeof status.fromCommit === "string") {
         const commit = status.fromCommit;
+        const to = status.toCommit;
         save({ phase: "waiting", message: "正在把部署目录切回原来的版本…", finishedAt: null });
-        job = resumeAfterRestart({ mode: "restore", commit })
+        job = resumeAfterRestart({ mode: "restore", commit, to })
           .then(() => {
             if (status.pendingRestore === true) {
               save({
