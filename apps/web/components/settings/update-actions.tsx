@@ -37,7 +37,12 @@ export function UpdateNowButton({ tag, initial }: { tag: string | null; initial:
             // The updater did not answer (it may be restarting): keep the bar and keep polling.
             sawDown = true;
             setMessage("正在重启…");
-          } else setStatus(next);
+          } else {
+            // The updater answered again: drop any "正在重启…" / click override so its own
+            // step text ("正在构建新版本…" 等) shows.
+            setMessage("");
+            setStatus(next);
+          }
         } catch {
           if (stopped) return;
           sawDown = true;
@@ -72,11 +77,17 @@ export function UpdateNowButton({ tag, initial }: { tag: string | null; initial:
           startTransition(() => {
             void startUpdateAction(tag).then(
               (result) => {
+                if (result.ok) {
+                  // Clear the click message ("已开始更新。") so the card falls through to
+                  // the updater's own step text ("正在构建新版本…" 等) as polls arrive.
+                  setMessage("");
+                  setStatus({ ...(status ?? emptyStatus()), phase: "waiting", message: "准备更新…" });
+                  return;
+                }
                 setMessage(result.message);
-                if (result.ok) setStatus({ ...(status ?? emptyStatus()), phase: "waiting", message: "准备更新…" });
                 // Another tab or the scheduled update already started one. The server
                 // render has the live progress; pull it in so "已经在更新了。" becomes a bar.
-                else if (result.reason === "busy") router.refresh();
+                if (result.reason === "busy") router.refresh();
               },
               () => setMessage("连不上更新助手，稍后再试。"),
             );
