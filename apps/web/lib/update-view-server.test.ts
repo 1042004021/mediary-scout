@@ -93,6 +93,17 @@ describe("loadUpdateView", () => {
     expect(view.available?.tag).toBe("v2026.10.02");
   });
 
+  it("reuses the commit from the status it already fetched instead of asking again", async () => {
+    const older = "d".repeat(40);
+    vi.mocked(readBuildCommit).mockResolvedValue(null);
+    vi.mocked(getUpdaterStatus).mockResolvedValue({ ...idle, repoCommit: older });
+    vi.mocked(fetchCommitRelation).mockResolvedValue("behind");
+    const view = await loadUpdateView();
+    expect(getUpdaterStatus).toHaveBeenCalledTimes(1);
+    expect(getCachedRepoCommit).not.toHaveBeenCalled();
+    expect(view.current.label).toBe("dddddddd · 开发版本");
+  });
+
   it("does not reach the updater for the deploy folder commit either when asked not to", async () => {
     vi.mocked(readBuildCommit).mockResolvedValue(null);
     vi.mocked(getCachedRepoCommit).mockResolvedValue("d".repeat(40));
@@ -104,6 +115,8 @@ describe("loadUpdateView", () => {
   it("uses the deploy folder commit when the image has none, and offers a release it is behind", async () => {
     const older = "d".repeat(40);
     vi.mocked(readBuildCommit).mockResolvedValue(null);
+    // A status without the commit (an older updater): fall back to the cached lookup.
+    vi.mocked(getUpdaterStatus).mockResolvedValue({ ...idle, repoCommit: null });
     vi.mocked(getCachedRepoCommit).mockResolvedValue(older);
     vi.mocked(fetchCommitRelation).mockResolvedValue("behind");
     const view = await loadUpdateView();

@@ -31,7 +31,17 @@ log_call() {
 function installStubs(bin) {
   writeExe(bin, "stat", `#!/bin/sh\n${LOG_FN}\nlog_call stat "$@"\nif [ "\${1-}" = "-c" ]; then printf '%s:%s\\n' "$(id -u)" "$(id -g)"; fi\n`);
   writeExe(bin, "hostname", `#!/bin/sh\n${LOG_FN}\nlog_call hostname "$@"\nprintf '%s\\n' updater-test\n`);
-  writeExe(bin, "sleep", `#!/bin/sh\nexit 0\n`);
+  // A fake clock: sleep moves it forward, `date +%s` reads it. Other date calls are real.
+  writeExe(
+    bin,
+    "sleep",
+    `#!/bin/sh\nt=0\nif [ -f "$STUB_DIR/clock" ]; then t=$(cat "$STUB_DIR/clock"); fi\nprintf '%s\\n' "$((t + \${1:-0}))" > "$STUB_DIR/clock"\n`,
+  );
+  writeExe(
+    bin,
+    "date",
+    `#!/bin/sh\nif [ "\${1-}" = "+%s" ]; then t=0; if [ -f "$STUB_DIR/clock" ]; then t=$(cat "$STUB_DIR/clock"); fi; printf '%s\\n' "$((1000000 + t))"; exit 0; fi\nexec /bin/date "$@"\n`,
+  );
   writeExe(bin, "chown", `#!/bin/sh\n${LOG_FN}\nlog_call chown "$@"\nexit 0\n`);
   writeExe(
     bin,
@@ -72,6 +82,11 @@ else
   line='{"busy":false}'
 fi
 if [ "$line" = FAIL ]; then exit 1; fi
+if [ "$line" = SLOW ]; then
+  t=0; if [ -f "$STUB_DIR/clock" ]; then t=$(cat "$STUB_DIR/clock"); fi
+  printf '%s\\n' "$((t + 10))" > "$STUB_DIR/clock"
+  exit 1
+fi
 printf '%s\\n' "$line"
 `,
   );
@@ -433,6 +448,7 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     writeFileSync(join(stubDir, "wget-lines"), "FAIL\n");
     const result = await run(env);
     expect(result.code).toBe(0);
+    // 30 minutes of 30-second waits, measured on the clock.
     expect(signatures(log).filter((step) => step === "wget")).toHaveLength(60);
     expect(result.stdout).toContain("==> STILL_BUSY (unreachable)");
   });
@@ -586,6 +602,28 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     writeFileSync(join(stubDir, "fail-checkout-from"), "1");
     const result = await run(env);
     expect(result.code).toBe(50);
+  });
+
+  it("bounds the wait by the clock, even when each probe is slow", async () => {
+    const { stubDir, log, env } = setup();
+    // Every probe hangs for its 10-second timeout, then fails.
+    writeFileSync(join(stubDir, "wget-lines"), "SLOW\n");
+    const result = await run(env);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("==> STILL_BUSY (unreachable)");
+    // 40 s per round (10 s timeout + 30 s sleep): 45 rounds fit in 30 minutes, not 60.
+    expect(signatures(log).filter((step) => step === "wget")).toHaveLength(45);
+  });
+
+  it("in resumed rollback mode, keeps rolling back when refreshing the hold fails", async () => {
+    const { stubDir, env } = setup();
+    writeFileSync(join(stubDir, "head"), `${TAG_COMMIT}\n`);
+    writeFileSync(join(stubDir, "wget-lines"), '{"busy":true}\n{"busy":false}\n');
+    writeFileSync(join(stubDir, "fail-hold-after"), "1");
+    const result = await runArgs(env, ["rollback", FROM]);
+    expect(result.stderr).not.toContain("unbound");
+    expect(result.code).toBe(10);
+    expect(result.stdout).toContain("==> ROLLED_BACK");
   });
 
   it("reaches the rollback-failed state when the rollback checkout itself fails", async () => {

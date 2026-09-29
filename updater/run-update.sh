@@ -93,16 +93,18 @@ compose() { docker compose -p "$PROJECT" --project-directory "$REPO" "$@"; }
 
 # Only an explicit "busy":false means idle. A failed request, the login page, or any
 # other answer is "not idle yet": swapping on a failed probe would cut running tasks.
+WAIT_LIMIT_S="${UPDATER_WAIT_LIMIT_S:-1800}"
 wait_idle() {
   i=0
   last=""
-  while [ "$i" -lt 60 ]; do
+  deadline=$(( $(date +%s) + WAIT_LIMIT_S ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
     # Refresh the hold each poll: it expires 40 minutes after the last refresh, and this
     # wait alone can take that long. Before the first swap a failed refresh stops the
     # update (the hold could lapse); the rollback keeps going, since it must restore.
     if [ "$HELD" = 1 ]; then
       if ! [ "$(web_post '{"hold":true}' 2>/dev/null || true)" = '{"hold":true}' ]; then
-        if [ "$SWAPPED" = 0 ]; then
+        if [ "$MODE" = update ] && [ "$SWAPPED" = 0 ]; then
           echo "==> HOLD_FAILED — could not refresh the pause"
           back_to_from 40
         fi
