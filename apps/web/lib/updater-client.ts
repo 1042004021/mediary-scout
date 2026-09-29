@@ -30,12 +30,17 @@ export interface UpdaterStatus {
   pendingRestore?: boolean;
   /** A rollback failed: what is running is unknown until a person runs deploy.sh. */
   needsManualRecovery?: boolean;
+  /** The deploy folder was changed during an update that did not swap (exit 60): its HEAD is
+   *  not what serves until the person's own deploy finishes. */
+  servingUnknown?: boolean;
 }
 
 /** The deploy folder's HEAD, only when it is the commit being served: no update is
  *  running (it checks out the new tag before the swap) and no checkout is pending. */
 export function servingRepoCommit(status: UpdaterStatus | null): string | null {
-  if (!status || status.pendingRestore === true || status.needsManualRecovery === true) return null;
+  if (!status || status.pendingRestore === true || status.needsManualRecovery === true || status.servingUnknown === true) {
+    return null;
+  }
   if (!["idle", "done", "rolled_back", "failed"].includes(status.phase)) return null;
   const commit = status.repoCommit;
   return typeof commit === "string" && /^[0-9a-f]{40}$/.test(commit) ? commit : null;

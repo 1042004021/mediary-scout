@@ -184,7 +184,7 @@ export function createUpdater(opts) {
   }
 
   async function run(tag) {
-    const { pendingRestore: _stale, ...fresh } = status;
+    const { pendingRestore: _stale, servingUnknown: _unknown, ...fresh } = status;
     status = fresh;
     log.length = 0;
     save({ phase: "waiting", targetTag: tag, fromCommit: null, toCommit: null, startedAt: opts.now(), finishedAt: null });
@@ -250,7 +250,12 @@ export function createUpdater(opts) {
                   ? // Still serving the old version, but the checkout is left on the new tag: retry it.
                     { phase: "failed", message: INTERRUPTED_MESSAGE, pendingRestore: true }
                   : code === 60
-                    ? { phase: "failed", message: "更新途中部署目录被人手动换过版本，这次先不更新了，更新助手没有再改动它。" }
+                    ? {
+                        phase: "failed",
+                        message: "更新途中部署目录被人手动换过版本，这次先不更新了，更新助手没有再改动它。",
+                        // The container was not swapped: the folder's HEAD is not what serves.
+                        servingUnknown: true,
+                      }
                     : code === 70
                       ? {
                           phase: "failed",
@@ -316,16 +321,18 @@ export function createUpdater(opts) {
   let rechecking = false;
   async function recheckRecovery() {
     // Not while a job runs (the web may be half way through a swap), and never two at once:
-    // the web probe is a slow docker call.
-    if (status.needsManualRecovery !== true || job || rechecking) return;
+    // the web probe is a slow docker call. Also clears servingUnknown (exit 60): once the web
+    // serves the folder's HEAD, the person's own deploy has finished.
+    const manual = status.needsManualRecovery === true;
+    if ((!manual && status.servingUnknown !== true) || job || rechecking) return;
     rechecking = true;
     try {
       const head = opts.repoCommit();
       const serving = opts.servingCommit ? await opts.servingCommit() : null;
       if (!head || head !== serving) return;
-      const { needsManualRecovery: _cleared, ...rest } = status;
+      const { needsManualRecovery: _cleared, servingUnknown: _known, ...rest } = status;
       status = rest;
-      save({ message: RECOVERED_MESSAGE });
+      save(manual ? { message: RECOVERED_MESSAGE } : {});
     } finally {
       rechecking = false;
     }

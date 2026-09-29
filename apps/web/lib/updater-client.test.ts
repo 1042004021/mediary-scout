@@ -106,6 +106,8 @@ describe("updater client", () => {
     }
     expect(servingRepoCommit({ ...base, phase: "failed", repoCommit: SHA, pendingRestore: true })).toBeNull();
     expect(servingRepoCommit({ ...base, phase: "failed", repoCommit: SHA, needsManualRecovery: true })).toBeNull();
+    // Exit 60: the folder moved while the old container kept serving — the folder HEAD is not it.
+    expect(servingRepoCommit({ ...base, phase: "failed", repoCommit: SHA, servingUnknown: true })).toBeNull();
     expect(servingRepoCommit({ ...base, phase: "idle", repoCommit: "nope" })).toBeNull();
     expect(servingRepoCommit({ ...base, phase: "idle" })).toBeNull();
     expect(servingRepoCommit(null)).toBeNull();

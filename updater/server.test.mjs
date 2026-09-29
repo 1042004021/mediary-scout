@@ -445,6 +445,62 @@ describe("updater", () => {
       message: "更新途中部署目录被人手动换过版本，这次先不更新了，更新助手没有再改动它。",
     });
     expect(updater.status().needsManualRecovery).toBeUndefined();
+    // The container was not swapped, so the folder HEAD is not what serves.
+    expect(updater.status().servingUnknown).toBe(true);
+  });
+
+  it("clears servingUnknown once a recheck sees the web serving the folder HEAD, and on a new run", async () => {
+    let serving = "f".repeat(40);
+    const calls = [];
+    const dir = mkdtempSync(join(tmpdir(), "updater-"));
+    const updater = createUpdater({
+      stateDir: dir,
+      runUpdate: (args) => {
+        calls.push(args);
+        return Promise.resolve(calls.length === 1 ? 60 : 0);
+      },
+      acquisitionsRunning: async () => false,
+      sleep: async () => {},
+      now: () => "2026-10-02T20:00:00.000Z",
+      waitPollMs: 1,
+      waitLimitMs: 1000,
+      repoCommit: () => "a".repeat(40),
+      servingCommit: async () => serving,
+    });
+    updater.start("v2026.10.02");
+    await updater.idle();
+    expect(updater.status().servingUnknown).toBe(true);
+    await updater.recheckRecovery(); // the web still serves another commit
+    expect(updater.status().servingUnknown).toBe(true);
+    serving = "a".repeat(40); // the person's deploy.sh finished
+    await updater.recheckRecovery();
+    expect(updater.status().servingUnknown).toBeUndefined();
+  });
+
+  it("a new run clears servingUnknown even when no recheck ever saw the web serve the folder HEAD", async () => {
+    const calls = [];
+    const dir = mkdtempSync(join(tmpdir(), "updater-"));
+    const updater = createUpdater({
+      stateDir: dir,
+      runUpdate: (args) => {
+        calls.push(args);
+        return Promise.resolve(calls.length === 1 ? 60 : 0);
+      },
+      acquisitionsRunning: async () => false,
+      sleep: async () => {},
+      now: () => "2026-10-02T20:00:00.000Z",
+      waitPollMs: 1,
+      waitLimitMs: 1000,
+      repoCommit: () => "a".repeat(40),
+      servingCommit: async () => "f".repeat(40),
+    });
+    updater.start("v2026.10.02");
+    await updater.idle();
+    expect(updater.status().servingUnknown).toBe(true);
+    updater.start("v2026.10.03");
+    await updater.idle();
+    expect(updater.status()).toMatchObject({ phase: "done" });
+    expect(updater.status().servingUnknown).toBeUndefined();
   });
 
   it("maps a failed download to a failed update that points at the proxy setting", async () => {
