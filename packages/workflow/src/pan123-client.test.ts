@@ -185,6 +185,16 @@ describe("Pan123Client transport / listFiles", () => {
     await expect(c.listFiles("0")).rejects.toBeInstanceOf(Pan123AuthError);
   });
 
+  it("throws Pan123AuthError on code===20101 未登录 (token kicked off, e.g. from the 123 App's device list)", async () => {
+    // Production 2026-09-30: a 90-day token still inside its lifetime answered
+    // file/list/new with HTTP 200 + {code:20101, message:"未登录"}. Not freezing on it
+    // left the drive "active" with no re-scan prompt while every run kept failing.
+    const fetchImpl = fetchStub(() => ({ status: 200, body: { code: 20101, message: "未登录" } }));
+    const c = new Pan123Client({ token: "KICKED", fetchImpl });
+    await expect(c.listFiles("0")).rejects.toBeInstanceOf(Pan123AuthError);
+    await expect(c.listFiles("0")).rejects.toThrow(/PAN123_AUTH_FAILED/);
+  });
+
   it("coerces a non-string token to \"\" — a malformed blob fails as a clean auth error, not a TypeError", async () => {
     // callers cast `credential` from unknown; a bad DB row can deliver token: number.
     const fetchImpl = fetchStub(() => ({ status: 401, body: { code: 401, message: "unauthorized" } }));
