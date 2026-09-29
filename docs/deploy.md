@@ -432,7 +432,7 @@ docker compose build --build-arg NPM_REGISTRY=https://registry.npmmirror.com
 
 它不会覆盖你改过的已跟踪文件。配置写在 `.env`。
 
-从 GitHub 下载新版本时，设了 `.env` 里的 `HTTPS_PROXY` / `HTTP_PROXY` 就走它——和应用其余出站请求（TMDB / PanSou 等）同一个代理；没设就直连。
+从 GitHub 下载新版本时，设了 `.env` 里的 `HTTPS_PROXY` / `HTTP_PROXY` 就走它——和应用其余出站请求（TMDB / PanSou 等）同一个代理；没设就直连。改了 `.env` 要在部署目录运行 `docker compose up -d` 才会生效。
 
 只有更新助手容器挂 Docker socket。它不映射任何端口，只接受「更新到这个发布标签」，令牌只有 web 容器能读。更新助手不会更新自己：一键更新只替换 web 容器。某个版本如果改了 `updater/`，发布说明会写明，那时在部署目录运行 `docker compose up -d --build updater`；运行 `./scripts/deploy.sh` 时它也会一并重建。
 
