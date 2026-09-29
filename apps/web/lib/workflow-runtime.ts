@@ -108,6 +108,12 @@ import { isUpdateHoldActive, whileInFlight } from "./update-hold";
  *  only at entry: the updater can take the hold while a tick is still setting up. */
 const mayStartRun = () => !isUpdateHoldActive(Date.now());
 
+/** True while the updater holds new work before a container swap. Lets server actions
+ *  (e.g. importForeignWorkAction) refuse upfront without importing update-hold directly. */
+export function isUpdateInProgress(): boolean {
+  return isUpdateHoldActive(Date.now());
+}
+
 export type CandidateTrackingRequestResult =
   | {
       status: "queued" | "already_running" | "already_tracked";
@@ -2782,17 +2788,22 @@ export async function importForeignWorkFiles(input: {
   movieTitle: string;
   year: number;
 }): Promise<{ movieDirectoryId: string; movedFileIds: string[] }> {
-  // Foreign-work UI is free-text title/year only (no TMDB id). Folder stays the
-  // legacy `Title (Year)` form on purpose — `importForeignWorkAsMovie` supports
-  // `{tmdb-N}` only when a caller passes tmdbId.
-  const accountId = await getCurrentAccountId();
-  const parents = await getWorkerStorageParents(accountId);
-  return importForeignWorkAsMovie({
-    storage: await getWorkerStorageExecutor(accountId),
-    providerFileIds: input.providerFileIds,
-    movieTitle: input.movieTitle,
-    year: input.year,
-    moviesParentDirectoryId: parents.movies,
+  // Count as in flight: this creates a folder and moves files on the drive. A container
+  // swap mid-way would leave the folder made and the files half moved, and the retry
+  // then fails. /api/update/busy waits for this to settle before the updater swaps.
+  return whileInFlight(async () => {
+    // Foreign-work UI is free-text title/year only (no TMDB id). Folder stays the
+    // legacy `Title (Year)` form on purpose — `importForeignWorkAsMovie` supports
+    // `{tmdb-N}` only when a caller passes tmdbId.
+    const accountId = await getCurrentAccountId();
+    const parents = await getWorkerStorageParents(accountId);
+    return importForeignWorkAsMovie({
+      storage: await getWorkerStorageExecutor(accountId),
+      providerFileIds: input.providerFileIds,
+      movieTitle: input.movieTitle,
+      year: input.year,
+      moviesParentDirectoryId: parents.movies,
+    });
   });
 }
 
