@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -823,6 +823,23 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     expect(result.code).not.toBe(0);
     const backups = readdirSync(join(repo, "backups"));
     expect(backups).toEqual([]);
+  });
+
+  it("clears leftover temp dumps at the start of the backup, and writes owner-only backups", async () => {
+    const { repo, env } = setup();
+    mkdirSync(join(repo, "backups"));
+    // A backup killed mid-way (SIGKILL, no trap) leaves these behind; they must be cleared.
+    writeFileSync(join(repo, "backups", "pre-update-20200101-000000.sql.tmp"), "stale");
+    writeFileSync(join(repo, "backups", "pre-update-20200101-000000.sql.tmp.gz"), "stale");
+    const result = await run(env);
+    expect(result.code).toBe(0);
+    const backups = readdirSync(join(repo, "backups"));
+    expect(backups.some((name) => name.endsWith(".tmp"))).toBe(false);
+    expect(backups.some((name) => name.endsWith(".tmp.gz"))).toBe(false);
+    const gz = backups.find((name) => name.endsWith(".sql.gz"));
+    expect(gz).toBeDefined();
+    // No group or other permission bits: the dump holds the 115 cookie and LLM keys.
+    expect(statSync(join(repo, "backups", gz)).mode & 0o077).toBe(0);
   });
 
   it("stops before checkout or build when pg_dump fails, and leaves no temp dump", async () => {

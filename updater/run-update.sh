@@ -273,6 +273,9 @@ echo "==> FROM $FROM"
 echo "==> STEP backing_up"
 mkdir -p ./backups
 chown "$OWNER" ./backups
+# A backup killed mid-way (container stop = SIGKILL, no trap) leaves these behind forever,
+# and the keep-5 rule below only counts .sql.gz. Clear just these temp names before starting.
+rm -f ./backups/pre-update-*.sql.tmp ./backups/pre-update-*.sql.tmp.gz
 STAMP="$(date +%Y%m%d-%H%M%S)"
 # Dump to a temp file first: `pg_dump | gzip` would hide a failed dump behind gzip's exit 0.
 TMP="./backups/pre-update-${STAMP}.sql.tmp"
@@ -301,10 +304,15 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
-compose exec -T postgres pg_dump -U mediatrack -d mediatrack > "$TMP"
-# Compress next to it and rename: a full disk must not leave a truncated .sql.gz that
-# the keep-5 rule would count as a backup.
-gzip -c "$TMP" > "$TMP.gz"
+# umask in a subshell so the dump files are owner-only (they hold the 115 cookie and LLM
+# keys) without making the later git checkout create owner-only files in the repo.
+(
+  umask 077
+  compose exec -T postgres pg_dump -U mediatrack -d mediatrack > "$TMP"
+  # Compress next to it and rename: a full disk must not leave a truncated .sql.gz that
+  # the keep-5 rule would count as a backup.
+  gzip -c "$TMP" > "$TMP.gz"
+)
 mv "$TMP.gz" "./backups/pre-update-${STAMP}.sql.gz"
 chown "$OWNER" "./backups/pre-update-${STAMP}.sql.gz"
 rm -f "$TMP"
