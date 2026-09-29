@@ -276,7 +276,7 @@ describe("loadSettingsAttentionSummary — per-account state", () => {
 
 describe("resolveCurrentIsOwner — single-user mode", () => {
   // 单用户下经隧道来的匿名访客带一个随便什么 mt_session 也能过 proxy(只查有无),
-  // getCurrentAccountId() 会给他哨兵账号。哨兵绝不能被当成站主。
+  // getCurrentAccountId() 会给这样的请求哨兵账号。哨兵绝不能被当成站主。
   it("is not the owner for the unauthenticated sentinel", async () => {
     makeRepository([]);
     (getCurrentAccountId as ReturnType<typeof vi.fn>).mockResolvedValue("acct_unauthenticated");

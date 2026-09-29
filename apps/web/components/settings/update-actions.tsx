@@ -10,7 +10,6 @@ import type { UpdaterStatus } from "../../lib/updater-client";
 const PROGRESS: Record<string, number> = { waiting: 5, backing_up: 15, building: 50, switching: 80, verifying: 92 };
 
 export function UpdateNowButton({ tag, initial }: { tag: string | null; initial: UpdaterStatus }) {
-  const router = useRouter();
   const [status, setStatus] = useState<UpdaterStatus | null>(initial);
   const [message, setMessage] = useState("");
   const [pending, startTransition] = useTransition();
@@ -77,17 +76,20 @@ export function UpdateNowButton({ tag, initial }: { tag: string | null; initial:
           startTransition(() => {
             void startUpdateAction(tag).then(
               (result) => {
-                if (result.ok) {
-                  // Clear the click message ("已开始更新。") so the card falls through to
-                  // the updater's own step text ("正在构建新版本…" 等) as polls arrive.
+                // Started, or "busy": another tab or a scheduled update already started one.
+                // Either way switch to the progress card and let the poller fetch the real
+                // step text ("正在构建新版本…" 等). Not router.refresh(): this component keeps
+                // its state across a refresh, and with no tag it would render nothing.
+                if (result.ok || result.reason === "busy") {
                   setMessage("");
-                  setStatus({ ...(status ?? emptyStatus()), phase: "waiting", message: "准备更新…" });
+                  setStatus({
+                    ...(status ?? emptyStatus()),
+                    phase: "waiting",
+                    message: result.ok ? "准备更新…" : "已经在更新了，正在读取进度…",
+                  });
                   return;
                 }
                 setMessage(result.message);
-                // Another tab or the scheduled update already started one. The server
-                // render has the live progress; pull it in so "已经在更新了。" becomes a bar.
-                if (result.reason === "busy") router.refresh();
               },
               () => setMessage("连不上更新助手，稍后再试。"),
             );
