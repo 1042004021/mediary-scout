@@ -14,14 +14,23 @@ const REASON_TEXT = {
   unreachable: "连不上更新助手，稍后再试。",
 } as const;
 
-export async function startUpdateAction(tag: string): Promise<{ ok: boolean; message: string }> {
-  if (isDemoMode() || !(await resolveCurrentIsOwner())) return { ok: false, message: "没有权限。" };
+export async function startUpdateAction(
+  tag: string,
+): Promise<{
+  ok: boolean;
+  message: string;
+  reason?: "no_updater" | "busy" | "needs_recovery" | "bad_tag" | "unreachable" | "denied" | "stale";
+}> {
+  if (isDemoMode() || !(await resolveCurrentIsOwner()))
+    return { ok: false, message: "没有权限。", reason: "denied" };
   // Only the release the view itself offers — never an arbitrary string from the client,
   // and never an older tag (that would be a downgrade).
   const offered = (await loadUpdateView()).available?.tag;
-  if (!offered || offered !== tag) return { ok: false, message: REASON_TEXT.bad_tag };
+  if (!offered || offered !== tag) return { ok: false, message: REASON_TEXT.bad_tag, reason: "stale" };
   const result = await requestUpdate(offered);
-  return result.ok ? { ok: true, message: "已开始更新。" } : { ok: false, message: REASON_TEXT[result.reason] };
+  return result.ok
+    ? { ok: true, message: "已开始更新。" }
+    : { ok: false, message: REASON_TEXT[result.reason], reason: result.reason };
 }
 
 let lastManualCheck = 0;
