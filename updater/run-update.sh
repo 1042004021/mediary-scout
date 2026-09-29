@@ -34,7 +34,9 @@ is_release_tag() {
   # A newline inside the tag would let grep match one line of it.
   case "$1" in *"
 "*) return 1 ;; esac
-  printf '%s' "$1" | grep -Eq '^v[0-9]{4}\.(0[1-9]|1[0-2])\.(0[1-9]|[12][0-9]|3[01])(\.([2-9]|[1-9][0-9]+))?$' || return 1
+  # Years 2000–2099 only: no leading zeros for $(( )) to misread as octal, and no year 0
+  # (JavaScript's Date.UTC maps years 0–99 to 1900–1999).
+  printf '%s' "$1" | grep -Eq '^v20[0-9]{2}\.(0[1-9]|1[0-2])\.(0[1-9]|[12][0-9]|3[01])(\.([2-9]|[1-9][0-9]+))?$' || return 1
   y=$(printf '%s' "$1" | cut -c2-5)
   m=$(printf '%s' "$1" | cut -c7-8)
   d=$(printf '%s' "$1" | cut -c10-11)

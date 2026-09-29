@@ -1,6 +1,6 @@
 /** Release tags: vYYYY.MM.DD, or vYYYY.MM.DD.N (N ≥ 2) for a later release the same day.
  *  Same rule as apps/web/lib/release-version.ts; tests/release-version.test.ts keeps the two in step. */
-const TAG_RE = /^v(\d{4})\.(0[1-9]|1[0-2])\.(0[1-9]|[12]\d|3[01])(?:\.([2-9]|[1-9]\d+))?$/;
+const TAG_RE = /^v(20\d{2})\.(0[1-9]|1[0-2])\.(0[1-9]|[12]\d|3[01])(?:\.([2-9]|[1-9]\d+))?$/;
 
 /** The app version a release tag ships as: v2026.09.28 → 2026.928.0, v2026.09.28.2 → 2026.928.2.
  *  Valid semver (no leading zeros), ordered like the tags, and above every 1.x release. Null for

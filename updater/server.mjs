@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 // Same shape as apps/web/lib/release-version.ts TAG_RE, plus that file's calendar check
 // (v2026.02.31 matches the pattern and is still not a date). Keep the two in sync.
-const TAG_RE = /^v(\d{4})\.(0[1-9]|1[0-2])\.(0[1-9]|[12]\d|3[01])(?:\.([2-9]|[1-9]\d+))?$/;
+const TAG_RE = /^v(20\d{2})\.(0[1-9]|1[0-2])\.(0[1-9]|[12]\d|3[01])(?:\.([2-9]|[1-9]\d+))?$/;
 
 const PHASE_MESSAGES = {
   idle: "",

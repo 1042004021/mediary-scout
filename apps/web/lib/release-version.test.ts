@@ -7,7 +7,7 @@ describe("parseReleaseTag", () => {
     expect(parseReleaseTag("v2026.09.28.2")).toEqual({ tag: "v2026.09.28.2", date: "2026-09-28", seq: 2 });
   });
   it("rejects anything else (old semver, refs, injection)", () => {
-    for (const bad of ["v1.4.1", "2026.09.28", "v2026.9.28", "v2026.13.01", "v2026.09.28.0", "main", "v2026.09.28;rm -rf /", ""]) {
+    for (const bad of ["v1.4.1", "2026.09.28", "v2026.9.28", "v2026.13.01", "v2026.09.28.0", "main", "v2026.09.28;rm -rf /", "", "v0000.02.29", "v1999.12.31", "v2100.01.01"]) {
       expect(parseReleaseTag(bad)).toBeNull();
     }
   });

@@ -25,6 +25,9 @@ describe("appVersionFromTag", () => {
       "main",
       "v2026.09.28;rm -rf /",
       "",
+      "v0000.02.29",
+      "v1999.12.31",
+      "v2100.01.01",
     ]) {
       expect(appVersionFromTag(bad)).toBeNull();
     }
@@ -54,6 +57,8 @@ describe("appVersionFromTag", () => {
       "v2026.9.28",
       "v1.4.1",
       "",
+      "v0008.02.29",
+      "v2100.01.01",
     ];
     for (const input of inputs) {
       expect(appVersionFromTag(input) !== null).toBe(parseReleaseTag(input) !== null);

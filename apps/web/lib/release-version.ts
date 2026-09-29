@@ -8,7 +8,7 @@ export interface ReleaseTag {
   seq: number;
 }
 
-const TAG_RE = /^v(\d{4})\.(0[1-9]|1[0-2])\.(0[1-9]|[12]\d|3[01])(?:\.([2-9]|[1-9]\d+))?$/;
+const TAG_RE = /^v(20\d{2})\.(0[1-9]|1[0-2])\.(0[1-9]|[12]\d|3[01])(?:\.([2-9]|[1-9]\d+))?$/;
 
 export function parseReleaseTag(value: string): ReleaseTag | null {
   const match = TAG_RE.exec(value);
