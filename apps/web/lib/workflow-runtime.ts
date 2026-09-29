@@ -498,6 +498,16 @@ export class UnauthenticatedAccountError extends Error {
   }
 }
 
+/** Thrown when a drive mutation is refused because an update is about to swap the web
+ *  container. Rechecked INSIDE the in-flight guard so the updater's busy check cannot miss
+ *  it: the caller turns it into a "try again after the update" message. */
+export class UpdateInProgressError extends Error {
+  constructor(message = "正在更新，更新完成后再试。") {
+    super(message);
+    this.name = "UpdateInProgressError";
+  }
+}
+
 let sessionSecretCache: string | null = null;
 
 /** The HMAC secret for session cookies: env override, else a generated value
@@ -2792,6 +2802,11 @@ export async function importForeignWorkFiles(input: {
   // swap mid-way would leave the folder made and the files half moved, and the retry
   // then fails. /api/update/busy waits for this to settle before the updater swaps.
   return whileInFlight(async () => {
+    // Recheck the hold now that this import is counted in flight. The action checks it too,
+    // but between that check and this increment the updater could take the hold and see
+    // inFlightCount() === 0 (busy:false), then swap mid-move. Ordering the increment before
+    // this check closes that gap: if the hold is on here, the swap has not been cleared yet.
+    if (isUpdateHoldActive(Date.now())) throw new UpdateInProgressError();
     // Foreign-work UI is free-text title/year only (no TMDB id). Folder stays the
     // legacy `Title (Year)` form on purpose — `importForeignWorkAsMovie` supports
     // `{tmdb-N}` only when a caller passes tmdbId.

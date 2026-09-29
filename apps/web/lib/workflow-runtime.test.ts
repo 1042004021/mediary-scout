@@ -29,6 +29,8 @@ import {
   JEV_PREFILTER_ENABLED_SETTING_KEY,
   JEV_HEALTH_SETTING_KEY,
   TMDB_API_KEY_SETTING_KEY,
+  importForeignWorkFiles,
+  UpdateInProgressError,
 } from "./workflow-runtime";
 
 describe("resolveIsDesktop", () => {
@@ -978,5 +980,22 @@ describe("resolveJevJudge (the single go/no-go for wrapping the provider)", () =
     expect(isJevPrefilterActive({ ...active, health: "fail" })).toBe(false);
     expect(isJevPrefilterActive({ ...active, enabled: false })).toBe(false);
     expect(isJevPrefilterActive({ ...active, apiKey: undefined })).toBe(false);
+  });
+});
+
+
+describe("importForeignWorkFiles rechecks the update hold inside the in-flight guard", () => {
+  it("throws UpdateInProgressError before any storage work when the hold is on", async () => {
+    const { setUpdateHold, clearUpdateHold, inFlightCount } = await import("./update-hold");
+    setUpdateHold(Date.now(), 60_000);
+    try {
+      await expect(
+        importForeignWorkFiles({ providerFileIds: ["1"], movieTitle: "沙丘", year: 2021 }),
+      ).rejects.toBeInstanceOf(UpdateInProgressError);
+      // The guard released even though the work threw.
+      expect(inFlightCount()).toBe(0);
+    } finally {
+      clearUpdateHold();
+    }
   });
 });

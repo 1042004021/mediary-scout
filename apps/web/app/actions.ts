@@ -293,10 +293,11 @@ export async function importForeignWorkAction(input: {
   if (input.providerFileIds.length === 0) {
     return { status: "failed", message: "没有可入库的文件。" };
   }
-  const { importForeignWorkFiles, isUpdateInProgress } = await import("../lib/workflow-runtime");
-  // A container swap mid-import leaves a half-moved folder the retry can't finish.
-  // Refuse upfront while the updater holds new work (importForeignWorkFiles also counts
-  // itself in flight, so a swap already in progress waits for one that slipped through).
+  const { importForeignWorkFiles, isUpdateInProgress, UpdateInProgressError } = await import("../lib/workflow-runtime");
+  // A container swap mid-import leaves a half-moved folder the retry can't finish. Refuse
+  // upfront while the updater holds new work; importForeignWorkFiles rechecks the hold once
+  // it is counted in flight and throws UpdateInProgressError if the hold was taken in the
+  // gap between here and there, so the swap handshake cannot win that race.
   if (isUpdateInProgress()) {
     return { status: "failed", message: "正在更新，更新完成后再入库。" };
   }
@@ -312,6 +313,9 @@ export async function importForeignWorkAction(input: {
       message: `已入库到 ${movieTitle} (${year})。`,
     };
   } catch (error) {
+    if (error instanceof UpdateInProgressError) {
+      return { status: "failed", message: "正在更新，更新完成后再入库。" };
+    }
     return { status: "failed", message: `入库失败：${String(error)}` };
   }
 }
