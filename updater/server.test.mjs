@@ -494,7 +494,7 @@ describe("updater", () => {
     expect(updater.status().pendingRestore).toBeUndefined();
   });
 
-  it("after a failed rollback, refuses new updates until the web serves the deploy folder HEAD again", async () => {
+  it("after a failed rollback, refuses new updates until a recheck finds the web serving the deploy folder HEAD again", async () => {
     let serving = "b".repeat(40);
     const calls = [];
     const dir = mkdtempSync(join(tmpdir(), "updater-"));
@@ -510,18 +510,142 @@ describe("updater", () => {
       waitPollMs: 1,
       waitLimitMs: 1000,
       repoCommit: () => "a".repeat(40),
-      servingCommit: () => serving,
+      servingCommit: async () => serving,
     });
     updater.start("v2026.10.02");
     await updater.idle();
     expect(updater.status()).toMatchObject({ phase: "failed", needsManualRecovery: true });
     expect(updater.start("v2026.10.03")).toEqual({ accepted: false, reason: "needs_recovery" });
     expect(calls).toHaveLength(1);
-    // A person ran deploy.sh: the web now serves the deploy folder's HEAD.
+    // A person ran deploy.sh: the web now serves the deploy folder's HEAD. Starting an update
+    // does not look at that; only the recheck does.
     serving = "a".repeat(40);
+    expect(updater.start("v2026.10.03")).toEqual({ accepted: false, reason: "needs_recovery" });
+    expect(calls).toHaveLength(1);
+    await updater.recheckRecovery();
+    expect(updater.status().needsManualRecovery).toBeUndefined();
+    expect(updater.status()).toMatchObject({ phase: "failed", message: "上次更新没成功，之后已经恢复正常，可以再次更新。" });
     expect(updater.start("v2026.10.03")).toEqual({ accepted: true });
     await updater.idle();
     expect(calls).toEqual(["v2026.10.02", "v2026.10.03"]);
+  });
+
+  it("a recheck leaves the recovery flag alone until the web really serves the deploy folder HEAD", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "updater-"));
+    const message = "新版本没通过自检，自动回退也没成功。请在部署目录运行 ./scripts/deploy.sh 恢复。";
+    writeFileSync(
+      join(dir, "status.json"),
+      JSON.stringify({ phase: "failed", targetTag: "v2026.10.02", fromCommit: null, startedAt: "x", finishedAt: "y", message, logTail: "", needsManualRecovery: true }),
+    );
+    let head = "a".repeat(40);
+    let serving = "b".repeat(40);
+    const updater = createUpdater({
+      stateDir: dir,
+      runUpdate: () => Promise.resolve(0),
+      acquisitionsRunning: async () => false,
+      sleep: async () => {},
+      now: () => "2026-10-02T20:00:00.000Z",
+      waitPollMs: 1,
+      waitLimitMs: 1000,
+      repoCommit: () => head,
+      servingCommit: async () => serving,
+    });
+    const stillFlagged = () => expect(updater.status()).toMatchObject({ needsManualRecovery: true, message });
+    await updater.recheckRecovery(); // the web serves another commit
+    stillFlagged();
+    serving = null; // the web does not answer
+    await updater.recheckRecovery();
+    stillFlagged();
+    head = null; // neither side is known: two nulls are not a match
+    await updater.recheckRecovery();
+    stillFlagged();
+    head = "a".repeat(40);
+    serving = "a".repeat(40);
+    await updater.recheckRecovery();
+    expect(updater.status().needsManualRecovery).toBeUndefined();
+  });
+
+  it("a recheck does nothing while a job runs", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "updater-"));
+    // Cut off mid-rollback with a flag left from an earlier failure: the resumed rollback is
+    // the running job, and a probe now could see the web half way through its swap.
+    writeFileSync(
+      join(dir, "status.json"),
+      JSON.stringify({ phase: "verifying", targetTag: "v2026.10.02", fromCommit: "c".repeat(40), startedAt: "x", finishedAt: null, message: "", logTail: "", needsManualRecovery: true }),
+    );
+    let release = () => {};
+    const blocked = new Promise((resolve) => (release = resolve));
+    let probes = 0;
+    const updater = createUpdater({
+      stateDir: dir,
+      runUpdate: () => blocked.then(() => 20),
+      acquisitionsRunning: async () => false,
+      sleep: async () => {},
+      now: () => "2026-10-02T20:00:00.000Z",
+      waitPollMs: 1,
+      waitLimitMs: 1000,
+      repoCommit: () => "a".repeat(40),
+      servingCommit: async () => {
+        probes += 1;
+        return "a".repeat(40);
+      },
+    });
+    await updater.recheckRecovery();
+    expect(probes).toBe(0);
+    expect(updater.status().needsManualRecovery).toBe(true);
+    release();
+    await updater.idle();
+  });
+
+  it("a recheck asks the web nothing when no recovery flag is set", async () => {
+    let probes = 0;
+    const dir = mkdtempSync(join(tmpdir(), "updater-"));
+    const updater = createUpdater({
+      stateDir: dir,
+      runUpdate: () => Promise.resolve(0),
+      acquisitionsRunning: async () => false,
+      sleep: async () => {},
+      now: () => "2026-10-02T20:00:00.000Z",
+      waitPollMs: 1,
+      waitLimitMs: 1000,
+      repoCommit: () => "a".repeat(40),
+      servingCommit: async () => {
+        probes += 1;
+        return "a".repeat(40);
+      },
+    });
+    await updater.recheckRecovery();
+    expect(probes).toBe(0);
+  });
+
+  it("two rechecks at once ask the web once", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "updater-"));
+    writeFileSync(
+      join(dir, "status.json"),
+      JSON.stringify({ phase: "failed", targetTag: "v2026.10.02", fromCommit: null, startedAt: "x", finishedAt: "y", message: "", logTail: "", needsManualRecovery: true }),
+    );
+    let probes = 0;
+    let answer = (_commit) => {};
+    const answered = new Promise((resolve) => (answer = resolve));
+    const updater = createUpdater({
+      stateDir: dir,
+      runUpdate: () => Promise.resolve(0),
+      acquisitionsRunning: async () => false,
+      sleep: async () => {},
+      now: () => "2026-10-02T20:00:00.000Z",
+      waitPollMs: 1,
+      waitLimitMs: 1000,
+      repoCommit: () => "a".repeat(40),
+      servingCommit: async () => {
+        probes += 1;
+        return answered;
+      },
+    });
+    const first = updater.recheckRecovery();
+    const second = updater.recheckRecovery();
+    answer("a".repeat(40));
+    await Promise.all([first, second]);
+    expect(probes).toBe(1);
     expect(updater.status().needsManualRecovery).toBeUndefined();
   });
 
@@ -540,7 +664,7 @@ describe("updater", () => {
       waitPollMs: 1,
       waitLimitMs: 1000,
       repoCommit: () => "a".repeat(40),
-      servingCommit: () => null,
+      servingCommit: async () => null,
     });
     await updater.idle();
     expect(updater.status().needsManualRecovery).toBe(true);
@@ -562,7 +686,7 @@ describe("updater", () => {
       waitPollMs: 1,
       waitLimitMs: 1000,
       repoCommit: () => "a".repeat(40),
-      servingCommit: () => null,
+      servingCommit: async () => null,
     });
     const handler = createUpdaterHttp(updater, "t0k3n");
     const req = new PassThrough();

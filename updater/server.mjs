@@ -1,12 +1,13 @@
 // Mediary Scout updater: the only process with Docker access. Listens on the compose
 // network only (no published port). One job at a time; status persisted to the state dir.
-import { execFileSync, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { promisify } from "node:util";
 
 // Same shape as apps/web/lib/release-version.ts TAG_RE, plus that file's calendar check
 // (v2026.02.31 matches the pattern and is still not a date). Keep the two in sync.
@@ -29,6 +30,7 @@ const STEP_PHASES = new Set(["waiting", "backing_up", "building", "switching", "
 const INTERRUPTED_MESSAGE = "更新被中断了，原来的版本仍在运行。";
 const RESUME_ROLLBACK_MESSAGE = "更新中途被打断，正在回到原来的版本。";
 const ROLLING_BACK_MESSAGE = "新版本没通过自检，正在回到原来的版本，网页会短暂打不开。";
+const RECOVERED_MESSAGE = "上次更新没成功，之后已经恢复正常，可以再次更新。";
 const MAX_BODY = 1024;
 
 export function isReleaseTag(value) {
@@ -275,23 +277,36 @@ export function createUpdater(opts) {
     });
   }
 
+  // A failed rollback needs a person (./scripts/deploy.sh). Once the running web serves the
+  // deploy folder's HEAD again, that happened: clear the flag and say so. Runs on its own
+  // schedule, so the page stops saying "needs a person" without anyone clicking update.
+  let rechecking = false;
+  async function recheckRecovery() {
+    // Not while a job runs (the web may be half way through a swap), and never two at once:
+    // the web probe is a slow docker call.
+    if (status.needsManualRecovery !== true || job || rechecking) return;
+    rechecking = true;
+    try {
+      const head = opts.repoCommit();
+      const serving = opts.servingCommit ? await opts.servingCommit() : null;
+      if (!head || head !== serving) return;
+      const { needsManualRecovery: _cleared, ...rest } = status;
+      status = rest;
+      save({ message: RECOVERED_MESSAGE });
+    } finally {
+      rechecking = false;
+    }
+  }
+
   return {
     // repoCommit is read fresh: it is the deploy folder's HEAD, which the web falls back
     // to when its image has no BUILD_COMMIT (built without GIT_SHA).
     status: () => ({ ...status, repoCommit: opts.repoCommit() }),
+    recheckRecovery,
     start(tag) {
       if (!isReleaseTag(tag)) return { accepted: false, reason: "bad_tag" };
       if (job) return { accepted: false, reason: "busy" };
-      // A rollback that failed needs a person (./scripts/deploy.sh). Once the running web
-      // serves the deploy folder's HEAD again, that happened: clear it and go on.
-      if (status.needsManualRecovery === true) {
-        const head = opts.repoCommit();
-        const serving = opts.servingCommit ? opts.servingCommit() : null;
-        if (!head || head !== serving) return { accepted: false, reason: "needs_recovery" };
-        const { needsManualRecovery: _cleared, ...rest } = status;
-        status = rest;
-        save({});
-      }
+      if (status.needsManualRecovery === true) return { accepted: false, reason: "needs_recovery" };
       // A cut-off update's checkout is not back on the old commit yet: try that again
       // first. The new update runs only once it worked, from the right commit.
       if (status.pendingRestore === true && typeof status.fromCommit === "string") {
@@ -395,6 +410,15 @@ if (isDirectRun()) {
   mkdirSync(stateDir, { recursive: true });
   const token = loadToken(stateDir);
   const webBase = process.env.UPDATER_WEB_BASE ?? "http://web:3000";
+  const execFileAsync = promisify(execFile);
+  // stdin is closed at once, as the old synchronous call did with stdio "ignore": compose
+  // exec forwards stdin by default. stderr is captured, so compose's variable warnings
+  // stay out of the log.
+  const dockerText = (args) => {
+    const pending = execFileAsync("docker", args, { encoding: "utf8", timeout: 15_000 });
+    pending.child.stdin?.end();
+    return pending.then((result) => result.stdout);
+  };
   const updater = createUpdater({
     stateDir,
     runUpdate: shellRunner(join(fileURLToPath(new URL(".", import.meta.url)), "run-update.sh")),
@@ -414,19 +438,27 @@ if (isDirectRun()) {
     now: () => new Date().toISOString(),
     waitPollMs: 30_000,
     waitLimitMs: 2 * 60 * 60 * 1000,
-    // The commit the running web container was built from (its BUILD_COMMIT).
-    servingCommit: () => {
+    // The commit the running web container was built from (its BUILD_COMMIT). Async with a
+    // timeout on both calls: the recheck skips a round while the last one is still running,
+    // so one hung docker call must not stop it for good.
+    servingCommit: async () => {
       try {
-        const project = execFileSync(
-          "docker",
-          ["inspect", "-f", '{{ index .Config.Labels "com.docker.compose.project" }}', hostname()],
-          { encoding: "utf8" },
+        const project = (
+          await dockerText(["inspect", "-f", '{{ index .Config.Labels "com.docker.compose.project" }}', hostname()])
         ).trim();
-        const commit = execFileSync(
-          "docker",
-          ["compose", "-p", project, "--project-directory", process.env.UPDATER_REPO_DIR ?? "/repo", "exec", "-T", "web", "cat", "BUILD_COMMIT"],
-          // stderr: compose prints its variable warnings there; keep them out of the log.
-          { encoding: "utf8", timeout: 15_000, stdio: ["ignore", "pipe", "ignore"] },
+        const commit = (
+          await dockerText([
+            "compose",
+            "-p",
+            project,
+            "--project-directory",
+            process.env.UPDATER_REPO_DIR ?? "/repo",
+            "exec",
+            "-T",
+            "web",
+            "cat",
+            "BUILD_COMMIT",
+          ])
         ).trim();
         return /^[0-9a-f]{40}$/.test(commit) ? commit : null;
       } catch {
@@ -452,4 +484,10 @@ if (isDirectRun()) {
   createServer(createUpdaterHttp(updater, token)).listen(8787, "0.0.0.0", () => {
     console.log("[updater] listening on :8787 (compose network only)");
   });
+  // Once at start-up, then every minute; a failed round just waits for the next one.
+  const recheck = () => {
+    updater.recheckRecovery().catch(() => {});
+  };
+  recheck();
+  setInterval(recheck, 60_000).unref();
 }
