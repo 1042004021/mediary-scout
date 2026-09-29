@@ -124,6 +124,7 @@ case "$cmd" in
     esac
     ;;
   fetch)
+    if [ -f "$STUB_DIR/fail-fetch" ]; then exit 1; fi
     ;;
   checkout)
     ref=""
@@ -833,5 +834,51 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     const backups = readdirSync(join(repo, "backups"));
     expect(backups.filter((name) => name.endsWith(".sql.tmp"))).toEqual([]);
     expect(backups.filter((name) => name.endsWith(".sql.gz"))).toEqual([]);
+  });
+
+  it("fails clearly and touches nothing when the release cannot be downloaded", async () => {
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "fail-fetch"), "1");
+    const result = await run(env);
+    expect(result.code).toBe(70);
+    expect(result.stdout).toContain("==> FETCH_FAILED");
+    const steps = signatures(log);
+    expect(steps).not.toContain("build");
+    expect(steps).not.toContain("hold");
+    expect(steps.some((step) => step.startsWith("checkout"))).toBe(false);
+  });
+
+  it("passes a configured proxy to git, and always sets a stall limit on the fetch", async () => {
+    // With a proxy configured: the fetch carries it, plus the low-speed settings.
+    {
+      const { log, env } = setup();
+      const result = await run({ ...env, UPDATER_HTTPS_PROXY: "http://proxy.example:8080" });
+      expect(result.code).toBe(0);
+      const fetch = linesOf(log).find((line) => line.startsWith("git ") && line.includes(" fetch "));
+      expect(fetch).toContain("http.proxy=http://proxy.example:8080");
+      expect(fetch).toContain("http.lowSpeedLimit=1000");
+      expect(fetch).toContain("http.lowSpeedTime=60");
+    }
+    // Without one: still the stall limit, no proxy setting.
+    {
+      const { log, env } = setup();
+      const result = await run({ ...env, UPDATER_HTTPS_PROXY: "", UPDATER_HTTP_PROXY: "" });
+      expect(result.code).toBe(0);
+      const fetch = linesOf(log).find((line) => line.startsWith("git ") && line.includes(" fetch "));
+      expect(fetch).toContain("http.lowSpeedLimit=1000");
+      expect(fetch).toContain("http.lowSpeedTime=60");
+      expect(fetch).not.toContain("http.proxy");
+    }
+  });
+
+  it("keeps calls to the web direct with -Y off, even when a proxy is set", async () => {
+    const { log, env } = setup();
+    const result = await run({ ...env, UPDATER_HTTPS_PROXY: "http://proxy.example:8080" });
+    expect(result.code).toBe(0);
+    const calls = linesOf(log).filter((entry) => /^(wget|hold) /.test(entry));
+    expect(calls.length).toBeGreaterThan(0);
+    for (const line of calls) {
+      expect(line).toMatch(/ -Y off /);
+    }
   });
 });

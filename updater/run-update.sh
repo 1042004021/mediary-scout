@@ -81,11 +81,13 @@ token() {
 }
 # -T: busybox wget has no timeout of its own; a web process that accepts the connection
 # and never answers would hang the update forever.
+# -Y off: never route these internal calls to http://web:3000 through a proxy, even when a
+# proxy variable is in the environment (only git's download should use the proxy).
 web_get() {
-  wget -q -T 10 -O- --header "Authorization: Bearer $(token)" "${WEB%/}$1"
+  wget -q -Y off -T 10 -O- --header "Authorization: Bearer $(token)" "${WEB%/}$1"
 }
 web_post() {
-  wget -q -T 10 -O- --header "Authorization: Bearer $(token)" --header "content-type: application/json" \
+  wget -q -Y off -T 10 -O- --header "Authorization: Bearer $(token)" --header "content-type: application/json" \
     --post-data "$1" "${WEB%/}/api/update/hold"
 }
 
@@ -315,7 +317,14 @@ find ./backups -name 'pre-update-*.sql.gz' -type f -print | sort -r | tail -n +6
 done || true
 
 echo "==> STEP building"
-g fetch --tags --force origin
+# Give git a proxy (only git — the web reads HTTP(S)_PROXY itself, this separate container
+# does not) and a stall limit (git has no default): a dead connection must fail, not hang.
+PROXY="${UPDATER_HTTPS_PROXY:-${UPDATER_HTTP_PROXY:-}}"
+if [ -n "$PROXY" ]; then
+  g -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 -c http.proxy="$PROXY" fetch --tags --force origin || { echo "==> FETCH_FAILED"; exit 70; }
+else
+  g -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 fetch --tags --force origin || { echo "==> FETCH_FAILED"; exit 70; }
+fi
 # The commit this tag points at. A missing tag after a successful fetch means the download
 # did not bring it: treat it as a download failure (exit 70), nothing checked out yet.
 TO="$(g rev-parse -q --verify "refs/tags/$TAG^{commit}")" || { echo "==> FETCH_FAILED"; exit 70; }

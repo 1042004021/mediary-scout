@@ -143,6 +143,10 @@ services:
       - updater-state:/state
     environment:
       UPDATER_WEB_BASE: http://web:3000
+      # Only git (the release download) uses these; calls to the web stay direct. The web
+      # reads HTTP(S)_PROXY on its own, but the updater is a separate container that does not.
+      UPDATER_HTTPS_PROXY: ${HTTPS_PROXY:-}
+      UPDATER_HTTP_PROXY: ${HTTP_PROXY:-}
     logging: *default-logging
     restart: unless-stopped
 

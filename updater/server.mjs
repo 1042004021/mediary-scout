@@ -247,7 +247,13 @@ export function createUpdater(opts) {
                     { phase: "failed", message: INTERRUPTED_MESSAGE, pendingRestore: true }
                   : code === 60
                     ? { phase: "failed", message: "更新途中部署目录被人手动换过版本，这次先不更新了，更新助手没有再改动它。" }
-                    : { phase: "failed" };
+                    : code === 70
+                      ? {
+                          phase: "failed",
+                          message:
+                            "没能从 GitHub 下载新版本，原来的版本一直在运行。网络不通时，可以在 .env 里设置 HTTPS_PROXY 后再试。",
+                        }
+                      : { phase: "failed" };
     save({ ...outcome, finishedAt: opts.now() });
     if (code === 50 && status.fromCommit) {
       await resumeAfterRestart({ mode: "restore", commit: status.fromCommit, to: status.toCommit });

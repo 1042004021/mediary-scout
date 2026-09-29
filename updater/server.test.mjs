@@ -427,6 +427,16 @@ describe("updater", () => {
     expect(updater.status().needsManualRecovery).toBeUndefined();
   });
 
+  it("maps a failed download to a failed update that points at the proxy setting", async () => {
+    const { updater } = make({ runUpdate: () => Promise.resolve(70) });
+    updater.start("v2026.10.02");
+    await updater.idle();
+    expect(updater.status()).toMatchObject({
+      phase: "failed",
+      message: "没能从 GitHub 下载新版本，原来的版本一直在运行。网络不通时，可以在 .env 里设置 HTTPS_PROXY 后再试。",
+    });
+  });
+
   it("after a restart before the swap, only checks the old commit back out", async () => {
     const dir = mkdtempSync(join(tmpdir(), "updater-"));
     writeFileSync(
