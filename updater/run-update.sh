@@ -213,23 +213,40 @@ verify() {
 # only ever leaves HEAD detached, on the old commit ($1) or on the commit it was moving to
 # ($2, empty when not known). A branch checked out means a person did it, at any commit (deploy.sh checks
 # out main, and a release tag usually points at main's HEAD, so the commit alone cannot
-# tell); so does any other commit, when $2 is known. An unreadable HEAD proves nothing.
+# tell); so does any other commit, when $2 is known.
+# Returns 0 changed · 1 the updater's own · 2 HEAD cannot be read. Callers never check out
+# over an unreadable HEAD: they stop without touching the folder and let a retry or a
+# person look again. Under set -e call it as `folder_state A B` (sets FOLDER).
 changed_by_someone_else() {
-  now_head="$(g rev-parse HEAD 2>/dev/null)" || return 1
+  now_head="$(g rev-parse HEAD 2>/dev/null)" || return 2
   # A branch first, even at the old commit: checking $1 out over it would detach it.
   g symbolic-ref -q HEAD >/dev/null 2>&1 && return 0
   [ "$now_head" = "$1" ] && return 1
   [ -n "$2" ] && [ "$now_head" != "$2" ]
+}
+folder_state() {
+  FOLDER=ours
+  rc=0
+  changed_by_someone_else "$1" "$2" || rc=$?
+  case "$rc" in
+    0) FOLDER=changed; echo "==> FOLDER_CHANGED — the deploy folder was changed by someone else; leaving it as it is" ;;
+    2) FOLDER=unreadable; echo "==> HEAD_UNREADABLE — cannot read the deploy folder's HEAD; leaving it as it is" ;;
+  esac
 }
 
 # Before any swap: put the deploy folder back on the commit that is serving, then exit
 # with $1. If that checkout fails, exit 50 so the updater keeps retrying it.
 back_to_from() {
   # Only undo a tree the updater itself moved; leave one a person changed as it is.
-  if changed_by_someone_else "$FROM" "$TO"; then
-    echo "==> FOLDER_CHANGED — the deploy folder was changed by someone else; leaving it as it is"
+  folder_state "$FROM" "$TO"
+  if [ "$FOLDER" = changed ]; then
     ON_TAG=0
     exit "$1"
+  fi
+  if [ "$FOLDER" = unreadable ]; then
+    # The old version still serves; exit 50 so the updater retries the checkout later.
+    ON_TAG=0
+    exit 50
   fi
   if g -c advice.detachedHead=false checkout "$FROM"; then
     ON_TAG=0
@@ -276,22 +293,31 @@ if [ "$MODE" = rollback ]; then
   echo "==> RESUMED_ROLLBACK — the update stopped after the swap began; going back to $ROLLBACK_TO"
   # If a person changed the deploy folder after the interruption (ran deploy.sh, say), do not
   # rebuild the old version over theirs; leave it and let a person decide.
-  if changed_by_someone_else "$ROLLBACK_TO" "$RESUME_TO"; then
-    echo "==> FOLDER_CHANGED — the deploy folder was changed by someone else; leaving it as it is"
+  folder_state "$ROLLBACK_TO" "$RESUME_TO"
+  if [ "$FOLDER" != ours ]; then
     web_post '{"hold":false}' >/dev/null 2>&1 || true
-    exit 60
+    # Changed by a person: 60. Unreadable: 20 — what serves is unknown; the updater clears
+    # that on its own once the web serves the folder's HEAD again.
+    if [ "$FOLDER" = changed ]; then exit 60; fi
+    exit 20
   fi
   roll_back "$ROLLBACK_TO"
 fi
 if [ "$MODE" = restore ]; then
   if [ "$(g rev-parse HEAD 2>/dev/null || true)" = "$ROLLBACK_TO" ]; then
     : # already on the old commit; nothing to check out
-  elif changed_by_someone_else "$ROLLBACK_TO" "$RESUME_TO"; then
-    # A person changed the folder off the new tag: leave whatever they put there.
-    echo "==> FOLDER_CHANGED — the deploy folder was changed by someone else; leaving it as it is"
   else
-    g -c advice.detachedHead=false checkout "$ROLLBACK_TO"
-    echo "==> RESTORED $ROLLBACK_TO"
+    folder_state "$ROLLBACK_TO" "$RESUME_TO"
+    if [ "$FOLDER" = unreadable ]; then
+      # Not restored yet: exit 50 keeps the restore pending, so the updater retries it.
+      web_post '{"hold":false}' >/dev/null 2>&1 || true
+      exit 50
+    fi
+    # A person changed the folder off the new tag: leave whatever they put there.
+    if [ "$FOLDER" = ours ]; then
+      g -c advice.detachedHead=false checkout "$ROLLBACK_TO"
+      echo "==> RESTORED $ROLLBACK_TO"
+    fi
   fi
   # The cut-off run may have taken the hold; the old version must start runs again.
   web_post '{"hold":false}' >/dev/null 2>&1 || true
@@ -324,9 +350,10 @@ cleanup() {
   # that exit on purpose already did (ON_TAG=0), and after the swap roll_back owns it.
   if [ "$code" != 0 ] && [ "$ON_TAG" = 1 ] && [ "$SWAPPED" = 0 ]; then
     # As in back_to_from: only undo a tree the updater moved; leave one a person changed.
-    if changed_by_someone_else "$FROM" "$TO"; then
-      echo "==> FOLDER_CHANGED — the deploy folder was changed by someone else; leaving it as it is"
-    elif ! g -c advice.detachedHead=false checkout "$FROM" >/dev/null 2>&1; then
+    folder_state "$FROM" "$TO"
+    if [ "$FOLDER" = unreadable ]; then
+      exit 50
+    elif [ "$FOLDER" = ours ] && ! g -c advice.detachedHead=false checkout "$FROM" >/dev/null 2>&1; then
       echo "==> RESTORE_FAILED"
       exit 50
     fi

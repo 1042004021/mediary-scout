@@ -135,6 +135,8 @@ case "$cmd" in
         printf '%s\\n' "$GIT_TAG_COMMIT"
         ;;
       *)
+        # HEAD that git cannot read (a transient index/lock problem).
+        if [ -f "$STUB_DIR/unreadable-head" ]; then exit 128; fi
         cat "$STUB_DIR/head"
         ;;
     esac
@@ -190,6 +192,7 @@ fi
 if printf '%s' "$args" | grep -q 'build web'; then
   printf '%s\\n' "\${GIT_SHA-}" >> "$STUB_DIR/git-shas"
   if [ -f "$STUB_DIR/branch-during-build" ]; then : > "$STUB_DIR/on-branch"; fi
+  if [ -f "$STUB_DIR/unreadable-during-build" ]; then : > "$STUB_DIR/unreadable-head"; fi
   if [ -f "$STUB_DIR/head-during-build" ]; then cat "$STUB_DIR/head-during-build" > "$STUB_DIR/head"; fi
   if [ -f "$STUB_DIR/fail-build" ]; then exit 1; fi
   exit 0
@@ -815,6 +818,40 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
         expect({ mode, badTo, code: result.code }).toEqual({ mode, badTo, code: 2 });
         expect(linesOf(log)).toEqual([]);
       }
+    }
+  });
+
+  it("never checks anything out over a HEAD it cannot read, in any recovery path", async () => {
+    // Restore: stays pending (non-zero), nothing checked out.
+    {
+      const { stubDir, log, env } = setup();
+      writeFileSync(join(stubDir, "unreadable-head"), "");
+      const result = await runArgs(env, ["restore", FROM, TAG_COMMIT]);
+      expect(result.code).toBe(50);
+      expect(result.stdout).toContain("==> HEAD_UNREADABLE");
+      expect(signatures(log).some((step) => step.startsWith("checkout"))).toBe(false);
+      expect(signatures(log)).toContain("release");
+    }
+    // Resumed rollback: no checkout, no build; a person is needed.
+    {
+      const { stubDir, log, env } = setup();
+      writeFileSync(join(stubDir, "unreadable-head"), "");
+      const result = await runArgs(env, ["rollback", FROM, TAG_COMMIT]);
+      expect(result.code).toBe(20);
+      expect(result.stdout).toContain("==> HEAD_UNREADABLE");
+      expect(signatures(log).some((step) => step.startsWith("checkout"))).toBe(false);
+      expect(signatures(log)).not.toContain("build");
+      expect(signatures(log)).toContain("release");
+    }
+    // A failed build whose HEAD then cannot be read: exit 50 (retried), no checkout of FROM.
+    {
+      const { stubDir, log, env } = setup();
+      writeFileSync(join(stubDir, "fail-build"), "1");
+      writeFileSync(join(stubDir, "unreadable-during-build"), "");
+      const result = await run(env);
+      expect(result.code).toBe(50);
+      expect(result.stdout).toContain("==> HEAD_UNREADABLE");
+      expect(signatures(log)).not.toContain(`checkout ${FROM}`);
     }
   });
 
