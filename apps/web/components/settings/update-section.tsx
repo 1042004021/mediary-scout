@@ -119,7 +119,10 @@ export function UpdateTab({ view, desktop }: { view: UpdateView; desktop: boolea
         {!desktop && view.updater && (updating || view.available) ? (
           <UpdateNowButton tag={updating ? null : (view.available?.tag ?? null)} initial={view.updater} />
         ) : null}
-        {!desktop && !updating && view.available && !view.updater ? (
+        {!desktop && !updating && view.available && !view.updater && view.updaterInstalled ? (
+          <p className="update-muted">更新助手暂时没有回应，稍后刷新再试。</p>
+        ) : null}
+        {!desktop && !updating && view.available && !view.updater && !view.updaterInstalled ? (
           <div className="update-migrate">
             <p className="update-muted">一键更新需要先完成一次手动升级。在部署目录运行：</p>
             <pre className="update-cmd">{MIGRATE_COMMAND}</pre>

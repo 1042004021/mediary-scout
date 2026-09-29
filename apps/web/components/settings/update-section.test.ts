@@ -37,6 +37,7 @@ const view = (overrides: Partial<UpdateView>): UpdateView => ({
   status: "latest",
   releases: [],
   updater: null,
+  updaterInstalled: false,
   download: null,
   ...overrides,
 });
@@ -136,6 +137,14 @@ describe("UpdateTab one-click update", () => {
     expect(building).not.toContain("立即更新");
     expect(render({ desktop: false, view: view({ updater: updater({ phase: "idle" }) }) })).not.toContain("立即更新");
     expect(render({ desktop: true, view: { ...ready, download: { url: DMG, file: "dmg" } } })).not.toContain("立即更新");
+  });
+
+  it("says the updater is not answering, without the migration command, when it is installed", () => {
+    const html = render({ view: view({ available: newer, status: "available", updaterInstalled: true }), desktop: false });
+    expect(html).toContain("更新助手暂时没有回应，稍后刷新再试。");
+    expect(html).not.toContain("一键更新需要先完成一次手动升级");
+    expect(html).not.toContain("./scripts/deploy.sh");
+    expect(html).not.toContain("立即更新");
   });
 
   it("tells a Docker instance with no updater to run deploy.sh once", () => {

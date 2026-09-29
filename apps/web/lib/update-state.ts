@@ -32,6 +32,8 @@ export interface UpdateView {
   status: UpdateStatus;
   releases: Array<ReleaseEntry & { isCurrent: boolean }>;
   updater: UpdaterStatus | null;
+  /** The updater's token volume is mounted, even if it did not answer just now. */
+  updaterInstalled: boolean;
   /** Desktop only, and only while a newer release is offered. */
   download: DesktopDownload | null;
 }
@@ -75,6 +77,7 @@ export function buildUpdateView(input: {
     status,
     releases: input.feed.map((release) => ({ ...release, isCurrent: release.tag === currentRelease?.tag })),
     updater: input.updater,
+    updaterInstalled: input.updater !== null,
     download: null,
   };
 }

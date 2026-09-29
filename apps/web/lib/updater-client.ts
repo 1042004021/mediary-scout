@@ -26,6 +26,17 @@ export interface UpdaterStatus {
   /** HEAD of the deploy folder, sent with every status. The version source for
    *  instances built without GIT_SHA — the documented `docker compose up -d` path. */
   repoCommit?: string | null;
+  /** The deploy folder is not back on the serving commit yet after a cut-off update. */
+  pendingRestore?: boolean;
+}
+
+/** The deploy folder's HEAD, only when it is the commit being served: no update is
+ *  running (it checks out the new tag before the swap) and no checkout is pending. */
+export function servingRepoCommit(status: UpdaterStatus | null): string | null {
+  if (!status || status.pendingRestore === true) return null;
+  if (!["idle", "done", "rolled_back", "failed"].includes(status.phase)) return null;
+  const commit = status.repoCommit;
+  return typeof commit === "string" && /^[0-9a-f]{40}$/.test(commit) ? commit : null;
 }
 
 const DEFAULT_STATE_DIR = "/updater-state";
@@ -55,6 +66,12 @@ function sameToken(presented: string, expected: string): boolean {
 
 function isUpdaterStatus(value: unknown): value is UpdaterStatus {
   return Boolean(value) && typeof value === "object" && typeof (value as { phase?: unknown }).phase === "string";
+}
+
+/** Whether this instance has an updater at all: its token volume is mounted. False on an
+ *  old compose file (and on desktop). An installed updater may still not answer. */
+export async function isUpdaterInstalled(options: ClientOptions = {}): Promise<boolean> {
+  return (await readToken(options.stateDir ?? DEFAULT_STATE_DIR)) !== null;
 }
 
 /** Null = no updater (old compose file, desktop, or it did not answer). */
@@ -95,23 +112,6 @@ export async function requestUpdate(
   } catch {
     return { ok: false, reason: "unreachable" };
   }
-}
-
-let repoCommitCache: { at: number; commit: string | null } | null = null;
-
-export function invalidateRepoCommitCache(): void {
-  repoCommitCache = null;
-}
-
-/** The deploy folder's HEAD as the updater reports it, cached 30 s (the badge polls every
- *  8 s; a missing updater costs one timed-out call per 30 s, not per poll). */
-export async function getCachedRepoCommit(options: ClientOptions = {}): Promise<string | null> {
-  if (repoCommitCache && Date.now() - repoCommitCache.at < 30_000) return repoCommitCache.commit;
-  const status = await getUpdaterStatus(options);
-  const reported = status?.repoCommit;
-  const commit = typeof reported === "string" && /^[0-9a-f]{40}$/.test(reported) ? reported : null;
-  repoCommitCache = { at: Date.now(), commit };
-  return commit;
 }
 
 /** The updater calls /api/update/busy with the same token; verify it here. */

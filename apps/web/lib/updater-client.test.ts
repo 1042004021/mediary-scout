@@ -3,11 +3,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  getCachedRepoCommit,
   getUpdaterStatus,
-  invalidateRepoCommitCache,
   isUpdaterToken,
   requestUpdate,
+  servingRepoCommit,
+  isUpdaterInstalled,
 } from "./updater-client";
 
 const dir = mkdtempSync(join(tmpdir(), "upd-"));
@@ -18,7 +18,6 @@ describe("updater client", () => {
   const previousUrl = process.env.MEDIA_TRACK_UPDATER_URL;
 
   beforeEach(() => {
-    invalidateRepoCommitCache();
     delete process.env.MEDIA_TRACK_UPDATER_URL;
   });
 
@@ -84,27 +83,23 @@ describe("updater client", () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it("caches the repo commit for 30s and rejects a malformed one", async () => {
-    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ phase: "idle", repoCommit: SHA }), { status: 200 }));
-    expect(await getCachedRepoCommit({ stateDir: dir, fetchImpl: fetchImpl as never })).toBe(SHA);
-    expect(await getCachedRepoCommit({ stateDir: dir, fetchImpl: fetchImpl as never })).toBe(SHA);
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  it("knows the updater is installed from its token volume alone", async () => {
+    expect(await isUpdaterInstalled({ stateDir: dir })).toBe(true);
+    expect(await isUpdaterInstalled({ stateDir: join(dir, "missing") })).toBe(false);
+  });
 
-    invalidateRepoCommitCache();
-    const malformed = vi.fn(async () => new Response(JSON.stringify({ phase: "idle", repoCommit: "nope" }), { status: 200 }));
-    expect(await getCachedRepoCommit({ stateDir: dir, fetchImpl: malformed as never })).toBeNull();
-    expect(await getCachedRepoCommit({ stateDir: dir, fetchImpl: malformed as never })).toBeNull();
-    expect(malformed).toHaveBeenCalledTimes(1);
-
-    const now = vi.spyOn(Date, "now");
-    let clock = 1_000_000;
-    now.mockImplementation(() => clock);
-    invalidateRepoCommitCache();
-    const again = vi.fn(async () => new Response(JSON.stringify({ phase: "idle", repoCommit: SHA }), { status: 200 }));
-    expect(await getCachedRepoCommit({ stateDir: dir, fetchImpl: again as never })).toBe(SHA);
-    clock += 31_000;
-    expect(await getCachedRepoCommit({ stateDir: dir, fetchImpl: again as never })).toBe(SHA);
-    expect(again).toHaveBeenCalledTimes(2);
+  it("reports the deploy folder commit only while the updater is at rest", () => {
+    const base = { targetTag: null, fromCommit: null, startedAt: null, finishedAt: null, message: "", logTail: "" };
+    for (const phase of ["idle", "done", "rolled_back", "failed"] as const) {
+      expect(servingRepoCommit({ ...base, phase, repoCommit: SHA })).toBe(SHA);
+    }
+    for (const phase of ["waiting", "backing_up", "building", "switching", "verifying"] as const) {
+      expect(servingRepoCommit({ ...base, phase, repoCommit: SHA })).toBeNull();
+    }
+    expect(servingRepoCommit({ ...base, phase: "failed", repoCommit: SHA, pendingRestore: true })).toBeNull();
+    expect(servingRepoCommit({ ...base, phase: "idle", repoCommit: "nope" })).toBeNull();
+    expect(servingRepoCommit({ ...base, phase: "idle" })).toBeNull();
+    expect(servingRepoCommit(null)).toBeNull();
   });
 
   it("accepts only the bearer token from the shared volume", async () => {

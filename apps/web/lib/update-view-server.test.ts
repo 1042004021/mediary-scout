@@ -7,10 +7,10 @@ vi.mock("./release-feed-server", () => ({
   fetchCommitRelation: vi.fn(),
   fetchLatestDesktopRelease: vi.fn(),
 }));
-vi.mock("./updater-client", () => ({
-  getUpdaterStatus: vi.fn(),
-  getCachedRepoCommit: vi.fn(),
-}));
+vi.mock("./updater-client", async () => {
+  const actual = await vi.importActual<typeof import("./updater-client")>("./updater-client");
+  return { ...actual, getUpdaterStatus: vi.fn(), isUpdaterInstalled: vi.fn(async () => false) };
+});
 vi.mock("./workflow-runtime", () => ({
   resolveIsDesktop: vi.fn(() => false),
 }));
@@ -18,7 +18,7 @@ vi.mock("./workflow-runtime", () => ({
 import { readBuildCommit } from "./deployment-update-server";
 import { fetchCommitRelation, fetchLatestDesktopRelease, fetchReleaseFeed } from "./release-feed-server";
 import { loadUpdateView } from "./update-view-server";
-import { getCachedRepoCommit, getUpdaterStatus } from "./updater-client";
+import { getUpdaterStatus, isUpdaterInstalled } from "./updater-client";
 import { resolveIsDesktop } from "./workflow-runtime";
 
 const feed = [
@@ -51,7 +51,6 @@ describe("loadUpdateView", () => {
     vi.mocked(fetchCommitRelation).mockResolvedValue(null);
     vi.mocked(fetchLatestDesktopRelease).mockResolvedValue(null);
     vi.mocked(getUpdaterStatus).mockResolvedValue(idle);
-    vi.mocked(getCachedRepoCommit).mockResolvedValue(null);
   });
 
   it("does not ask the updater on desktop, and still offers the published installer", async () => {
@@ -59,7 +58,6 @@ describe("loadUpdateView", () => {
     vi.mocked(fetchLatestDesktopRelease).mockResolvedValue(published);
     const view = await loadUpdateView();
     expect(getUpdaterStatus).not.toHaveBeenCalled();
-    expect(getCachedRepoCommit).not.toHaveBeenCalled();
     expect(view.updater).toBeNull();
     expect(view.download).not.toBeNull();
     expect(view.available?.tag).toBe("v2026.10.02");
@@ -71,7 +69,6 @@ describe("loadUpdateView", () => {
     vi.mocked(fetchLatestDesktopRelease).mockResolvedValue(null);
     const view = await loadUpdateView();
     expect(getUpdaterStatus).not.toHaveBeenCalled();
-    expect(getCachedRepoCommit).not.toHaveBeenCalled();
     expect(view.updater).toBeNull();
     expect(view.current.label).toBe("未知版本");
   });
@@ -80,7 +77,6 @@ describe("loadUpdateView", () => {
     const view = await loadUpdateView();
     expect(fetchLatestDesktopRelease).not.toHaveBeenCalled();
     expect(getUpdaterStatus).toHaveBeenCalledTimes(1);
-    expect(getCachedRepoCommit).not.toHaveBeenCalled();
     expect(view.available?.tag).toBe("v2026.10.02");
     expect(view.updater).toBe(idle);
   });
@@ -88,7 +84,6 @@ describe("loadUpdateView", () => {
   it("skips the updater status when the caller asks, and still uses a stamped commit", async () => {
     const view = await loadUpdateView({ updaterStatus: false });
     expect(getUpdaterStatus).not.toHaveBeenCalled();
-    expect(getCachedRepoCommit).not.toHaveBeenCalled();
     expect(view.updater).toBeNull();
     expect(view.available?.tag).toBe("v2026.10.02");
   });
@@ -100,29 +95,48 @@ describe("loadUpdateView", () => {
     vi.mocked(fetchCommitRelation).mockResolvedValue("behind");
     const view = await loadUpdateView();
     expect(getUpdaterStatus).toHaveBeenCalledTimes(1);
-    expect(getCachedRepoCommit).not.toHaveBeenCalled();
     expect(view.current.label).toBe("dddddddd · 开发版本");
   });
 
   it("does not reach the updater for the deploy folder commit either when asked not to", async () => {
     vi.mocked(readBuildCommit).mockResolvedValue(null);
-    vi.mocked(getCachedRepoCommit).mockResolvedValue("d".repeat(40));
     const view = await loadUpdateView({ updaterStatus: false });
-    expect(getCachedRepoCommit).not.toHaveBeenCalled();
+    expect(getUpdaterStatus).not.toHaveBeenCalled();
     expect(view.current.label).toBe("未知版本");
   });
 
   it("uses the deploy folder commit when the image has none, and offers a release it is behind", async () => {
     const older = "d".repeat(40);
     vi.mocked(readBuildCommit).mockResolvedValue(null);
-    // A status without the commit (an older updater): fall back to the cached lookup.
-    vi.mocked(getUpdaterStatus).mockResolvedValue({ ...idle, repoCommit: null });
-    vi.mocked(getCachedRepoCommit).mockResolvedValue(older);
+    vi.mocked(getUpdaterStatus).mockResolvedValue({ ...idle, repoCommit: older });
     vi.mocked(fetchCommitRelation).mockResolvedValue("behind");
     const view = await loadUpdateView();
-    expect(getCachedRepoCommit).toHaveBeenCalledTimes(1);
     expect(fetchCommitRelation).toHaveBeenCalledWith("c".repeat(40), older);
     expect(view.available?.tag).toBe("v2026.10.02");
     expect(view.current.label).toBe("dddddddd · 开发版本");
+  });
+
+  it("tells an installed updater that did not answer apart from no updater at all", async () => {
+    vi.mocked(getUpdaterStatus).mockResolvedValue(null);
+    vi.mocked(isUpdaterInstalled).mockResolvedValue(true);
+    expect((await loadUpdateView()).updaterInstalled).toBe(true);
+    vi.mocked(isUpdaterInstalled).mockResolvedValue(false);
+    expect((await loadUpdateView()).updaterInstalled).toBe(false);
+    vi.mocked(resolveIsDesktop).mockReturnValue(true);
+    vi.mocked(isUpdaterInstalled).mockResolvedValue(true);
+    expect((await loadUpdateView()).updaterInstalled).toBe(false);
+  });
+
+  it("does not report the deploy folder commit as serving while an update runs or a checkout is pending", async () => {
+    vi.mocked(readBuildCommit).mockResolvedValue(null);
+    for (const status of [
+      { ...idle, phase: "building" as const, repoCommit: "c".repeat(40) },
+      { ...idle, phase: "failed" as const, repoCommit: "c".repeat(40), pendingRestore: true },
+    ]) {
+      vi.mocked(getUpdaterStatus).mockResolvedValue(status);
+      const view = await loadUpdateView();
+      expect(view.current.label).toBe("未知版本");
+      expect(view.current.tag).toBeNull();
+    }
   });
 });
