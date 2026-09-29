@@ -313,6 +313,26 @@ describe("updater", () => {
     expect(calls).toEqual([["rollback", "c".repeat(40)]]);
   });
 
+  it("saves the log tail after every line, so a restart keeps the lines right before it", async () => {
+    let seen = null;
+    let updater;
+    const made = make({
+      runUpdate: (_tag, onLine) => {
+        onLine("==> STEP building");
+        onLine("#12 [web 4/9] RUN npm ci");
+        onLine("==> BUSY_CHECK busy");
+        seen = JSON.parse(readFileSync(join(made.dir, "status.json"), "utf8"));
+        return new Promise(() => {});
+      },
+    });
+    updater = made.updater;
+    updater.start("v2026.10.02");
+    for (let tries = 0; tries < 50 && !seen; tries += 1) await new Promise((resolve) => setTimeout(resolve, 1));
+    // Neither line is a step: both must already be in the file a restart would read.
+    expect(seen.logTail.split("\n").slice(-2)).toEqual(["#12 [web 4/9] RUN npm ci", "==> BUSY_CHECK busy"]);
+    expect(updater.status().logTail.endsWith("==> BUSY_CHECK busy")).toBe(true);
+  });
+
   it("says the old version is coming back as soon as the new one fails its check or its start", async () => {
     for (const failure of ["==> VERIFY_FAILED — rolling back to c", "==> UP_FAILED — rolling back to c"]) {
       let seen = null;

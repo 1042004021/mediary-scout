@@ -205,21 +205,25 @@ export function createUpdater(opts) {
     let pastSwap = false;
     const code = await opts.runUpdate(tag, (line) => {
       log.push(line);
+      const patch = {};
       if (line.startsWith("==> BUILD_FAILED")) buildFailed = true;
       const from = /^==> FROM ([0-9a-f]{40})/.exec(line);
-      if (from) save({ fromCommit: from[1] });
+      if (from) patch.fromCommit = from[1];
       const to = /^==> TO ([0-9a-f]{40})/.exec(line);
-      if (to) save({ toCommit: to[1] });
+      if (to) patch.toCommit = to[1];
       if (line.startsWith("==> VERIFY_FAILED") || line.startsWith("==> UP_FAILED")) {
         pastSwap = true;
-        save({ phase: "switching", message: ROLLING_BACK_MESSAGE });
+        Object.assign(patch, { phase: "switching", message: ROLLING_BACK_MESSAGE });
       }
       const step = /^==> STEP (\w+)/.exec(line);
       if (step && STEP_PHASES.has(step[1])) {
         const swapPhase = step[1] === "switching" || step[1] === "verifying";
         if (swapPhase) pastSwap = true;
-        if (swapPhase || !pastSwap) save({ phase: step[1] });
+        if (swapPhase || !pastSwap) patch.phase = step[1];
       }
+      // Every line, as resumeAfterRestart does: the saved tail is what a restart starts from,
+      // and the lines right before an interruption are the ones that explain it.
+      save(patch);
     });
     const outcome =
       code === 0
