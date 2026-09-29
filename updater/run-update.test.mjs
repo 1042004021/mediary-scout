@@ -44,6 +44,13 @@ function installStubs(bin) {
     `#!/bin/sh\nif [ "\${1-}" = "+%s" ]; then t=0; if [ -f "$STUB_DIR/clock" ]; then t=$(cat "$STUB_DIR/clock"); fi; printf '%s\\n' "$((1000000 + t))"; exit 0; fi\nexec /bin/date "$@"\n`,
   );
   writeExe(bin, "chown", `#!/bin/sh\n${LOG_FN}\nlog_call chown "$@"\nexit 0\n`);
+  // busybox timeout: SECS PROG ARGS. macOS has none, so stub it — drop the SECS and exec the
+  // rest, or (hang-build) exit 124 as a timeout would, without running the build at all.
+  writeExe(
+    bin,
+    "timeout",
+    `#!/bin/sh\n${LOG_FN}\nlog_call timeout "$@"\nshift\nif [ -f "$STUB_DIR/hang-build" ]; then exit 124; fi\nexec "$@"\n`,
+  );
   writeExe(
     bin,
     "su-exec",
@@ -840,6 +847,18 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     expect(gz).toBeDefined();
     // No group or other permission bits: the dump holds the 115 cookie and LLM keys.
     expect(statSync(join(repo, "backups", gz)).mode & 0o077).toBe(0);
+  });
+
+  it("treats a build that hangs as a failed build in update mode, and does not swap", async () => {
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "hang-build"), "1");
+    const result = await run(env);
+    expect(result.code).toBe(10);
+    expect(result.stdout).toContain("==> BUILD_FAILED");
+    const steps = signatures(log);
+    expect(steps).not.toContain("up"); // never swapped
+    expect(steps).not.toContain("build"); // timeout stopped it before it ran
+    expect(steps.at(-1)).toBe(`checkout ${FROM}`); // back on the old commit
   });
 
   it("stops before checkout or build when pg_dump fails, and leaves no temp dump", async () => {

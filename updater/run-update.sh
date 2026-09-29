@@ -110,6 +110,12 @@ fi
 PROJECT="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' "$(hostname)")"
 [ -n "$PROJECT" ] || { echo "==> ERROR cannot read compose project name"; exit 2; }
 compose() { docker compose -p "$PROJECT" --project-directory "$REPO" "$@"; }
+# `compose` is a shell function, so `timeout compose ...` would run an external `compose`,
+# not it. Call docker compose directly under a wall-clock limit: a build that hangs must
+# count as a failed build, not leave the update "in progress" forever.
+compose_build() {
+  timeout "${UPDATER_BUILD_LIMIT_S:-5400}" docker compose -p "$PROJECT" --project-directory "$REPO" build web
+}
 
 # Only an explicit "busy":false means idle. A failed request, the login page, or any
 # other answer is "not idle yet": swapping on a failed probe would cut running tasks.
@@ -222,7 +228,7 @@ roll_back() {
     HELD=1
     wait_idle
   fi
-  if compose build web && compose up -d --no-deps web && verify "$1"; then
+  if compose_build && compose up -d --no-deps web && verify "$1"; then
     echo "==> ROLLED_BACK"
     exit 10
   fi
@@ -341,7 +347,7 @@ ON_TAG=1
 g -c advice.detachedHead=false checkout "refs/tags/$TAG"
 GIT_SHA="$(g rev-parse HEAD)"
 export GIT_SHA
-if ! compose build web; then
+if ! compose_build; then
   echo "==> BUILD_FAILED"
   back_to_from 10
 fi
