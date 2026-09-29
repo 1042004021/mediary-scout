@@ -625,7 +625,7 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     expect(result.code).toBe(10);
     expect(result.stdout).toContain("==> RESUMED_ROLLBACK");
     expect(result.stdout).toContain("==> ROLLED_BACK");
-    expect(signatures(log)).toEqual(["status", "inspect", `checkout ${FROM}`, "hold", "hold", "wget", "build", "up", "cat_commit", "health"]);
+    expect(signatures(log)).toEqual(["inspect", `checkout ${FROM}`, "hold", "hold", "wget", "build", "up", "cat_commit", "health"]);
     expect(gitShas(stubDir)).toEqual([FROM]);
   });
 
@@ -634,7 +634,7 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     writeFileSync(join(stubDir, "head"), `${TAG_COMMIT}\n`);
     const result = await runArgs(env, ["restore", FROM]);
     expect(result.code).toBe(0);
-    expect(signatures(log)).toEqual(["status", "inspect", "rev-parse", `checkout ${FROM}`, "release"]);
+    expect(signatures(log)).toEqual(["inspect", "rev-parse", `checkout ${FROM}`, "release"]);
   });
 
   it("restore leaves a folder someone else changed alone, and still exits 0", async () => {
@@ -713,6 +713,19 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
         expect({ mode, badTo, code: result.code }).toEqual({ mode, badTo, code: 2 });
         expect(linesOf(log)).toEqual([]);
       }
+    }
+  });
+
+  it("in rollback and restore modes, proceeds even when tracked files are edited", async () => {
+    for (const mode of ["rollback", "restore"]) {
+      const { stubDir, log, env } = setup();
+      writeFileSync(join(stubDir, "head"), `${TAG_COMMIT}\n`);
+      writeFileSync(join(stubDir, "status-out"), " M docker-compose.yml\n");
+      const result = await runArgs(env, [mode, FROM]);
+      expect({ mode, code: result.code }).toEqual({ mode, code: mode === "rollback" ? 10 : 0 });
+      // The dirty-tree check is update-only: no LOCAL_CHANGES, no exit 30, no `git status`.
+      expect(result.stdout).not.toContain("==> LOCAL_CHANGES");
+      expect(signatures(log)).not.toContain("status");
     }
   });
 

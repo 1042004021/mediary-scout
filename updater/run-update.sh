@@ -94,8 +94,10 @@ web_post() {
 OWNER="$(stat -c '%u:%g' "$REPO")"
 g() { HOME=/tmp su-exec "$OWNER" git "$@"; }
 
-# Never overwrite a user's edits. No checkout --force. Config belongs in .env.
-if [ -n "$(g status --porcelain --untracked-files=no)" ]; then
+# Never overwrite a user's edits. No checkout --force. Config belongs in .env. Update mode
+# only: a plain `git checkout` in rollback/restore already refuses to clobber conflicting
+# edits, and a dirty tree must not block a resumed rollback from restoring the old version.
+if [ "$MODE" = update ] && [ -n "$(g status --porcelain --untracked-files=no)" ]; then
   echo "==> LOCAL_CHANGES"
   g status --short --untracked-files=no
   exit 30
