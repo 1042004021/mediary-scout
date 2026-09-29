@@ -593,7 +593,7 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
       const { stubDir, env } = setup();
       writeFileSync(join(stubDir, "head"), `${TAG_COMMIT}\n`);
       writeFileSync(join(stubDir, "wget-lines"), '{"busy":true}\n{"busy":false}\n');
-      const result = await runArgs(env, ["rollback", FROM]);
+      const result = await runArgs(env, ["rollback", FROM, TAG_COMMIT]);
       expect(result.code).toBe(10);
       expect(result.stdout).toContain("==> BUSY_CHECK busy");
       expect(result.stdout).not.toContain("==> STEP waiting");
@@ -605,7 +605,7 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
       const { stubDir, log, env } = setup();
       writeFileSync(join(stubDir, "head"), `${TAG_COMMIT}\n`);
       writeFileSync(join(stubDir, "wget-lines"), `${answer}\n`);
-      const result = await runArgs(env, ["rollback", FROM]);
+      const result = await runArgs(env, ["rollback", FROM, TAG_COMMIT]);
       expect({ answer, code: result.code }).toEqual({ answer, code: 10 });
       expect(signatures(log).filter((step) => step === "wget")).toHaveLength(2);
       // One 30-second sleep between the two probes, not the 30-minute limit.
@@ -621,7 +621,7 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     const { stubDir, log, env } = setup();
     writeFileSync(join(stubDir, "head"), `${TAG_COMMIT}\n`);
     writeFileSync(join(stubDir, "wget-lines"), 'FAIL\n{"busy":true}\nFAIL\n{"busy":true}\n{"busy":true}\n{"busy":false}\n');
-    const result = await runArgs(env, ["rollback", FROM]);
+    const result = await runArgs(env, ["rollback", FROM, TAG_COMMIT]);
     expect(result.code).toBe(10);
     // Six probes before the build, one more (idle) when it pauses again after the build.
     expect(signatures(log).filter((step) => step === "wget")).toHaveLength(7);
@@ -656,7 +656,7 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
   it("rollback mode rebuilds and swaps back to the given commit, without a backup or a tag", async () => {
     const { stubDir, log, env } = setup();
     writeFileSync(join(stubDir, "head"), `${TAG_COMMIT}\n`);
-    const result = await runArgs(env, ["rollback", FROM]);
+    const result = await runArgs(env, ["rollback", FROM, TAG_COMMIT]);
     expect(result.code).toBe(10);
     expect(result.stdout).toContain("==> RESUMED_ROLLBACK");
     expect(result.stdout).toContain("==> ROLLED_BACK");
@@ -682,7 +682,7 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
   it("restore mode checks the old commit out and releases the hold", async () => {
     const { stubDir, log, env } = setup();
     writeFileSync(join(stubDir, "head"), `${TAG_COMMIT}\n`);
-    const result = await runArgs(env, ["restore", FROM]);
+    const result = await runArgs(env, ["restore", FROM, TAG_COMMIT]);
     expect(result.code).toBe(0);
     expect(signatures(log)).toEqual(["inspect", "rev-parse", "rev-parse", "symbolic-ref", `checkout ${FROM}`, "release"]);
   });
@@ -867,7 +867,7 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     writeFileSync(join(stubDir, "head"), `${TAG_COMMIT}\n`);
     writeFileSync(join(stubDir, "wget-lines"), '{"busy":false}\n');
     writeFileSync(join(stubDir, "busy-after-build"), "1");
-    const result = await runArgs(env, ["rollback", FROM]);
+    const result = await runArgs(env, ["rollback", FROM, TAG_COMMIT]);
     expect(result.code).toBe(10);
     const steps = signatures(log);
     const afterBuild = steps.slice(steps.indexOf("build") + 1, steps.indexOf("up"));
@@ -889,7 +889,7 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
       const { stubDir, log, env } = setup();
       writeFileSync(join(stubDir, "head"), `${TAG_COMMIT}\n`);
       writeFileSync(join(stubDir, "status-out"), " M docker-compose.yml\n");
-      const result = await runArgs(env, [mode, FROM]);
+      const result = await runArgs(env, [mode, FROM, TAG_COMMIT]);
       expect({ mode, code: result.code }).toEqual({ mode, code: mode === "rollback" ? 10 : 0 });
       // The dirty-tree check is update-only: no LOCAL_CHANGES, no exit 30, no `git status`.
       expect(result.stdout).not.toContain("==> LOCAL_CHANGES");
@@ -911,15 +911,38 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     expect(steps.some((step) => step.startsWith("checkout"))).toBe(false);
   });
 
-  it("does not take the repo lock in rollback or restore modes, so recovery is never blocked", async () => {
+  it("takes the repo lock BLOCKING in rollback and restore modes, so it serializes with a deploy", async () => {
     for (const mode of ["rollback", "restore"]) {
       const { stubDir, log, env } = setup();
       writeFileSync(join(stubDir, "head"), `${TAG_COMMIT}\n`);
-      writeFileSync(join(stubDir, "lock-held"), "1"); // a deploy "holds" it; recovery ignores that
-      const result = await runArgs(env, [mode, FROM]);
+      const result = await runArgs(env, [mode, FROM, TAG_COMMIT]);
       expect({ mode, code: result.code }).toEqual({ mode, code: mode === "rollback" ? 10 : 0 });
-      // The lock block is update-only: recovery never even calls flock.
-      expect(linesOf(log).some((line) => line.startsWith("flock "))).toBe(false);
+      // Recovery takes the lock blocking (no -n): it waits for any deploy instead of racing it,
+      // then re-checks the folder under the lock. update mode uses -n (see the exit-80 test).
+      const flockCalls = linesOf(log).filter((line) => line.startsWith("flock "));
+      expect(flockCalls.length).toBeGreaterThan(0);
+      expect(flockCalls.every((line) => !line.includes(" -n"))).toBe(true);
+    }
+  });
+
+  it("fails closed when the target commit is unknown: a foreign detached HEAD is left alone", async () => {
+    // No `to` argument (an ancient status.json). A person's unrelated detached checkout must
+    // not be overwritten: rollback exits 60 without building, restore leaves it and exits 0.
+    {
+      const { stubDir, log, env } = setup();
+      writeFileSync(join(stubDir, "head"), `${FOREIGN}\n`);
+      const result = await runArgs(env, ["rollback", FROM]);
+      expect(result.code).toBe(60);
+      expect(result.stdout).toContain("==> FOLDER_CHANGED");
+      expect(signatures(log)).not.toContain("build");
+    }
+    {
+      const { stubDir, log, env } = setup();
+      writeFileSync(join(stubDir, "head"), `${FOREIGN}\n`);
+      const result = await runArgs(env, ["restore", FROM]);
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain("==> FOLDER_CHANGED");
+      expect(signatures(log).some((step) => step.startsWith("checkout"))).toBe(false);
     }
   });
 
@@ -984,7 +1007,7 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     writeFileSync(join(stubDir, "head"), `${TAG_COMMIT}\n`);
     writeFileSync(join(stubDir, "wget-lines"), '{"busy":true}\n{"busy":false}\n');
     writeFileSync(join(stubDir, "fail-hold-after"), "1");
-    const result = await runArgs(env, ["rollback", FROM]);
+    const result = await runArgs(env, ["rollback", FROM, TAG_COMMIT]);
     expect(result.stderr).not.toContain("unbound");
     expect(result.code).toBe(10);
     expect(result.stdout).toContain("==> ROLLED_BACK");
@@ -1003,7 +1026,7 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     const { stubDir, log, env } = setup();
     writeFileSync(join(stubDir, "head"), `${TAG_COMMIT}\n`);
     writeFileSync(join(stubDir, "fail-build"), "1");
-    const result = await runArgs(env, ["rollback", FROM]);
+    const result = await runArgs(env, ["rollback", FROM, TAG_COMMIT]);
     expect(result.code).toBe(20);
     expect(result.stdout).toContain("==> ROLLBACK_FAILED");
     expect(signatures(log).at(-1)).toBe("release");

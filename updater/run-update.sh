@@ -81,17 +81,26 @@ cd "$REPO"
 # and this updater must never build / check out this repo at the same time. Non-blocking —
 # if the other side holds it, refuse cleanly instead of racing. fd 9 stays open for the whole
 # script, so the lock covers backup, checkout, build, swap and the update's own rollback.
-# Only update mode: the resumed rollback/restore is the updater's own recovery, guarded by
-# changed_by_someone_else, and must not be blocked by a deploy that is fixing the folder.
-# flock is in the Alpine image and on Linux hosts; absent on the macOS unit-test host, where
-# `command -v flock` skips the block. The lock file is git/docker-ignored.
+# One repo lock, shared with ./scripts/deploy.sh, held for the whole run so a manual deploy
+# and the updater never mutate the same repo/compose project at once. update mode takes it
+# non-blocking (a deploy running → not the moment to update, exit 80). Recovery (rollback/
+# restore) takes it BLOCKING: it waits for any deploy to finish, then re-checks the folder
+# under the lock before touching it (changed_by_someone_else below) — a deploy that fixed
+# the folder is then seen as a person's checkout and left alone, so recovery never races a
+# deploy nor overwrites its result. flock is in the Alpine image and on Linux hosts; absent
+# on the macOS unit-test host, where `command -v flock` skips the block. The lock file is
+# git/docker-ignored.
 LOCK="${UPDATER_LOCK_FILE:-$REPO/.update.lock}"
-if [ "$MODE" = update ] && command -v flock >/dev/null 2>&1; then
+if command -v flock >/dev/null 2>&1; then
   [ -e "$LOCK" ] || (umask 000; : > "$LOCK") 2>/dev/null || true
   exec 9>>"$LOCK"
-  if ! flock -n 9; then
-    echo "==> DEPLOY_IN_PROGRESS — a manual deploy is running in the deploy folder; not updating now"
-    exit 80
+  if [ "$MODE" = update ]; then
+    if ! flock -n 9; then
+      echo "==> DEPLOY_IN_PROGRESS — a manual deploy is running in the deploy folder; not updating now"
+      exit 80
+    fi
+  else
+    flock 9
   fi
 fi
 
@@ -214,7 +223,10 @@ verify() {
 # only ever leaves HEAD detached, on the old commit ($1) or on the commit it was moving to
 # ($2, empty when not known). A branch checked out means a person did it, at any commit (deploy.sh checks
 # out main, and a release tag usually points at main's HEAD, so the commit alone cannot
-# tell); so does any other commit, when $2 is known.
+# tell); so does any other commit, when $2 is known. When $2 is NOT known, fail closed:
+# a detached HEAD that is not $1 is treated as changed, so a person's unrelated detached
+# checkout is never overwritten (the server records $2 before the swap, so a real resume
+# has it; only an ancient status.json or a pre-fetch restore lacks it, and then HEAD is $1).
 # Returns 0 changed · 1 the updater's own · 2 HEAD cannot be read. Callers never check out
 # over an unreadable HEAD: they stop without touching the folder and let a retry or a
 # person look again. Under set -e call it as `folder_state A B` (sets FOLDER).
@@ -223,7 +235,9 @@ changed_by_someone_else() {
   # A branch first, even at the old commit: checking $1 out over it would detach it.
   g symbolic-ref -q HEAD >/dev/null 2>&1 && return 0
   [ "$now_head" = "$1" ] && return 1
-  [ -n "$2" ] && [ "$now_head" != "$2" ]
+  # Ours only when it is exactly the commit we were moving to; unknown $2 → fail closed.
+  [ -n "$2" ] && [ "$now_head" = "$2" ] && return 1
+  return 0
 }
 folder_state() {
   FOLDER=ours
