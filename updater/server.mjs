@@ -144,7 +144,9 @@ export function createUpdater(opts) {
     resume = { mode: "restore", commit: from };
   }
   let job = null;
-  const log = [];
+  // Seeded from the saved tail, so a recovery after a restart adds to the lines that
+  // explain the interruption instead of replacing them. A new update starts it over.
+  const log = typeof status.logTail === "string" && status.logTail ? status.logTail.split("\n") : [];
 
   const save = (patch) => {
     status = { ...status, ...patch };
@@ -177,6 +179,7 @@ export function createUpdater(opts) {
   async function run(tag) {
     const { pendingRestore: _stale, ...fresh } = status;
     status = fresh;
+    log.length = 0;
     save({ phase: "waiting", targetTag: tag, fromCommit: null, startedAt: opts.now(), finishedAt: null });
     let waited = 0;
     while (await acquisitionsBusy()) {

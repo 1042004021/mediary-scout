@@ -502,6 +502,45 @@ describe("updater", () => {
     expect(JSON.parse(res.body)).toEqual({ accepted: false, reason: "needs_recovery" });
   });
 
+  it("keeps the saved log tail through a restart recovery, and starts it over for a new update", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "updater-"));
+    writeFileSync(
+      join(dir, "status.json"),
+      JSON.stringify({
+        phase: "verifying",
+        targetTag: "v2026.10.02",
+        fromCommit: "c".repeat(40),
+        startedAt: "x",
+        finishedAt: null,
+        message: "",
+        logTail: "==> STEP building\n==> STEP switching\n==> STEP verifying",
+      }),
+    );
+    const updater = createUpdater({
+      stateDir: dir,
+      runUpdate: (args, onLine) => {
+        onLine(Array.isArray(args) ? "==> ROLLED_BACK" : "==> DONE v2026.10.03");
+        return Promise.resolve(Array.isArray(args) ? 10 : 0);
+      },
+      acquisitionsRunning: async () => false,
+      sleep: async () => {},
+      now: () => "2026-10-02T20:00:00.000Z",
+      waitPollMs: 1,
+      waitLimitMs: 1000,
+      repoCommit: () => "a".repeat(40),
+    });
+    await updater.idle();
+    expect(updater.status().logTail.split("\n")).toEqual([
+      "==> STEP building",
+      "==> STEP switching",
+      "==> STEP verifying",
+      "==> ROLLED_BACK",
+    ]);
+    updater.start("v2026.10.03");
+    await updater.idle();
+    expect(updater.status().logTail).toBe("==> DONE v2026.10.03");
+  });
+
   it("writes status.json atomically, leaving no temp file behind", async () => {
     const { updater, dir } = make();
     updater.start("v2026.10.02");
