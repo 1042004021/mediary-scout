@@ -251,7 +251,8 @@ export function createUpdater(opts) {
                       ? {
                           phase: "failed",
                           message:
-                            "没能从 GitHub 下载新版本，原来的版本一直在运行。网络不通时，可以在 .env 里设置 HTTPS_PROXY 后再试。",
+                            // .env is read when the container is created: a new proxy needs `up -d`.
+                            "没能从 GitHub 下载新版本，原来的版本一直在运行。网络不通时，可以在 .env 里设置 HTTPS_PROXY，在部署目录运行 docker compose up -d 让它生效，再点更新。",
                         }
                       : { phase: "failed" };
     save({ ...outcome, finishedAt: opts.now() });
@@ -453,10 +454,10 @@ if (isDirectRun()) {
   // stdin is closed at once, as the old synchronous call did with stdio "ignore": compose
   // exec forwards stdin by default. stderr is captured, so compose's variable warnings
   // stay out of the log.
-  const dockerText = (args) => {
+  const dockerText = async (args) => {
     const pending = execFileAsync("docker", args, { encoding: "utf8", timeout: 15_000 });
     pending.child.stdin?.end();
-    return pending.then((result) => result.stdout);
+    return (await pending).stdout;
   };
   const updater = createUpdater({
     stateDir,

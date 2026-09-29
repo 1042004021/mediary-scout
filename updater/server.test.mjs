@@ -433,7 +433,8 @@ describe("updater", () => {
     await updater.idle();
     expect(updater.status()).toMatchObject({
       phase: "failed",
-      message: "没能从 GitHub 下载新版本，原来的版本一直在运行。网络不通时，可以在 .env 里设置 HTTPS_PROXY 后再试。",
+      message:
+        "没能从 GitHub 下载新版本，原来的版本一直在运行。网络不通时，可以在 .env 里设置 HTTPS_PROXY，在部署目录运行 docker compose up -d 让它生效，再点更新。",
     });
   });
 

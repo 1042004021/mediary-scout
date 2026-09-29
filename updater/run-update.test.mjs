@@ -82,6 +82,7 @@ log_call wget "$@"
 # A person changing the deploy folder during the wait: on each busy poll, move HEAD to the
 # commit in move-head (one the updater did not put there).
 if [ -f "$STUB_DIR/move-head" ]; then cat "$STUB_DIR/move-head" > "$STUB_DIR/head"; fi
+if [ -f "$STUB_DIR/move-branch" ]; then : > "$STUB_DIR/on-branch"; fi
 n=0
 if [ -f "$STUB_DIR/wget-n" ]; then n=$(cat "$STUB_DIR/wget-n"); fi
 n=$((n + 1))
@@ -110,7 +111,7 @@ log_call git "$@"
 cmd=""
 for arg in "$@"; do
   case "$arg" in
-    status|rev-parse|fetch|checkout) cmd="$arg" ;;
+    status|rev-parse|fetch|checkout|symbolic-ref) cmd="$arg" ;;
   esac
 done
 case "$cmd" in
@@ -133,7 +134,14 @@ case "$cmd" in
   fetch)
     if [ -f "$STUB_DIR/fail-fetch" ]; then exit 1; fi
     ;;
+  symbolic-ref)
+    # On a branch only when a test put it there (a person ran deploy.sh, which checks out main).
+    if [ -f "$STUB_DIR/on-branch" ]; then printf '%s\\n' refs/heads/main; exit 0; fi
+    exit 1
+    ;;
   checkout)
+    # Checking out a tag or a commit id leaves HEAD detached, as real git does.
+    rm -f "$STUB_DIR/on-branch"
     ref=""
     for arg in "$@"; do ref="$arg"; done
     case "$ref" in
@@ -173,6 +181,7 @@ if printf '%s' "$args" | grep -q pg_dump; then
 fi
 if printf '%s' "$args" | grep -q 'build web'; then
   printf '%s\\n' "\${GIT_SHA-}" >> "$STUB_DIR/git-shas"
+  if [ -f "$STUB_DIR/branch-during-build" ]; then : > "$STUB_DIR/on-branch"; fi
   if [ -f "$STUB_DIR/fail-build" ]; then exit 1; fi
   exit 0
 fi
@@ -273,6 +282,7 @@ function signatures(log) {
       if (line.startsWith("docker ") && line.includes(" inspect ")) return "inspect";
       if (line.startsWith("git ") && line.includes(" status ")) return "status";
       if (line.startsWith("git ") && line.includes(" rev-parse ")) return "rev-parse";
+      if (line.startsWith("git ") && line.includes(" symbolic-ref ")) return "symbolic-ref";
       if (line.startsWith("git ") && line.includes(" fetch ")) return "fetch";
       if (line.startsWith("git ") && line.includes(" checkout ")) return `checkout ${line.trim().split(" ").at(-1)}`;
       return line;
@@ -303,6 +313,7 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
       "hold",
       "wget",
       "rev-parse",
+      "symbolic-ref",
       "up",
       "cat_commit",
       "health",
@@ -362,6 +373,7 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
       "rev-parse",
       "build",
       "rev-parse",
+      "symbolic-ref",
       `checkout ${FROM}`,
     ]);
     expect(gitShas(stubDir)).toEqual([TAG_COMMIT]);
@@ -633,7 +645,19 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     expect(result.code).toBe(10);
     expect(result.stdout).toContain("==> RESUMED_ROLLBACK");
     expect(result.stdout).toContain("==> ROLLED_BACK");
-    expect(signatures(log)).toEqual(["inspect", `checkout ${FROM}`, "hold", "hold", "wget", "build", "up", "cat_commit", "health"]);
+    expect(signatures(log)).toEqual([
+      "inspect",
+      "rev-parse",
+      "symbolic-ref",
+      `checkout ${FROM}`,
+      "hold",
+      "hold",
+      "wget",
+      "build",
+      "up",
+      "cat_commit",
+      "health",
+    ]);
     expect(gitShas(stubDir)).toEqual([FROM]);
   });
 
@@ -642,7 +666,7 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     writeFileSync(join(stubDir, "head"), `${TAG_COMMIT}\n`);
     const result = await runArgs(env, ["restore", FROM]);
     expect(result.code).toBe(0);
-    expect(signatures(log)).toEqual(["inspect", "rev-parse", `checkout ${FROM}`, "release"]);
+    expect(signatures(log)).toEqual(["inspect", "rev-parse", "rev-parse", "symbolic-ref", `checkout ${FROM}`, "release"]);
   });
 
   it("restore leaves a folder someone else changed alone, and still exits 0", async () => {
@@ -654,6 +678,55 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     expect(signatures(log).some((step) => step.startsWith("checkout"))).toBe(false);
     expect(signatures(log)).toContain("release");
     expect(readFileSync(join(stubDir, "head"), "utf8").trim()).toBe(FOREIGN);
+  });
+
+  it("restore leaves a folder a person put on a branch alone, even at the new commit or before it was known", async () => {
+    // deploy.sh checks out main; a release tag usually points at main's HEAD, so the commit
+    // alone cannot tell the updater's detached checkout from a person's deploy.
+    for (const args of [["restore", FROM, TAG_COMMIT], ["restore", FROM]]) {
+      const { stubDir, log, env } = setup();
+      writeFileSync(join(stubDir, "head"), `${TAG_COMMIT}\n`);
+      writeFileSync(join(stubDir, "on-branch"), "");
+      const result = await runArgs(env, args);
+      expect({ args, code: result.code }).toEqual({ args, code: 0 });
+      expect(result.stdout).toContain("==> FOLDER_CHANGED");
+      expect(signatures(log).some((step) => step.startsWith("checkout"))).toBe(false);
+      expect(signatures(log)).toContain("release");
+    }
+  });
+
+  it("rollback leaves a folder a person put on a branch alone, exiting 60 without building", async () => {
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "head"), `${TAG_COMMIT}\n`);
+    writeFileSync(join(stubDir, "on-branch"), "");
+    const result = await runArgs(env, ["rollback", FROM, TAG_COMMIT]);
+    expect(result.code).toBe(60);
+    expect(result.stdout).toContain("==> FOLDER_CHANGED");
+    expect(signatures(log)).not.toContain("build");
+    expect(signatures(log)).toContain("release");
+  });
+
+  it("in update mode, does not swap when a person checks out a branch at the same commit during the wait", async () => {
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "wget-lines"), '{"busy":true}\n{"busy":false}\n');
+    writeFileSync(join(stubDir, "move-branch"), "");
+    const result = await run(env);
+    expect(result.code).toBe(60);
+    expect(result.stdout).toContain("==> FOLDER_CHANGED");
+    expect(signatures(log)).not.toContain("up");
+    expect(signatures(log)).toContain("release");
+    expect(signatures(log)).not.toContain(`checkout ${FROM}`);
+  });
+
+  it("a failed build leaves a folder a person put on a branch meanwhile alone", async () => {
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "fail-build"), "1");
+    writeFileSync(join(stubDir, "branch-during-build"), "");
+    const result = await run(env);
+    expect(result.code).toBe(10);
+    expect(result.stdout).toContain("==> BUILD_FAILED");
+    expect(result.stdout).toContain("==> FOLDER_CHANGED");
+    expect(signatures(log)).not.toContain(`checkout ${FROM}`);
   });
 
   it("rollback leaves a folder someone else changed alone, exiting 60 without building", async () => {
@@ -746,7 +819,7 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     const waitSteps = steps.slice(steps.indexOf("build") + 1, steps.indexOf("up"));
     // One hold to take it, then one refresh before each of the four probes, then the
     // pre-swap HEAD check just before the swap.
-    expect(waitSteps).toEqual(["hold", "hold", "wget", "hold", "wget", "hold", "wget", "hold", "wget", "rev-parse"]);
+    expect(waitSteps).toEqual(["hold", "hold", "wget", "hold", "wget", "hold", "wget", "hold", "wget", "rev-parse", "symbolic-ref"]);
   });
 
   it("stops before the swap when refreshing the hold fails, and goes back to the old commit", async () => {

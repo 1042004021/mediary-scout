@@ -190,14 +190,23 @@ verify() {
   return 1
 }
 
+# Whether a person changed the deploy folder since the updater last moved it. The updater
+# only ever leaves HEAD detached, on the old commit ($1) or on the commit it was moving to
+# ($2, empty when not known). A branch checked out means a person did it (deploy.sh checks
+# out main, and a release tag usually points at main's HEAD, so the commit alone cannot
+# tell); so does any other commit, when $2 is known. An unreadable HEAD proves nothing.
+changed_by_someone_else() {
+  now_head="$(g rev-parse HEAD 2>/dev/null)" || return 1
+  [ "$now_head" = "$1" ] && return 1
+  g symbolic-ref -q HEAD >/dev/null 2>&1 && return 0
+  [ -n "$2" ] && [ "$now_head" != "$2" ]
+}
+
 # Before any swap: put the deploy folder back on the commit that is serving, then exit
 # with $1. If that checkout fails, exit 50 so the updater keeps retrying it.
 back_to_from() {
-  # Only undo a tree the updater itself moved: still on FROM, or on the tag it just checked
-  # out (TO). If HEAD is some other commit, a person changed the folder — leave it alone.
-  # An unreadable HEAD falls through to the checkout, today's behaviour.
-  HEAD_NOW="$(g rev-parse HEAD 2>/dev/null || true)"
-  if [ -n "$HEAD_NOW" ] && [ "$HEAD_NOW" != "$FROM" ] && [ "$HEAD_NOW" != "$TO" ]; then
+  # Only undo a tree the updater itself moved; leave one a person changed as it is.
+  if changed_by_someone_else "$FROM" "$TO"; then
     echo "==> FOLDER_CHANGED — the deploy folder was changed by someone else; leaving it as it is"
     ON_TAG=0
     exit "$1"
@@ -245,23 +254,19 @@ TO=""
 if [ "$MODE" = rollback ]; then
   echo "==> STEP switching"
   echo "==> RESUMED_ROLLBACK — the update stopped after the swap began; going back to $ROLLBACK_TO"
-  # If a person changed the deploy folder to some third commit after the interruption,
-  # do not rebuild the old version over theirs; leave it and let a person decide.
-  if [ -n "$RESUME_TO" ]; then
-    HEAD_NOW="$(g rev-parse HEAD)"
-    if [ "$HEAD_NOW" != "$RESUME_TO" ] && [ "$HEAD_NOW" != "$ROLLBACK_TO" ]; then
-      echo "==> FOLDER_CHANGED — the deploy folder was changed by someone else; leaving it as it is"
-      web_post '{"hold":false}' >/dev/null 2>&1 || true
-      exit 60
-    fi
+  # If a person changed the deploy folder after the interruption (ran deploy.sh, say), do not
+  # rebuild the old version over theirs; leave it and let a person decide.
+  if changed_by_someone_else "$ROLLBACK_TO" "$RESUME_TO"; then
+    echo "==> FOLDER_CHANGED — the deploy folder was changed by someone else; leaving it as it is"
+    web_post '{"hold":false}' >/dev/null 2>&1 || true
+    exit 60
   fi
   roll_back "$ROLLBACK_TO"
 fi
 if [ "$MODE" = restore ]; then
-  HEAD_NOW="$(g rev-parse HEAD)"
-  if [ "$HEAD_NOW" = "$ROLLBACK_TO" ]; then
+  if [ "$(g rev-parse HEAD 2>/dev/null || true)" = "$ROLLBACK_TO" ]; then
     : # already on the old commit; nothing to check out
-  elif [ -n "$RESUME_TO" ] && [ "$HEAD_NOW" != "$RESUME_TO" ]; then
+  elif changed_by_someone_else "$ROLLBACK_TO" "$RESUME_TO"; then
     # A person changed the folder off the new tag: leave whatever they put there.
     echo "==> FOLDER_CHANGED — the deploy folder was changed by someone else; leaving it as it is"
   else
@@ -298,10 +303,8 @@ cleanup() {
   # tag while the old version keeps serving: check the old commit back out. The paths
   # that exit on purpose already did (ON_TAG=0), and after the swap roll_back owns it.
   if [ "$code" != 0 ] && [ "$ON_TAG" = 1 ] && [ "$SWAPPED" = 0 ]; then
-    # As in back_to_from: only undo a tree the updater moved (FROM or the tag TO). If a
-    # person changed HEAD to some other commit, leave it; an unreadable HEAD tries the checkout.
-    HEAD_NOW="$(g rev-parse HEAD 2>/dev/null || true)"
-    if [ -n "$HEAD_NOW" ] && [ "$HEAD_NOW" != "$FROM" ] && [ "$HEAD_NOW" != "$TO" ]; then
+    # As in back_to_from: only undo a tree the updater moved; leave one a person changed.
+    if changed_by_someone_else "$FROM" "$TO"; then
       echo "==> FOLDER_CHANGED — the deploy folder was changed by someone else; leaving it as it is"
     elif ! g -c advice.detachedHead=false checkout "$FROM" >/dev/null 2>&1; then
       echo "==> RESTORE_FAILED"
@@ -364,9 +367,10 @@ else
   back_to_from 40
 fi
 wait_idle
-# A person may have run deploy.sh / git pull during the wait. Do not swap their commit out:
-# leave the folder as it is (nothing built here is lost) and let the running version stay.
-if [ "$(g rev-parse HEAD)" != "$GIT_SHA" ]; then
+# A person may have run deploy.sh / git pull during the wait (the updater left HEAD detached on
+# the tag; deploy.sh checks out main). Do not swap their work out: leave the folder as it is
+# and let the running version stay.
+if [ "$(g rev-parse HEAD)" != "$GIT_SHA" ] || g symbolic-ref -q HEAD >/dev/null 2>&1; then
   echo "==> FOLDER_CHANGED — the deploy folder was changed by someone else; leaving it as it is"
   ON_TAG=0
   exit 60
