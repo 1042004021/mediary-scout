@@ -182,6 +182,8 @@ back_to_from() {
 roll_back() {
   if ! g -c advice.detachedHead=false checkout "$1"; then
     echo "==> ROLLBACK_FAILED — could not check out $1"
+    # Giving up: let whatever version is up start runs again instead of staying paused.
+    web_post '{"hold":false}' >/dev/null 2>&1 || true
     exit 20
   fi
   GIT_SHA="$1"
@@ -198,6 +200,8 @@ roll_back() {
     exit 10
   fi
   echo "==> ROLLBACK_FAILED"
+  # Giving up: let whatever version is up start runs again instead of staying paused.
+  web_post '{"hold":false}' >/dev/null 2>&1 || true
   exit 20
 }
 

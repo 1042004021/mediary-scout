@@ -702,6 +702,16 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     expect(result.stdout).toContain("==> ROLLBACK_FAILED");
   });
 
+  it("releases the hold when the rollback gives up, so the version left up can start runs again", async () => {
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "head"), `${TAG_COMMIT}\n`);
+    writeFileSync(join(stubDir, "fail-build"), "1");
+    const result = await runArgs(env, ["rollback", FROM]);
+    expect(result.code).toBe(20);
+    expect(result.stdout).toContain("==> ROLLBACK_FAILED");
+    expect(signatures(log).at(-1)).toBe("release");
+  });
+
   it("leaves no partial backup when compression fails", async () => {
     const { repo, stubDir, env } = setup();
     writeExe(join(stubDir, "..", "bin"), "gzip", "#!/bin/sh\nprintf partial\nexit 1\n");
