@@ -15,3 +15,4 @@ docs
 *.log
 # Database dumps from ./scripts/pg-backup.sh and the updater. Never ship them into an image.
 backups
+.update.lock

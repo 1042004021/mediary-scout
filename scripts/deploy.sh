@@ -22,6 +22,24 @@ set -eu
 # portability across /bin/sh implementations (busybox ash, dash, bash).
 cd "$(dirname "$0")/.."
 
+# Take the same repository lock the updater's run-update.sh takes, so a one-click update and
+# this manual deploy never build/checkout/swap the same repo and compose project at once. The
+# lock is a git/docker-ignored file at the repo root; the updater sees the same inode through
+# its bind mount, and flock is an inode-level advisory lock the kernel shares across the two.
+# The updater only holds it during a normal update, not during its own recovery, so a deploy
+# meant to fix a broken state is never blocked. Held via fd 9 for this whole script.
+# flock is on Linux hosts (util-linux) and the updater's Alpine image; absent on macOS, where
+# `command -v flock` skips it (the deployment box is Linux). Non-blocking: refuse, don't hang.
+if command -v flock >/dev/null 2>&1; then
+  LOCK=".update.lock"
+  [ -e "$LOCK" ] || (umask 000; : > "$LOCK") 2>/dev/null || true
+  exec 9>>"$LOCK"
+  if ! flock -n 9; then
+    echo "==> 一键更新正在进行，请等它结束后再运行本脚本（或在设置→更新里查看进度）。"
+    exit 1
+  fi
+fi
+
 # The updater leaves the deploy folder on a release tag; pull needs a branch.
 git symbolic-ref -q HEAD >/dev/null || git checkout main
 

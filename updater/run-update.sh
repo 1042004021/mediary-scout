@@ -8,6 +8,7 @@
 #         (the old version is still serving; the updater retries the checkout).
 #       · 60 the deploy folder was changed by someone else (left as it is; nothing swapped)
 #       · 70 could not download the new version from GitHub (nothing touched)
+#       · 80 a manual ./scripts/deploy.sh holds the repo lock (nothing touched)
 #
 # When the updater restarts and finds an update that was cut off:
 #   `run-update.sh rollback <commit> [to]` — the swap had begun: rebuild and swap back.
@@ -75,6 +76,24 @@ REPO="${UPDATER_REPO_DIR:-/repo}"
 STATE="${UPDATER_STATE_DIR:-/state}"
 WEB="${UPDATER_WEB_BASE:-http://web:3000}"
 cd "$REPO"
+
+# Shared lock with a hand-run ./scripts/deploy.sh (it takes the same one): a manual deploy
+# and this updater must never build / check out this repo at the same time. Non-blocking —
+# if the other side holds it, refuse cleanly instead of racing. fd 9 stays open for the whole
+# script, so the lock covers backup, checkout, build, swap and the update's own rollback.
+# Only update mode: the resumed rollback/restore is the updater's own recovery, guarded by
+# changed_by_someone_else, and must not be blocked by a deploy that is fixing the folder.
+# flock is in the Alpine image and on Linux hosts; absent on the macOS unit-test host, where
+# `command -v flock` skips the block. The lock file is git/docker-ignored.
+LOCK="${UPDATER_LOCK_FILE:-$REPO/.update.lock}"
+if [ "$MODE" = update ] && command -v flock >/dev/null 2>&1; then
+  [ -e "$LOCK" ] || (umask 000; : > "$LOCK") 2>/dev/null || true
+  exec 9>>"$LOCK"
+  if ! flock -n 9; then
+    echo "==> DEPLOY_IN_PROGRESS — a manual deploy is running in the deploy folder; not updating now"
+    exit 80
+  fi
+fi
 
 token() {
   if [ -r "$STATE/token" ]; then cat "$STATE/token"; fi
@@ -192,13 +211,14 @@ verify() {
 
 # Whether a person changed the deploy folder since the updater last moved it. The updater
 # only ever leaves HEAD detached, on the old commit ($1) or on the commit it was moving to
-# ($2, empty when not known). A branch checked out means a person did it (deploy.sh checks
+# ($2, empty when not known). A branch checked out means a person did it, at any commit (deploy.sh checks
 # out main, and a release tag usually points at main's HEAD, so the commit alone cannot
 # tell); so does any other commit, when $2 is known. An unreadable HEAD proves nothing.
 changed_by_someone_else() {
   now_head="$(g rev-parse HEAD 2>/dev/null)" || return 1
-  [ "$now_head" = "$1" ] && return 1
+  # A branch first, even at the old commit: checking $1 out over it would detach it.
   g symbolic-ref -q HEAD >/dev/null 2>&1 && return 0
+  [ "$now_head" = "$1" ] && return 1
   [ -n "$2" ] && [ "$now_head" != "$2" ]
 }
 

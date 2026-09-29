@@ -46,6 +46,14 @@ function installStubs(bin) {
   writeExe(bin, "chown", `#!/bin/sh\n${LOG_FN}\nlog_call chown "$@"\nexit 0\n`);
   // busybox timeout: SECS PROG ARGS. macOS has none, so stub it — drop the SECS and exec the
   // rest, or (hang-build) exit 124 as a timeout would, without running the build at all.
+  // flock stub (macOS has none): with -n, fail when a manual deploy "holds" the lock
+  // (marker file), else succeed. The script's `exec 9>>LOCK` is real fd redirection the
+  // stub need not model; it only decides the exit code from the marker.
+  writeExe(
+    bin,
+    "flock",
+    `#!/bin/sh\n${LOG_FN}\nlog_call flock "$@"\ncase "$*" in *-n*) [ -f "$STUB_DIR/lock-held" ] && exit 1 ;; esac\nexit 0\n`,
+  );
   writeExe(
     bin,
     "timeout",
@@ -182,6 +190,7 @@ fi
 if printf '%s' "$args" | grep -q 'build web'; then
   printf '%s\\n' "\${GIT_SHA-}" >> "$STUB_DIR/git-shas"
   if [ -f "$STUB_DIR/branch-during-build" ]; then : > "$STUB_DIR/on-branch"; fi
+  if [ -f "$STUB_DIR/head-during-build" ]; then cat "$STUB_DIR/head-during-build" > "$STUB_DIR/head"; fi
   if [ -f "$STUB_DIR/fail-build" ]; then exit 1; fi
   exit 0
 fi
@@ -729,6 +738,18 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     expect(signatures(log)).not.toContain(`checkout ${FROM}`);
   });
 
+  it("a failed build leaves a branch a person checked out at the old commit alone, not detached", async () => {
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "fail-build"), "1");
+    // deploy.sh ran during the build: main checked out, and main is still the old commit.
+    writeFileSync(join(stubDir, "branch-during-build"), "");
+    writeFileSync(join(stubDir, "head-during-build"), `${FROM}\n`);
+    const result = await run(env);
+    expect(result.code).toBe(10);
+    expect(result.stdout).toContain("==> FOLDER_CHANGED");
+    expect(signatures(log)).not.toContain(`checkout ${FROM}`);
+  });
+
   it("rollback leaves a folder someone else changed alone, exiting 60 without building", async () => {
     const { stubDir, log, env } = setup();
     writeFileSync(join(stubDir, "head"), `${FOREIGN}\n`);
@@ -807,6 +828,32 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
       // The dirty-tree check is update-only: no LOCAL_CHANGES, no exit 30, no `git status`.
       expect(result.stdout).not.toContain("==> LOCAL_CHANGES");
       expect(signatures(log)).not.toContain("status");
+    }
+  });
+
+  it("refuses to update while a manual deploy holds the repo lock, touching nothing", async () => {
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "lock-held"), "1"); // deploy.sh holds the lock
+    const result = await run(env);
+    expect(result.code).toBe(80);
+    expect(result.stdout).toContain("==> DEPLOY_IN_PROGRESS");
+    const steps = signatures(log);
+    // Nothing was touched: no backup, no fetch/checkout, no build, no swap.
+    expect(steps).not.toContain("pg_dump");
+    expect(steps).not.toContain("build");
+    expect(steps).not.toContain("up");
+    expect(steps.some((step) => step.startsWith("checkout"))).toBe(false);
+  });
+
+  it("does not take the repo lock in rollback or restore modes, so recovery is never blocked", async () => {
+    for (const mode of ["rollback", "restore"]) {
+      const { stubDir, log, env } = setup();
+      writeFileSync(join(stubDir, "head"), `${TAG_COMMIT}\n`);
+      writeFileSync(join(stubDir, "lock-held"), "1"); // a deploy "holds" it; recovery ignores that
+      const result = await runArgs(env, [mode, FROM]);
+      expect({ mode, code: result.code }).toEqual({ mode, code: mode === "rollback" ? 10 : 0 });
+      // The lock block is update-only: recovery never even calls flock.
+      expect(linesOf(log).some((line) => line.startsWith("flock "))).toBe(false);
     }
   });
 

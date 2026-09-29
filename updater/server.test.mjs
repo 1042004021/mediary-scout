@@ -458,6 +458,17 @@ describe("updater", () => {
     });
   });
 
+  it("maps a manual-deploy lock clash (exit 80) to a failed update that says a deploy is running", async () => {
+    const { updater } = make({ runUpdate: () => Promise.resolve(80) });
+    updater.start("v2026.10.02");
+    await updater.idle();
+    expect(updater.status()).toMatchObject({
+      phase: "failed",
+      message: "正在进行一次手动部署，这次先不更新了，原来的版本一直在运行。手动部署完成后可以再点更新。",
+    });
+    expect(updater.status().needsManualRecovery).toBeUndefined();
+  });
+
   it("after a restart before the swap, only checks the old commit back out", async () => {
     const dir = mkdtempSync(join(tmpdir(), "updater-"));
     writeFileSync(
