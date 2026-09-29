@@ -193,6 +193,7 @@ if printf '%s' "$args" | grep -q 'build web'; then
   printf '%s\\n' "\${GIT_SHA-}" >> "$STUB_DIR/git-shas"
   if [ -f "$STUB_DIR/branch-during-build" ]; then : > "$STUB_DIR/on-branch"; fi
   if [ -f "$STUB_DIR/unreadable-during-build" ]; then : > "$STUB_DIR/unreadable-head"; fi
+  if [ -f "$STUB_DIR/busy-after-build" ]; then printf '%s\n' '{"busy":true}' '{"busy":false}' >> "$STUB_DIR/wget-lines"; fi
   if [ -f "$STUB_DIR/head-during-build" ]; then cat "$STUB_DIR/head-during-build" > "$STUB_DIR/head"; fi
   if [ -f "$STUB_DIR/fail-build" ]; then exit 1; fi
   exit 0
@@ -566,11 +567,12 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     const ups = steps.map((step, index) => [step, index]).filter(([step]) => step === "up").map(([, index]) => index);
     expect(ups).toHaveLength(2);
     // Between the first swap and the rollback swap: a hold is taken, then the rollback
-    // waits (two probes: busy, then idle), refreshing the hold on each.
+    // waits (two probes: busy, then idle), refreshing the hold on each; after the build it
+    // pauses again and checks once more (idle) right before swapping.
     const between = steps.slice(ups[0] + 1, ups[1]);
     expect(between.indexOf("hold")).toBeGreaterThanOrEqual(0);
-    expect(between.filter((step) => step === "wget")).toHaveLength(2);
-    expect(between.filter((step) => step === "hold")).toHaveLength(3);
+    expect(between.filter((step) => step === "wget")).toHaveLength(3);
+    expect(between.filter((step) => step === "hold")).toHaveLength(5);
     expect(between.indexOf("hold")).toBeLessThan(between.indexOf("wget"));
   });
 
@@ -621,7 +623,8 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     writeFileSync(join(stubDir, "wget-lines"), 'FAIL\n{"busy":true}\nFAIL\n{"busy":true}\n{"busy":true}\n{"busy":false}\n');
     const result = await runArgs(env, ["rollback", FROM]);
     expect(result.code).toBe(10);
-    expect(signatures(log).filter((step) => step === "wget")).toHaveLength(6);
+    // Six probes before the build, one more (idle) when it pauses again after the build.
+    expect(signatures(log).filter((step) => step === "wget")).toHaveLength(7);
     expect(result.stdout).not.toContain("does not answer");
   });
 
@@ -666,6 +669,9 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
       "hold",
       "wget",
       "build",
+      "hold",
+      "hold",
+      "wget",
       "up",
       "cat_commit",
       "health",
@@ -853,6 +859,29 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
       expect(result.stdout).toContain("==> HEAD_UNREADABLE");
       expect(signatures(log)).not.toContain(`checkout ${FROM}`);
     }
+  });
+
+  it("pauses the version being replaced again after the rollback build, and waits for work it started", async () => {
+    // The build can outlast the pause (40 minutes): the old version may start a run meanwhile.
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "head"), `${TAG_COMMIT}\n`);
+    writeFileSync(join(stubDir, "wget-lines"), '{"busy":false}\n');
+    writeFileSync(join(stubDir, "busy-after-build"), "1");
+    const result = await runArgs(env, ["rollback", FROM]);
+    expect(result.code).toBe(10);
+    const steps = signatures(log);
+    const afterBuild = steps.slice(steps.indexOf("build") + 1, steps.indexOf("up"));
+    expect(afterBuild[0]).toBe("hold"); // pause taken again right after the build
+    expect(afterBuild.filter((step) => step === "wget")).toHaveLength(2); // busy, then idle
+  });
+
+  it("restore releases the pause even when its checkout fails, and stays pending", async () => {
+    const { stubDir, log, env } = setup();
+    writeFileSync(join(stubDir, "head"), `${TAG_COMMIT}\n`);
+    writeFileSync(join(stubDir, "fail-checkout-from"), "1");
+    const result = await runArgs(env, ["restore", FROM, TAG_COMMIT]);
+    expect(result.code).toBe(50);
+    expect(signatures(log).at(-1)).toBe("release");
   });
 
   it("in rollback and restore modes, proceeds even when tracked files are edited", async () => {

@@ -185,6 +185,7 @@ wait_idle() {
       if [ "$seen" = busy ]; then unanswered=0; else unanswered=$((unanswered + 1)); fi
       if [ "$unanswered" -ge 2 ]; then
         echo "==> BUSY_CHECK the new version does not answer — the rollback goes ahead"
+        WAIT_GAVE_UP=1
         return 0
       fi
     fi
@@ -257,6 +258,19 @@ back_to_from() {
   exit 50
 }
 
+# The version being replaced may have started its worker. If it answers, pause it and let
+# its running tasks end before swapping it out; one that does not answer is not running
+# tasks, and waiting on it would only delay getting the old version back. Best effort: the
+# rollback goes ahead either way.
+pause_before_rollback_swap() {
+  if [ "$(web_post '{"hold":true}' 2>/dev/null || true)" = '{"hold":true}' ]; then
+    HELD=1
+    # A version that already failed to answer the busy check is not running tasks: keep it
+    # paused, but do not wait on it a second time.
+    if [ "$WAIT_GAVE_UP" = 0 ]; then wait_idle; fi
+  fi
+}
+
 # Back to $1: check it out, rebuild, swap, and check it serves. Exits 10 or 20.
 roll_back() {
   if ! g -c advice.detachedHead=false checkout "$1"; then
@@ -267,14 +281,18 @@ roll_back() {
   fi
   GIT_SHA="$1"
   export GIT_SHA
-  # The version being replaced may have started its worker. If it answers, pause it and
-  # let its running tasks end before swapping it out; one that does not answer is not
-  # running tasks, and waiting on it would only delay getting the old version back.
-  if [ "$(web_post '{"hold":true}' 2>/dev/null || true)" = '{"hold":true}' ]; then
-    HELD=1
-    wait_idle
+  pause_before_rollback_swap
+  if ! compose_build; then
+    echo "==> ROLLBACK_FAILED"
+    # Giving up: let whatever version is up start runs again instead of staying paused.
+    web_post '{"hold":false}' >/dev/null 2>&1 || true
+    exit 20
   fi
-  if compose_build && compose up -d --no-deps web && verify "$1"; then
+  # The build can outlast the pause (it lapses 40 minutes after the last refresh, the build
+  # may take up to UPDATER_BUILD_LIMIT_S), so the version being replaced may have started work
+  # meanwhile: pause it again and let that finish right before the swap.
+  pause_before_rollback_swap
+  if compose up -d --no-deps web && verify "$1"; then
     echo "==> ROLLED_BACK"
     exit 10
   fi
@@ -288,6 +306,7 @@ HELD=0
 SWAPPED=0
 ON_TAG=0
 TO=""
+WAIT_GAVE_UP=0
 if [ "$MODE" = rollback ]; then
   echo "==> STEP switching"
   echo "==> RESUMED_ROLLBACK — the update stopped after the swap began; going back to $ROLLBACK_TO"
@@ -315,7 +334,13 @@ if [ "$MODE" = restore ]; then
     fi
     # A person changed the folder off the new tag: leave whatever they put there.
     if [ "$FOLDER" = ours ]; then
-      g -c advice.detachedHead=false checkout "$ROLLBACK_TO"
+      if ! g -c advice.detachedHead=false checkout "$ROLLBACK_TO"; then
+        # Not under set -e: a failed checkout must still release the pause. Exit 50 keeps
+        # the restore pending, so the updater retries it.
+        echo "==> RESTORE_FAILED"
+        web_post '{"hold":false}' >/dev/null 2>&1 || true
+        exit 50
+      fi
       echo "==> RESTORED $ROLLBACK_TO"
     fi
   fi
