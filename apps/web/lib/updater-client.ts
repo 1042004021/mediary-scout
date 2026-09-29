@@ -28,12 +28,14 @@ export interface UpdaterStatus {
   repoCommit?: string | null;
   /** The deploy folder is not back on the serving commit yet after a cut-off update. */
   pendingRestore?: boolean;
+  /** A rollback failed: what is running is unknown until a person runs deploy.sh. */
+  needsManualRecovery?: boolean;
 }
 
 /** The deploy folder's HEAD, only when it is the commit being served: no update is
  *  running (it checks out the new tag before the swap) and no checkout is pending. */
 export function servingRepoCommit(status: UpdaterStatus | null): string | null {
-  if (!status || status.pendingRestore === true) return null;
+  if (!status || status.pendingRestore === true || status.needsManualRecovery === true) return null;
   if (!["idle", "done", "rolled_back", "failed"].includes(status.phase)) return null;
   const commit = status.repoCommit;
   return typeof commit === "string" && /^[0-9a-f]{40}$/.test(commit) ? commit : null;
@@ -95,7 +97,7 @@ export async function getUpdaterStatus(options: ClientOptions = {}): Promise<Upd
 export async function requestUpdate(
   tag: string,
   options: ClientOptions = {},
-): Promise<{ ok: true } | { ok: false; reason: "no_updater" | "busy" | "bad_tag" | "unreachable" }> {
+): Promise<{ ok: true } | { ok: false; reason: "no_updater" | "busy" | "needs_recovery" | "bad_tag" | "unreachable" }> {
   const token = await readToken(options.stateDir ?? DEFAULT_STATE_DIR);
   if (!token) return { ok: false, reason: "no_updater" };
   try {
@@ -106,7 +108,10 @@ export async function requestUpdate(
       signal: AbortSignal.timeout(5000),
     });
     if (response.status === 202) return { ok: true };
-    if (response.status === 409) return { ok: false, reason: "busy" };
+    if (response.status === 409) {
+      const body = (await response.json().catch(() => null)) as { reason?: unknown } | null;
+      return { ok: false, reason: body?.reason === "needs_recovery" ? "needs_recovery" : "busy" };
+    }
     if (response.status === 400) return { ok: false, reason: "bad_tag" };
     return { ok: false, reason: "unreachable" };
   } catch {

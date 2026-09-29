@@ -116,7 +116,7 @@ export function UpdateTab({ view, desktop }: { view: UpdateView; desktop: boolea
           </div>
         </div>
         {desktop ? <DesktopUpdateHint view={view} /> : null}
-        {!desktop && view.updater && (updating || view.available) ? (
+        {!desktop && view.updater && (updating || (view.available && !view.updater.needsManualRecovery)) ? (
           <UpdateNowButton tag={updating ? null : (view.available?.tag ?? null)} initial={view.updater} />
         ) : null}
         {!desktop && !updating && view.available && !view.updater && view.updaterInstalled ? (

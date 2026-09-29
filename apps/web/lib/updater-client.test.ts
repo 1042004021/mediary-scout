@@ -52,6 +52,14 @@ describe("updater client", () => {
     expect(await getUpdaterStatus({ stateDir: dir, fetchImpl: down as never })).toBeNull();
   });
 
+  it("maps a 409 with needs_recovery to needs_recovery", async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ accepted: false, reason: "needs_recovery" }), { status: 409 }));
+    expect(await requestUpdate("v2026.10.02", { stateDir: dir, fetchImpl: fetchImpl as never })).toEqual({
+      ok: false,
+      reason: "needs_recovery",
+    });
+  });
+
   it("maps 409 to busy, 400 to bad_tag, and anything else to unreachable", async () => {
     const busy = vi.fn(async () => new Response(JSON.stringify({ accepted: false, reason: "busy" }), { status: 409 }));
     expect(await requestUpdate("v2026.10.02", { stateDir: dir, fetchImpl: busy as never })).toEqual({
@@ -97,6 +105,7 @@ describe("updater client", () => {
       expect(servingRepoCommit({ ...base, phase, repoCommit: SHA })).toBeNull();
     }
     expect(servingRepoCommit({ ...base, phase: "failed", repoCommit: SHA, pendingRestore: true })).toBeNull();
+    expect(servingRepoCommit({ ...base, phase: "failed", repoCommit: SHA, needsManualRecovery: true })).toBeNull();
     expect(servingRepoCommit({ ...base, phase: "idle", repoCommit: "nope" })).toBeNull();
     expect(servingRepoCommit({ ...base, phase: "idle" })).toBeNull();
     expect(servingRepoCommit(null)).toBeNull();

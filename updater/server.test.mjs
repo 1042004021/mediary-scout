@@ -418,6 +418,90 @@ describe("updater", () => {
     expect(updater.status().pendingRestore).toBeUndefined();
   });
 
+  it("after a failed rollback, refuses new updates until the web serves the deploy folder HEAD again", async () => {
+    let serving = "b".repeat(40);
+    const calls = [];
+    const dir = mkdtempSync(join(tmpdir(), "updater-"));
+    const updater = createUpdater({
+      stateDir: dir,
+      runUpdate: (args) => {
+        calls.push(args);
+        return Promise.resolve(calls.length === 1 ? 20 : 0);
+      },
+      acquisitionsRunning: async () => false,
+      sleep: async () => {},
+      now: () => "2026-10-02T20:00:00.000Z",
+      waitPollMs: 1,
+      waitLimitMs: 1000,
+      repoCommit: () => "a".repeat(40),
+      servingCommit: () => serving,
+    });
+    updater.start("v2026.10.02");
+    await updater.idle();
+    expect(updater.status()).toMatchObject({ phase: "failed", needsManualRecovery: true });
+    expect(updater.start("v2026.10.03")).toEqual({ accepted: false, reason: "needs_recovery" });
+    expect(calls).toHaveLength(1);
+    // A person ran deploy.sh: the web now serves the deploy folder's HEAD.
+    serving = "a".repeat(40);
+    expect(updater.start("v2026.10.03")).toEqual({ accepted: true });
+    await updater.idle();
+    expect(calls).toEqual(["v2026.10.02", "v2026.10.03"]);
+    expect(updater.status().needsManualRecovery).toBeUndefined();
+  });
+
+  it("marks a resumed rollback that fails as needing a person too", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "updater-"));
+    writeFileSync(
+      join(dir, "status.json"),
+      JSON.stringify({ phase: "verifying", targetTag: "v2026.10.02", fromCommit: "c".repeat(40), startedAt: "x", finishedAt: null, message: "", logTail: "" }),
+    );
+    const updater = createUpdater({
+      stateDir: dir,
+      runUpdate: () => Promise.resolve(20),
+      acquisitionsRunning: async () => false,
+      sleep: async () => {},
+      now: () => "2026-10-02T20:00:00.000Z",
+      waitPollMs: 1,
+      waitLimitMs: 1000,
+      repoCommit: () => "a".repeat(40),
+      servingCommit: () => null,
+    });
+    await updater.idle();
+    expect(updater.status().needsManualRecovery).toBe(true);
+    expect(updater.start("v2026.10.03")).toEqual({ accepted: false, reason: "needs_recovery" });
+  });
+
+  it("answers 409 needs_recovery over HTTP", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "updater-"));
+    writeFileSync(
+      join(dir, "status.json"),
+      JSON.stringify({ phase: "failed", targetTag: "v2026.10.02", fromCommit: null, startedAt: "x", finishedAt: "y", message: "", logTail: "", needsManualRecovery: true }),
+    );
+    const updater = createUpdater({
+      stateDir: dir,
+      runUpdate: () => Promise.resolve(0),
+      acquisitionsRunning: async () => false,
+      sleep: async () => {},
+      now: () => "2026-10-02T20:00:00.000Z",
+      waitPollMs: 1,
+      waitLimitMs: 1000,
+      repoCommit: () => "a".repeat(40),
+      servingCommit: () => null,
+    });
+    const handler = createUpdaterHttp(updater, "t0k3n");
+    const req = new PassThrough();
+    req.method = "POST";
+    req.url = "/update";
+    req.headers = { authorization: "Bearer t0k3n" };
+    const res = { code: 0, body: "", writeHead(code) { this.code = code; return this; }, end(body) { this.body = body ?? ""; this.done?.(); } };
+    const done = new Promise((resolve) => (res.done = resolve));
+    handler(req, res);
+    req.end(JSON.stringify({ tag: "v2026.10.03" }));
+    await done;
+    expect(res.code).toBe(409);
+    expect(JSON.parse(res.body)).toEqual({ accepted: false, reason: "needs_recovery" });
+  });
+
   it("writes status.json atomically, leaving no temp file behind", async () => {
     const { updater, dir } = make();
     updater.start("v2026.10.02");

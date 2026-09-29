@@ -156,6 +156,25 @@ describe("UpdateTab one-click update", () => {
     expect(html).not.toContain("立即更新");
   });
 
+  it("does not offer 立即更新 after a failed rollback, only the recovery message", () => {
+    const html = render({
+      desktop: false,
+      view: view({
+        available: newer,
+        status: "available",
+        updaterInstalled: true,
+        updater: updater({
+          phase: "failed",
+          message: "新版本没通过自检，自动回退也没成功。请在部署目录运行 ./scripts/deploy.sh 恢复。",
+          needsManualRecovery: true,
+          finishedAt: FINISHED,
+        }),
+      }),
+    });
+    expect(html).not.toContain("立即更新");
+    expect(html).toContain("自动回退也没成功");
+  });
+
   it("shows an amber failure line and the log tail", () => {
     for (const phase of ["rolled_back", "failed"] as const) {
       const html = render({

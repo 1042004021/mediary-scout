@@ -4,6 +4,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
+import { hostname } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -204,7 +205,11 @@ export function createUpdater(opts) {
             ? { phase: "rolled_back", message: "新版本构建没成功，原来的版本一直在运行，没有受影响。" }
             : { phase: "rolled_back" }
           : code === 20
-            ? { phase: "failed", message: "新版本没通过自检，自动回退也没成功。请在部署目录运行 ./scripts/deploy.sh 恢复。" }
+            ? {
+                phase: "failed",
+                message: "新版本没通过自检，自动回退也没成功。请在部署目录运行 ./scripts/deploy.sh 恢复。",
+                needsManualRecovery: true,
+              }
             : code === 30
               ? {
                   phase: "failed",
@@ -243,6 +248,7 @@ export function createUpdater(opts) {
         : {
             phase: "failed",
             message: "更新中途被打断，自动回退也没成功。请在部署目录运行 ./scripts/deploy.sh 恢复。",
+            needsManualRecovery: true,
           }),
       finishedAt: opts.now(),
     });
@@ -260,6 +266,16 @@ export function createUpdater(opts) {
     start(tag) {
       if (!isReleaseTag(tag)) return { accepted: false, reason: "bad_tag" };
       if (job) return { accepted: false, reason: "busy" };
+      // A rollback that failed needs a person (./scripts/deploy.sh). Once the running web
+      // serves the deploy folder's HEAD again, that happened: clear it and go on.
+      if (status.needsManualRecovery === true) {
+        const head = opts.repoCommit();
+        const serving = opts.servingCommit ? opts.servingCommit() : null;
+        if (!head || head !== serving) return { accepted: false, reason: "needs_recovery" };
+        const { needsManualRecovery: _cleared, ...rest } = status;
+        status = rest;
+        save({});
+      }
       // A cut-off update's checkout is not back on the old commit yet: try that again
       // first. The new update runs only once it worked, from the right commit.
       if (status.pendingRestore === true && typeof status.fromCommit === "string") {
@@ -312,7 +328,7 @@ export function createUpdaterHttp(updater, token) {
             tag = null;
           }
           const outcome = updater.start(tag);
-          const status = outcome.accepted ? 202 : outcome.reason === "busy" ? 409 : 400;
+          const status = outcome.accepted ? 202 : outcome.reason === "busy" || outcome.reason === "needs_recovery" ? 409 : 400;
           res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(outcome));
         })
         .catch(() => {
@@ -382,6 +398,25 @@ if (isDirectRun()) {
     now: () => new Date().toISOString(),
     waitPollMs: 30_000,
     waitLimitMs: 2 * 60 * 60 * 1000,
+    // The commit the running web container was built from (its BUILD_COMMIT).
+    servingCommit: () => {
+      try {
+        const project = execFileSync(
+          "docker",
+          ["inspect", "-f", '{{ index .Config.Labels "com.docker.compose.project" }}', hostname()],
+          { encoding: "utf8" },
+        ).trim();
+        const commit = execFileSync(
+          "docker",
+          ["compose", "-p", project, "--project-directory", process.env.UPDATER_REPO_DIR ?? "/repo", "exec", "-T", "web", "cat", "BUILD_COMMIT"],
+          // stderr: compose prints its variable warnings there; keep them out of the log.
+          { encoding: "utf8", timeout: 15_000, stdio: ["ignore", "pipe", "ignore"] },
+        ).trim();
+        return /^[0-9a-f]{40}$/.test(commit) ? commit : null;
+      } catch {
+        return null;
+      }
+    },
     // As the deploy folder's owner (see run-update.sh), so git does not refuse the repo.
     repoCommit: () => {
       try {
