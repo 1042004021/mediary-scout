@@ -307,12 +307,24 @@ export function createUpdater(opts) {
       if (!isReleaseTag(tag)) return { accepted: false, reason: "bad_tag" };
       if (job) return { accepted: false, reason: "busy" };
       if (status.needsManualRecovery === true) return { accepted: false, reason: "needs_recovery" };
-      // A cut-off update's checkout is not back on the old commit yet: try that again
-      // first. The new update runs only once it worked, from the right commit.
+      // A cut-off update's checkout is not back on the old commit yet: try that again first,
+      // from the right commit, and say so. The new update runs only once it worked; if the
+      // restore keeps failing, stop and ask for a person rather than update from a wrong tree.
       if (status.pendingRestore === true && typeof status.fromCommit === "string") {
         const commit = status.fromCommit;
+        save({ phase: "waiting", message: "正在把部署目录切回原来的版本…", finishedAt: null });
         job = resumeAfterRestart({ mode: "restore", commit })
-          .then(() => (status.pendingRestore === true ? undefined : run(tag)))
+          .then(() => {
+            if (status.pendingRestore === true) {
+              save({
+                phase: "failed",
+                message: "部署目录没能切回原来的版本，这次先不更新了。请在部署目录运行 ./scripts/deploy.sh。",
+                finishedAt: opts.now(),
+              });
+              return undefined;
+            }
+            return run(tag);
+          })
           .finally(() => {
             job = null;
           });

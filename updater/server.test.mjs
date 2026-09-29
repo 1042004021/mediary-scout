@@ -438,12 +438,18 @@ describe("updater", () => {
       }),
     );
     const calls = [];
+    const restoreMessages = [];
     let restoreCode = 1;
     const updater = createUpdater({
       stateDir: dir,
       runUpdate: (args) => {
         calls.push(args);
-        if (Array.isArray(args)) return Promise.resolve(restoreCode);
+        if (Array.isArray(args)) {
+          // Read from disk to avoid the closure touching `updater` before it is assigned
+          // (the constructor runs the start-up retry synchronously).
+          restoreMessages.push(JSON.parse(readFileSync(join(dir, "status.json"), "utf8")).message);
+          return Promise.resolve(restoreCode);
+        }
         return Promise.resolve(0);
       },
       acquisitionsRunning: async () => false,
@@ -455,10 +461,16 @@ describe("updater", () => {
     });
     await updater.idle(); // the start-up retry, which fails
     calls.length = 0;
+    restoreMessages.length = 0;
     expect(updater.start("v2026.10.03")).toEqual({ accepted: true });
     await updater.idle();
     expect(calls).toEqual([["restore", "c".repeat(40)]]); // failed again: no update ran
-    expect(updater.status().pendingRestore).toBe(true);
+    expect(restoreMessages).toEqual(["正在把部署目录切回原来的版本…"]); // the message shown while it tries
+    expect(updater.status()).toMatchObject({
+      phase: "failed",
+      pendingRestore: true,
+      message: "部署目录没能切回原来的版本，这次先不更新了。请在部署目录运行 ./scripts/deploy.sh。",
+    });
 
     restoreCode = 0;
     calls.length = 0;
