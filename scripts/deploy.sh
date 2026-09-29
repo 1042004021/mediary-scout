@@ -34,7 +34,10 @@ echo "==> Building web at commit ${GIT_SHA}"
 # compose reads build.args GIT_SHA=${GIT_SHA} from the exported env above — no need to
 # pass --build-arg. No --no-cache either: the GIT_SHA cache-bust already forces the
 # source COPY + build to re-run, while keeping the (slow) npm ci layer cached.
-docker compose build web
+# Build the updater too: `docker compose up -d` never rebuilds an existing image, and
+# one-click updates only replace web (the updater can't swap its own container) — a
+# manual deploy is the only way the updater itself gets new code.
+docker compose build web updater
 
 echo "==> Starting stack"
 docker compose up -d "$@"
