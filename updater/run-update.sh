@@ -123,7 +123,10 @@ wait_idle() {
     else
       seen=unreachable
     fi
-    if [ "$i" -eq 0 ]; then
+    # Only the wait before the swap is a "waiting" phase. After it the updater's saved phase
+    # must stay switching/verifying: a restart in a rollback's wait would otherwise read a
+    # pre-swap phase and only check the folder out, leaving the failed new version serving.
+    if [ "$i" -eq 0 ] && [ "$MODE" = update ] && [ "$SWAPPED" = 0 ]; then
       echo "==> STEP waiting"
     fi
     if [ "$seen" != "$last" ]; then

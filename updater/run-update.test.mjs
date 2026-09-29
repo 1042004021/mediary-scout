@@ -521,6 +521,30 @@ describe("run-update.sh", { timeout: 60_000 }, () => {
     expect(between.indexOf("hold")).toBeLessThan(between.indexOf("wget"));
   });
 
+  it("prints no waiting step once the swap has begun, in a rollback after a failed check or a resumed one", async () => {
+    // Update mode: the swap happens, the check fails, the rollback waits on a busy new version.
+    {
+      const { stubDir, env } = setup();
+      writeFileSync(join(stubDir, "hide-shas"), `${TAG_COMMIT}\n`);
+      writeFileSync(join(stubDir, "wget-lines"), '{"busy":false}\n{"busy":true}\n{"busy":false}\n');
+      const result = await run(env);
+      expect(result.code).toBe(10);
+      const afterSwap = result.stdout.slice(result.stdout.indexOf("==> STEP switching"));
+      expect(afterSwap).toContain("==> BUSY_CHECK busy");
+      expect(afterSwap).not.toContain("==> STEP waiting");
+    }
+    // A rollback resumed after an updater restart.
+    {
+      const { stubDir, env } = setup();
+      writeFileSync(join(stubDir, "head"), `${TAG_COMMIT}\n`);
+      writeFileSync(join(stubDir, "wget-lines"), '{"busy":true}\n{"busy":false}\n');
+      const result = await runArgs(env, ["rollback", FROM]);
+      expect(result.code).toBe(10);
+      expect(result.stdout).toContain("==> BUSY_CHECK busy");
+      expect(result.stdout).not.toContain("==> STEP waiting");
+    }
+  });
+
   it("rolls back when `up` itself fails instead of exiting through set -e", async () => {
     const { stubDir, log, env } = setup();
     writeFileSync(join(stubDir, "fail-first-up"), "1");

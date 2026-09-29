@@ -28,6 +28,7 @@ const TERMINAL_PHASES = new Set(["idle", "done", "rolled_back", "failed"]);
 const STEP_PHASES = new Set(["waiting", "backing_up", "building", "switching", "verifying"]);
 const INTERRUPTED_MESSAGE = "更新被中断了，原来的版本仍在运行。";
 const RESUME_ROLLBACK_MESSAGE = "更新中途被打断，正在回到原来的版本。";
+const ROLLING_BACK_MESSAGE = "新版本没通过自检，正在回到原来的版本，网页会短暂打不开。";
 const MAX_BODY = 1024;
 
 export function isReleaseTag(value) {
@@ -192,13 +193,25 @@ export function createUpdater(opts) {
       waited += opts.waitPollMs;
     }
     let buildFailed = false;
+    // Set once this job has saved switching or verifying. From then on the saved phase never
+    // goes back to a pre-swap one: a restart during the rollback would read it as "the old
+    // version never stopped" and only check the folder out, leaving the failed version up.
+    let pastSwap = false;
     const code = await opts.runUpdate(tag, (line) => {
       log.push(line);
       if (line.startsWith("==> BUILD_FAILED")) buildFailed = true;
       const from = /^==> FROM ([0-9a-f]{40})/.exec(line);
       if (from) save({ fromCommit: from[1] });
+      if (line.startsWith("==> VERIFY_FAILED") || line.startsWith("==> UP_FAILED")) {
+        pastSwap = true;
+        save({ phase: "switching", message: ROLLING_BACK_MESSAGE });
+      }
       const step = /^==> STEP (\w+)/.exec(line);
-      if (step && STEP_PHASES.has(step[1])) save({ phase: step[1] });
+      if (step && STEP_PHASES.has(step[1])) {
+        const swapPhase = step[1] === "switching" || step[1] === "verifying";
+        if (swapPhase) pastSwap = true;
+        if (swapPhase || !pastSwap) save({ phase: step[1] });
+      }
     });
     const outcome =
       code === 0

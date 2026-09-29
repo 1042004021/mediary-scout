@@ -261,6 +261,82 @@ describe("updater", () => {
     }
   });
 
+  it("keeps the phase past the swap when the rollback prints a waiting step, so a restart still rolls back", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "updater-"));
+    let fed = () => {};
+    const feeding = new Promise((resolve) => {
+      fed = resolve;
+    });
+    const options = {
+      stateDir: dir,
+      acquisitionsRunning: async () => false,
+      sleep: async () => {},
+      now: () => "2026-10-02T20:00:00.000Z",
+      waitPollMs: 1,
+      waitLimitMs: 1000,
+      repoCommit: () => "a".repeat(40),
+    };
+    const first = createUpdater({
+      ...options,
+      runUpdate: (_tag, onLine) => {
+        for (const line of [
+          `==> FROM ${"c".repeat(40)}`,
+          "==> STEP backing_up",
+          "==> STEP building",
+          "==> STEP switching",
+          "==> STEP verifying",
+          "==> VERIFY_FAILED — rolling back to c",
+          "==> STEP waiting",
+          "==> STEP building",
+        ]) {
+          onLine(line);
+        }
+        fed();
+        // The updater is killed here: the runner never finishes.
+        return new Promise(() => {});
+      },
+    });
+    first.start("v2026.10.02");
+    await feeding;
+    expect(first.status().phase).toBe("switching");
+    expect(JSON.parse(readFileSync(join(dir, "status.json"), "utf8")).phase).toBe("switching");
+    const calls = [];
+    const second = createUpdater({
+      ...options,
+      runUpdate: (args, onLine) => {
+        calls.push(args);
+        onLine("==> ROLLED_BACK");
+        return Promise.resolve(10);
+      },
+    });
+    await second.idle();
+    expect(calls).toEqual([["rollback", "c".repeat(40)]]);
+  });
+
+  it("says the old version is coming back as soon as the new one fails its check or its start", async () => {
+    for (const failure of ["==> VERIFY_FAILED — rolling back to c", "==> UP_FAILED — rolling back to c"]) {
+      let seen = null;
+      let updater;
+      const made = make({
+        runUpdate: (_tag, onLine) => {
+          onLine(`==> FROM ${"c".repeat(40)}`);
+          onLine("==> STEP switching");
+          onLine("==> STEP verifying");
+          onLine(failure);
+          seen = updater.status();
+          return new Promise(() => {});
+        },
+      });
+      updater = made.updater;
+      updater.start("v2026.10.02");
+      for (let tries = 0; tries < 50 && !seen; tries += 1) await new Promise((resolve) => setTimeout(resolve, 1));
+      expect(seen).toMatchObject({
+        phase: "switching",
+        message: "新版本没通过自检，正在回到原来的版本，网页会短暂打不开。",
+      });
+    }
+  });
+
   it("says a person is needed when that rollback fails too", async () => {
     const dir = mkdtempSync(join(tmpdir(), "updater-"));
     writeFileSync(
