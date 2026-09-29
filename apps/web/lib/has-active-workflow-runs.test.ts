@@ -4,7 +4,7 @@ import { HOLD_GRACE_MS, hasActiveWorkflowRuns } from "./has-active-workflow-runs
 
 async function saveRun(
   repo: InMemoryWorkflowRepository,
-  input: { id: string; accountId: string; status: WorkflowStatus; kind: WorkflowKind },
+  input: { id: string; accountId: string; status: WorkflowStatus; kind: WorkflowKind; nextAttemptAt?: string },
 ): Promise<void> {
   await repo.saveWorkflowRunSnapshot({
     accountId: input.accountId,
@@ -37,6 +37,7 @@ async function saveRun(
       startedAt: "2026-10-02T00:00:00.000Z",
       finishedAt: input.status === "queued" || input.status === "running" ? null : "2026-10-02T01:00:00.000Z",
       auditEvents: [],
+      ...(input.nextAttemptAt ? { nextAttemptAt: input.nextAttemptAt } : {}),
     },
     episodes: [],
     resourceSnapshots: [],
@@ -79,6 +80,24 @@ describe("hasActiveWorkflowRuns", () => {
     await saveRun(repo, { id: "run-default", accountId: DEFAULT_ACCOUNT_ID, status: "queued", kind: "type2_init" });
     expect(await repo.listAccounts()).toEqual([]);
     expect(await hasActiveWorkflowRuns(repo)).toBe(true);
+  });
+
+  it("ignores a queued run still in backoff before the hold: the worker defers it too", async () => {
+    const now = Date.parse("2026-10-02T12:00:00.000Z");
+    const repo = new InMemoryWorkflowRepository();
+    // A transient failure re-queued this run with a future nextAttemptAt; the worker will
+    // not claim it yet, so an update must not sit waiting for it on an idle instance.
+    await saveRun(repo, {
+      id: "run-backoff",
+      accountId: DEFAULT_ACCOUNT_ID,
+      status: "queued",
+      kind: "type2_init",
+      nextAttemptAt: "2026-10-02T12:05:00.000Z",
+    });
+    expect(await hasActiveWorkflowRuns(repo, { holdStartedAt: null, now })).toBe(false);
+    // Once its backoff has elapsed it is claimable again → busy.
+    const later = Date.parse("2026-10-02T12:06:00.000Z");
+    expect(await hasActiveWorkflowRuns(repo, { holdStartedAt: null, now: later })).toBe(true);
   });
 
   describe("while the update hold is on", () => {
